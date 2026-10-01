@@ -1,0 +1,305 @@
+---
+title: Жизненный цикл документа
+description: "Как документ появляется, читается, меняется и удаляется: состояния новый, загруженный, изменённый и удалённый, Model.new и Model.hydrate"
+icon: RefreshCw
+---
+
+Документ в Typemo проходит четыре состояния: **новый** (создан в памяти, в базе его нет), **загруженный** (совпадает с базой), **изменённый** (в памяти есть правки, которых нет в базе) и **удалённый** (запись из базы убрана). От состояния зависит, что сделает [`$save`](../reference/documents/document-api.mdx#save): вставит документ, обновит его, ничего не отправит или откажется работать.
+
+Зная состояния, вы понимаете, почему `$save` нового документа делает вставку, а `$save` прочитанного — короткое обновление, и почему сохранить удалённый документ нельзя. Узнать состояние можно прямо в коде: [`$isNew`](../reference/documents/document-api.mdx#isnew) и [`$isModified`](../reference/documents/document-api.mdx#ismodified).
+
+## Что предполагается
+
+Примеры используют заказ из руководства [Изменить и сохранить документ](./change-and-save.mdx). Подключение — как в руководстве [Подключиться к базе](../connection/connect.mdx).
+
+## Быстрый путь
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = Orders.new({ customer: "alice", tags: [], lines: [] }); // новый
+console.log(order.$isNew(), order.$isModified());
+// → true true
+
+await order.$save(); // загруженный
+console.log(order.$isNew(), order.$isModified());
+// → false false
+
+order.customer = "bob"; // изменённый
+console.log(order.$isNew(), order.$isModified());
+// → false true
+
+await order.$deleteOne(); // удалённый
+```
+
+## Создать новый документ
+
+[`Model.new`](../reference/documents/model-document-methods.mdx#modelnew) создаёт документ в памяти: значения по умолчанию подставлены, `_id` выдан, каждое поле приведено к типу. В базе документа нет. Приведение типов идёт сразу, поэтому неверный тип и неизвестный ключ — [`CastError`](../reference/errors/data-errors.mdx#casterror) на вызове `new`. Обязательность и правила проверяются позже, при [`$save`](../reference/documents/document-api.mdx#save) или [`$validate`](../reference/documents/document-api.mdx#validate).
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = Orders.new({ customer: "alice", tags: [], lines: [] });
+console.log(order.$isNew(), order.__v, order._id.constructor.name);
+// → true undefined "ObjectId"
+
+await order.$save();
+console.log(order.__v);
+// → 0
+```
+
+Поле версии `__v` у нового документа не задано: его выставит вставка. Если вам сразу нужен сохранённый документ, используйте [`create`](../reference/writes/writes.mdx#create): он делает то же самое в одну строку.
+
+## Прочитать существующий документ
+
+Всё, что вы читаете запросами без [`.lean()`](../reference/query/reading.mdx#lean) и [`.plain()`](../reference/query/reading.mdx#plain), приходит загруженным: `$isNew()` равен `false`, изменений нет. Документ хранит своё исходное состояние и с ним сравнивается при каждой проверке изменений.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+const created = await Orders.create({ customer: "alice", tags: ["gift"], lines: [] });
+// ---cut---
+const order = await Orders.findById(created._id).orFail();
+console.log(order.$isNew(), order.$isModified());
+// → false false
+```
+
+## Изменить и сохранить
+
+Любое изменение делает документ изменённым, а успешный [`$save`](../reference/documents/document-api.mdx#save) возвращает его в состояние «загруженный». Если вы вернули значение к прежнему, документ снова не считается изменённым: Typemo сравнивает значения, а не запоминает присваивания. Подробности — в руководстве [Изменить и сохранить документ](./change-and-save.mdx).
+
+## Оживить данные, прочитанные не через Typemo
+
+Данные бывают из кеша, очереди сообщений или драйвера. [`Model.hydrate`](../reference/documents/model-document-methods.mdx#modelhydrate) превращает такой объект в загруженный документ с типизированными коллекциями. Метод верит, что данные — то, что лежит в базе: он не приводит и не проверяет их, а принимает имена полей базы.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+import { ObjectId } from "mongodb";
+// ---cut---
+const order = Orders.hydrate({ _id: new ObjectId(), customer: "alice", tags: ["gift"], lines: [], __v: 0 });
+console.log(order.$isNew(), order.$isModified(), order.tags.constructor.name);
+// → false false "StrictArray"
+
+order.customer = "bob";
+console.log(order.$getChanges());
+// → { $set: { customer: "bob" } }
+```
+
+Массив тегов — [`StrictArray`](../reference/documents/typed-collections.mdx#strictarray): `constructor.name` называет публичный тип коллекции, так что по имени класса можно проверять, что массив типизированный, а не обычный `Array` (массив поддокументов называется `SubdocumentArray`, Map — `TypedMap`).
+
+Если документа с таким `_id` в базе нет, `hydrate` его всё равно создаст, а вот `$save` не найдёт запись и бросит [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#documentnotfounderror):
+
+```text
+DocumentNotFoundError: Order.save: the document is no longer in the collection (deleted since it was read, or out of the scope of the operation's policies); nothing was written
+```
+
+## Удалить документ
+
+[`$deleteOne`](../reference/documents/document-api.mdx#deleteone) убирает запись из базы и помечает документ удалённым. Такой документ нельзя ни сохранить, ни удалить второй раз: это ошибки, а не тихие пустые операции, потому что обычно это значит, что вы работаете с устаревшим объектом.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: [], lines: [] });
+await order.$deleteOne();
+
+try {
+  order.customer = "bob";
+  await order.$save();
+} catch (error) {
+  console.log(error instanceof Error && error.message);
+  // → "save: the document of Order was deleted"
+}
+```
+
+## Как выбрать
+
+Спросите себя: **откуда у меня данные?** Если вы создаёте запись — [`Model.new`](../reference/documents/model-document-methods.mdx#modelnew) (и потом `$save`) или сразу [`create`](../reference/writes/writes.mdx#create). Если читаете из базы — запрос вернёт загруженные документы сам. Если данные пришли откуда-то ещё и вам нужны `$`-методы — [`Model.hydrate`](../reference/documents/model-document-methods.mdx#modelhydrate). Если нужен только ответ клиенту, документ вообще не нужен: [`.plain()`](../reference/query/reading.mdx#plain).
+
+## Когда это не нужно
+
+Если вы не будете менять и сохранять данные, а только отдадите их, документ ни к чему: он тяжелее обычного объекта. Читайте через [`.plain()`](../reference/query/reading.mdx#plain) или [`.lean()`](../reference/query/reading.mdx#lean). Для массовых изменений используйте [`updateMany`](../reference/writes/writes.mdx#updatemany), а не цикл по документам.
+
+## Частые ошибки
+
+### Сохраняется не тот документ, что задумано
+
+После `Model.hydrate` документ считается существующим. Если вы гидратировали данные, которых нет в базе, а затем вызвали `$save`, вы получите `DocumentNotFoundError`, а не вставку. Исправление: для несуществующих данных используйте [`Model.new`](../reference/documents/model-document-methods.mdx#modelnew).
+
+### Сохранение после удаления
+
+```text
+QueryError: save: the document of Order was deleted
+```
+
+Исправление: создайте новый документ через `Model.new` или прочитайте актуальный.
+
+## Полный пример
+
+```ts twoslash title="orders/orders.service.ts"
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+export const openOrder = async (customer: string) => {
+  const order = Orders.new({ customer, tags: [], lines: [] });
+  await order.$save();
+  return order._id;
+};
+
+export const renameCustomer = async (orderId: Order["_id"], customer: string) => {
+  const order = await Orders.findById(orderId).orFail();
+  order.customer = customer;
+  await order.$save();
+};
+
+export const cancelOrder = async (orderId: Order["_id"]) => {
+  const order = await Orders.findById(orderId).orFail();
+  await order.$deleteOne();
+};
+```
+
+## Если вы пришли из Mongoose
+
+<Callout type="migration">
+
+`new Model(data)` называется `Model.new(data)`, а `doc.isNew` — метод `doc.$isNew()`. `Model.hydrate` есть и в Mongoose. В Typemo он принимает данные в форме базы (с именами полей базы) и отклоняет всё, что не обычный объект.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Изменить и сохранить документ" href="./change-and-save.mdx">
+  Как менять поля и коллекции и что уходит в базу при `$save`.
+</Card>
+<Card title="Валидация документа" href="./validation.mdx">
+  Когда и как проверяется документ.
+</Card>
+<Card title="Методы модели для документов" href="../reference/documents/model-document-methods.mdx">
+  Подробно про `Model.new`, `Model.hydrate`, `castObject` и `validate`.
+</Card>
+</Cards>

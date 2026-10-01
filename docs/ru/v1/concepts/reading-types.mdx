@@ -1,0 +1,300 @@
+---
+title: Как читать типы в редакторе
+description: "Что показывают подсказки редактора для документа, lean, plain и Selected и как по сообщению компилятора понять, почему запрос не компилируется"
+icon: MousePointer2
+---
+
+В Typemo половина информации о результате запроса живёт в типах: какие поля есть у строки, что стало с `bigint`, пропало ли скрытое поле, может ли результат быть `null`. Все эти ответы вы получаете наведением курсора на переменную, без запуска кода. Страница показывает, что именно вы при этом увидите, что означают странные на вид части подсказки и как прочитать сообщение компилятора, когда запрос не компилируется.
+
+Типы Typemo **выводятся из вашего класса**, а не написаны вручную. Подсказка для целого документа при этом короткая: в ней стоит имя класса, `HydratedDoc<Account>`, а если документ отличается от обычного чтения, то и список отличающихся полей. Результаты чтения и сериализации (`lean`, `plain`, `$toPlain()`, `$toObject()`, `$toJSON()`) редактор раскрывает до полей. Чтобы узнать точный тип одного поля, наведите курсор на это свойство.
+
+Все подсказки ниже получены настоящим компилятором на одной модели счёта. Скрытое поле `pin` (в обычных результатах его нет, подробнее в справочнике [`Hidden`](../reference/schemas/field-markers.mdx#hidden)) нужно, чтобы показать, как оно пропадает из типов.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema, type Hidden } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => BigInt, { required: true })
+  balance!: bigint;
+
+  @Prop(() => Date)
+  openedAt?: Date;
+
+  @Prop(() => String, { hidden: true })
+  pin?: Hidden<string>;
+}
+```
+
+## Документ
+
+**Документ** — результат обычного чтения: объект модели, у которого есть методы `$save`, `$set` и отслеживание изменений. Его тип называется `HydratedDoc`, а в скобках Typemo пишет данные модели. Наведите курсор на переменную с документом, а затем на его свойства:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, type Hidden, type Selected } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => BigInt, { required: true }) balance!: bigint;
+  @Prop(() => Date) openedAt?: Date;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const account = await Accounts.findOne({ owner: "ann" }).orFail();
+//    ^?
+const balance = account.balance;
+//    ^?
+const id = account._id;
+//    ^?
+```
+
+Подсказка `account` — `HydratedDoc<Account>`: документ модели `Account` в том виде, в каком его отдаёт обычное чтение. Это значит, что в нём есть все поля класса, кроме скрытых: `pin` в документ по умолчанию не входит, и обращение `account.pin` не компилируется. Тот же тип `HydratedDoc<Account>` возвращают `new()` и `create()`, поэтому его можно писать в сигнатурах функций, которые принимают прочитанный документ. Свойства читаются как обычные значения: `account.balance` — `bigint`, `account._id` — `ObjectId`. Служебных пометок вроде «поле нельзя менять после создания» в подсказках нет. Они есть только в объявлении класса, а зачем они нужны, описано в справочнике [Маркерные типы полей](../reference/schemas/field-markers.mdx).
+
+Если документ отличается от обычного чтения, подсказка называется `HydratedDocWith` и вторым аргументом перечисляет только отличающиеся поля. Это бывает в трёх случаях: связь загружена через populate (`HydratedDocWith<Post, { author: HydratedDoc<User> | null }>`), скрытое поле запрошено знаком `+` (пример в разделе [Скрытые поля](#скрытые-поля)) или поле сужено условием `.where(…).in(…)`. Остальные поля такие же, как в `HydratedDoc` того же класса. Как читать подсказку документа с populate, показывает руководство [Проверки типов при populate](../populate/type-checks.mdx).
+
+Если вы забыли [`.orFail()`](../reference/query/reading.mdx#orfail), то в подсказке появится `| null`, а компилятор потребует проверки: результат `findOne` может быть пустым.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, type Hidden, type Selected } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => BigInt, { required: true }) balance!: bigint;
+  @Prop(() => Date) openedAt?: Date;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const account = await Accounts.findOne({ owner: "ann" });
+//    ^?
+```
+
+## Lean и plain
+
+**Lean** и **plain** — формы результата без методов, только данные. В lean значения остаются такими, как их отдал драйвер (`ObjectId`, `bigint`), в plain типы MongoDB превращены в строки, чтобы данные можно было отдать клиенту. Разницу видно по свойствам:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, type Hidden, type Selected } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => BigInt, { required: true }) balance!: bigint;
+  @Prop(() => Date) openedAt?: Date;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const lean = await Accounts.findOne({ owner: "ann" }).orFail().lean();
+//    ^?
+const plain = await Accounts.findOne({ owner: "ann" }).orFail().plain();
+const plainBalance = plain.balance;
+//    ^?
+const plainId = plain._id;
+//    ^?
+```
+
+Тип `lean` раскрыт целиком: `_id` — `ObjectId`, а `balance` — `bigint`. В plain-строке те же поля стали `` `${bigint}` `` и `string`: строка `${bigint}` описывает «десятичную запись целого числа», и такую строку принимают обратно методы записи. Как выбрать между формами, объясняет руководство [Чтение данных](../queries/reading-data.mdx), а список типов форм — справочник [Типы форм](../reference/values/form-types.mdx).
+
+Те же формы получаются и из документа: [`$toPlain()`](../reference/documents/document-api.mdx#toplain), [`$toObject()`](../reference/documents/document-api.mdx#toobject) и [`$toJSON()`](../reference/documents/document-api.mdx#tojson). Их подсказки раскрыты до полей, и скрытого поля в них нет:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, type Hidden } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => BigInt, { required: true }) balance!: bigint;
+  @Prop(() => Date) openedAt?: Date;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const account = await Accounts.findOne({ owner: "ann" }).orFail();
+const toPlain = account.$toPlain();
+//    ^?
+const toObject = account.$toObject();
+//    ^?
+const toJson = account.$toJSON();
+//    ^?
+```
+
+Разница видна по полям: `$toPlain()` превращает `balance` в `` `${bigint}` `` и `_id` в строку, `$toObject()` оставляет значения драйвера (`bigint`, `ObjectId`), а `$toJSON()` ещё и превращает дату в строку, потому что JSON не знает `Date`.
+
+## Скрытые поля
+
+Скрытое поле пропадает из типа результата, пока вы не попросили его явно знаком `+` в [`.select`](../reference/query/reading.mdx#select). После этого оно есть в типе документа, но в ответ клиенту не попадает, пока вы не разрешите это отдельно. Тип отвечает на вопрос «может ли поле оказаться в ответе» ещё до запуска:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, type Hidden, type Selected } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => BigInt, { required: true }) balance!: bigint;
+  @Prop(() => Date) openedAt?: Date;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const account = await Accounts.findOne({ owner: "ann" }).select({ "+pin": true }).orFail();
+//    ^?
+const inDocument = account.pin;
+//    ^?
+const forInternalUse = account.$toPlain({ hidden: true }).pin;
+//    ^?
+// @errors: 2339
+account.$toPlain().pin;
+```
+
+Подсказка документа — `HydratedDocWith<Account, { pin?: string }>`: по сравнению с обычным чтением у него есть одно лишнее поле, и подсказка называет только его. И в документе, и в plain-виде с `{ hidden: true }` поле читается как `string | undefined`: запросив его знаком `+`, вы получаете обычную строку. Обычный `$toPlain()` поля не содержит, и компилятор не даёт к нему обратиться: если `pin` не находится, отправить его клиенту случайно нельзя. Как скрытые поля работают целиком, объясняет руководство [Чтение данных](../queries/reading-data.mdx#не-отдать-секретные-поля).
+
+## Selected
+
+Когда вы выбираете часть полей через [`.select`](../reference/query/reading.mdx#select), тип строки сужается до выбранных полей и `_id`. Такую форму можно записать отдельным типом, [`Selected`](../reference/query/contracts.mdx#selected): «поля этой модели в plain-виде». Он нужен, чтобы описать результат в сигнатуре функции, и раскрывается в подсказке полностью:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, type Hidden, type Selected } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => BigInt, { required: true }) balance!: bigint;
+  @Prop(() => Date) openedAt?: Date;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.connection.model(Account);
+// ---cut---
+type BalanceRow = Selected<Account, "owner" | "balance">;
+declare const row: BalanceRow;
+const shown = row;
+//    ^?
+const rows = await Accounts.find().select({ owner: 1, balance: 1 }).plain();
+//    ^?
+```
+
+Тип строки, выведенный из запроса (`rows`), и тип, записанный руками (`BalanceRow`), совпадают по полям, только порядок полей в подсказке разный. Если они разойдутся, [`.expect`](../reference/query/contracts.mdx#expect) сообщит об этом на этапе компиляции.
+
+## Когда не компилируется
+
+Сообщение компилятора для Typemo бывает длинным, потому что типы вложены друг в друга. Чтобы его понять, читайте с двух мест: первая строка называет правило (`Property … does not exist`, `is possibly 'null'`), а последняя вложенная строка обычно называет причину. Ниже пять типичных случаев с настоящим текстом компилятора.
+
+**Метод документа у lean-строки.** Lean — данные без методов, поэтому `$save` у неё нет. Сообщение показывает раскрытый тип строки, и по нему видно, что методов в ней нет:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, type Hidden, type Selected } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => BigInt, { required: true }) balance!: bigint;
+  @Prop(() => Date) openedAt?: Date;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const lean = await Accounts.findOne({ owner: "ann" }).orFail().lean();
+// @errors: 2339
+await lean.$save();
+```
+
+Чтобы менять и сохранять, читайте документ, а не lean.
+
+**Результат может быть `null`.** `findOne` без `.orFail()` возвращает `null`, когда ничего не нашлось, и компилятор заставляет вас это учесть:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, type Hidden, type Selected } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => BigInt, { required: true }) balance!: bigint;
+  @Prop(() => Date) openedAt?: Date;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const account = await Accounts.findOne({ owner: "ann" });
+// @errors: 18047
+account.owner;
+```
+
+Добавьте `.orFail()`, если отсутствие документа для вас ошибка, или проверьте `null` сами.
+
+**Неверный тип значения при записи.** Здесь ошибка в самой последней строке сообщения. Первые строки лишь говорят, что ни один из двух вариантов `create` не подошёл, а причина написана в конце каждого варианта. Для `balance` поле объявлено как `bigint`, поэтому вход принимает `bigint` или его десятичную строку, а число нет:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, type Hidden, type Selected } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => BigInt, { required: true }) balance!: bigint;
+  @Prop(() => Date) openedAt?: Date;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.connection.model(Account);
+// ---cut---
+// @errors: 2769
+await Accounts.create({ owner: "ann", balance: 5 });
+```
+
+Исправление: `balance: 5n` или `balance: "5"`.
+
+**Поле, которого нет.** Имя, которого нет в модели, компилятор отвергает в `.select`, в фильтре и в обновлении. В фильтре это `Object literal may only specify known properties` с подсказкой ближайшего имени. В `.select` сообщение всегда одно и то же на любой модели: в нём есть пара `"projection error"` с причиной `unknown field "nope"`, то есть компилятор прямо называет неизвестное поле:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, type Hidden, type Selected } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => BigInt, { required: true }) balance!: bigint;
+  @Prop(() => Date) openedAt?: Date;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.connection.model(Account);
+// ---cut---
+// @errors: 2345
+await Accounts.find().select({ nope: 1 });
+```
+
+**Контракт результата не сходится.** Метод `.expect` сравнивает ожидаемую форму строки с реальной. При расхождении сообщение перечисляет лишние поля (`extra`) и несовпадающие (`mismatch`):
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, type Hidden, type Selected } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => BigInt, { required: true }) balance!: bigint;
+  @Prop(() => Date) openedAt?: Date;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.connection.model(Account);
+// ---cut---
+// @errors: 2684
+await Accounts.find({ owner: "ann" }).plain().expect<{ owner: number }>();
+```
+
+Каждый раз работает один и тот же способ чтения: найдите в сообщении имя поля или метода, посмотрите, какой тип назван справа, а затем наведите курсор на переменную и сравните. Если запрос компилируется, но падает при запуске, причина в данных, а не в типах: правила строгости описывает страница [Строгость](./strictness.mdx).
+
+## Что дальше
+
+<Cards>
+<Card title="Формы значений" href="../reference/values/value-forms.mdx">
+  Как выглядит каждый тип MongoDB в документе, lean, `$toObject()`, plain и JSON.
+</Card>
+<Card title="Контракты результата" href="../queries/contracts.mdx">
+  `.expect`, `.parse` и `Selected`: как описать форму ответа и проверить её.
+</Card>
+<Card title="Строгость" href="./strictness.mdx">
+  Что Typemo считает ошибкой при запуске и при компиляции.
+</Card>
+</Cards>

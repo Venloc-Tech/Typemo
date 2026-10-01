@@ -1,0 +1,161 @@
+---
+title: Типы данных MongoDB
+description: "Что такое BSON, чем ObjectId, int64, Decimal128, Binary, UUID, Date, Timestamp и векторы отличаются от JSON и как каждый из них выглядит в коде Typemo"
+icon: Braces
+---
+
+MongoDB хранит документы не в JSON, а в **BSON** — двоичном формате, который похож на JSON, но знает больше типов значений. Из-за этого у нескольких значений в базе нет пары в JavaScript и в JSON: идентификатор `ObjectId`, 64-битное целое, точное десятичное число, двоичные данные. Typemo превращает их в понятные типы TypeScript и явно показывает, где значение остаётся собой, а где становится строкой, чтобы данные не менялись незаметно для вас.
+
+Страница объясняет, откуда берутся эти типы и почему для них нужны разные формы результата. Читать её стоит один раз, до руководств по [выбору типов полей](../schemas/field-types.mdx) и [чтению данных](../queries/reading-data.mdx): дальше в документации на неё ссылаются, когда встречается очередной `ObjectId` или `bigint`. Полную таблицу «тип и форма» держит справочник [Формы значений](../reference/values/value-forms.mdx).
+
+## Что такое BSON
+
+**BSON** (binary JSON) — формат, в котором сервер MongoDB хранит документы и в котором драйвер обменивается с ним данными. Как и JSON, он состоит из объектов, массивов, строк, чисел и логических значений. В отличие от JSON, в нём есть отдельные типы для даты, идентификатора, двоичных данных, целых разной ширины и точного десятичного числа. Официальный драйвер `mongodb` превращает эти типы в объекты JavaScript и обратно, а классы для них берёт из пакета `bson`.
+
+Разница между типами видна и вам, и базе. Запрос по полю, в котором лежит `ObjectId`, не найдёт документ, если в фильтре стоит строка из тех же двадцати четырёх символов: для сервера это два разных значения. Сортировка и сравнение тоже идут по типу значения, а не по тому, как оно выглядит в тексте.
+
+## Почему они не помещаются в JSON
+
+JSON знает только строку, число, логическое значение, `null`, массив и объект, а число в нём — это число JavaScript, то есть double. Чтобы понять, что происходит с остальными типами, отправьте их в `JSON.stringify` напрямую, как это сделал бы обработчик запроса, который отдаёт прочитанную строку клиенту:
+
+```ts twoslash
+import { Binary, Decimal128, Long, ObjectId } from "mongodb";
+// ---cut---
+console.log(JSON.stringify({ id: new ObjectId("6abcb88b25109dc2cd5d67c3") }));
+// → {"id":"6abcb88b25109dc2cd5d67c3"}
+console.log(JSON.stringify({ price: Decimal128.fromString("19.99") }));
+// → {"price":{"$numberDecimal":"19.99"}}
+console.log(JSON.stringify({ bytes: new Binary(new Uint8Array([1, 2, 3])) }));
+// → {"bytes":"AQID"}
+console.log(JSON.stringify({ total: Long.fromString("9007199254740993") }));
+// → {"total":{"high":2097152,"low":1,"unsigned":false}}
+```
+
+Каждая строка выглядит по-своему, и ни одна не годится клиенту без переделки. `ObjectId` превратился в строку, но клиент, который пришлёт её обратно, пришлёт строку, а не идентификатор. `Decimal128` стал объектом со служебным ключом, двоичные данные — строкой base64, а `Long` — двумя половинками числа. Самое опасное — число за пределами точности double: `9007199254740993` в числе JavaScript превращается в `9007199254740992`, и никакой ошибки нет. `JSON.stringify` не умеет только `bigint` и падает с `TypeError: JSON.stringify cannot serialize BigInt.`, поэтому lean-строку с int64 нельзя отдать клиенту напрямую.
+
+Поэтому Typemo не выбирает одну картину значения на все случаи. Одно и то же сохранённое значение доступно в нескольких **формах**: как в драйвере (для расчётов внутри приложения), как plain (данные JavaScript, где типы MongoDB стали строками) и как JSON. Выбор формы — это ответ на вопрос «что будет с данными после чтения», и руководство [Чтение данных](../queries/reading-data.mdx#отдать-данные-клиенту) разбирает его на задачах.
+
+## ObjectId
+
+`ObjectId` — 12-байтовый идентификатор, который сервер и драйвер создают для поля `_id`, когда вы его не задали. Он начинается со времени создания в секундах, поэтому сортировка по `_id` примерно совпадает с порядком создания. В базе это отдельный тип, а не строка, и в тексте он записывается 24 шестнадцатеричными символами.
+
+В документе, в lean и в `$toObject()` это экземпляр `ObjectId`, в plain и в JSON — строка. Строку принимают обратно все методы записи, фильтры и [`findById`](../reference/query/reading.mdx#modelfindbyid): клиентскую строку не нужно оборачивать в `ObjectId` вручную. Два экземпляра `ObjectId` с одним значением — разные объекты, поэтому `===` между ними даёт `false`: сравнивайте `id.equals(other)`.
+
+## Целые числа: int32, int64 и double
+
+В BSON три числовых типа: 32-битное целое, 64-битное целое и double. JavaScript знает одно число, поэтому драйверу приходится выбирать. Число JavaScript, которое вы сохраняете полем `Number`, лежит в базе как int32, если оно целое и помещается, и как double, если нет. `Types.Int32` требует именно int32 и отвергает дробное число или число вне диапазона; `Types.Double` всегда хранит double.
+
+64-битное целое устроено иначе: в JavaScript его точно хранит только `bigint`. Поле объявляется типом `BigInt` (`Types.Long` как тип поля не подходит), а во всех формах, где значение остаётся значением, это `bigint`. Точность здесь — вся причина существования типа: целые больше 2⁵³ в числе JavaScript теряют младшие цифры, поэтому сумма в наименьших единицах валюты или счётчик событий, которые вышли за эту границу, должны лежать в `int64`. В plain и JSON он становится **десятичной строкой** `"9007199254740993"`, которая сохраняет все цифры и без ошибок проходит через `JSON.stringify`. Строку принимают обратно методы записи, в том числе `$inc`, `$mul`, `$min` и `$max`. Обычное число в int64-поле принимается только если оно безопасное целое; иначе это ошибка с подсказкой: `Cast to Long failed at path "total" for 1152921504606847000 (number): beyond Number.MAX_SAFE_INTEGER the number is already imprecise; pass a bigint (5n) or a decimal integer string ("5") [precision]`.
+
+## Decimal128
+
+`Decimal128` — десятичное число с точностью до 34 цифр. Число JavaScript двоичное, поэтому `0.1 + 0.2` даёт `0.30000000000000004`, а для денег такая ошибка недопустима: сумма в базе должна быть ровно `19.99`. `Decimal128` хранит десятичную запись как есть и считает по десятичным правилам.
+
+В документе и lean это экземпляр `Decimal128`, в plain и JSON — строка вида `"19.99"`. Значение создаётся из строки, `Types.Decimal128.fromString("19.99")`, а не из числа JavaScript: число уже потеряло бы точность до того, как попало в `Decimal128`. Методы записи принимают и саму строку `"19.99"`: в запуске `create({ weight: "19.99" })` сохранил точное значение.
+
+## Даты и Timestamp
+
+`Date` в BSON — количество миллисекунд от 1 января 1970 года в UTC. В JavaScript это родной `Date`, поэтому в lean и plain он остаётся `Date`, а в JSON становится ISO-строкой `"2026-01-02T03:04:05.000Z"`. Часового пояса у значения нет: он появляется только при показе.
+
+`Timestamp` — не дата, хотя название так подсказывает. Это служебный тип MongoDB для репликации: пара из секунд и порядкового номера внутри секунды. В plain и JSON он становится объектом `{ t, i }`. Для моментов времени в ваших данных используйте `Date`; `Timestamp` вы объявляете полем, только если читаете чужие данные, где он уже есть.
+
+## Binary, UUID и векторы
+
+`Binary` — байты с **подтипом**, который говорит, что в них лежит. Подтип 0 — произвольные данные, подтип 4 — UUID, подтип 9 — вектор, а значения от 128 доступны для ваших нужд. В документе это экземпляр `Binary`, в plain — копия `Uint8Array`, в JSON — строка base64.
+
+`UUID` — 16-байтовый идентификатор, который хранится как `Binary` подтипа 4. Typemo отдаёт его как класс `UUID` с методами и принимает строку формата `0f8fad5b-d9cb-469f-a165-70867728950e`, в plain и JSON это та же строка. **Вектор** — массив чисел одного типа (`int8`, `float32` или упакованные биты) в `Binary` подтипа 9; MongoDB использует его для векторного поиска. В документе он остаётся `Binary`, а в plain и JSON превращается в обычный массив чисел, потому что клиенту нужны числа, а не байты. Как объявить поле, описано в справочнике [`Spec.binary`](../reference/schemas/types-and-spec.mdx#specbinary) и [`Spec.vector`](../reference/schemas/types-and-spec.mdx#specvector).
+
+## Как это выглядит в коде Typemo
+
+Поле объявляется тем классом, который соответствует типу в базе: `BigInt` для int64, `Types.Decimal128` для точного числа, `Types.UUID`, `Date`. Допустим, датчик записывает показания с точным весом, большим счётчиком и идентификатором устройства:
+
+```ts twoslash title="sensors/reading.ts"
+import { Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, Types } from "@venloc/typemo";
+
+@Schema({ collection: "readings" })
+export class Reading extends Entity {
+  @Prop(() => String, { required: true })
+  label!: string;
+
+  @Prop(() => BigInt)
+  total?: bigint;
+
+  @Prop(() => Types.Decimal128)
+  weight?: Decimal128;
+
+  @Prop(() => Types.UUID)
+  device?: UUID;
+
+  @Prop(() => Date)
+  at?: Date;
+}
+```
+
+Форма определяется тем, как вы читаете, а не схемой. Lean отдаёт значения драйвера, а plain — данные, которые можно сразу отправить клиенту. Подсказки редактора показывают разницу без запуска:
+
+```ts twoslash
+import { Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, TypemoClient, Types } from "@venloc/typemo";
+@Schema({ collection: "readings" })
+class Reading extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+  @Prop(() => BigInt) total?: bigint;
+  @Prop(() => Types.Decimal128) weight?: Decimal128;
+  @Prop(() => Types.UUID) device?: UUID;
+  @Prop(() => Date) at?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/sensors");
+const Readings = client.connection.model(Reading);
+// ---cut---
+const doc = await Readings.findOne({ label: "r1" }).orFail();
+const inDocument = doc.total;
+//    ^?
+const forClient = doc.$toPlain().total;
+//    ^?
+const device = doc.$toPlain().device;
+//    ^?
+```
+
+`doc.total` осталось `bigint | undefined`: поле необязательное, а в документе оно хранит значение как есть. В plain-форме то же поле — `` `${bigint}` `` (тип [`Int64String`](../reference/values/form-types.mdx#int64string)): строка из десятичных цифр, которую методы записи принимают обратно без приведения. Идентификатор устройства в plain — `string`. Запуск подтверждает картину для одного документа:
+
+```ts twoslash
+import { Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, TypemoClient, Types } from "@venloc/typemo";
+@Schema({ collection: "readings" })
+class Reading extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+  @Prop(() => BigInt) total?: bigint;
+  @Prop(() => Types.Decimal128) weight?: Decimal128;
+  @Prop(() => Types.UUID) device?: UUID;
+  @Prop(() => Date) at?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/sensors");
+const Readings = client.connection.model(Reading);
+// ---cut---
+const reading = await Readings.create({
+  label: "r1",
+  total: 9007199254740993n,
+  weight: Types.Decimal128.fromString("19.99"),
+  device: "0f8fad5b-d9cb-469f-a165-70867728950e", // a string is accepted for UUID
+  at: new Date("2026-01-02T03:04:05Z"),
+});
+console.log(JSON.stringify(reading.$toPlain()));
+// → {"_id":"…","label":"r1","total":"9007199254740993","weight":"19.99","device":"0f8fad5b-d9cb-469f-a165-70867728950e","at":"2026-01-02T03:04:05.000Z"}
+```
+
+Обратите внимание, что `total` в ответе — строка с последней цифрой `3`: `bigint` дошёл до клиента без потерь, а обычное число потеряло бы её.
+
+## Что дальше
+
+<Cards>
+<Card title="Формы значений" href="../reference/values/value-forms.mdx">
+  Полная таблица: как каждый тип выглядит в документе, lean, `$toObject()`, plain и JSON.
+</Card>
+<Card title="Типы и спецификации" href="../reference/schemas/types-and-spec.mdx">
+  `Types` и `Spec`: как объявить поле каждого типа и что бросает неверное значение.
+</Card>
+<Card title="Чтение данных" href="../queries/reading-data.mdx">
+  Как выбрать между документом, lean и plain в реальной задаче.
+</Card>
+</Cards>

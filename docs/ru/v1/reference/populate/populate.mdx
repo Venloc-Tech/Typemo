@@ -1,0 +1,1115 @@
+---
+title: ".populate"
+description: "Все формы вызова populate и все его опции: от пути и select до required, clone и transform"
+icon: Link
+---
+
+**Populate** заменяет в результате чтения сохранённые идентификаторы связанных документов самими документами. Пост хранит `author` как `ObjectId` пользователя, а после `.populate("author")` в этом поле лежит пользователь. Метод `.populate` — это метод строителя запроса: его вызывают после [`find`](../query/reading.mdx#modelfind), [`findOne`](../query/reading.mdx#modelfindone) и других методов чтения, а сам запрос уходит в базу на `await`.
+
+Если вы впервые работаете со связанными данными, сначала прочитайте руководство [Populate: основы](../../populate/basics.mdx). Эта страница — справочник: на ней описаны все формы вызова, все опции и все ошибки. Типы результата описаны на странице [Типы populate](./populate-types.mdx), методы документа — в разделе [API документа](../documents/document-api.mdx#populate).
+
+Все примеры используют одну модель блога. Ссылка на автора хранится в `Post.author`, ссылки на теги — массивом в `Post.tags`, ссылки на рецензентов — картой `Post.reviewers`, а комментарии не хранятся в посте: это **виртуальное поле** `comments`, которое находит комментарии по их полю `post` (виртуальные поля описаны в разделе [`@Virtual`](../schemas/virtual.mdx)).
+
+```ts twoslash title="blog/models.ts"
+import { Entity, Prop, Schema, Spec, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => String)
+  email?: string;
+
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" })
+  posts?: VirtualRef<Post>;
+}
+
+@Schema({ collection: "tags" })
+export class Tag extends Entity {
+  @Prop(() => String, { required: true })
+  label!: string;
+}
+
+@Schema({ collection: "posts" })
+export class Post extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true })
+  views!: number;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User })
+  editor?: Ref<User>;
+
+  @Prop(() => [Types.ObjectId], { ref: () => Tag })
+  tags!: Ref<Tag>[];
+
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User })
+  reviewers?: Map<string, Ref<User>>;
+
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" })
+  comments?: VirtualRef<Comment>;
+
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true })
+  commentCount?: VirtualRef<Comment, false, true>;
+}
+
+@Schema({ collection: "comments" })
+export class Comment extends Entity {
+  @Prop(() => String, { required: true })
+  text!: string;
+
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true })
+  post!: Ref<Post>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+```
+
+В базе два пользователя (Alice с почтой `a@example.com` и Bob), два тега (`db` и `ts`) и три поста. «Hello» написала Alice, у него теги `db` и `ts` и 10 просмотров. «Second» написала Alice, редактор — Bob, тег `ts`, 50 просмотров. «Bob's» написал Bob, тегов нет, 5 просмотров. Комментариев три: `c1` (автор Bob) и `c2` (автор Alice) к «Hello», `c3` (автор Bob) к «Second». Идентификаторы в результатах сокращены до `"…"`, потому что база выдаёт их заново при каждой загрузке данных.
+
+Элементы на странице: [`.populate`](#populate) и его [опции](#опции-объекта) [`path`](#path), [`select`](#select), [`match`](#match), [`options`](#options), [`populate`](#опция-populate), [`justOne`](#justone), [`retainNullValues`](#retainnullvalues), [`perDocumentLimit`](#perdocumentlimit), [`required`](#required), [`clone`](#clone) и [`transform`](#transform).
+
+---
+
+## .populate
+
+`.populate` говорит строителю запроса: после чтения замени ссылки в перечисленных полях документами, на которые они указывают. Он нужен там, где по одной записи нужно показать данные из другой: пост с именем автора, заказ с товарами, комментарий с постом. Без populate вы читали бы связанные документы отдельными запросами и склеивали результат вручную.
+
+Метод принимает три вида аргумента: строку с путём, список путей и объектов, или один объект с опциями. Что бы вы ни передали, Typemo не присоединяет документы одним запросом на стороне базы. Для каждого пути он берёт идентификаторы из прочитанных документов, одним запросом находит документы целевой модели и раскладывает их по местам. Это обычные операции целевой модели, поэтому её политики (мягкое удаление, тенант, скрытые поля) действуют и здесь.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" }).populate("author").orFail().plain();
+console.log(post.author?.name);
+// → "Alice"
+```
+
+Знак `?.` здесь не украшение: автора могли удалить, и тогда в `author` лежит `null`. Почему так и как это выключить, рассказано в разделе [Ссылка без документа](#ссылка-без-документа).
+
+<Returns type="QueryBuilder">
+
+Новый строитель запроса, в типе которого путь помечен как загруженный. Строитель неизменяем: каждый вызов возвращает новый. Что окажется в поле, зависит от вида результата: у документа это документы модели-цели (массив — только для чтения), у [`.lean()`](../query/reading.mdx#lean) и [`.plain()`](../query/reading.mdx#plain) — простые объекты. Если для ссылки не нашлось документа, единичная ссылка станет `null` (тип поля это допускает), а из массива элемент исчезнет; подробнее — в разделе [Ссылка без документа](#ссылка-без-документа).
+
+</Returns>
+
+<Params>
+<Param name="path" type="string" required>
+
+Путь поля со ссылкой или виртуального поля. Вложенные поля и поля документов внутри массивов записываются через точку (`lines.product`), значения карты ссылок — через `$*` (`reviewers.$*`). Путь можно продолжить в связанную модель (`post.author`): это вложенный populate. Компилятор проверяет путь по сегментам и подсказывает пути глубиной до трёх сегментов; проверяются пути до семи сегментов.
+
+</Param>
+<Param name="list" type="(string | PopulateObject)[]" required>
+
+Список путей и объектов с опциями вместо одного пути: `["author", { path: "tags", select: { label: 1 } }]`. Пустой список и повтор одного пути запрещены. Повтор видит уже компилятор, а пустой список — только проверка во время работы.
+
+</Param>
+<Param name="spec" type="PopulateObject" required>
+
+Объект с полем `path` и [опциями](#опции-объекта). Путь выводится первым, поэтому все остальные опции типизируются по модели-цели этого пути: `select` подсказывает поля целевой модели, `match` — её фильтр.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+populate<
+  const Ps = never,
+  const Pa extends PopulatePathHint<T> = never,
+  const Sel = undefined,
+  const O extends PopulateObjectSpec<T, Pa, Sel> = PopulateObjectSpec<T, Pa, Sel>,
+  const L = never,
+>(
+  arg: PopulateArgument<T, Ps, Pa, Sel, O, L>,
+): IsAny<Ps> extends true
+  ? PathError<"populate(): the argument is typed any; give it a type (a path literal, a list of paths or a populate object)">
+  : QueryBuilder<T, Op, S, ReplaceEntries<E, PopulateArgumentEntries<Ps, Pa, O, L>>, Form, Found, N, X>;
+```
+
+</FullType>
+
+### Одна ссылка
+
+Самый частый случай — путь одной ссылки. В документе на её месте оказывается документ модели-цели, со всеми методами: его можно менять и сохранять.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" }).populate("author").orFail();
+console.log(post.author?.name);
+// → "Alice"
+console.log(post.author?.$isNew());
+// → false
+```
+
+Тип поля тоже изменился: вместо `Ref<User>` компилятор видит документ пользователя. Так выглядит тот же результат в виде plain и в виде lean (различие видно по типу `_id`):
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const plain = await Posts.findOne({ title: "Hello" }).populate("author").orFail().plain();
+//    ^?
+const lean = await Posts.findOne({ title: "Hello" }).populate("author").orFail().lean();
+//    ^?
+```
+
+Единичная ссылка без значения (в «Hello» нет поля `editor`) остаётся без значения: populate ничего не выдумывает и ключ `editor` в результате не появляется.
+
+### Несколько путей списком
+
+Чтобы загрузить несколько путей за один вызов, передайте список. В списке можно смешивать строки и объекты с опциями. Каждый путь — отдельный запрос к модели-цели этого пути.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" })
+  .populate(["author", { path: "tags", select: { label: 1 } }])
+  .orFail()
+  .plain();
+console.log(post.author?.name, post.tags.map((tag) => tag.label));
+// → "Alice" ["db", "ts"]
+```
+
+### Путь через точку
+
+Путь можно продолжить в модель, на которую ведёт ссылка: `post.author` значит «загрузи пост комментария и автора этого поста». Это вложенный populate: Typemo находит посты, затем авторов этих постов. Тот же вложенный populate можно записать [опцией `populate`](#опция-populate); путь через точку короче, а опция нужна, когда для вложенного пути нужны свои опции.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const comment = await Comments.findOne({ text: "c1" }).populate("post.author").orFail().plain();
+console.log(comment.post?.title, comment.post?.author?.name);
+// → "Hello" "Alice"
+```
+
+Каждое звено цепочки — единичная ссылка, поэтому и `post`, и `author` допускают `null`. Путь через точку проходит и внутри массивов поддокументов (`lines.product`), и внутри вложенных объектов, и через карты (`reviewers.$*`, `notes.$*.author`). Примеры со связями такого рода — в руководстве [Сложные связи](../../populate/complex-relations.mdx).
+
+### Повторный вызов заменяет
+
+Populate одного и того же пути дважды не складывает опции. Последний вызов заменяет предыдущий целиком: если сначала вы загрузили автора полностью, а затем с `select: { name: 1 }`, результат содержит только имя. Пути, которых второй вызов не касается, остаются как были.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" })
+  .populate("author")
+  .populate({ path: "author", select: { name: 1 } })
+  .orFail()
+  .plain();
+console.log(post.author);
+// → { _id: "…", name: "Alice" }
+```
+
+Внутри одного списка тот же путь дважды — ошибка: какой из двух вариантов победит, было бы догадкой. Компилятор останавливает такой список (`"populate error": populate "author": the path is given twice`), а для пути, собранного из данных, то же говорит [`QueryError`](../errors/query-errors.mdx#queryerror) во время работы (текст — в разделе [Ошибки](#ошибки)).
+
+### Ссылка без документа
+
+Ссылка может указывать на документ, которого нет: его удалили, он скрыт мягким удалением или отфильтрован опцией [`match`](#match). Populate в таком случае не бросает ошибку (если вы не попросили [`required`](#required)), а ведёт себя по форме поля:
+
+- единичная ссылка становится `null`, и тип поля это допускает: `HydratedDoc<User> | null` у документа, `{ … } | null` у lean и plain;
+- в массиве ссылок этот элемент исчезает, остальные остаются в прежнем порядке (позицию сохраняет [`retainNullValues`](#retainnullvalues));
+- значение карты ссылок без документа остаётся в карте со значением `null` (ключ не теряется);
+- поле, которого в документе не было, остаётся без значения.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const [bobPost, hello] = await Posts.find({ title: { $in: ["Bob's", "Hello"] } })
+  .sort({ title: 1 })
+  .populate({ path: "tags", match: { label: "ts" } })
+  .plain();
+console.log(bobPost?.tags.length, hello?.tags.map((tag) => tag.label));
+// → 0 ["ts"]
+```
+
+Здесь `match` отфильтровал тег `db`, и из массива поста «Hello» исчезла одна ссылка. У поста «Bob's» тегов не было вовсе, поэтому массив пуст.
+
+Тип единичной ссылки после populate всегда содержит `null`, даже когда `@Prop` объявлен с `required: true`. Причина в том, что `required` в схеме требует, чтобы в документе лежал идентификатор, а не гарантирует, что документ по этому идентификатору ещё существует: базе не важно, удалили ли вы автора после записи поста. Поэтому к полю нужно обратиться через `?.` или сузить его проверкой [`isPresent`](./populate-types.mdx#ispresent). Если пропавшая ссылка для вас ошибка данных, попросите [`required: true`](#required) у самого populate: тогда бросается ошибка, а `null` из типа уходит.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+await Users.deleteOne({ name: "Bob" });
+
+const bobs = await Posts.findOne({ title: "Bob's" }).populate("author").orFail().plain();
+console.log(bobs.author);
+// → null
+
+const strict = await Posts.findOne({ title: "Hello" }).populate({ path: "author", required: true }).orFail().plain();
+console.log(strict.author.name);
+// → "Alice"
+```
+
+У поста «Bob's» автор удалён, поэтому `author` — `null`. У поста «Hello» автор есть, и с `required: true` тип не содержит `null`: обращение `strict.author.name` компилируется без `?.`.
+
+Документ целевой модели, удалённый мягким удалением, populate тоже не находит: подгрузка идёт как обычное чтение целевой модели и получает то же условие, что и любое чтение.
+
+### Скрытые поля целевой модели
+
+Populate читает целевую модель по её правилам, поэтому её скрытые поля (`hidden`) не попадают в загруженные документы вида plain. Чтобы получить скрытое поле, добавьте его в [`select`](#select) с префиксом `+` и, для plain, запросите его выдачу опцией `hidden`.
+
+### Сколько запросов уходит в базу
+
+Один вызов `.populate` с одним путём — один дополнительный запрос к модели-цели независимо от количества прочитанных документов. Идентификаторы всех документов собираются в один `$in`, а сами запросы к целевым моделям идут параллельно, а внутри транзакции — по очереди. Фактическое число запросов можно увидеть в [событиях операций](../observability/events.mdx): подзапросы populate вложены в родительскую операцию, а у каждого заполнен `populatePath`.
+
+```text
+find:Post
+find:User@author
+find:Tag@tags
+find:User@editor
+```
+
+Это события для `Posts.find().populate(["author", "tags", "editor"])`: один запрос постов и по одному на каждый путь. Виртуальное поле с ограничением `perDocumentLimit` (или `options.limit`) на нескольких документах превращается в один запрос-агрегацию с `$lookup`, а счётчик (`count: true`) — в агрегацию, которая считает документы на стороне базы, не загружая их.
+
+### Где работает populate
+
+Метод работает с `find`, `findOne`, `findById`, с курсором (`cursor`) и с `findOneAndUpdate`: результат изменения возвращается уже с загруженными связями. У агрегаций метода `populate` нет: там связи присоединяют стадией [`$lookup`](../aggregation/stages.mdx#lookup). У загруженного документа есть собственные методы [`$populate`](../documents/document-api.mdx#populate), [`$depopulate`](../documents/document-api.mdx#depopulate) и [`$populated`](../documents/document-api.mdx#populated); о них рассказывает руководство [Populate у документа](../../populate/document-populate.mdx).
+
+### Ошибки
+
+Путь и опции проверяются дважды. Компилятор ловит неверный путь, неизвестную опцию, `select` и `match` с полями, которых нет в модели-цели. Он не остановит только ошибки, которые видны лишь во время работы, например путь, собранный из данных.
+
+```ts twoslash
+// @errors: 2345
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+Posts.find().populate("title");
+```
+
+Компилятор отвечает одним сообщением `TS2345`: у метода одна сигнатура, и причина стоит прямо в типе параметра: `Argument of type '"title"' is not assignable to parameter of type 'PopulateObject | "Invalid populate path \"title\": \"title\" is not a reference"'`. Для объекта с опциями текст причины приходит в свойстве `"populate error"`, например `select of "author": unknown field "nope"`, `match of "author" is not a valid filter of the populated model`, `retainNullValues of "comments": a virtual has no positions to keep` или `populate "author": the path is given twice` для повтора пути в списке. Неизвестное имя опции компилятор называет сам (`TS2353`: `'foo' does not exist in type …`). Часть проверок во время работы у компилятора нет: пустой список, `sort`, `limit` и `skip` у единичной ссылки, `justOne` у значений карты, обе формы лимита сразу.
+
+Во время работы те же проверки бросают [`QueryError`](../errors/query-errors.mdx#queryerror). Тексты получены запуском:
+
+```text
+QueryError: populate "nope": "nope" is not a field of Post
+QueryError: populate "title": "title" is neither a reference nor an embedded document
+QueryError: populate: invalid path "a..b"
+QueryError: populate: an empty list
+QueryError: populate: the path "author" is given twice
+QueryError: populate: an object needs a string path
+QueryError: populate: a path, an object with a path, or a list of them
+QueryError: populate "author": unknown option "foo"
+QueryError: populate "author": select is a projection object
+QueryError: populate "tags": unknown option "foo"
+QueryError: populate "tags": limit must be a number
+QueryError: populate "tags": justOne must be a boolean
+QueryError: populate "author": a single reference holds one document; options sort apply to reference arrays only
+QueryError: populate "author": the match function must return a filter object
+QueryError: populate "reviewers.$*": justOne does not apply to the values of a Map
+QueryError: populate "tags": retainNullValues keeps positions, sort reorders: they cannot be combined
+QueryError: populate "reviewers": "reviewers" is a Map: its values are "reviewers.$*"
+QueryError: populate "commentCount": a count virtual takes no justOne (it gives a number)
+QueryError: populate "commentCount": a count virtual takes no select (it gives a number)
+QueryError: populate "comments": "options.limit" and "perDocumentLimit" are the same per-document limit; give one
+QueryError: populate "comments": retainNullValues keeps the positions of a reference array; a virtual has none
+QueryError: projection: cannot mix inclusion (name) and exclusion (email); the server refuses it
+```
+
+Причина у всех одна: populate не угадывает намерение. Опечатка в пути или конфликт двух опций дали бы результат, который выглядит правдоподобно и отличается от задуманного, поэтому Typemo останавливается сразу.
+
+### Когда не подходит
+
+Если связанные данные нужны для расчёта на стороне базы (сумма по комментариям, группировка по автору), используйте агрегацию со стадией [`$lookup`](../aggregation/stages.mdx#lookup): populate загрузит документы в приложение, а считать вы будете уже там. Если нужно только количество связанных документов, вместо загрузки самих документов заведите виртуальное поле со счётчиком (`count: true`, см. [`@Virtual`](../schemas/virtual.mdx)) и запросите его через populate. Если связь нужна один раз по одному документу, который у вас уже есть, вызовите [`$populate`](../documents/document-api.mdx#populate) на нём.
+
+---
+
+## Опции объекта
+
+Объект принимает следующие опции. Кроме `path` все необязательны. Неизвестное имя опции — ошибка и при компиляции, и во время работы: `QueryError: populate "author": unknown option "foo"`.
+
+### path
+
+Обязательная строка: путь поля со ссылкой или виртуального поля, по тем же правилам, что и в строковой форме. Путь `title` (обычное поле) и путь до встроенного документа без ссылки — ошибки.
+
+### select
+
+Проекция загружаемых документов: `{ name: 1 }` оставляет только имя, `{ email: 0 }` убирает почту. Включение и исключение вместе не смешиваются, `_id` можно исключить в любом режиме. Поле, которое выбрано в родительском запросе, не влияет на выбор в populate: они независимы.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" })
+  .populate({ path: "author", select: { name: 1, _id: 0 } })
+  .orFail()
+  .plain();
+console.log(post.author);
+// → { name: "Alice" }
+```
+
+Проекция типизирована по модели-цели, поэтому тип загруженного поля сужается так же, как у обычного [`.select`](../query/reading.mdx#select): читатель не получит `email`, если не выбрал его. Для счётчика (`count: true`) `select` запрещён: результат — число.
+
+### match
+
+Дополнительное условие для загружаемых документов. Документ, который условию не удовлетворяет, считается ненайденным: единичная ссылка становится `null`, а из массива элемент исчезает. Поэтому тип единичной ссылки с `match` включает `null`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const posts = await Posts.find().sort({ title: 1 }).populate({ path: "author", match: { name: "Bob" } }).plain();
+console.log(posts.map((post) => post.author?.name ?? null));
+// → [ "Bob", null, null ]
+```
+
+`match` может быть и функцией, которая получает исходный документ и возвращает условие. Тогда условие своё для каждого документа, а для каждого документа уходит свой запрос к базе. Документ попадает в функцию в lean-виде, до загрузки этого пути, поэтому ссылки в нём ещё идентификаторы. Функция обязана вернуть объект-фильтр: иначе `QueryError: populate "author": the match function must return a filter object`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const posts = await Posts.find()
+  .sort({ title: 1 })
+  .populate({ path: "author", match: (post) => ({ name: post.title === "Hello" ? "Alice" : "Nobody" }) })
+  .plain();
+console.log(posts.map((post) => post.author?.name ?? null));
+// → [ null, "Alice", null ]
+```
+
+Условие `match` — фильтр модели-цели и проверяется как обычный фильтр. Опечатка в поле — ошибка компиляции `match of "author" is not a valid filter of the populated model`.
+
+### options
+
+Объект с ключами `sort`, `limit` и `skip`. Другие ключи — `QueryError: populate "tags": unknown option "foo"`. `sort` упорядочивает загруженные документы, `limit` и `skip` действуют **на каждый исходный документ отдельно**: `limit: 2` значит «не больше двух комментариев на пост», а не «два комментария всего».
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" })
+  .populate({ path: "comments", options: { sort: { text: -1 }, limit: 2 } })
+  .orFail()
+  .plain();
+console.log(post.comments.map((comment) => comment.text));
+// → ["c2", "c1"]
+```
+
+Одиночная ссылка не имеет порядка, поэтому `sort`, `limit` и `skip` для неё не имеют смысла, и Typemo отвечает ошибкой, а не молча игнорирует опции: `QueryError: populate "author": a single reference holds one document; options sort apply to reference arrays only` (так же для `limit` и `skip`, и для `perDocumentLimit`). Для ссылок-массивов и виртуальных полей они работают. С `retainNullValues` вместе `sort` использовать нельзя: одна опция хранит позиции, другая их меняет.
+
+### Опция populate
+
+Вложенный populate: пути для документов, которые загрузил этот путь. Значение — такое же, как у `.populate`: строка, объект или список. Путь пишется относительно модели-цели.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const comment = await Comments.findOne({ text: "c1" })
+  .populate({ path: "post", populate: { path: "author", select: { name: 1 } } })
+  .orFail()
+  .plain();
+console.log(comment.post?.author);
+// → { _id: "…", name: "Alice" }
+```
+
+Вложенный populate выполняется на найденных документах до того, как они займут свои места. Поэтому [`transform`](#transform) видит документ уже с загруженными вложенными связями. Запись `populate("post.author")` даёт тот же результат без опций для `author`.
+
+### justOne
+
+Принудительно один документ (`true`) или список (`false`) вместо того, что подсказывает тип поля. Для ссылки-массива `justOne: true` оставляет только первый найденный документ, для единичной ссылки `justOne: false` превращает результат в массив. Для виртуального поля это способ получить один документ вместо списка. Для значений карты ссылок опция запрещена (`QueryError: populate "reviewers.$*": justOne does not apply to the values of a Map`), для счётчика — тоже.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" })
+  .populate({ path: "comments", justOne: true, options: { sort: { text: 1 } } })
+  .orFail()
+  .plain();
+console.log(post.comments);
+// → { _id: "…", text: "c1", post: "…", author: "…" }
+```
+
+Виртуальное поле, объявленное с `justOne: true` в [`@Virtual`](../schemas/virtual.mdx), уже возвращает один документ, и повторять опцию не нужно.
+
+### retainNullValues
+
+Для массива ссылок сохраняет позицию каждой ссылки, для которой документа не нашлось: на её месте стоит `null`. По умолчанию такие элементы исчезают, и индексы результата перестают совпадать с индексами исходного массива. Опция нужна, когда позиция значима: например, порядок тегов задан пользователем.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" })
+  .populate({ path: "tags", match: { label: "ts" }, retainNullValues: true })
+  .orFail()
+  .plain();
+console.log(post.tags.map((tag) => tag?.label ?? null));
+// → [null, "ts"]
+```
+
+Опция не имеет смысла для виртуальных полей (у них нет исходных позиций): компилятор отвечает `retainNullValues of "comments": a virtual has no positions to keep`, а во время работы `QueryError` говорит `retainNullValues keeps the positions of a reference array; a virtual has none`. С `sort` она несовместима тоже: `QueryError: populate "tags": retainNullValues keeps positions, sort reorders: they cannot be combined`.
+
+### perDocumentLimit
+
+Не больше стольки документов на каждый исходный документ: лимит применяется к каждому посту отдельно. Опция — то же самое, что `options.limit`, и задать нужно одну из двух: обе вместе — ошибка `"options.limit" and "perDocumentLimit" are the same per-document limit; give one`. Для виртуального поля на нескольких документах лимит превращается в один запрос-агрегацию с `$lookup` и `$limit` на владельца; если владелец один, запрос обычный `find` с лимитом. В `@Virtual` та же опция задаёт лимит по умолчанию.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const posts = await Posts.find({ title: { $in: ["Hello", "Second"] } })
+  .sort({ title: 1 })
+  .populate({ path: "comments", perDocumentLimit: 1 })
+  .plain();
+console.log(posts.map((post) => post.comments.map((comment) => comment.text)));
+// → [["c1"], ["c3"]]
+```
+
+### required
+
+Ссылка без документа — ошибка, а не `null`. Тогда [`DocumentNotFoundError`](../errors/query-errors.mdx#documentnotfounderror) бросается при первой же ссылке, которая ничего не нашла, а в типе результата нет `| null`, как после [`.orFail()`](../query/reading.mdx#orfail) у запроса. Опция нужна там, где висячая ссылка означает повреждённые данные, и продолжать нельзя. Это опция самого populate: одноимённый параметр `required` у `@Prop` тип загруженного поля не меняет. Для поля, которого в документе нет совсем (у поста «Hello» нет `editor`), опция ничего не требует: ссылки нет, значит, искать нечего.
+
+```text
+DocumentNotFoundError: populate "editor": no document for the reference 6abcfa3dd4c0f052aabe53b9 (required: true)
+```
+
+### clone
+
+Даёт каждому исходному документу собственную копию загруженного документа. По умолчанию документ, найденный для нескольких владельцев, — один общий объект: два поста одного автора получают в `author` один и тот же объект. Изменение через один пост видно через другой, а `$save()` этого документа сохранит всё, что поменяли через любого из владельцев. `clone: true` разделяет копии, ценой памяти и времени.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const [hello, second] = await Posts.find({ title: { $in: ["Hello", "Second"] } })
+  .sort({ title: 1 })
+  .populate("author");
+console.log(hello?.author === second?.author);
+// → true
+```
+
+### transform
+
+Функция `(doc, id) => value`, которая заменяет каждое загруженное значение своим результатом. `doc` — загруженный документ в lean-виде (или `null`, если документа нет), `id` — исходное значение ссылки. Поле хранит то, что функция вернула, и в типе результата оно так и записано. Нужна, когда клиенту нужна не вся связанная запись, а одно значение.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const posts = await Posts.find()
+  .sort({ title: 1 })
+  .populate({ path: "author", transform: (user, id) => user?.name ?? String(id) })
+  .plain();
+console.log(posts.map((post) => post.author));
+// → ["Bob", "Alice", "Alice"]
+```
+
+Для массива ссылок функция вызывается для каждого элемента, результат — массив её результатов. Тип `doc` следует за [`select`](#select): если выбрано только имя, то `doc` — `{ _id, name } | null`.
+
+---
+
+## Ограничения и глубина путей
+
+Компилятор проверяет путь по сегментам, а не перебирает все возможные пути: на плотных моделях таких путей были бы десятки тысяч, и компилятор бы не справился. Поэтому подсказки редактора ограничены тремя сегментами, а проверка идёт до семи. Путь в восемь сегментов — ошибка компиляции с текстом `populate path is deeper than the 7-level ceiling`. Во время работы отдельного ограничения глубины нет: путь, собранный из строки, проверяется по схеме, а не по счётчику.
+
+Ниже полиморфной ссылки (`refPath`, `refModel`) заполнить ничего нельзя: цель там не одна модель. Попытка — ошибка: `QueryError: populate "target.author": "target" is a polymorphic reference (refPath/refModel); nothing below it can be populated`. Путь к карте без `$*` тоже ошибка: `QueryError: populate "reviewers": "reviewers" is a Map: its values are "reviewers.$*"`.
+
+## Остальные методы
+
+Метод документа [`$populate`](../documents/document-api.mdx#populate) описан на странице [API документа](../documents/document-api.mdx). Типы результата и вспомогательные типы — на странице [Типы populate](./populate-types.mdx). Схемные опции, которыми задаются связи (`ref`, `refPath`, `refModel`, `@Virtual`), — в разделе [Схемы](../schemas/prop.mdx).

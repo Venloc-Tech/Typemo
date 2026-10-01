@@ -1,0 +1,1236 @@
+---
+title: "@venloc/typemo-nestjs"
+description: "Справочник пакета NestJS: TypemoModule, внедрение моделей, токены, @Transactional, политики из запроса, фильтр ошибок, пайпы и тестовые помощники"
+icon: Boxes
+---
+
+`@venloc/typemo-nestjs` встраивает Typemo в приложение на NestJS 12: модуль создаёт и закрывает клиента, модели внедряются по классу сущности, транзакции объявляются декоратором метода, тенант и актор берутся из запроса, а ошибки Typemo превращаются в ответы HTTP. Пакет отдельный: в ядре `@venloc/typemo` нет кода Nest, а пакет не зависит от `mongoose` и `@nestjs/mongoose`. Если вы только начинаете, сначала прочитайте руководство [Подключить Typemo к NestJS](../../integrations/nestjs/setup.mdx). Эта страница — справочник.
+
+Пакет требует NestJS 12 (`@nestjs/common` и `@nestjs/core` не ниже 12.1.2), `rxjs` 7, `reflect-metadata` и драйвер `mongodb` как peer-зависимости. Работает только с HTTP-адаптером Express; GraphQL, микросервисы и Fastify не поддерживаются.
+
+```package-install
+@venloc/typemo @venloc/typemo-nestjs mongodb @nestjs/common @nestjs/core @nestjs/platform-express rxjs reflect-metadata
+```
+
+Примеры страницы используют модель счёта. Все результаты получены запуском приложения Nest на MongoDB 9.0 (реплика-сет из одного узла).
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  balance!: number;
+}
+```
+
+<TypeTable
+  type={{
+    "TypemoModule.forRoot": { description: "Создаёт клиента и подключает его при старте приложения.", type: "(uri, options?) => DynamicModule" },
+    "TypemoModule.forRootAsync": { description: "То же, с опциями из фабрики, класса или чужого провайдера.", type: "(options) => DynamicModule" },
+    "TypemoModule.forFeature": { description: "Регистрирует модели сущностей модуля.", type: "(features, target?) => DynamicModule" },
+    "TypemoModule.view": { description: "Представление для `forFeature`.", type: "(View, definition) => ViewFeature" },
+    "TypemoModule.materialized": { description: "Материализованный результат для `forFeature`.", type: "(Target, definition) => MaterializedFeature" },
+    "InjectModel": { description: "Внедряет модель сущности.", type: "(Entity, target?) => decorator" },
+    "InjectConnection": { description: "Внедряет `Connection` базы.", type: "(target?) => decorator" },
+    "InjectClient": { description: "Внедряет `TypemoClient`.", type: "(name?) => decorator" },
+    "getModelToken": { description: "Токен модели.", type: "(Entity, target?) => symbol" },
+    "getConnectionToken": { description: "Токен подключения к базе.", type: "(target?) => string" },
+    "getClientToken": { description: "Токен клиента.", type: "(name?) => string" },
+    "Transactional": { description: "Выполняет метод в транзакции.", type: "(options?) => decorator" },
+    "PolicyInterceptor": { description: "Заполняет контекст политик из запроса.", type: "class" },
+    "AllTenants": { description: "Межтенантный доступ для обработчика или контроллера.", type: "() => decorator" },
+    "TypemoExceptionFilter": { description: "Ошибки Typemo и драйвера → ответы HTTP.", type: "class" },
+    "ParseIdPipe": { description: "Параметр маршрута → `_id` модели.", type: "class" },
+    "ValidateBodyPipe": { description: "Проверка тела запроса схемой сущности.", type: "class" },
+    "provideModelMock": { description: "Мок модели для модульных тестов (`/testing`).", type: "(Entity, mock, target?) => MockProvider" },
+    "provideClientMock": { description: "Мок клиента и привязка `@Transactional` (`/testing`).", type: "(mock?, name?) => providers" },
+    "TypemoTestingModule": { description: "Модуль тестов на настоящей базе (`/testing`).", type: "class" },
+  }}
+/>
+
+---
+
+## TypemoModule.forRoot
+
+`TypemoModule.forRoot` создаёт [`TypemoClient`](../connection/typemo-client.mdx#new-typemoclient), подключает его, когда приложение стартует, и закрывает, когда приложение останавливается. Клиент, подключение к его базе по умолчанию и модели всех `forFeature` доступны во всём приложении: модуль клиента глобальный, импортировать его в каждый модуль не нужно. Его импортируют один раз, в корневой модуль.
+
+```ts twoslash title="app.module.ts"
+import { Module } from "@nestjs/common";
+import { Entity, Prop, Schema } from "@venloc/typemo";
+import { TypemoModule } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+// ---cut---
+@Module({
+  imports: [
+    TypemoModule.forRoot("mongodb://localhost:27017", { dbName: "bank", retryAttempts: 3 }),
+    TypemoModule.forFeature([Account]),
+  ],
+})
+export class AppModule {}
+```
+
+Пока клиент не подключился, приложение не стартует: `createNestApplication().init()` и `NestFactory.create` ждут подключения и падают, если все попытки не удались. Модуль **не пишет в базу** при старте, пока вы не включите [`sync`](#sync): коллекции и индексы — явное решение.
+
+<Returns type="DynamicModule">
+
+Модуль для `imports` корневого модуля.
+
+</Returns>
+
+<Params>
+<Param name="uri" type="string" required>
+
+Строка подключения. Пустая строка — [`ConfigurationError`](../errors/configuration-errors.mdx#configurationerror) сразу при вызове.
+
+</Param>
+<Param name="options" type="TypemoModuleOptions" default="{}">
+
+Опции клиента ядра ([`TypemoClientOptions`](../connection/typemo-client.mdx#опции-клиента): `name`, `dbName`, `readyTimeoutMS`, опции драйвера) и опции модуля из раздела [TypemoModuleOptions](#typemomoduleoptions). `name` называет клиента и входит в его токены.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static forRoot(uri: string, options?: TypemoModuleOptions): DynamicModule
+```
+
+</FullType>
+
+### Ошибки
+
+Неверные опции модуля отвергаются в момент вызова `forRoot`, до старта. Каждый текст получен запуском:
+
+```text
+ConfigurationError: TypemoModule.forRoot: retryAttempts is a whole number of 0 or more, got -1
+ConfigurationError: TypemoModule.forRoot: sync is false, "init" or "sync", got "all"
+ConfigurationError: getClientToken: the client name is a non-empty string without "/", got "a/b"
+ConfigurationError: TypemoModule.forRoot: the connection string is a non-empty string
+```
+
+Два `forRoot` с одним именем в одном приложении — ошибка при старте. Без неё оба модуля предоставили бы токен `TypemoClient:default`, и Nest молча взял бы один из них:
+
+```text
+ConfigurationError: TypemoModule.forRoot: two clients named "default" in one application; give each forRoot its own name
+```
+
+---
+
+## TypemoModule.forRootAsync
+
+`TypemoModule.forRootAsync` делает то же, что [`forRoot`](#typemomoduleforroot), но опции вычисляются при старте приложения: строку подключения читают из конфигурации, секреты — из хранилища. Источник опций — ровно один из трёх: `useFactory` с `inject`, `useClass` (класс, который модуль создаст сам и в который внедрит зависимости) или `useExisting` (такой класс уже предоставлен другим модулем).
+
+```ts twoslash title="app.module.ts"
+import { Injectable, Module } from "@nestjs/common";
+import { TypemoModule, type TypemoModuleFactoryOptions } from "@venloc/typemo-nestjs";
+@Injectable()
+class Config {
+  readonly mongoUri = "mongodb://localhost:27017";
+}
+@Module({ providers: [Config], exports: [Config] })
+class ConfigModule {}
+// ---cut---
+@Module({
+  imports: [
+    TypemoModule.forRootAsync({
+      name: "main",
+      imports: [ConfigModule],
+      inject: [Config],
+      useFactory: (config: Config): TypemoModuleFactoryOptions => ({ uri: config.mongoUri, dbName: "bank" }),
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+Имя клиента `name` стоит **рядом** с фабрикой, а не в том, что она возвращает. Так имя известно, когда Nest строит граф модулей, ещё до вызова фабрики: от него зависят токены. Параметры фабрики объявляйте с типами: модуль не знает, что вы перечислили в `inject`, и без аннотации параметр получит тип `never`.
+
+<Returns type="DynamicModule">
+
+Модуль для `imports` корневого модуля.
+
+</Returns>
+
+<Params>
+<Param name="options.name" type="string" default="&quot;default&quot;">
+
+Имя клиента.
+
+</Param>
+<Param name="options.imports" type="модули" default="[]">
+
+Модули, чьи провайдеры нужны фабрике или классу опций.
+
+</Param>
+<Param name="options.useFactory" type="(...args) => TypemoModuleFactoryOptions | Promise">
+
+Фабрика опций. Возвращает [`TypemoModuleFactoryOptions`](#typemomodulefactoryoptions): `uri` и опции, без `name`.
+
+</Param>
+<Param name="options.inject" type="токены" default="[]">
+
+Провайдеры, которые получит `useFactory`, по порядку. Только вместе с `useFactory`.
+
+</Param>
+<Param name="options.useClass" type="класс TypemoOptionsFactory">
+
+Класс с методом `createTypemoOptions()` ([`TypemoOptionsFactory`](#typemooptionsfactory)).
+
+</Param>
+<Param name="options.useExisting" type="класс TypemoOptionsFactory">
+
+Такой же класс, уже предоставленный модулем из `imports`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static forRootAsync(options: TypemoModuleAsyncOptions): DynamicModule
+
+type TypemoModuleAsyncOptions = TypemoAsyncFactory | TypemoAsyncClass | TypemoAsyncExisting;
+```
+
+</FullType>
+
+### `name` в результате фабрики
+
+`name` внутри результата — ошибка компиляции, потому что тип результата объявляет его как `never`:
+
+```ts twoslash
+import { TypemoModule } from "@venloc/typemo-nestjs";
+// ---cut---
+// @errors: 2322
+TypemoModule.forRootAsync({ useFactory: () => ({ uri: "mongodb://localhost:27017", name: "main" }) });
+```
+
+Если тип обойдён (фабрика вернула `any` из чужой конфигурации), старт падает сразу, без попыток подключения. Проверка одинакова для всех трёх видов:
+
+```text
+ConfigurationError: TypemoModule.forRootAsync (useFactory): the result has "name"; name the client next to useFactory: forRootAsync({ name, useFactory })
+ConfigurationError: TypemoModule.forRootAsync (useFactory): uri is a non-empty connection string
+ConfigurationError: TypemoModule.forRootAsync: give one of useFactory, useClass, useExisting (got none)
+```
+
+<Callout type="migration" title="Если вы пришли из @nestjs/mongoose">
+
+В `@nestjs/mongoose` `connectionName` в результате фабрики компилировался (фабрика типизирована через `any[]`), а при старте драйвер отвергал неизвестную опцию и модуль уходил в повторы. Здесь та же ошибка ловится компилятором, а если тип обойдён — одной понятной ошибкой без повторов.
+
+</Callout>
+
+---
+
+## TypemoModuleOptions
+
+Опции [`forRoot`](#typemomoduleforroot): все [`TypemoClientOptions`](../connection/typemo-client.mdx#опции-клиента) ядра и опции модуля ниже ([`TypemoConnectOptions`](#typemoconnectoptions)). Опции клиента модуль передаёт в `new TypemoClient` как есть, поэтому опечатку в имени опции драйвера отвергнет драйвер при создании клиента.
+
+### retryAttempts
+
+`number`, по умолчанию `9`. Сколько раз модуль пытается подключиться, прежде чем старт упадёт; `0` и `1` означают одну попытку. Повторяются только ошибки, которые повтор может исправить: нет сервера, сеть. Неверный пароль и ошибка настройки останавливают попытки сразу. Между попытками модуль пишет в лог Nest (`Logger("TypemoModule")`) имя клиента и вид ошибки, но не строку подключения: в ней бывают пароль и адреса.
+
+```text
+Unable to connect client "default" (ConnectionError: server-selection). Retrying (1)...
+```
+
+Запуск с `retryAttempts: 3`, `retryDelay: 20` и мёртвым сервером: три попытки, `onClientCreate` вызван один раз (клиент один на все попытки), старт упал с ошибкой из [`clientErrorFactory`](#clienterrorfactory), клиент закрыт.
+
+### retryDelay
+
+`number`, по умолчанию `3000`. Пауза между попытками в миллисекундах. Если приложение остановили во время паузы, ожидание заканчивается сразу.
+
+### lazyConnection
+
+`boolean`, по умолчанию `false`. `true` — приложение стартует, не дожидаясь подключения: клиент подключается в фоне с теми же повторами. Операции, вызванные до подключения, ждут его не дольше `readyTimeoutMS` клиента, а если подключиться не удалось, получают [`ConnectionError`](../errors/configuration-errors.mdx#connectionerror). Когда все попытки исчерпаны, модуль пишет в лог:
+
+```text
+Client "default" could not connect after 1 try (ConnectionError: server-selection); its operations fail until it connects
+```
+
+[`onClientCreate`](#onclientcreate) вызывается и при ленивом подключении.
+
+### sync
+
+`false | "init" | "sync"`, по умолчанию `false`. Что создать в базе при старте, после регистрации моделей всех `forFeature`: `"init"` вызывает [`connection.init()`](../connection/connection.mdx#connectioninit) — создаёт недостающие коллекции, индексы и представления, ничего не меняя; `"sync"` вызывает [`connection.syncAll()`](../connection/connection.mdx#connectionsyncall) — приводит всё к схемам, в том числе заменяет индекс, объявленный иначе. Синхронизация идёт для каждой базы, в которой есть модели `forFeature`, в `onApplicationBootstrap`. Ошибка — [`SyncError`](../errors/configuration-errors.mdx#syncerror) — останавливает старт. По умолчанию модуль ничего не пишет: изменение базы при каждом запуске приложения — решение, а не умолчание.
+
+### onClientCreate
+
+`(client: TypemoClient) => void | Promise<void>`. Вызывается один раз с новым клиентом до подключения и до создания любой модели. Это место для [`client.use`](../connection/typemo-client.mdx#clientuse) (расширения), плагинов подключения и [`client.instrument`](../connection/typemo-client.mdx#clientinstrument): расширения запечатываются первой компиляцией модели, и позже их не добавить.
+
+### clientFactory
+
+`(client: TypemoClient) => TypemoClient | Promise<TypemoClient>`. Получает подключённого клиента (при `lazyConnection` — подключающегося) и возвращает клиента, которого получат провайдеры. Обычно возвращает того же. Если вернуть что-то другое:
+
+```text
+ConfigurationError: TypemoModule: clientFactory of client "default" returned no TypemoClient
+```
+
+### clientErrorFactory
+
+`(error: unknown) => Error`. Получает ошибку последней попытки и возвращает ошибку, с которой падает старт. При успешном подключении не вызывается.
+
+<FullType>
+
+```ts
+type TypemoModuleOptions = TypemoClientOptions & TypemoConnectOptions;
+
+interface TypemoConnectOptions {
+  readonly retryAttempts?: number;
+  readonly retryDelay?: number;
+  readonly lazyConnection?: boolean;
+  readonly sync?: TypemoSync;
+  readonly onClientCreate?: (client: TypemoClient) => void | Promise<void>;
+  readonly clientFactory?: (client: TypemoClient) => TypemoClient | Promise<TypemoClient>;
+  readonly clientErrorFactory?: (error: unknown) => Error;
+}
+
+type TypemoSync = false | "init" | "sync";
+```
+
+</FullType>
+
+## TypemoConnectOptions
+
+Опции модуля без опций клиента: [`retryAttempts`](#retryattempts), [`retryDelay`](#retrydelay), [`lazyConnection`](#lazyconnection), [`sync`](#sync), [`onClientCreate`](#onclientcreate), [`clientFactory`](#clientfactory), [`clientErrorFactory`](#clienterrorfactory). Входит и в [`TypemoModuleOptions`](#typemomoduleoptions), и в [`TypemoModuleFactoryOptions`](#typemomodulefactoryoptions).
+
+## TypemoModuleFactoryOptions
+
+Что возвращает фабрика [`forRootAsync`](#typemomoduleforrootasync): `uri` (обязательна), опции клиента без `name` и [`TypemoConnectOptions`](#typemoconnectoptions). `name?: never` делает имя в результате ошибкой компиляции.
+
+## TypemoOptionsFactory
+
+Интерфейс класса для `useClass` и `useExisting`: один метод `createTypemoOptions()`, который возвращает [`TypemoModuleFactoryOptions`](#typemomodulefactoryoptions) или промис с ними.
+
+```ts twoslash title="database.config.ts"
+import { Injectable } from "@nestjs/common";
+import type { TypemoModuleFactoryOptions, TypemoOptionsFactory } from "@venloc/typemo-nestjs";
+// ---cut---
+@Injectable()
+export class DatabaseConfig implements TypemoOptionsFactory {
+  createTypemoOptions(): TypemoModuleFactoryOptions {
+    return { uri: "mongodb://localhost:27017", dbName: "bank" };
+  }
+}
+```
+
+---
+
+## TypemoModule.forFeature
+
+`TypemoModule.forFeature` регистрирует модели сущностей в модуле, который его импортирует: каждая запись списка становится провайдером под токеном [`getModelToken(Entity, target)`](#getmodeltoken), и её внедряют через [`@InjectModel`](#injectmodel). Модель — объект ядра [`connection.model(Entity)`](../connection/connection.mdx#connectionmodel), поэтому одна сущность в двух модулях — **один и тот же** объект модели, а дискриминаторы ядро разбирает само.
+
+```ts twoslash title="accounts/accounts.module.ts"
+import { Injectable, Module } from "@nestjs/common";
+import { Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, TypemoModule } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+// ---cut---
+@Injectable()
+export class AccountsService {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+
+  count() {
+    return this.accounts.countDocuments({ balance: { $gt: 0 } });
+  }
+}
+
+@Module({ imports: [TypemoModule.forFeature([Account])], providers: [AccountsService] })
+export class AccountsModule {}
+```
+
+Провайдеры `forFeature` создаются при старте приложения и только регистрируют модель: в базу они не обращаются. Коллекции и индексы создаёт [`sync`](#sync) корневого модуля или ваш шаг развёртывания.
+
+<Returns type="DynamicModule">
+
+Модуль для `imports` того модуля, чьи провайдеры используют модели. Он экспортирует токены всех записей, а при `target.db` — ещё и токен [`Connection`](#getconnectiontoken) этой базы.
+
+</Returns>
+
+<Params>
+<Param name="features" type="TypemoFeature[]" required>
+
+Записи по одной на класс:
+- класс сущности (`@Schema`);
+- `{ entity, statics }` — модель со статиками плагинов (см. [ниже](#статики-плагинов));
+- [`TypemoModule.view(...)`](#typemomoduleview) — представление;
+- [`TypemoModule.materialized(...)`](#typemomodulematerialized) — материализованный результат.
+
+</Param>
+<Param name="target" type="FeatureTarget" default="{}">
+
+`client` — имя клиента (`"default"`), `db` — база этого клиента (по умолчанию база клиента по умолчанию). Одна сущность на двух клиентах или в двух базах — два разных токена и две разные модели.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static forFeature(features: readonly TypemoFeature[], target?: FeatureTarget): DynamicModule
+
+type TypemoFeature = EntityClass | ModelFeature | ViewFeature<object> | MaterializedFeature<object>;
+
+interface ModelFeature<E extends EntityClass = EntityClass> {
+  readonly entity: E;
+  readonly statics?: SchemaPlugin<never, object> | readonly SchemaPlugin<never, object>[];
+}
+
+interface FeatureTarget {
+  readonly client?: string;
+  readonly db?: string;
+}
+```
+
+</FullType>
+
+### Статики плагинов
+
+Запись `{ entity, statics }` внедряет модель, к которой применён [`Model.statics(plugin)`](../hooks/plugins.mdx#modelstatics) для каждого плагина: статики плагина есть и в объекте, и в типе. Плагин должен быть применён к схеме сущности (`@Plugin`, плагин подключения или глобальный), иначе старт падает, а не внедряет модель без обещанного метода:
+
+```text
+ConfigurationError: Account: plugin "count" is not applied to this model's schema
+```
+
+Тип внедрённой модели вы пишете сами: `Model<Note> & PluginStatics<typeof countPlugin>` ([`PluginStatics`](../hooks/plugins.mdx#pluginstatics)).
+
+### Дискриминаторы
+
+Потомок с [`@Discriminator`](../schemas/discriminator.mdx) делит коллекцию своей базы при любом порядке списка. Если в списке только потомок, ядро компилирует базу для него в той же коллекции, но провайдера у базы нет: её модель нужно перечислить, чтобы внедрить. Запуск трёх порядков `[Event, Click, SignUp]`, `[Click, SignUp, Event]`, `[Click, Event, SignUp]` дал одну коллекцию `nt_events` и ключ `__t` на созданных документах.
+
+### Ошибки
+
+```text
+ConfigurationError: TypemoModule.forFeature: Account is listed twice
+ConfigurationError: TypemoModule.forFeature: an entry is an entity class, { entity, statics }, TypemoModule.view(...) or TypemoModule.materialized(...), got string
+ConfigurationError: TypemoModule.forFeature: unknown key "collection" in { entity: Account } (known: entity, statics)
+ConfigurationError: NotASchema: not a schema; decorate the class with @Schema()
+ConfigurationError: TypemoModule.forFeature: OpenAccount is registered as a view and as a model on database "bank" of client "default"; a class is one of them
+```
+
+Первые три — в момент вызова `forFeature`, остальные — при старте. Имени коллекции в `forFeature` нет: коллекция — свойство сущности (`@Schema({ collection })`), и две записи одной сущности с разными коллекциями противоречили бы друг другу. Класс, зарегистрированный как модель в одном модуле и как представление в другом на той же базе, дал бы два разных объекта для одной коллекции, поэтому старт падает. Если модуль, которому нужна модель, не импортировал `forFeature`, Nest сообщает об этом своей ошибкой с токеном модели:
+
+```text
+Nest can't resolve dependencies of the AccountsService (?). Please make sure that the argument Symbol(TypemoModel:Account#1 (client "default")) at index [0] is available in the AccountsModule module.
+```
+
+## TypemoModule.view
+
+`TypemoModule.view` описывает представление MongoDB для `forFeature`: класс строки, источник `on` и конвейер. Конвейер сверяется с классом теми же типами, что у [`TypedView.define`](../collections/typed-view.mdx#typedviewdefine), а определение применяется к базе записи, когда создаётся провайдер. Внедряется [`TypedView`](../collections/typed-view.mdx) класса: у него только чтения. Создаёт представление в базе [`sync`](#sync) (`"init"` или `"sync"`); пока его нет, чтение бросает [`ConfigurationError`](../errors/configuration-errors.mdx#configurationerror), а не возвращает пустой список.
+
+```ts twoslash title="accounts/accounts.module.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+import { TypemoModule } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+// ---cut---
+const openAccounts = TypemoModule.view(OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.match({ balance: { $gt: 0 } }).project({ title: 1, balance: 1 }),
+});
+const imports = [TypemoModule.forFeature([Account, openAccounts])];
+```
+
+Если строки конвейера не дают поле класса, определение не компилируется:
+
+```ts twoslash
+import { Entity, Prop, Schema } from "@venloc/typemo";
+import { TypemoModule } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+// ---cut---
+TypemoModule.view(OpenAccount, {
+  on: Account,
+  // @errors: 2322
+  pipeline: (p) => p.project({ title: 1 }),
+});
+```
+
+<Returns type="ViewFeature">
+
+Запись для `forFeature`. Внедряйте `@InjectModel(OpenAccount)` с типом `TypedView<OpenAccount>`.
+
+</Returns>
+
+<Params>
+<Param name="view" type="класс" required>
+
+Класс строки представления (`@Schema({ collection: "<имя представления>" })`).
+
+</Param>
+<Param name="definition" type="TypedViewDefinition" required>
+
+`on` — сущность или представление-источник, `pipeline` — конвейер, `collation` — необязательная сортировка строк.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static view<View extends abstract new () => object, const Src extends SourceInput, R extends StagedPipeline>(
+  view: View,
+  definition: TypedViewDefinition<Src, R> & { readonly pipeline: (p) => R & ViewRowCheck<…> },
+): ViewFeature<InstanceType<View>>
+```
+
+</FullType>
+
+## TypemoModule.materialized
+
+`TypemoModule.materialized` описывает для `forFeature` материализованный результат: обычную коллекцию класса `Target`, которую заполняет конвейер над сущностью `from` при каждом `refresh()`. Определение проверяется так же, как у [`Materialized.define`](../collections/materialized.mdx#materializeddefine). Внедряется объект [`Materialized`](../collections/materialized.mdx): его `model` читает коллекцию, `refresh()` пересчитывает её.
+
+```ts twoslash title="reports/reports.module.ts"
+import { Entity, EntityWithId, fn, Prop, Schema } from "@venloc/typemo";
+import { TypemoModule } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+// ---cut---
+@Schema({ collection: "title_totals" })
+class TitleTotal extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true }) total!: number;
+}
+
+const totals = TypemoModule.materialized(TitleTotal, {
+  from: Account,
+  pipeline: (p) => p.match({ balance: { $gt: 0 } }).group((f) => ({ _id: f.title, total: fn.sum(f.balance) })),
+  mode: "replace",
+});
+const imports = [TypemoModule.forFeature([Account, totals])];
+```
+
+Запуск: два счёта (`Main` с балансом 5 и `Empty` с 0), затем `refresh()` и чтение `totals.model.find({}).lean()` дали `[{ _id: "Main", total: 5 }]`.
+
+<Returns type="MaterializedFeature">
+
+Запись для `forFeature`. Внедряйте с типом `Materialized<TitleTotal>`.
+
+</Returns>
+
+<Params>
+<Param name="target" type="класс" required>
+
+Класс целевой коллекции.
+
+</Param>
+<Param name="definition" type="объект" required>
+
+`from`, `pipeline` и настройки записи `mode`, `on`, `whenMatched`, `whenNotMatched` — как у `Materialized.define`.
+
+</Param>
+</Params>
+
+## TypemoCoreModule
+
+Глобальный модуль одного клиента, который импортируют [`forRoot`](#typemomoduleforroot) и [`forRootAsync`](#typemomoduleforrootasync): он предоставляет клиента, подключение к базе по умолчанию и реестр моделей, запускает [`sync`](#sync) в `onApplicationBootstrap` и закрывает клиента в `onApplicationShutdown`. Напрямую его не импортируют. У него те же `forRoot(uri, options)` и `forRootAsync(options)`, что у `TypemoModule`.
+
+---
+
+## InjectModel
+
+`@InjectModel(Entity, target?)` внедряет модель сущности, зарегистрированной в [`forFeature`](#typemomoduleforfeature) с тем же `target`: `Inject(getModelToken(Entity, target))`. Работает на параметре конструктора и на свойстве. Для представления внедряется `TypedView`, для материализованного результата — `Materialized`.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { Injectable } from "@nestjs/common";
+import { Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+// ---cut---
+@Injectable()
+export class AccountsService {
+  constructor(
+    @InjectModel(Account) private readonly accounts: Model<Account>,
+    @InjectModel(Account, { db: "archive" }) private readonly archived: Model<Account>,
+  ) {}
+}
+```
+
+Тип параметра вы пишете сами: декоратор параметра не видит его типа и не может его проверить, поэтому `@InjectModel(Account) orders: Model<Order>` скомпилируется. Пишите `Model<Сущность>` той же сущности, что в декораторе. Класс с аргументами конструктора и строка вместо класса — ошибки компиляции:
+
+```ts twoslash
+import { InjectModel } from "@venloc/typemo-nestjs";
+// ---cut---
+// @errors: 2345
+InjectModel("Account");
+```
+
+<Params>
+<Param name="entity" type="класс" required>
+
+Класс, перечисленный в `forFeature`.
+
+</Param>
+<Param name="target" type="FeatureTarget" default="{}">
+
+Клиент и база той записи `forFeature`.
+
+</Param>
+</Params>
+
+<Returns type="PropertyDecorator & ParameterDecorator">
+
+Декоратор.
+
+</Returns>
+
+## InjectConnection
+
+`@InjectConnection(target?)` внедряет [`Connection`](../connection/connection.mdx) — базу клиента по умолчанию или базу `target.db`. Подключение к базе по умолчанию предоставляет `forRoot`; другой базы — `forFeature(…, { db })` в том же модуле. Нужно для того, что у ядра есть только на подключении: [`connection.aggregate`](../connection/connection.mdx#connectionaggregate) по базе, [`connection.init`](../connection/connection.mdx#connectioninit) в скрипте развёртывания.
+
+```ts twoslash title="reports/reports.service.ts"
+import { Injectable } from "@nestjs/common";
+import type { Connection } from "@venloc/typemo";
+import { InjectConnection } from "@venloc/typemo-nestjs";
+// ---cut---
+@Injectable()
+export class ReportsService {
+  constructor(
+    @InjectConnection() private readonly connection: Connection,
+    @InjectConnection({ db: "archive" }) private readonly archive: Connection,
+  ) {}
+}
+```
+
+## InjectClient
+
+`@InjectClient(name?)` внедряет [`TypemoClient`](../connection/typemo-client.mdx#new-typemoclient) с этим именем (`"default"` без имени). Клиент нужен для [`client.transaction`](../connection/typemo-client.mdx#clienttransaction), состояния подключения и сессий.
+
+```ts twoslash title="health/health.controller.ts"
+import { Controller, Get } from "@nestjs/common";
+import type { TypemoClient } from "@venloc/typemo";
+import { InjectClient } from "@venloc/typemo-nestjs";
+// ---cut---
+@Controller("health")
+export class HealthController {
+  constructor(@InjectClient() private readonly client: TypemoClient) {}
+
+  @Get()
+  check() {
+    return { database: this.client.state };
+  }
+}
+```
+
+---
+
+## getModelToken
+
+`getModelToken(Entity, target?)` возвращает токен модели: **символ**, созданный один раз для пары «класс + клиент и база». Строка из имени класса (`"AccountModel"`, как в `@nestjs/mongoose`) не подходит: два класса `Account` в двух модулях получили бы один токен, и второй молча занял бы место первого. Нужен для `Test.createTestingModule(...).overrideProvider(getModelToken(Account))` и для `moduleRef.get`.
+
+```ts twoslash
+import { Entity, Prop, Schema } from "@venloc/typemo";
+import { getModelToken } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+// ---cut---
+const token = getModelToken(Account, { db: "archive" });
+//    ^?
+console.log(token.description);
+// → TypemoModel:Account#1 (client "default", db "archive")
+```
+
+Число после `#` — порядковый номер класса в процессе: оно различает классы с одинаковым именем.
+
+## getConnectionToken
+
+`getConnectionToken(target?)` возвращает строку `"TypemoConnection:<клиент>/"` для базы по умолчанию или `"TypemoConnection:<клиент>/<база>"`.
+
+## getClientToken
+
+`getClientToken(name?)` возвращает строку `"TypemoClient:<имя>"`. Имя — непустая строка без `/`; иначе [`ConfigurationError`](../errors/configuration-errors.mdx#configurationerror).
+
+<FullType>
+
+```ts
+const getModelToken: (entity: EntityClass, target?: FeatureTarget) => symbol;
+const getConnectionToken: (target?: FeatureTarget) => string;
+const getClientToken: (name?: string) => string;
+```
+
+</FullType>
+
+---
+
+## Transactional <Badge variant="requires">реплика-сет</Badge>
+
+`@Transactional(options?)` выполняет метод в [`client.transaction`](../connection/typemo-client.mdx#clienttransaction): каждая операция Typemo внутри метода и в методах, которые он вызывает, входит в транзакцию сама, без передачи сессии. Транзакция фиксируется, когда промис метода выполнился, и откатывается, когда он отклонён; ошибка доходит до вызвавшего. Нужен для действий, которые меняют несколько документов и должны случиться целиком или никак: перевод между счетами, заказ со списанием остатка.
+
+```ts twoslash title="transfers/transfers.service.ts"
+import { Injectable } from "@nestjs/common";
+import { Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, Transactional } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+// ---cut---
+@Injectable()
+export class TransfersService {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+
+  @Transactional()
+  async transfer(from: Account["_id"], to: Account["_id"], amount: number): Promise<void> {
+    await this.accounts.updateOne({ _id: from }, { $inc: { balance: -amount } });
+    await this.accounts.updateOne({ _id: to }, { $inc: { balance: amount } });
+  }
+}
+```
+
+Декоратор не видит контейнер Nest, поэтому он только оборачивает метод, а клиента находит приложение: при старте оно привязывает к своим клиентам все провайдеры и контроллеры с такими методами (синглтоны — сами объекты, классы с областью запроса — через прототип). После остановки привязка снимается.
+
+Метод может выполниться **несколько раз**: временная ошибка (`TransientTransactionError`) повторяет транзакцию целиком. Запуск с отказом первой вставки (точка отказа сервера с меткой `TransientTransactionError`) выполнил метод дважды и зафиксировал одну пару документов. Поэтому читайте документы внутри метода и меняйте суммы атомарно (`$inc`), а не арифметикой над объектом, загруженным снаружи.
+
+<Params>
+<Param name="options.client" type="string" default="&quot;default&quot;">
+
+Клиент, чья транзакция.
+
+</Param>
+<Param name="options.join" type="boolean" default="false">
+
+`true` — если метод вызван внутри уже открытой транзакции того же клиента, он выполняется в ней: своей фиксации и отката у него нет, а ошибка уходит наружу и откатывает внешнюю транзакцию. Вне транзакции метод открывает свою. Внутри транзакции **другого** клиента — ошибка: молча открыть вторую транзакцию значило бы, что запись метода не откатится вместе с внешней. С `join` опции транзакции не задаются (компилятор и проверка при декорировании): они принадлежат внешней транзакции. Без `join` вложенный вызов — строгая ошибка ядра. Как метод узнаёт об открытой транзакции, описано в [`client.currentTransaction`](../transactions/transactions.mdx#clientcurrenttransaction).
+
+</Param>
+<Param name="options.readConcern" type="&quot;local&quot; | &quot;majority&quot; | &quot;snapshot&quot;">
+
+Опции транзакции ядра ([`TransactionOptions`](../connection/typemo-client.mdx#clienttransaction)): `readConcern`, `writeConcern`, `timeoutMS`, `maxCommitTimeMS`.
+
+</Param>
+</Params>
+
+<Returns type="MethodDecorator">
+
+Декоратор метода, который возвращает промис. Синхронный метод — ошибка компиляции: транзакция асинхронна.
+
+</Returns>
+
+<FullType>
+
+```ts
+const Transactional: (options?: TransactionalOptions) =>
+  <M extends (...args: never[]) => Promise<unknown>>(target: object, key: string | symbol, descriptor: TypedPropertyDescriptor<M>) => TypedPropertyDescriptor<M>;
+
+type TransactionalOptions = TransactionalOwnOptions | TransactionalJoinOptions;
+
+interface TransactionalOwnOptions extends TransactionOptions {
+  readonly client?: string;
+  readonly join?: false;
+}
+
+interface TransactionalJoinOptions {
+  readonly client?: string;
+  readonly join: true;
+  readonly readConcern?: never;
+  readonly writeConcern?: never;
+  readonly timeoutMS?: never;
+  readonly maxCommitTimeMS?: never;
+}
+```
+
+</FullType>
+
+### На обработчике маршрута
+
+Декоратор можно поставить и на метод контроллера, в любом порядке с `@Post()`: метаданные маршрута переносятся на обёртку. Запуск `POST /accounts/pair`, где обработчик создаёт счёт и падает перед вторым, вернул 500 и не оставил ни одного счёта.
+
+### Вложенный вызов: join
+
+Метод, который вызывают и сам по себе, и из другого транзакционного метода, помечают `join: true`:
+
+```ts twoslash title="ledger/ledger.service.ts"
+import { Injectable } from "@nestjs/common";
+import { Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, Transactional } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+// ---cut---
+@Injectable()
+export class LedgerService {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+
+  @Transactional({ join: true })
+  async entry(title: string): Promise<void> {
+    await this.accounts.create({ title, balance: 1 });
+  }
+
+  @Transactional()
+  async pair(title: string): Promise<number> {
+    await this.entry(title);
+    await this.entry(title);
+    return this.accounts.countDocuments({ title });
+  }
+}
+```
+
+Запуск: `pair` выполнил оба `entry` в одной транзакции (`client.currentTransaction()` внутри них вернул один и тот же объект) и вернул 2; `entry`, вызванный отдельно, открыл свою транзакцию. Ошибка внутри `entry` откатила обе записи `pair`. Временная ошибка сервера повторила внешнюю транзакцию целиком: при отказе первой вставки `entry` выполнился трижды (один раз в неудачной попытке и дважды в повторной), а в базе остались две записи.
+
+### Ошибки
+
+Каждый текст получен запуском:
+
+```text
+ConfigurationError: transaction(): transactions do not nest (already inside a transaction of this client)
+ConfigurationError: @Transactional(): no TypemoClient named "missing" in this application (TypemoModule.forRoot(uri, { name: "missing" }))
+ConfigurationError: @Transactional(): AccountsService.openTwo was called on an object no Nest application with TypemoModule has registered; it works on the providers and controllers of such an application
+ConfigurationError: @Transactional(): Wrong.run is static; decorate an instance method
+ConfigurationError: @Transactional({ join: true }): LedgerService.entry was called inside a transaction of another client; it joins only a transaction of client "default"
+ConfigurationError: @Transactional({ join: true }): timeoutMS cannot go with join; a joined method runs in the outer transaction, give the options to it
+```
+
+Первая — ядра: декорированный метод, вызванный из другого декорированного метода, открыл бы вложенную транзакцию, а их в MongoDB нет. Пометьте внутренний метод `@Transactional({ join: true })`: тогда он выполнится во внешней транзакции, а вызванный сам по себе — в своей. Третья защищает от тихой работы без транзакции: объект, созданный через `new` в обход Nest, приложение не привязывало, и метод отказывается выполняться. На отдельном `mongod` без реплика-сета ядро отвергает транзакцию до записи ([`client.transaction`](../connection/typemo-client.mdx#clienttransaction)).
+
+---
+
+## PolicyInterceptor
+
+`PolicyInterceptor` выполняет каждый обработчик HTTP внутри [`PolicyContext.run`](../policies/policy-context.mdx#policycontextrun) со значениями из запроса: тенант и актор для аудита. Всё, что вызывает обработчик, получает тенанта без передачи параметром, в том числе после `await` и в потоке `Observable`. Запуск 20 одновременных запросов двух тенантов: каждый ответ содержал только заказы своего тенанта.
+
+```ts twoslash title="main.ts"
+import { NestFactory } from "@nestjs/core";
+import { Module } from "@nestjs/common";
+import { PolicyInterceptor } from "@venloc/typemo-nestjs";
+@Module({})
+class AppModule {}
+// ---cut---
+const app = await NestFactory.create(AppModule);
+app.useGlobalInterceptors(
+  new PolicyInterceptor({
+    tenant: (request) => request.headers["x-tenant"],
+    actor: (request) => request.headers["x-user"],
+  }),
+);
+```
+
+Перехватчик создаётся через `new`: подключайте его через `app.useGlobalInterceptors`, `@UseInterceptors(new PolicyInterceptor(...))` или `{ provide: APP_INTERCEPTOR, useValue: new PolicyInterceptor(...) }`. Если резолвер вернул `undefined`, значение не задаётся: тенантная модель тогда отвергнет операцию ошибкой [`StrictModeError`](../errors/data-errors.mdx#strictmodeerror) с причиной `tenant`, а [`TypemoExceptionFilter`](#typemoexceptionfilter) ответит 400. Пустой тенант (`null`, `""`) отвергает само ядро: «без тенанта» пишется явно, через [`@AllTenants()`](#alltenants).
+
+<Params>
+<Param name="options.tenant" type="(request: R) => unknown">
+
+Тенант запроса.
+
+</Param>
+<Param name="options.actor" type="(request: R) => unknown">
+
+Актор для записей аудита.
+
+</Param>
+</Params>
+
+Тип запроса по умолчанию — [`PolicyRequest`](#policyrequest), в нём есть только заголовки. Для своего запроса укажите тип: `new PolicyInterceptor<AuthRequest>({ tenant: (request) => request.user.orgId })`.
+
+### Ошибки
+
+```text
+ConfigurationError: PolicyInterceptor works in HTTP handlers only, got a "rpc" context
+ConfigurationError: PolicyInterceptor: tenant is a function of the request, got string
+ConfigurationError: PolicyInterceptor: tenant returned a promise; resolve it from the request at once
+```
+
+Резолвер синхронный: контекст открывается до вызова обработчика, и асинхронный тенант пришлось бы ждать вне контекста. Достаньте тенанта раньше (guard, middleware аутентификации) и положите в запрос.
+
+## PolicyRequest
+
+Часть запроса, которую читает перехватчик по умолчанию: `headers` (`Readonly<Record<string, string | readonly string[] | undefined>>`).
+
+## AllTenants
+
+`@AllTenants()` на обработчике или контроллере заменяет тенанта запроса на `allTenants: true`: операции видят документы всех тенантов. Нужен для административных маршрутов. Запуск `GET /orders/all` с `@AllTenants()` вернул заказы двух тенантов, а тот же маршрут без декоратора и без заголовка — 400.
+
+```ts twoslash title="admin/admin.controller.ts"
+import { Controller, Get } from "@nestjs/common";
+import { AllTenants } from "@venloc/typemo-nestjs";
+// ---cut---
+@Controller("admin")
+export class AdminController {
+  @AllTenants()
+  @Get("orders")
+  orders(): string[] {
+    return [];
+  }
+}
+```
+
+---
+
+## TypemoExceptionFilter
+
+`TypemoExceptionFilter` превращает ошибки Typemo и «сырого» драйвера (например, от [`client.unsafeDriver()`](../connection/typemo-client.mdx#clientunsafedriver)) в ответы HTTP, чтобы обработчики не ловили их по одной. Вид ошибки определяет [`ErrorClassifier.classify`](../errors/hierarchy.mdx#classify). Ответ не содержит текста сервера, адресов и сохранённых значений: в нём только поля, которые безопасно показать клиенту. Работает только в HTTP-контексте Express; в другом контексте фильтр бросает ошибку дальше.
+
+```ts twoslash title="main.ts"
+import { NestFactory } from "@nestjs/core";
+import { Module } from "@nestjs/common";
+import { TypemoExceptionFilter } from "@venloc/typemo-nestjs";
+@Module({})
+class AppModule {}
+// ---cut---
+const app = await NestFactory.create(AppModule);
+app.useGlobalFilters(new TypemoExceptionFilter());
+```
+
+Тело ответа устроено как у ошибок самого Nest: `statusCode`, `error`, `message` и поля конкретного вида. Каждая строка таблицы получена запросом к приложению:
+
+| Вид | Статус | Тело |
+|---|---|---|
+| `duplicate-key` (и дубликат `_id` от сырого драйвера) | 409 | `{ message: "Duplicate value", fields: ["email"] }` — имена полей ключа, без значений |
+| `validation` | 422 | `{ message: "Validation failed", errors: { age: "must be at most 150" } }` |
+| `server-validation` | 422 | `{ message: "Validation failed" }` |
+| `cast` | 400 | `{ message: "Invalid value", path: "age" }` |
+| `strict` | 400 | `{ message: "Not allowed", reason: "unknown-path", path: "filter.nickname" }` |
+| `not-found` (`orFail`) | 404 | `{ message: "Not found" }` |
+| `version`, `write-conflict` | 409 | `{ message: "The document was changed by someone else" }` |
+| `timeout` | 504 | `{ message: "The database took too long" }` |
+| `connection` | 503 | `{ message: "The database is unavailable" }` |
+| прочее с меткой `TransientTransactionError` | 503 | `{ message: "Try again" }` |
+| `bulk-write` с дубликатом | 409 | `{ message: "Duplicate value" }` |
+| прочее, в том числе `post-hook` | 500 | `{ message: "Internal server error" }` |
+
+Значения ключа дубликата не попадают в ответ: поле может быть скрытым или `sensitive`, а для ошибки сырого драйвера схемы нет вовсе. Ответы 500 фильтр пишет в лог (`Logger("TypemoExceptionFilter")`) с текстом ошибки; [`PostHookError`](../errors/hierarchy.mdx#posthookerror) помечается `(the write was applied)`: запись в базе осталась, упал хук после неё.
+
+### toResponse
+
+`toResponse(error, classification)` возвращает `{ status, body }`. Переопределите его в наследнике, чтобы изменить ответ одного вида, и вызовите `super.toResponse` для остальных:
+
+```ts twoslash title="errors/api-exception.filter.ts"
+import type { ErrorClassification } from "@venloc/typemo";
+import { TypemoExceptionFilter, type TypemoHttpResponse } from "@venloc/typemo-nestjs";
+// ---cut---
+export class ApiExceptionFilter extends TypemoExceptionFilter {
+  override toResponse(error: unknown, classification: ErrorClassification): TypemoHttpResponse {
+    if (classification.kind === "not-found") return { status: 404, body: { code: "NOT_FOUND" } };
+    return super.toResponse(error, classification);
+  }
+}
+```
+
+Фильтр ловит `TypemoError` и `MongoError`; ошибки самого Nest (`HttpException`) и ваши собственные он не трогает.
+
+## TypemoHttpResponse
+
+`{ readonly status: number; readonly body: Readonly<Record<string, unknown>> }` — ответ, который возвращает [`toResponse`](#toresponse).
+
+---
+
+## ParseIdPipe
+
+`ParseIdPipe` превращает параметр маршрута (всегда строку) в `_id` модели любого типа: `ObjectId` (24 шестнадцатеричных символа), `UUID`, строку, число. Неверный id — ответ 400 с понятным текстом, а не ошибка приведения в глубине запроса. `ParseIdPipe.for(Entity)` возвращает класс пайпа, в который Nest внедрит модель сущности из `forFeature` модуля контроллера.
+
+```ts twoslash title="accounts/accounts.controller.ts"
+import { Controller, Get, Param } from "@nestjs/common";
+import { Entity, type IdOf, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, ParseIdPipe } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+// ---cut---
+@Controller("accounts")
+export class AccountsController {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+
+  @Get(":id")
+  get(@Param("id", ParseIdPipe.for(Account)) id: IdOf<Account>) {
+    return this.accounts.findById(id).orFail().plain();
+  }
+}
+```
+
+Ядро приводит строку к `ObjectId` и `UUID` само, а строку `"5"` для числового `_id` не принимает: молчаливого приведения нет. Поэтому для числового `_id` пайп сначала разбирает цифры, строго: `"42"` даёт `42`, а `"42abc"` и `"1e3"` — 400. Тексты ответов получены запуском:
+
+```text
+Invalid id: expected ObjectId (not a 24-character hex string)
+Invalid id: expected number (expected a number)
+```
+
+Вместо `id` в тексте стоит имя параметра маршрута. Если модель уже есть в руках, создайте пайп напрямую: `new ParseIdPipe(model).transform(value)`.
+
+<FullType>
+
+```ts
+class ParseIdPipe<T extends object> implements PipeTransform<unknown, IdOf<T>> {
+  constructor(model: Model<T>);
+  static for<T extends object>(entity: EntityClass<T>, target?: FeatureTarget): Type<ParseIdPipe<T>>;
+  transform(value: unknown, metadata?: ArgumentMetadata<unknown>): IdOf<T>;
+}
+```
+
+</FullType>
+
+## ValidateBodyPipe
+
+`ValidateBodyPipe` проверяет тело запроса схемой сущности ([`Model.validate`](../documents/model-document-methods.mdx#modelvalidate)): типы полей, `required`, `min`/`max`, `enum`, длины, валидаторы — без отдельного DTO, который нужно держать в согласии с сущностью. Все ошибки возвращаются разом — 422 с сообщением по каждому полю. Результат — приведённые поля, которые были присланы, без умолчаний: их добавит `create`.
+
+```ts twoslash title="accounts/accounts.controller.ts"
+import { Body, Controller, Post } from "@nestjs/common";
+import { type CreateInput, Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, ValidateBodyPipe } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+// ---cut---
+@Controller("accounts")
+export class AccountsController {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+
+  @Post()
+  async open(@Body(ValidateBodyPipe.for(Account)) body: CreateInput<Account>) {
+    return (await this.accounts.create(body)).$toPlain();
+  }
+}
+```
+
+**Неизвестное поле** — 422 по умолчанию: опечатка в имени поля (`balanse`) не пропадает молча. Строка вместо числа (`"30"` для `age`) тоже 422: ядро не приводит строки к числам, а в JSON число и так приходит числом. Тело-не-объект — 422 с ключом `""`.
+
+<Params>
+<Param name="options.pick" type="поля сущности">
+
+Только эти поля можно прислать; остальные — `"not allowed here"`.
+
+</Param>
+<Param name="options.omit" type="поля сущности">
+
+Эти поля прислать нельзя (роль, владелец, которых задаёт сервер). Вместе с `pick` — ошибка.
+
+</Param>
+<Param name="options.partial" type="boolean" default="false">
+
+Для обновления: проверяются только присланные поля, обязательное поле может отсутствовать. `_id`, неизменяемые поля и поля, которые ведёт ядро (`createdAt`, `updatedAt`), отвергаются с текстом `"cannot be changed"`. Тип результата для обновления — [`UpdateInput<T>`](../writes/input-types.mdx#updateinput): его принимает `$set`.
+
+</Param>
+<Param name="options.dropUnknown" type="boolean" default="false">
+
+Выбрасывать неизвестные поля и поля, которые исключают `pick`, `omit` и `partial`, вместо ответа 422.
+
+</Param>
+</Params>
+
+Ответ 422 устроен так (запуск с `{ email: "bob@x.io", name: "B", age: 200, role: "root" }`):
+
+```json
+{
+  "statusCode": 422,
+  "error": "Unprocessable Entity",
+  "message": "Validation failed",
+  "errors": {
+    "name": "must be at least 2 characters long",
+    "age": "must be at most 150",
+    "role": "must be one of \"user\", \"admin\""
+  }
+}
+```
+
+Значение `sensitive`-поля не попадает в ответ: запуск с числом вместо строки в таком поле вернул 422 без присланного значения.
+
+<FullType>
+
+```ts
+class ValidateBodyPipe<T extends object> implements PipeTransform<unknown, Promise<CreateInput<T>>> {
+  constructor(model: Model<T>, options?: ValidateBodyOptions<T>);
+  static for<T extends object>(entity: EntityClass<T>, options?: ValidateBodyOptions<T>, target?: FeatureTarget): Type<ValidateBodyPipe<T>>;
+  transform(value: unknown, metadata?: ArgumentMetadata<unknown>): Promise<CreateInput<T>>;
+}
+
+interface ValidateBodyOptions<T> {
+  readonly pick?: readonly (DataKeys<T> | "_id")[];
+  readonly omit?: readonly (DataKeys<T> | "_id")[];
+  readonly partial?: boolean;
+  readonly dropUnknown?: boolean;
+}
+```
+
+</FullType>
+
+### Ошибки
+
+Неверные опции отвергаются при создании пайпа:
+
+```text
+ConfigurationError: ValidateBodyPipe: give pick or omit, not both
+ConfigurationError: ValidateBodyPipe: unknown option "strip" (known: pick, omit, partial, dropUnknown)
+```
+
+---
+
+## Тестирование: `@venloc/typemo-nestjs/testing`
+
+Помощники для тестов своих сервисов: моки для модульных тестов без базы и модуль для тестов на настоящей базе. Как ими пользоваться в задачах, рассказывает руководство [Тесты Nest-приложения](../../integrations/nestjs/testing.mdx).
+
+### provideModelMock
+
+`provideModelMock(Entity, mock, target?)` возвращает провайдер под токеном модели сущности со значением `mock`. Мок сохраняет имена и параметры методов модели ([`ModelMock`](#modelmock)): опечатка в имени метода или неверные аргументы — ошибка компиляции. Метод, которого нет в моке, равен `undefined`, поэтому вызов забытого метода падает `TypeError`, а не возвращает что-то правдоподобное.
+
+```ts twoslash title="accounts/accounts.service.spec.ts"
+import { Injectable } from "@nestjs/common";
+import { Test } from "@nestjs/testing";
+import { Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel } from "@venloc/typemo-nestjs";
+import { provideModelMock } from "@venloc/typemo-nestjs/testing";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+@Injectable()
+class AccountsService {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+  count() {
+    return this.accounts.countDocuments({ balance: { $gt: 0 } });
+  }
+}
+// ---cut---
+const moduleRef = await Test.createTestingModule({
+  providers: [AccountsService, provideModelMock(Account, { countDocuments: async () => 3 })],
+}).compile();
+console.log(await moduleRef.get(AccountsService).count());
+// → 3
+```
+
+Для представления укажите тип мока вторым параметром типа: `provideModelMock<typeof OpenAccount, TypedView<OpenAccount>>(OpenAccount, { … })`. Возвращает [`MockProvider`](#mockprovider).
+
+### provideClientMock
+
+`provideClientMock(mock?, name?)` возвращает провайдеры клиента-мока и привязку [`@Transactional`](#transactional): по умолчанию `transaction(fn)` сразу вызывает `fn` и возвращает её результат, поэтому сервис с транзакциями проверяется без реплика-сета. Результат разворачивают в `providers`: `...provideClientMock()`. Для привязки `@Transactional` модуль нужно инициализировать (`await moduleRef.init()`).
+
+### ModelMock
+
+`ModelMock<M>` — члены `M`, которые может дать мок: каждый метод со своими параметрами и любым результатом, все необязательные.
+
+### MockProvider
+
+`{ provide: string | symbol; useValue: unknown }` — провайдер-значение Nest, который возвращает `provideModelMock`.
+
+### TypemoTestingModule.forRoot
+
+`TypemoTestingModule.forRoot(uri, options?)` — [`TypemoModule.forRoot`](#typemomoduleforroot) для теста: своя база на каждый вызов (`typemo_test_<время>_<номер>`, если не задан `dbName`), [`sync: "init"`](#sync) (коллекции созданы до первого теста, и транзакция не столкнётся с созданием коллекции) и одна попытка подключения. Любую опцию можно переопределить.
+
+### TypemoTestingModule.clear
+
+`TypemoTestingModule.clear(moduleRef, name?)` удаляет документы всех моделей `forFeature` клиента через сами модели ([`Filters.all()`](../policies/violations.mdx#filtersall)), во всех тенантах и вместе с мягко удалёнными. Представления пропускаются. Вызывайте его между тестами, чтобы каждый начинал с пустых коллекций.
+
+```ts twoslash title="test/accounts.e2e-spec.ts"
+import { afterEach } from "bun:test";
+import { Test } from "@nestjs/testing";
+import { Entity, Prop, Schema } from "@venloc/typemo";
+import { TypemoModule } from "@venloc/typemo-nestjs";
+import { TypemoTestingModule } from "@venloc/typemo-nestjs/testing";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+// ---cut---
+const moduleRef = await Test.createTestingModule({
+  imports: [TypemoTestingModule.forRoot("mongodb://localhost:27017"), TypemoModule.forFeature([Account])],
+}).compile();
+await moduleRef.init();
+afterEach(() => TypemoTestingModule.clear(moduleRef));
+```
+
+<FullType>
+
+```ts
+const provideModelMock: <E extends EntityClass, M = Model<InstanceType<E>>>(
+  entity: E,
+  mock: ModelMock<NoInfer<M>>,
+  target?: FeatureTarget,
+) => MockProvider;
+const provideClientMock: (mock?: ModelMock<TypemoClient>, name?: string) => (MockProvider | Type<TransactionalBinder>)[];
+type ModelMock<M> = { readonly [K in keyof M]?: M[K] extends (...args: infer A) => unknown ? (...args: A) => unknown : M[K] };
+
+class TypemoTestingModule {
+  static forRoot(uri: string, options?: TypemoModuleOptions): DynamicModule;
+  static clear(ref: ProviderLookup, name?: string): Promise<void>;
+}
+interface ProviderLookup {
+  get(token: string, options: { readonly strict: false }): unknown;
+}
+```
+
+</FullType>
+
+---
+
+## Остальные типы
+
+<TypeTable
+  type={{
+    "TypemoFeature": { description: "Запись `forFeature`: класс, `ModelFeature`, `ViewFeature` или `MaterializedFeature`." },
+    "ModelFeature": { description: "`{ entity, statics }`: модель со статиками плагинов." },
+    "ViewFeature": { description: "Результат [`TypemoModule.view`](#typemomoduleview)." },
+    "MaterializedFeature": { description: "Результат [`TypemoModule.materialized`](#typemomodulematerialized)." },
+    "FeatureKind": { description: "`\"model\" | \"view\" | \"materialized\"`: чем класс является в базе." },
+    "FeatureTarget": { description: "`{ client?, db? }`: клиент и база записи." },
+    "TypemoAsyncFactory": { description: "`forRootAsync` с `useFactory` и `inject`." },
+    "TypemoAsyncClass": { description: "`forRootAsync` с `useClass`." },
+    "TypemoAsyncExisting": { description: "`forRootAsync` с `useExisting`." },
+    "TypemoAsyncCommon": { description: "Общее для трёх видов: `name` и `imports`." },
+    "TransactionalOwnOptions": { description: "Опции `@Transactional`, который открывает свою транзакцию: `client` и опции транзакции." },
+    "TransactionalJoinOptions": { description: "`{ join: true, client? }`: присоединиться к открытой транзакции клиента." },
+    "PolicyInterceptorOptions": { description: "Резолверы `tenant` и `actor` перехватчика." },
+    "ValidateBodyOptions": { description: "`pick`, `omit`, `partial`, `dropUnknown`." },
+  }}
+/>
+
+## Когда пакет не подходит
+
+- **Не HTTP.** Фильтр и перехватчик работают только в HTTP-контексте Express. В GraphQL, микросервисах и на WebSocket открывайте контекст сами через [`PolicyContext.run`](../policies/policy-context.mdx#policycontextrun) и переводите ошибки по [`ErrorClassifier.classify`](../errors/hierarchy.mdx#classify).
+- **Fastify.** Не поддерживается: фильтр отвечает через `response.status().json()` Express.
+- **Проверка здоровья.** Своего индикатора нет: отдавайте [`client.state`](../connection/typemo-client.mdx#clientstate) или ждите [`client.ready`](../connection/typemo-client.mdx#clientready) в своём контроллере.
+- **Плагины с зависимостями из контейнера** (`forFeatureAsync` в `@nestjs/mongoose`). Не поддерживаются: плагины подключают в [`onClientCreate`](#onclientcreate) или декоратором `@Plugin` на сущности.
+
+## Что дальше
+
+<Cards>
+<Card title="Подключить Typemo к NestJS" href="../../integrations/nestjs/setup.mdx">
+  Установка, первый модуль и первая модель в приложении.
+</Card>
+<Card title="Модели в модулях" href="../../integrations/nestjs/models.mdx">
+  `forFeature`, несколько баз, дискриминаторы, представления и синхронизация при старте.
+</Card>
+<Card title="Ошибки, id и тело запроса" href="../../integrations/nestjs/http.mdx">
+  Фильтр ошибок и пайпы на задачах REST API.
+</Card>
+<Card title="Переход с @nestjs/mongoose" href="../../integrations/nestjs/migration-from-nestjs-mongoose.mdx">
+  Таблица соответствия и пошаговый переход.
+</Card>
+</Cards>

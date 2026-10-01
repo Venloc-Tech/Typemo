@@ -1,0 +1,139 @@
+---
+title: Имена коллекций
+description: "Как имя класса становится именем коллекции в базе, как задать своё имя и подключиться к существующим данным"
+icon: Type
+---
+
+Модель хранит документы в **коллекции** — именованной группе документов в базе. Если имя вы не указали, Typemo выводит его из имени класса, и это удобно для новой базы, но опасно для существующей: переименование класса без явного имени тихо перенесло бы модель в другую, пустую коллекцию. Поэтому важно знать, как имя выводится, и уметь задать его явно. То же относится к именам полей в базе: свойство класса и поле документа могут называться по-разному.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и банковские модели из файлов `accounts/*.ts`.
+
+## Быстрый путь
+
+Без `collection` имя класса переводится в нижний регистр и ставится во множественное число по английским правилам. Явное имя задаётся опцией [`collection`](../reference/schemas/schema.mdx#collection):
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Account extends Entity {}
+
+@Schema({ collection: "legacy_clients" }) // [!code highlight]
+class Client extends Entity {}
+
+console.log(client.db().model(Account).collectionName, client.db().model(Client).collectionName);
+// → accounts legacy_clients
+```
+
+## Как имя выводится из класса
+
+Правило простое: имя класса строчными буквами, затем множественное число. Составные имена не разделяются: `BankAccount` станет `bankaccounts`, а не `bank_accounts`. Правила те же, что у Mongoose, кроме исправленных ошибок, поэтому существующие коллекции сохраняют свои имена. Функция [`CollectionNaming.default`](../reference/schemas/collection-naming.mdx#collectionnamingdefault) применяет их к любой строке, так что проверить результат можно, не создавая модель.
+
+```ts twoslash title="accounts/names.ts"
+import { CollectionNaming } from "@venloc/typemo";
+// ---cut---
+console.log(["Person", "Category", "Status", "Data"].map(CollectionNaming.default).join(" "));
+// → people categories status data
+```
+
+Слова, которые не меняются (`status`, `data`), и неправильные формы (`people`) учтены. Отдельно ставить слово во множественное число умеет [`CollectionNaming.pluralize`](../reference/schemas/collection-naming.mdx#collectionnamingpluralize).
+
+## Подключиться к существующей коллекции
+
+Когда данные уже лежат в базе под своим именем, задайте его явно. Тогда модель работает с этой коллекцией, а переименование класса ничего не сдвинет. Имя проверяется при описании модели: оно не должно быть пустым, содержать `$` или начинаться с `system.` — такие имена сервер зарезервировал. Ошибка бросается сразу, а не при первой записи, и вы вызываете такую же проверку сами через [`CollectionNaming.check`](../reference/schemas/collection-naming.mdx#collectionnamingcheck).
+
+```ts twoslash title="accounts/names.ts"
+import { CollectionNaming } from "@venloc/typemo";
+// ---cut---
+try {
+  CollectionNaming.check("system.users", "Client");
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Client: "system." collections are reserved
+```
+
+## Назвать поле в базе иначе, чем в классе
+
+Опция [`dbName`](../reference/schemas/prop.mdx#dbname) хранит поле под другим именем. В коде, фильтрах и результатах вы пишете имя свойства, а в базе оно выглядит по-своему. Это нужно для чужих данных: свойство `email` ложится на поле `e` уже существующих документов.
+
+```ts twoslash title="accounts/client.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ collection: "legacy_clients" })
+class Client extends Entity {
+  @Prop(() => String, { dbName: "e" }) // [!code highlight]
+  email?: string;
+}
+
+const Clients = client.db().model(Client);
+await Clients.create({ email: "a@b.c" });
+// в базе: { e: "a@b.c" }
+const row = await Clients.find({ email: "a@b.c" }).plain();
+// → [{ _id: "…", email: "a@b.c" }]
+console.log(Clients.schema.toDbPath("email"));
+// → e
+```
+
+Два поля с одним `dbName` или `dbName`, совпадающий с именем другого поля, — `ConfigurationError`: Typemo не даёт двум полям делить одно место в документе.
+
+## Как выбрать
+
+Задайте себе один вопрос: **есть ли уже данные?** Если это новая база, автоматическое имя подойдёт. Если данные уже лежат в базе, задавайте `collection` и `dbName` явно, всегда. Явное имя нужно и в тех проектах, где классы переименовывают при рефакторинге: имя коллекции — часть контракта с данными, а не с кодом.
+
+## Когда это не нужно
+
+Свою функцию именования (например, `snake_case`) подключить нельзя: у клиента и у схемы нет опции, которая её принимает. Чтобы получить другое правило, задавайте `collection` в каждом классе.
+
+## Частые ошибки
+
+### Данные «пропали» после переименования класса
+
+Вы переименовали `Client` в `Customer`, и запросы вернули пустой список: без явного имени новый класс смотрит в коллекцию `customers`, а данные остались в `clients`. Задайте `collection: "clients"` явно.
+
+### Недопустимое имя коллекции
+
+Имя с `$` или `system.` отвергается при описании модели: `ConfigurationError: Client: the collection name "a$b" cannot contain "$" or a null character`. Выберите другое имя.
+
+## Полный пример
+
+```ts twoslash title="accounts/clients.service.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+// коллекция и поле названы явно: данные существуют до Typemo
+@Schema({ collection: "legacy_clients" })
+class Client extends Entity {
+  @Prop(() => String, { dbName: "e", required: true })
+  email!: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Clients = client.db().model(Client);
+
+// в коде пишем email, в базе лежит e
+export const findByEmail = async (email: string) => Clients.findOne({ email }).plain();
+```
+
+<Callout type="migration">
+
+Правила вывода имени те же, что в Mongoose (нижний регистр и множественное число), с исправлением нескольких ошибок в словах вроде `data` и `matrix`. Опции, которая заменяет функцию именования, в Typemo нет.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник: CollectionNaming" href="../reference/schemas/collection-naming.mdx">
+  Правила вывода имени и проверка имени с точными текстами ошибок.
+</Card>
+<Card title="Особые коллекции" href="./special-collections.mdx">
+  Ограниченные коллекции, временные ряды и другие свойства коллекции.
+</Card>
+<Card title="Создание коллекций" href="../collections/create.mdx">
+  Как создать коллекцию с нужными опциями до первой записи.
+</Card>
+</Cards>

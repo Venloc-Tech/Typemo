@@ -1,0 +1,369 @@
+---
+title: Выполнить код при сохранении документа
+description: "Как хуками привести поля перед сохранением, отреагировать на проверку, чтение и удаление документа и что происходит с поддокументами"
+icon: FileCheck
+---
+
+Хук документа — это метод модели, который Typemo вызывает вокруг жизненных событий одного документа: сохранение, проверка, чтение из базы, удаление. В таком хуке `this` — сам документ (а если класс встроен в другую модель, то поддокумент), поэтому его можно читать и менять как обычный объект: убрать пробелы из названия, заполнить служебное поле, записать в журнал, что документ сохранён. Хуки пишутся один раз в модели и срабатывают при любом пути, которым документ доходит до базы.
+
+Если вам нужно вмешаться в запрос (условие, обновление, результат), а не в документ, читайте руководство [Вмешаться в операцию](./operation-hooks.mdx). Хуки документа не срабатывают у запросов модели вроде `updateOne` и `deleteMany`: для них есть события `query.*`.
+
+## Что предполагается
+
+Примеры используют модель счёта, которая растёт по ходу страницы. `Accounts` — модель счёта, которую вы получили у клиента: `client.db().model(Account)`.
+
+## Быстрый путь
+
+События документа называются `document.*`. Три самых частых хука — привести значение перед сохранением, записать успех и записать ошибку:
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Post, PostError, Pre, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Pre("document.save")
+  normalizeTitle(this: Account): void {
+    this.title = this.title.trim();
+  }
+
+  @Post("document.save")
+  logSaved(this: Account): void {
+    console.log(`сохранён счёт ${this.title}`);
+  }
+
+  @PostError("document.save")
+  logFailed(this: Account, error: unknown): void {
+    console.error(`счёт ${this.title} не сохранён:`, error);
+  }
+}
+```
+
+Хукам, которые работают только с полями, достаточно `this: Account`. Методы документа (`$isModified()`, `$getChanges()`) нужны хукам ниже, и для них есть свой тип `this`, о нём — в разделе «Посмотреть, что уйдёт в базу». Остальная страница разбирает каждое событие на задачах.
+
+## Привести значение перед сохранением
+
+Ситуация: название счёта приходит из формы с лишними пробелами по краям. Хук `@Pre("document.save")` запускается перед записью и может менять документ: изменения попадут в базу.
+
+```ts twoslash
+import { Entity, Pre, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Pre("document.save")
+  normalizeTitle(this: Account): void {
+    this.title = this.title.trim();
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const account = await Accounts.create({ title: "  Main  " });
+console.log(JSON.stringify(account.title));
+// → "Main"
+```
+
+Что произошло. [`create`](../reference/writes/writes.mdx#create) собирает документ и сохраняет его; перед записью сработал хук, и в базу ушло название без пробелов. Тот же хук срабатывает при `$save` загруженного документа и при `Model.new(...)` с последующим `$save`.
+
+Хук вызывается и тогда, когда у документа нет изменений: `$save` без единой правки всё равно запускает `document.save`. Поэтому не считайте, что хук выполняется только при реальной записи. Если действие нужно только при настоящих изменениях (запись в журнал, пересчёт), начните хук с раннего выхода:
+
+```ts twoslash
+import { Entity, type HookThis, Pre, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String) note?: string;
+  @Pre("document.save")
+  audit(this: HookThis<"document.save", Account>): void {
+    if (!this.$isModified()) return;
+    console.log("изменения будут записаны");
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const account = await Accounts.create({ title: "Main" });
+// → изменения будут записаны
+await account.$save();
+// без изменений: хук вызван, но вышел сразу
+account.note = "checked";
+await account.$save();
+// → изменения будут записаны
+```
+
+[`$isModified()`](../reference/documents/document-api.mdx#ismodified) для нового документа возвращает `true`, поэтому при `create` хук отрабатывает целиком. У документа без изменений проверка (`document.validate`) не запускается, а хуки `save` и их `post` — запускаются.
+
+Событие `document.save` запускает любой способ создать или сохранить документ: `create`, `insertOne`, `insertMany`, `$save`, `bulkSave`, а также вставка `insertOne` внутри [`bulkWrite`](../writes/bulk.mdx#хуки-операций-внутри-bulkwrite). Правило, которое должно работать при любой вставке, достаточно повесить на `document.save`.
+
+## Посмотреть, что уйдёт в базу
+
+Ситуация: перед сохранением нужно узнать, новый ли это документ и какие поля изменены. Хук класса не знает, где этот класс окажется: моделью коллекции или поддокументом внутри другой модели, и Typemo запускает его в обоих случаях. Поэтому тип `this` в хуке документа — [`HookThis<"document.save", Account>`](../reference/hooks/pre-post.mdx#hookthis), то есть `HydratedDoc<Account> | Subdocument<Account>`. На обоих есть поля класса и методы `$isNew()` и `$isModified()`. Методы, которые есть только у корневого документа, например `$getChanges()` и `$save()`, становятся доступны после проверки [`this.$isRoot()`](../reference/documents/document-api.mdx#isroot): она сужает тип до `HydratedDoc<Account>`.
+
+```ts twoslash
+import { type Defaulted, Entity, type HookThis, Pre, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { default: 0 }) balance!: Defaulted<number>;
+
+  @Pre("document.save")
+  describeSave(this: HookThis<"document.save", Account>): void {
+    if (!this.$isRoot()) return;
+    console.log(this.$isNew(), JSON.stringify(this.$getChanges()));
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const account = await Accounts.create({ title: "Main" });
+account.balance = 5;
+await account.$save();
+// → true {"$set":{"_id":"…","title":"Main","balance":0}}
+// → false {"$set":{"balance":5}}
+```
+
+Что произошло. `Account` — модель, поэтому `$isRoot()` вернул `true`, и хук дошёл до `$getChanges()`. Первый хук сработал на создании, и `$getChanges()` показал документ целиком: у нового документа уходят все поля, включая `_id` и значения по умолчанию. Второй сработал на `$save` и показал единственное изменение. Подробнее об отслеживании изменений — в руководстве [Изменить и сохранить](../documents/change-and-save.mdx).
+
+## Реагировать на проверку
+
+Ситуация: перед проверкой документа нужно заполнить поле, от которого зависит валидация, или записать в журнал, что проверка не прошла. Проверка — отдельное событие `document.validate`: оно вложено в `document.save` и запускается ещё при вызове [`$validate()`](../reference/documents/document-api.mdx#validate).
+
+```ts twoslash
+import { Entity, Post, PostError, Pre, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, minLength: 3 }) title!: string;
+
+  @Pre("document.validate")
+  beforeValidate(this: Account): void {
+    console.log("проверка началась");
+  }
+
+  @PostError("document.validate")
+  validationFailed(this: Account, error: unknown): void {
+    console.log("проверка не прошла:", error instanceof Error ? error.name : error);
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.create({ title: "ab" }).catch(() => undefined);
+// → проверка началась
+// → проверка не прошла: ValidationError
+```
+
+Что произошло. При сохранении документа с изменениями порядок такой: `pre(save)`, `pre(validate)`, проверка, `post(validate)` или `postError(validate)`, запись, `post(save)`. Если проверка не прошла, дальше запись не выполняется, `postError` срабатывает у `validate` и у `save`, а вызывающий код получает [`ValidationError`](../reference/errors/data-errors.mdx#validationerror).
+
+## Выполнить код после чтения
+
+Ситуация: гидратированный документ нужно дополнить вычисляемым значением, которое не хранится в базе. Событие `document.init` срабатывает, когда документ создан из данных, прочитанных из базы. Хуки `@Pre("document.init")` и `@Post("document.init")` не получают данных чтения, но видят готовый документ.
+
+```ts twoslash
+import { Entity, Post, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+
+  @Post("document.init")
+  afterRead(this: Account): void {
+    console.log(`прочитан счёт ${this.title}`);
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.findOne({ title: "Main" });
+// → прочитан счёт Main
+await Accounts.findOne({ title: "Main" }).lean();
+```
+
+Что произошло. `findOne` вернул гидратированный документ, и хук сработал. Для `.lean()` и `.plain()` документа нет, и хук не вызывается: смысл `lean` в том, чтобы не создавать документы. Хук срабатывает и для `Model.hydrate(...)`: но там он не может быть асинхронным. Если хук `document.init` возвращает промис, `hydrate` бросает `ConfigurationError`, потому что синхронный вызов не может его дождаться; читайте документ запросом.
+
+## Выполнить код при удалении
+
+Ситуация: перед удалением документа нужно проверить условие или после — очистить связанные данные. Метод документа [`$deleteOne`](../reference/documents/document-api.mdx#deleteone) запускает `document.deleteOne`, а результат `@Post` — `DeleteResult`.
+
+```ts twoslash
+import { Entity, Post, Pre, Prop, Schema, TypemoClient, type DeleteResult } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+
+  @Pre("document.deleteOne")
+  beforeDelete(this: Account): void {
+    console.log(`удаляем ${this.title}`);
+  }
+
+  @Post("document.deleteOne")
+  afterDelete(this: Account, result: DeleteResult): void {
+    console.log(`удалено: ${result.deletedCount}`);
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const account = await Accounts.findOne({ title: "Main" }).orFail();
+await account.$deleteOne();
+// → удаляем Main
+// → удалено: 1
+```
+
+Что произошло. `$deleteOne` вызвал оба хука вокруг удаления. Запрос модели `Accounts.deleteOne({ title: "Main" })` этого события **не** запускает: он запускает `query.deleteOne`, и хуки для него описаны в руководстве [Вмешаться в операцию](./operation-hooks.mdx). Так же `document.updateOne` соответствует методу документа `$updateOne`, а не запросу `updateOne` модели.
+
+## Поддокументы
+
+Ситуация: у счёта есть проводки — вложенные объекты со своей моделью, и у проводки тоже есть хуки. Typemo запускает хуки поддокументов вместе с хуками корневого документа: сначала `pre` корня, затем `pre` всех поддокументов в порядке дерева, затем `post` в обратном порядке: сначала поддокументы, потом корень.
+
+```ts twoslash
+import { Entity, type HookThis, Post, Pre, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) note!: string;
+
+  @Pre("document.save")
+  preSave(this: HookThis<"document.save", Line>): void {
+    console.log(`  проводка ${this.note}: pre, новая: ${this.$isNew()}, корень: ${this.$isRoot()}`);
+  }
+  @Post("document.save")
+  postSave(this: Line): void {
+    console.log(`  проводка ${this.note}: post`);
+  }
+}
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => [Line]) lines!: Line[];
+
+  @Pre("document.save")
+  preSave(this: Account): void {
+    console.log("счёт: pre");
+  }
+  @Post("document.save")
+  postSave(this: Account): void {
+    console.log("счёт: post");
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.create({ title: "Main", lines: [{ note: "a" }, { note: "b" }] });
+// → счёт: pre
+// →   проводка a: pre, новая: true, корень: false
+// →   проводка b: pre, новая: true, корень: false
+// →   проводка a: post
+// →   проводка b: post
+// → счёт: post
+```
+
+Что произошло. Хуки поддокументов идут строго друг за другом, в порядке массива, и никогда параллельно: параллельные хуки давали бы непредсказуемый порядок. `this` в хуке поддокумента — сам поддокумент ([`Subdocument<Line>`](../reference/documents/typed-collections.mdx#subdocument)): в нём есть поля класса `Line` и методы `$isNew()`, `$isModified()` и `$isRoot()`, общие с корневым документом. `$isNew()` поддокумента отвечает за документ, которому он принадлежит: проводки нового счёта новые, проводки загруженного — нет. `$isModified()` смотрит на собственные поля поддокумента. `$isRoot()` здесь возвращает `false`, а методов корня, например `$getChanges()`, у поддокумента нет, поэтому тип без проверки их не даёт. Хуки `validate` поддокумента отрабатывают после проверки его собственных путей, и его `postError` получает только ошибки его же полей.
+
+Каждый документ и поддокумент, у которого сработали хуки `@Pre`, завершается ровно одним из двух: `@Post` или `@PostError`. Если сохранение не удалось, `@PostError(document.save)` вызывается у каждого из них, сначала у поддокументов, затем у корня.
+
+## Как выбрать
+
+Задайте себе один вопрос: **это правило о документе или об операции?** Если о самом документе (привести поле, заполнить служебное значение, записать в журнал, что он сохранён), используйте хук документа. Если правило должно действовать на запросы модели: `updateMany`, `deleteMany`, `find`, используйте [хук операции](./operation-hooks.mdx): хуки документа для них не запускаются. Если нужно привести значение поля при любой записи, используйте опции [`@Prop`](../reference/schemas/prop.mdx): `trim`, `lowercase`, `validate`.
+
+## Когда это не нужно
+
+Если правило проверяет значение поля, выражайте его опцией поля, а не хуком `document.validate`: опции работают и у обновлений, а хуки документа — только при сохранении. Если вам нужно только наблюдать за сохранениями, подпишитесь на [события операций](../observability/events.mdx): подписчик не может нарушить работу приложения.
+
+## Частые ошибки
+
+### Хук документа не сработал при updateOne
+
+`Accounts.updateOne(...)` и `deleteOne(...)` запускают события `query.*`, а не `document.*`. Чтобы сработали хуки документа, загрузите документ и вызовите его методы: `$save`, `$updateOne`, `$deleteOne`.
+
+### Хук документа изменил `this`, но в базе изменения нет
+
+Изменение в `@Post(document.save)` уже не попадёт в базу: запись выполнена. Меняйте документ в `@Pre`. В `@Pre(document.validate)` изменения тоже учитываются, но он вызывается внутри `save`: если вам нужно, чтобы значение было готово к проверке, меняйте его в `@Pre("document.save")`.
+
+### this.$isNew не найден
+
+```text
+TS2339: Property '$isNew' does not exist on type 'Account'.
+```
+
+Вы объявили `this: Account`: такой тип допустим, но в нём только поля класса. Объявите `this: HookThis<"document.save", Account>`, как в разделе «Посмотреть, что уйдёт в базу».
+
+### Хук с this: HydratedDoc не компилируется
+
+Неправильно: объявить `this: HydratedDoc<Account>`. Хук класса запускается и тогда, когда класс встроен в другую модель, а у поддокумента нет `$getChanges()` и `$save()`: вызов упал бы во время работы. Компилятор останавливает такой хук на декораторе:
+
+```text
+@Pre("document.save"): a document hook may also run on a subdocument of the class; declare this as HydratedDoc<Entity> | Subdocument<Entity>, or narrow with if (this.$isRoot())
+```
+
+Правильно: объявите `this: HookThis<"document.save", Account>` и проверьте `this.$isRoot()` перед методами корня.
+
+## Полный пример
+
+Один файл собирает все хуки документа страницы: приведение названия, проверка, журнал сохранения и ошибок, поддокументы.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Post, PostError, Pre, Prop, Schema } from "@venloc/typemo";
+
+@Schema()
+export class Line {
+  @Prop(() => String, { required: true })
+  note!: string;
+
+  // Поддокумент выполняет свои хуки вместе с корнем.
+  @Post("document.save")
+  logSaved(this: Line): void {
+    console.log(`проводка ${this.note} сохранена`);
+  }
+}
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, minLength: 3 })
+  title!: string;
+
+  @Prop(() => [Line])
+  lines!: Line[];
+
+  // Приводим значение до проверки и записи.
+  @Pre("document.save")
+  normalizeTitle(this: Account): void {
+    this.title = this.title.trim();
+  }
+
+  // Записываем успех.
+  @Post("document.save")
+  logSaved(this: Account): void {
+    console.log(`счёт ${this.title} сохранён`);
+  }
+
+  // Записываем ошибку, если проверка или запись не удалась.
+  @PostError("document.save")
+  logFailed(this: Account, error: unknown): void {
+    console.error(`счёт ${this.title} не сохранён:`, error instanceof Error ? error.message : error);
+  }
+}
+```
+
+<Callout type="migration">
+
+В Mongoose `pre("save")` и `pre("validate")` получали `this` документом, а `updateOne` и `deleteOne` были одновременно хуком документа и запроса. В Typemo `document.updateOne` и `document.deleteOne` — только методы документа `$updateOne` и `$deleteOne`, а запросы модели используют события `query.*`. Хуки поддокументов не выполняются параллельно, как `saveSubdocs` в Mongoose: порядок всегда один и тот же.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Вмешаться в операцию" href="./operation-hooks.mdx">
+  Хуки для `find`, `updateMany`, `deleteMany` и `aggregate`: изменить запрос или пропустить его.
+</Card>
+<Card title="Порядок и ошибки хуков" href="./order-and-errors.mdx">
+  Что выполняется раньше, что будет при ошибке и как хуки ведут себя в транзакции.
+</Card>
+<Card title="Изменить и сохранить" href="../documents/change-and-save.mdx">
+  Как документ отслеживает изменения и что уходит в базу при `$save`.
+</Card>
+<Card title="@Pre, @Post и @PostError" href="../reference/hooks/pre-post.mdx">
+  Полный список событий документа с результатом каждого.
+</Card>
+</Cards>

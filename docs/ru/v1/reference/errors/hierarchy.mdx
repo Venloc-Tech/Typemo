@@ -1,0 +1,328 @@
+---
+title: Иерархия ошибок
+description: "Дерево классов ошибок Typemo, общие поля TypemoError, PostHookError и ErrorClassifier"
+icon: Network
+---
+
+Каждая ошибка, которую бросает Typemo, — экземпляр [`TypemoError`](#typemoerror). Поэтому один `instanceof` отделяет отказы библиотеки и базы от чужих ошибок в вашем коде: от `TypeError` в вашей функции, от ошибки сети в соседней библиотеке. Специальные классы наследуются от `TypemoError` и добавляют структурированные поля, по которым можно принять решение без разбора текста сообщения.
+
+Если вы только начинаете, сначала прочитайте руководство [Обработка ошибок](../../errors/handling.mdx). Эта страница — справочник по общему корню; каждый конкретный класс описан на странице своей группы. Здесь же описаны два элемента, которые не принадлежат ни одной группе: [`PostHookError`](#posthookerror) (запись прошла, а хук после неё упал) и [`ErrorClassifier`](#errorclassifier) (разбор любой ошибки для повторов, журналов и метрик).
+
+## Дерево классов
+
+Классы разложены по группам по тому, где вы встретите ошибку, а не по файлам исходного кода. Ошибки данных приходят, когда значение не подходит схеме. Ошибки запросов — когда запрос нельзя построить или он ничего не нашёл. Ошибки сервера — когда отказала сама база. Ошибки конфигурации и подключения — когда неверна настройка или нет связи.
+
+```tree
+TypemoError
+  ValidationError            # данные не прошли схему
+  CastError                  # значение не приводится к типу поля
+  StrictModeError            # операция нарушила правило строгости
+  UnknownFieldsError         # сохранение стёрло бы неизвестные поля
+  DirectWriteError           # коллекцию изменили в обход её методов
+  PartialArrayError          # массив загружен частично
+  QueryError                 # запрос нельзя построить
+    KeysetTokenError         # токен страницы отвергнут
+  DocumentNotFoundError      # orFail ничего не нашёл
+  VersionError               # документ изменили после чтения
+  EachAsyncError             # сбои колбэка в eachAsync
+  ServerError                # база отказала
+    DuplicateKeyError        # нарушен уникальный индекс
+    ServerValidationError    # отказал валидатор коллекции
+    WriteConflictError       # две записи задели один документ
+  BulkWriteError             # часть пакетной записи не прошла
+  TimeoutError               # закончилось время
+  ConnectionError            # нет связи с сервером
+  DriverError                # драйвер отказал на своей стороне
+  ConfigurationError         # неверная настройка
+  IndexSyncError             # индексы не применились
+  SyncError                  # init() или syncAll() не привели базу к схеме
+  CollectionOptionsError     # опции коллекции расходятся со схемой
+  AuditError                 # запись аудита не удалась
+  PostHookError              # post-хук упал после успешной записи
+  InternalError              # нарушен внутренний инвариант
+```
+
+Страницы групп: [ошибки данных](./data-errors.mdx), [ошибки запросов](./query-errors.mdx), [ошибки сервера](./server-errors.mdx), [ошибки конфигурации и подключения](./configuration-errors.mdx); там же [`SyncError`](./configuration-errors.mdx#syncerror).
+
+Обратите внимание на два места, где дерево неочевидно. `KeysetTokenError` — потомок `QueryError`, поэтому `catch` по `QueryError` поймает и его. А `DuplicateKeyError`, `ServerValidationError` и `WriteConflictError` — потомки `ServerError`, поэтому проверка по `ServerError` ловит все три вместе с остальными отказами сервера. Порядок проверок в обработчике поэтому идёт от частного к общему: сначала `DuplicateKeyError`, потом `ServerError`.
+
+---
+
+## TypemoError
+
+`TypemoError` — корень иерархии. Сам по себе он почти не встречается: библиотека бросает его потомков. Он нужен как общий знаменатель в `catch` и как база для ваших собственных ошибок, если вы хотите, чтобы они проходили те же проверки.
+
+```ts twoslash
+import { ConfigurationError, TypemoError } from "@venloc/typemo";
+// ---cut---
+const error = new ConfigurationError("bad option", { cause: new Error("original") });
+
+console.log(error instanceof TypemoError);
+// → true
+console.log(String(error));
+// → "ConfigurationError: bad option"
+console.log(error.cause instanceof Error);
+// → true
+```
+
+### Поля
+
+**`message`** — текст для человека. Он читается сам по себе, без других полей: в нём есть имя модели, операции, путь и причина. По тексту не стоит принимать решения: он может уточняться между версиями. Для решений есть структурированные поля конкретных классов (`reason`, `code`, `path`).
+
+**`cause`** — оригинальная ошибка, из-за которой возникла эта: ошибка драйвера, ошибка вашей функции в хуке, ошибка приведения внутри валидации. Поле стандартное для `Error`; Typemo только заполняет его. Драйверная ошибка сохраняется в нём без изменений, чтобы вы могли достать любые её поля. Если в оригинале были значения полей с пометкой `sensitive`, в `cause` лежит копия, в которой значения заменены на `[hidden]`: секрет не попадёт в журнал вместе с ошибкой (запуск: у ошибки `DuplicateKeyError` по полю с `sensitive: "hide"` и `keyValue`, и текст сообщения, и текст `cause` содержат `[hidden]`).
+
+**`name`** — имя класса: `"ConfigurationError"`, `"CastError"`. Оно лежит на прототипе, а не на экземпляре, поэтому не попадает в `Object.keys(error)` и не дублируется в каждой строке структурированного журнала. Для проверки типа используйте `instanceof`, а не сравнение `name`: `instanceof` учитывает наследование.
+
+```ts twoslash
+import { ConfigurationError } from "@venloc/typemo";
+// ---cut---
+console.log(Object.keys(new ConfigurationError("x")));
+// → []
+```
+
+### Конструктор
+
+<Params>
+<Param name="message" type="string" required>
+
+Описание для человека. Оно должно быть понятно без остальных полей.
+
+</Param>
+<Param name="options" type="TypemoErrorOptions" default="{}">
+
+Объект с необязательным полем `cause` — оригинальной ошибкой.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+class TypemoError extends Error {
+  constructor(message: string, options?: TypemoErrorOptions);
+}
+
+interface TypemoErrorOptions {
+  readonly cause?: unknown;
+}
+```
+
+</FullType>
+
+Собственные классы ошибок Typemo вы не создаёте: библиотека сама выбирает нужный класс по ситуации. Конструктор пригождается в тестах, когда нужно подать обработчику готовую ошибку.
+
+### Когда не подходит
+
+Если вам нужно разобрать причину отказа, `instanceof TypemoError` слишком грубая проверка: ловите конкретный класс, например [`DuplicateKeyError`](./server-errors.mdx#duplicatekeyerror) или [`CastError`](./data-errors.mdx#casterror). Общий `TypemoError` годится для последнего звена обработчика: «это отказ библиотеки, а не мой баг».
+
+---
+
+## PostHookError
+
+`PostHookError` бросается, когда [post-хук](../hooks/pre-post.mdx) упал **после** успешной записи. Запись в базе уже есть, а вызывающий код получил ошибку. Если принять это за обычный отказ и повторить вызов, документ запишется второй раз. Поэтому библиотека не отдаёт ошибку хука как есть, а оборачивает её в класс с полем `applied`: оно всегда `true` и говорит «запись применена, не повторяйте».
+
+Ошибка нужна в сервисах, где после записи что-то делают хуки: отправляют письмо, пишут в журнал, обновляют кеш. Сбой такого хука не должен выглядеть как провал самой записи. Здесь хук документа падает после `create`:
+
+```ts twoslash
+import { Entity, Post, PostHookError, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+
+  @Post("document.save")
+  notify(this: Account): void {
+    throw new Error("the hook failed");
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+try {
+  await Accounts.create({ owner: "ann" });
+} catch (error) {
+  if (error instanceof PostHookError) {
+    console.log(error.message);
+    // → Account.create: a post hook failed after the write succeeded: the hook failed. The write IS applied (outside a transaction nothing rolls it back); do not repeat it — the hook's error is the cause
+    console.log(error.model, error.operation, error.applied);
+    // → "Account" "create" true
+    console.log((error.cause as Error).message);
+    // → "the hook failed"
+  }
+}
+```
+
+`operation` называет метод, который вызвали вы (`create`), а не внутреннюю операцию, в которую он превращается. Документ из примера записан в коллекцию, а `error.result` — то, что вернула запись: для `create` сохранённый документ, для `updateOne` результат обновления, для `insertMany` массив документов, для `$deleteOne` результат удаления. Поле `result` неперечисляемое: оно не попадает в `Object.keys(error)` и не уходит в журнал вместе с ошибкой, потому что документы могут содержать секреты.
+
+### Поля
+
+<Params title="Поля ошибки">
+<Param name="model" type="string">
+
+Имя модели, у которой упал хук.
+
+</Param>
+<Param name="operation" type="string">
+
+Метод, который вызвал запись: `create`, `save`, `updateOne`, `insertMany`.
+
+</Param>
+<Param name="applied" type="true">
+
+Всегда `true`: запись осталась в базе. Тип `true`, а не `boolean`, чтобы проверка не оставляла сомнений.
+
+</Param>
+<Param name="result" type="unknown">
+
+Что вернула запись. Неперечисляемое поле. Тип `unknown`: сузьте его под операцию, которую вы вызвали.
+
+</Param>
+<Param name="cause" type="unknown">
+
+Ошибка, которую бросил хук, как она была брошена.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+class PostHookError extends TypemoError {
+  readonly model: string;
+  readonly operation: string;
+  readonly applied: true;
+  readonly result: unknown;
+  constructor(model: string, operation: string, result: unknown, options?: TypemoErrorOptions);
+}
+```
+
+</FullType>
+
+### Внутри транзакции
+
+В транзакции всё иначе: сбой post-хука прерывает транзакцию, запись откатывается, а вызывающий код получает ошибку хука **как она была брошена**, без оболочки. `PostHookError` нужен только там, где откатывать нечего, то есть вне транзакции. Проверка запуском: хук `document.save` бросил ошибку внутри `transaction`, снаружи пришла та же ошибка, коллекция осталась пустой.
+
+### Хук чтения и хук ошибки
+
+Post-хук **чтения** (`query.find`) ничего не записывал, поэтому его ошибка приходит как есть. Если сам хук `@PostError` бросает ошибку, исходная ошибка операции не теряется: она лежит в `cause` ошибки хука.
+
+### Когда не подходит
+
+Не повторяйте вызов при `PostHookError`: запись уже есть. Если хук должен откатываться вместе с записью, выполняйте запись внутри [транзакции](../../transactions/transactions.mdx): тогда ошибка хука отменит и запись. Порядок хуков и их ошибок разобран в руководстве [Порядок и ошибки хуков](../../hooks/order-and-errors.mdx).
+
+---
+
+## ErrorClassifier
+
+`ErrorClassifier` отвечает на вопросы об ошибке, которые задают журналы, метрики и повторы: какого она рода, есть ли у неё код сервера, поможет ли повтор. Он принимает **любое** брошенное значение: ошибку Typemo, необработанную ошибку драйвера `mongodb` (её он классифицирует как тот класс Typemo, в который её превратила бы библиотека) или что угодно ещё. Поэтому классификатор годится и там, где ошибка пришла не через модель, а из [`client.unsafeDriver()`](../connection/typemo-client.mdx#clientunsafedriver).
+
+```ts twoslash
+import { ErrorClassifier } from "@venloc/typemo";
+declare const error: unknown;
+// ---cut---
+const { kind, code, retryable } = ErrorClassifier.classify(error);
+```
+
+Запуск на нарушении уникальности дал `{ kind: "duplicate-key", name: "DuplicateKeyError", code: 11000, errorLabels: [], retryable: false, transient: false }`. Тот же результат получился для необработанной ошибки драйвера из `insertOne`, выполненного мимо Typemo. Для конфликта записей с меткой `TransientTransactionError` результат такой: `{ kind: "write-conflict", name: "WriteConflictError", code: 112, errorLabels: ["TransientTransactionError"], retryable: true, transient: true }`.
+
+### Методы
+
+У класса шесть статических методов, других публичных членов нет.
+
+<TypeTable
+  type={{
+    "ErrorClassifier.classify": { description: "Полный разбор: род, имя класса, код сервера, метки, признаки повтора. Результат заморожен.", type: "(error: unknown) => ErrorClassification" },
+    "ErrorClassifier.isDuplicateKey": { description: "`true` для нарушения уникальности. Сужает тип до `DuplicateKeyError`. Пакетную ошибку не считает.", type: "(error: unknown) => error is DuplicateKeyError" },
+    "ErrorClassifier.hasDuplicateKey": { description: "`true` для нарушения уникальности и для `BulkWriteError`, где есть хотя бы один дубликат.", type: "(error: unknown) => boolean" },
+    "ErrorClassifier.isRetryable": { description: "Может ли помочь повтор той же операции без изменений.", type: "(error: unknown) => boolean" },
+    "ErrorClassifier.isTransient": { description: "У ошибки метка `TransientTransactionError`: всю транзакцию можно выполнить заново.", type: "(error: unknown) => boolean" },
+    "ErrorClassifier.isTimeout": { description: "`true` для `TimeoutError` любого вида. Сужает тип до `TimeoutError`.", type: "(error: unknown) => error is TimeoutError" },
+  }}
+/>
+
+### classify
+
+`classify` возвращает `ErrorClassification`: `kind` (род, таблица ниже), `name` (имя класса ошибки; для не-ошибки — `typeof` значения), `code` (код сервера, если он есть), `errorLabels`, `retryable` и `transient`.
+
+`retryable` равен `true` в трёх случаях: у ошибки есть метка `TransientTransactionError` или `RetryableWriteError`; это `ConnectionError`, причём не вида `closed` и не `authentication`; код сервера относится к временным состояниям (остановка узла, смена первичного, сетевой таймаут, конфликт записей и подобные). Нарушение уникальности, ошибка приведения и отказ валидатора коллекции дают `false`: повтор с теми же данными даст тот же результат.
+
+<TypeTable
+  type={{
+    validation: { description: "`ValidationError`." },
+    cast: { description: "`CastError`." },
+    strict: { description: "`StrictModeError`." },
+    query: { description: "`QueryError`, в том числе `KeysetTokenError`." },
+    configuration: { description: "`ConfigurationError`." },
+    "not-found": { description: "`DocumentNotFoundError`." },
+    version: { description: "`VersionError`." },
+    "duplicate-key": { description: "`DuplicateKeyError`." },
+    "server-validation": { description: "`ServerValidationError`." },
+    "write-conflict": { description: "`WriteConflictError`." },
+    timeout: { description: "`TimeoutError`." },
+    "bulk-write": { description: "`BulkWriteError`." },
+    "index-sync": { description: "`IndexSyncError` и `SyncError`: синхронизация индексов и коллекций не удалась." },
+    "post-hook": { description: "`PostHookError`: запись удалась, упал post-хук. Повтор записал бы документ второй раз." },
+    audit: { description: "`AuditError`: запись аудита не удалась, и операция откачена." },
+    "each-async": { description: "`EachAsyncError`: сбои колбэка `eachAsync` с `continueOnError`." },
+    connection: { description: "`ConnectionError`." },
+    server: { description: "`ServerError` без более точного класса." },
+    driver: { description: "`DriverError`." },
+    other: { description: "Всё остальное: чужие ошибки (в том числе ошибка вашего хука) и не-ошибки." },
+  }}
+/>
+
+У `PostHookError`, `AuditError` и `EachAsyncError` свои роды, и их не спутать с чужой ошибкой. Запуск `PostHookError` (post-хук `document.save` бросил после `create`) дал `{ kind: "post-hook", name: "PostHookError", errorLabels: [], retryable: false, transient: false }`. Род `post-hook` важнее остальных: запись уже есть, `retryable` равен `false`, и повтор создал бы дубликат. Если ваш общий обработчик повторяет вызовы, проверяйте род до повтора.
+
+<FullType>
+
+```ts
+class ErrorClassifier {
+  static classify(error: unknown): ErrorClassification;
+  static isDuplicateKey(error: unknown): error is DuplicateKeyError;
+  static hasDuplicateKey(error: unknown): boolean;
+  static isRetryable(error: unknown): boolean;
+  static isTransient(error: unknown): boolean;
+  static isTimeout(error: unknown): error is TimeoutError;
+}
+
+interface ErrorClassification {
+  readonly kind: ErrorKind;
+  readonly name: string;
+  readonly code: number | undefined;
+  readonly errorLabels: readonly string[];
+  readonly retryable: boolean;
+  readonly transient: boolean;
+}
+```
+
+</FullType>
+
+### Сценарии
+
+Первый: решение «создан, занят или попробуйте позже» в одном месте.
+
+```ts twoslash
+import { ErrorClassifier, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+export const openAccount = async (title: string): Promise<"created" | "taken" | "later"> => {
+  try {
+    await Accounts.create({ title });
+    return "created";
+  } catch (error) {
+    if (ErrorClassifier.isDuplicateKey(error)) return "taken";
+    if (ErrorClassifier.isRetryable(error)) return "later";
+    throw error;
+  }
+};
+```
+
+Второй: пакетная запись. `isDuplicateKey` для `BulkWriteError` вернёт `false`, потому что пакетная ошибка — другой класс. Вопрос «был ли среди отказов дубликат» задаёт `hasDuplicateKey`. Запуск `insertMany` с одним повтором и `ordered: false` дал `isDuplicateKey: false`, `hasDuplicateKey: true` и род `bulk-write`.
+
+### Когда не подходит
+
+Классификатор не заменяет `instanceof`, когда нужны поля конкретного класса: `keyValue`, `failures`, `errors`. Сначала сузьте тип проверкой класса, потом читайте поля. Решение, что ответить клиенту, классификатор тоже не принимает: соответствие родов кодам HTTP определяет ваше приложение, пример — в руководстве [Обработка ошибок](../../errors/handling.mdx#ответить-клиенту-кодом-http).

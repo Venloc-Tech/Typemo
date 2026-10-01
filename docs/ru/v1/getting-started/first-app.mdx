@@ -1,0 +1,1130 @@
+---
+title: Первое приложение
+description: "Блог с пользователями, постами и комментариями: модели, подключение, сервисы, связи и ошибки, шаг за шагом"
+icon: BookOpenCheck
+---
+
+Это учебный проект, на котором строятся остальные руководства: небольшой блог, где пользователи пишут посты, а читатели их комментируют. Вы опишете три модели, подключитесь к MongoDB, напишете функции сервисов и запустите скрипт, который проходит весь путь от регистрации до удаления комментария.
+
+Проект обычный: файлы лежат рядом, функции сервисов вызываются из скрипта, а веб-фреймворка нет. Тот же код вызывается из обработчика любого фреймворка, а границу приложения, например ответ «занято» или «не найдено», показывают ваши классы `__Conflict__` и `__NotFound__`. Модель растёт по ходу страницы: сначала пользователь с двумя полями, потом пост, потом скрытое поле и связь между постом и комментариями.
+
+## Что предполагается
+
+Пакеты установлены, а `tsconfig.json` настроен по руководству [Установка и настройка](./installation.mdx): legacy-декораторы, `target` `ESNext`. Если вы ещё ничего не запускали, начните с [Быстрого старта](./quick-start.mdx). Нужен работающий сервер MongoDB на `localhost:27017`.
+
+## Разложить проект по файлам
+
+Проект плоский: все файлы лежат в `src`, а в имени файла видно, что это. Так короткие примеры не приходится дополнять путями.
+
+```tree
+src/
+  user.model.ts       # модель пользователя
+  post.model.ts       # модель поста
+  comment.model.ts    # модель комментария
+  db.ts               # клиент, подключение, модели
+  users.service.ts    # регистрация
+  posts.service.ts    # написать, опубликовать, показать
+  comments.service.ts # добавить и удалить комментарий
+  main.ts             # скрипт, который всё это запускает
+```
+
+## Описать пользователя
+
+Начнём с модели пользователя: имя и адрес почты. [`trim`](../reference/schemas/prop.mdx#trim) обрезает пробелы по краям имени, [`lowercase`](../reference/schemas/prop.mdx#lowercase) приводит адрес к нижнему регистру, чтобы `Alice@Example.com` и `alice@example.com` считались одним адресом, а [`unique`](../reference/schemas/prop.mdx#unique) запрещает двух пользователей с одним адресом. Подробнее о том, как устроены `@Schema` и `@Prop`, — в руководстве [Описать модель](../schemas/define-model.mdx).
+
+```ts twoslash title="src/user.model.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, trim: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true, lowercase: true })
+  email!: string;
+}
+```
+
+## Описать пост
+
+Пост принадлежит пользователю. Автор хранится как **ссылка**: в базе лежит только `_id` пользователя, а [`ref`](../reference/schemas/prop.mdx#ref) говорит, в какой модели его искать. Тип [`Ref<User>`](../reference/schemas/field-markers.mdx#ref) сообщает компилятору, что здесь бывает и идентификатор, и полный пользователь. Подробнее — в руководстве [Ссылки на другие модели](../schemas/references.mdx).
+
+Есть и два новых приёма. [`Timestamped(Entity)`](../reference/schemas/base-classes.mdx#timestamped) добавляет посту `createdAt` и `updatedAt`, которые Typemo заполняет сам (подробнее — в руководстве [Метки времени и версии](../schemas/timestamps-and-versions.mdx)). Поле `tags` — массив: у массива без `required` и без `default` всегда есть значение, пустой `[]`, поэтому при создании поста его можно не передавать и оно никогда не `undefined`. У `published` есть значение по умолчанию (см. руководство [Значения по умолчанию](../schemas/defaults.mdx)), и его тип объявлен как [`Defaulted<boolean>`](../reference/schemas/field-markers.mdx#defaulted): компилятор знает, что при создании поста поле можно не передавать. Забыть `Defaulted` нельзя: об этом рассказывает раздел [Частые ошибки](#частые-ошибки).
+
+```ts twoslash title="src/post.model.ts"
+// @filename: user.model.ts
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, trim: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true, lowercase: true })
+  email!: string;
+}
+// @filename: post.model.ts
+// ---cut---
+import { type Defaulted, Entity, Prop, type Ref, Schema, Timestamped, Types } from "@venloc/typemo";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "posts" })
+export class Post extends Timestamped(Entity) {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => Boolean, { default: false })
+  published!: Defaulted<boolean>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+```
+
+## Описать комментарий и связать его с постом
+
+Комментарий хранит ссылки на пост и на автора. А вот пост комментарии не хранит: их идентификаторы не лежат внутри поста, потому что список рос бы без предела. Вместо этого в модель поста добавляется **виртуальное поле** `comments`: оно ничего не записывает в базу, а при запросе находит комментарии, у которых `post` равно `_id` поста. Виртуальные поля разобраны в руководстве [Виртуальные поля](../schemas/virtuals.mdx).
+
+```ts twoslash title="src/comment.model.ts"
+// @filename: user.model.ts
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, trim: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true, lowercase: true })
+  email!: string;
+
+  @Prop(() => String, { hidden: true })
+  passwordHash?: Hidden<string>;
+}
+// @filename: post.model.ts
+import { type Defaulted, Entity, Prop, type Ref, Schema, Timestamped, Types, Virtual, type VirtualRef } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "posts" })
+export class Post extends Timestamped(Entity) {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => Boolean, { default: false })
+  published!: Defaulted<boolean>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" })
+  comments?: VirtualRef<Comment>;
+}
+// @filename: comment.model.ts
+// ---cut---
+import { Entity, Prop, type Ref, Schema, Types } from "@venloc/typemo";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "comments" })
+export class Comment extends Entity {
+  @Prop(() => String, { required: true })
+  text!: string;
+
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true })
+  post!: Ref<Post>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+```
+
+В пост добавляются импорт комментария и виртуальное поле. [`@Virtual`](../reference/schemas/virtual.mdx#virtual) получает `localField` (поле поста, значение которого ищем: `_id`) и `foreignField` (поле комментария, в котором оно лежит: `post`). Тип [`VirtualRef<Comment>`](../reference/schemas/field-markers.mdx#virtualref) сообщает компилятору, что после заполнения связи здесь появятся комментарии.
+
+```ts twoslash title="src/post.model.ts"
+// @filename: user.model.ts
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, trim: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true, lowercase: true })
+  email!: string;
+
+  @Prop(() => String, { hidden: true })
+  passwordHash?: Hidden<string>;
+}
+// @filename: comment.model.ts
+import { Entity, Prop, type Ref, Schema, Types } from "@venloc/typemo";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "comments" })
+export class Comment extends Entity {
+  @Prop(() => String, { required: true })
+  text!: string;
+
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true })
+  post!: Ref<Post>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+// @filename: post.model.ts
+// ---cut---
+import { type Defaulted, Entity, Prop, type Ref, Schema, Timestamped, Types, Virtual, type VirtualRef } from "@venloc/typemo"; // [!code ++]
+import { Comment } from "./comment.model.ts"; // [!code ++]
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "posts" })
+export class Post extends Timestamped(Entity) {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => Boolean, { default: false })
+  published!: Defaulted<boolean>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) // [!code ++]
+  comments?: VirtualRef<Comment>; // [!code ++]
+}
+```
+
+Пост и комментарий импортируют друг друга. Это нормально: `ref: () => Comment` и `ref: () => Post` — функции, которые вызываются позже, когда оба класса уже загружены.
+
+## Подключиться к базе и создать индексы
+
+Клиент и модели создаются один раз в отдельном файле. [`TypemoClient.connect`](../reference/connection/typemo-client.mdx#typemoclientconnect) открывает соединение, [`connection.model`](../reference/connection/connection.mdx#connectionmodel) выдаёт модель по классу, а [`connection.init`](../reference/connection/connection.mdx#connectioninit) создаёт в базе то, чего там ещё нет, в первую очередь уникальный индекс по `email`. Typemo сам индексы не создаёт: без `init` опция `unique` ничего бы не гарантировала. Подробнее о клиенте — в руководстве [Подключиться к базе](../connection/connect.mdx).
+
+```ts twoslash title="src/db.ts"
+// @filename: user.model.ts
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, trim: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true, lowercase: true })
+  email!: string;
+
+  @Prop(() => String, { hidden: true })
+  passwordHash?: Hidden<string>;
+}
+// @filename: post.model.ts
+import { type Defaulted, Entity, Prop, type Ref, Schema, Timestamped, Types, Virtual, type VirtualRef } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "posts" })
+export class Post extends Timestamped(Entity) {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => Boolean, { default: false })
+  published!: Defaulted<boolean>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" })
+  comments?: VirtualRef<Comment>;
+}
+// @filename: comment.model.ts
+import { Entity, Prop, type Ref, Schema, Types } from "@venloc/typemo";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "comments" })
+export class Comment extends Entity {
+  @Prop(() => String, { required: true })
+  text!: string;
+
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true })
+  post!: Ref<Post>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+// @filename: db.ts
+// ---cut---
+import { TypemoClient } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+
+export const Users = client.connection.model(User);
+export const Posts = client.connection.model(Post);
+export const Comments = client.connection.model(Comment);
+
+await client.connection.init();
+```
+
+Файл использует `await` на верхнем уровне: Bun и `module: "Preserve"` это допускают. Другие файлы импортируют из `db.ts` готовые `Users`, `Posts` и `Comments`.
+
+## Зарегистрировать пользователя
+
+Ситуация: пользователь заполнил форму регистрации. Хеш пароля нужно сохранить, но никогда не отдавать: добавим в модель поле `passwordHash` с опцией [`hidden`](../reference/schemas/prop.mdx#hidden) и типом [`Hidden<string>`](../reference/schemas/field-markers.mdx#hidden). Скрытое поле хранится в базе, но не попадает в plain-вид, то есть в данные для ответа клиенту. Подробнее — в руководстве [Скрытые и чувствительные поля](../schemas/hidden-and-sensitive.mdx).
+
+```ts twoslash title="src/user.model.ts"
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo"; // [!code ++]
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, trim: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true, lowercase: true })
+  email!: string;
+
+  @Prop(() => String, { hidden: true }) // [!code ++]
+  passwordHash?: Hidden<string>; // [!code ++]
+}
+```
+
+Функция `registerUser` создаёт пользователя методом [`create`](../reference/writes/writes.mdx#create). Если адрес уже занят, уникальный индекс отвергает запись, а Typemo бросает [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicatekeyerror): её сервис превращает в свою ошибку `__Conflict__`, которую обработчик запроса покажет как ответ 409. Результат `create` — документ, а [`$toPlain`](../reference/documents/document-api.mdx#toplain) превращает его в plain-объект без скрытых полей.
+
+```ts twoslash title="src/users.service.ts"
+// @filename: user.model.ts
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, trim: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true, lowercase: true })
+  email!: string;
+
+  @Prop(() => String, { hidden: true })
+  passwordHash?: Hidden<string>;
+}
+// @filename: post.model.ts
+import { type Defaulted, Entity, Prop, type Ref, Schema, Timestamped, Types, Virtual, type VirtualRef } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "posts" })
+export class Post extends Timestamped(Entity) {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => Boolean, { default: false })
+  published!: Defaulted<boolean>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" })
+  comments?: VirtualRef<Comment>;
+}
+// @filename: comment.model.ts
+import { Entity, Prop, type Ref, Schema, Types } from "@venloc/typemo";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "comments" })
+export class Comment extends Entity {
+  @Prop(() => String, { required: true })
+  text!: string;
+
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true })
+  post!: Ref<Post>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+// @filename: db.ts
+import { TypemoClient } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+
+export const Users = client.connection.model(User);
+export const Posts = client.connection.model(Post);
+export const Comments = client.connection.model(Comment);
+
+await client.connection.init();
+// @filename: users.service.ts
+// ---cut---
+import { DuplicateKeyError } from "@venloc/typemo";
+import { Users } from "./db.ts";
+
+// код читателя: ошибка на границе приложения и хеширование пароля
+export class __Conflict__ extends Error {}
+const __hashPassword__ = (password: string): string => `hash:${password}`;
+
+export const registerUser = async (name: string, email: string, password: string) => {
+  try {
+    const user = await Users.create({ name, email, passwordHash: __hashPassword__(password) });
+    return user.$toPlain();
+  } catch (error) {
+    if (error instanceof DuplicateKeyError) throw new __Conflict__(`email ${email} is taken`);
+    throw error;
+  }
+};
+```
+
+`__hashPassword__` — ваша функция хеширования, в Typemo её нет: двойные подчёркивания обозначают код читателя. Результат `registerUser("Alice", "alice@example.com", "s3cret")`: `{ _id: "…", name: "Alice", email: "alice@example.com" }`. Поля `passwordHash` в нём нет, хотя в базе оно есть.
+
+## Написать и опубликовать пост
+
+Ситуация: автор пишет черновик, потом публикует его и добавляет тег. `writePost` создаёт пост. Идентификатор автора приходит строкой (например, из сессии), и [`create`](../reference/writes/writes.mdx#create) принимает строку там, где ждёт `ObjectId`: приводить её самому не нужно. Поле `published` не передаётся, значит, оно `false`.
+
+[`updateOne`](../reference/writes/writes.mdx#updateone) меняет документ без предварительного чтения: `$set` записывает новое значение поля, а `$addToSet` добавляет тег в массив, только если такого ещё нет. Оба вызова тоже принимают `_id` строкой.
+
+```ts twoslash title="src/posts.service.ts"
+// @filename: user.model.ts
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, trim: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true, lowercase: true })
+  email!: string;
+
+  @Prop(() => String, { hidden: true })
+  passwordHash?: Hidden<string>;
+}
+// @filename: post.model.ts
+import { type Defaulted, Entity, Prop, type Ref, Schema, Timestamped, Types, Virtual, type VirtualRef } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "posts" })
+export class Post extends Timestamped(Entity) {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => Boolean, { default: false })
+  published!: Defaulted<boolean>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" })
+  comments?: VirtualRef<Comment>;
+}
+// @filename: comment.model.ts
+import { Entity, Prop, type Ref, Schema, Types } from "@venloc/typemo";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "comments" })
+export class Comment extends Entity {
+  @Prop(() => String, { required: true })
+  text!: string;
+
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true })
+  post!: Ref<Post>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+// @filename: db.ts
+import { TypemoClient } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+
+export const Users = client.connection.model(User);
+export const Posts = client.connection.model(Post);
+export const Comments = client.connection.model(Comment);
+
+await client.connection.init();
+// @filename: posts.service.ts
+// ---cut---
+import { Posts } from "./db.ts";
+
+export const writePost = (authorId: string, title: string, body: string, tags: string[] = []) =>
+  Posts.create({ author: authorId, title, body, tags });
+
+export const publishPost = (id: string) => Posts.updateOne({ _id: id }, { $set: { published: true } });
+
+export const addTag = (id: string, tag: string) => Posts.updateOne({ _id: id }, { $addToSet: { tags: tag } });
+```
+
+`updateOne` возвращает счётчики, а не документ: `matchedCount` — сколько документов подошло, `modifiedCount` — сколько изменилось. Вместе с полями, которые вы задали, `updatedAt` Typemo обновляет сам. Другие способы изменить данные разобраны в руководстве [Изменить документы](../writes/update.mdx).
+
+## Показать ленту постов
+
+Ситуация: на главной странице список опубликованных постов, новые сверху, по десять на страницу, с именем автора. [`find`](../reference/query/reading.mdx#modelfind) принимает фильтр, а дальше запрос строится цепочкой вызовов: [`.sort`](../reference/query/reading.mdx#sort) задаёт порядок (второй ключ `_id` делает порядок стабильным при равных датах), [`.skip`](../reference/query/reading.mdx#skip) и [`.limit`](../reference/query/reading.mdx#limit) выбирают страницу, [`.select`](../reference/query/reading.mdx#select) оставляет только нужные поля.
+
+[`.populate`](../reference/populate/populate.mdx#populate) заменяет идентификатор автора самим автором, а `select` внутри него берёт только имя. Автор поста обязателен, но пользователя могли удалить, и тогда ссылка «висит»: без опции `required: true` заполненное поле имело бы тип `User | null` и `item.author.name` не скомпилировалось бы. С `required: true` висячая ссылка становится ошибкой [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#documentnotfounderror), а `null` из типа исчезает. Завершает цепочку [`.plain()`](../reference/query/reading.mdx#plain): результат — обычные объекты, готовые к отправке клиенту.
+
+```ts twoslash title="src/posts.service.ts"
+// @filename: user.model.ts
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, trim: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true, lowercase: true })
+  email!: string;
+
+  @Prop(() => String, { hidden: true })
+  passwordHash?: Hidden<string>;
+}
+// @filename: post.model.ts
+import { type Defaulted, Entity, Prop, type Ref, Schema, Timestamped, Types, Virtual, type VirtualRef } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "posts" })
+export class Post extends Timestamped(Entity) {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => Boolean, { default: false })
+  published!: Defaulted<boolean>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" })
+  comments?: VirtualRef<Comment>;
+}
+// @filename: comment.model.ts
+import { Entity, Prop, type Ref, Schema, Types } from "@venloc/typemo";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "comments" })
+export class Comment extends Entity {
+  @Prop(() => String, { required: true })
+  text!: string;
+
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true })
+  post!: Ref<Post>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+// @filename: db.ts
+import { TypemoClient } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+
+export const Users = client.connection.model(User);
+export const Posts = client.connection.model(Post);
+export const Comments = client.connection.model(Comment);
+
+await client.connection.init();
+// @filename: posts.service.ts
+// ---cut---
+import { Posts } from "./db.ts";
+
+export const listPublished = (page: number, pageSize = 10) =>
+  Posts.find({ published: true })
+    .sort({ createdAt: -1, _id: 1 })
+    .skip((page - 1) * pageSize)
+    .limit(pageSize)
+    .select({ title: 1, tags: 1, author: 1, createdAt: 1 })
+    .populate({ path: "author", select: { name: 1 }, required: true })
+    .plain();
+```
+
+Тип результата выводится из цепочки. Наведите курсор на `item` в скрипте ниже: у него будут только выбранные поля, а `item.author.name` — строка, потому что связь заполнена. Подробнее об этих методах — в руководствах [Чтение данных](../queries/reading-data.mdx) и [Показать связанные данные](../populate/basics.mdx).
+
+## Показать пост с комментариями
+
+Ситуация: страница поста с автором и комментариями, у каждого комментария тоже показан автор. Комментарии берутся из виртуального поля `comments`, а вложенный `populate` заполняет авторов комментариев. Если поста нет, [`.orFail()`](../reference/query/reading.mdx#orfail) бросает [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#documentnotfounderror): без него `findById` вернул бы `null`.
+
+```ts twoslash title="src/posts.service.ts"
+// @filename: user.model.ts
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, trim: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true, lowercase: true })
+  email!: string;
+
+  @Prop(() => String, { hidden: true })
+  passwordHash?: Hidden<string>;
+}
+// @filename: post.model.ts
+import { type Defaulted, Entity, Prop, type Ref, Schema, Timestamped, Types, Virtual, type VirtualRef } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "posts" })
+export class Post extends Timestamped(Entity) {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => Boolean, { default: false })
+  published!: Defaulted<boolean>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" })
+  comments?: VirtualRef<Comment>;
+}
+// @filename: comment.model.ts
+import { Entity, Prop, type Ref, Schema, Types } from "@venloc/typemo";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "comments" })
+export class Comment extends Entity {
+  @Prop(() => String, { required: true })
+  text!: string;
+
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true })
+  post!: Ref<Post>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+// @filename: db.ts
+import { TypemoClient } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+
+export const Users = client.connection.model(User);
+export const Posts = client.connection.model(Post);
+export const Comments = client.connection.model(Comment);
+
+await client.connection.init();
+// @filename: posts.service.ts
+// ---cut---
+import { Posts } from "./db.ts";
+
+export const readPost = (id: string) =>
+  Posts.findById(id)
+    .populate([
+      { path: "author", required: true },
+      { path: "comments", populate: { path: "author", select: { name: 1 }, required: true } },
+    ])
+    .orFail()
+    .plain();
+```
+
+[`findById`](../reference/query/reading.mdx#modelfindbyid) принимает `id` строкой, как он приходит из адреса страницы. Что именно возвращает запрос и сколько обращений к базе он делает, описано в руководстве [Показать связанные данные](../populate/basics.mdx).
+
+## Добавить и удалить комментарий
+
+Ситуация: читатель оставляет комментарий, а автор или модератор может его убрать. `addComment` создаёт комментарий, `removeComment` удаляет его методом [`deleteOne`](../reference/writes/writes.mdx#deleteone) и по счётчику `deletedCount` сообщает, был ли он найден. Повторное удаление вернёт `false`, а не ошибку: удалять уже удалённое безвредно.
+
+```ts twoslash title="src/comments.service.ts"
+// @filename: user.model.ts
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, trim: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true, lowercase: true })
+  email!: string;
+
+  @Prop(() => String, { hidden: true })
+  passwordHash?: Hidden<string>;
+}
+// @filename: post.model.ts
+import { type Defaulted, Entity, Prop, type Ref, Schema, Timestamped, Types, Virtual, type VirtualRef } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "posts" })
+export class Post extends Timestamped(Entity) {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => Boolean, { default: false })
+  published!: Defaulted<boolean>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" })
+  comments?: VirtualRef<Comment>;
+}
+// @filename: comment.model.ts
+import { Entity, Prop, type Ref, Schema, Types } from "@venloc/typemo";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "comments" })
+export class Comment extends Entity {
+  @Prop(() => String, { required: true })
+  text!: string;
+
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true })
+  post!: Ref<Post>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+// @filename: db.ts
+import { TypemoClient } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+
+export const Users = client.connection.model(User);
+export const Posts = client.connection.model(Post);
+export const Comments = client.connection.model(Comment);
+
+await client.connection.init();
+// @filename: comments.service.ts
+// ---cut---
+import { Comments } from "./db.ts";
+
+export const addComment = (postId: string, authorId: string, text: string) =>
+  Comments.create({ post: postId, author: authorId, text });
+
+export const removeComment = async (id: string) => {
+  const result = await Comments.deleteOne({ _id: id });
+  return result.deletedCount === 1;
+};
+```
+
+Удаление подробно разобрано в руководстве [Удалить документы](../writes/delete.mdx).
+
+## Запустить приложение
+
+Скрипт проходит весь сценарий: регистрирует двух пользователей, пробует занять адрес повторно, пишет и публикует пост, читает ленту и страницу поста, оставляет и удаляет комментарий. Результаты в комментариях `// →` получены запуском на настоящей MongoDB.
+
+```ts twoslash title="src/main.ts"
+// @filename: user.model.ts
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, trim: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true, lowercase: true })
+  email!: string;
+
+  @Prop(() => String, { hidden: true })
+  passwordHash?: Hidden<string>;
+}
+// @filename: post.model.ts
+import { type Defaulted, Entity, Prop, type Ref, Schema, Timestamped, Types, Virtual, type VirtualRef } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "posts" })
+export class Post extends Timestamped(Entity) {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => Boolean, { default: false })
+  published!: Defaulted<boolean>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" })
+  comments?: VirtualRef<Comment>;
+}
+// @filename: comment.model.ts
+import { Entity, Prop, type Ref, Schema, Types } from "@venloc/typemo";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "comments" })
+export class Comment extends Entity {
+  @Prop(() => String, { required: true })
+  text!: string;
+
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true })
+  post!: Ref<Post>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+// @filename: db.ts
+import { TypemoClient } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+
+export const Users = client.connection.model(User);
+export const Posts = client.connection.model(Post);
+export const Comments = client.connection.model(Comment);
+
+await client.connection.init();
+// @filename: users.service.ts
+import { DuplicateKeyError } from "@venloc/typemo";
+import { Users } from "./db.ts";
+
+// код читателя: ошибка на границе приложения и хеширование пароля
+export class __Conflict__ extends Error {}
+const __hashPassword__ = (password: string): string => `hash:${password}`;
+
+export const registerUser = async (name: string, email: string, password: string) => {
+  try {
+    const user = await Users.create({ name, email, passwordHash: __hashPassword__(password) });
+    return user.$toPlain();
+  } catch (error) {
+    if (error instanceof DuplicateKeyError) throw new __Conflict__(`email ${email} is taken`);
+    throw error;
+  }
+};
+// @filename: posts.service.ts
+import { Posts } from "./db.ts";
+
+export const writePost = (authorId: string, title: string, body: string, tags: string[] = []) =>
+  Posts.create({ author: authorId, title, body, tags });
+
+export const publishPost = (id: string) => Posts.updateOne({ _id: id }, { $set: { published: true } });
+
+export const addTag = (id: string, tag: string) => Posts.updateOne({ _id: id }, { $addToSet: { tags: tag } });
+
+export const listPublished = (page: number, pageSize = 10) =>
+  Posts.find({ published: true })
+    .sort({ createdAt: -1, _id: 1 })
+    .skip((page - 1) * pageSize)
+    .limit(pageSize)
+    .select({ title: 1, tags: 1, author: 1, createdAt: 1 })
+    .populate({ path: "author", select: { name: 1 }, required: true })
+    .plain();
+
+export const readPost = (id: string) =>
+  Posts.findById(id)
+    .populate([
+      { path: "author", required: true },
+      { path: "comments", populate: { path: "author", select: { name: 1 }, required: true } },
+    ])
+    .orFail()
+    .plain();
+// @filename: comments.service.ts
+import { Comments } from "./db.ts";
+
+export const addComment = (postId: string, authorId: string, text: string) =>
+  Comments.create({ post: postId, author: authorId, text });
+
+export const removeComment = async (id: string) => {
+  const result = await Comments.deleteOne({ _id: id });
+  return result.deletedCount === 1;
+};
+// @filename: main.ts
+// ---cut---
+import { addComment, removeComment } from "./comments.service.ts";
+import { client } from "./db.ts";
+import { addTag, listPublished, publishPost, readPost, writePost } from "./posts.service.ts";
+import { __Conflict__, registerUser } from "./users.service.ts";
+
+const alice = await registerUser("Alice", "alice@example.com", "s3cret");
+const bob = await registerUser("Bob", "bob@example.com", "pa55word");
+
+try {
+  await registerUser("Alice again", "Alice@Example.com", "other");
+} catch (error) {
+  console.log(error instanceof __Conflict__, (error as Error).message);
+  // → true email Alice@Example.com is taken
+}
+
+const post = await writePost(alice._id, "Hello", "My first post", ["intro"]);
+await writePost(alice._id, "Draft", "Not ready yet");
+
+console.log((await listPublished(1)).length);
+// → 0
+
+await publishPost(post._id.toString());
+await addTag(post._id.toString(), "typemo");
+console.log((await listPublished(1)).map((item) => `${item.title} by ${item.author.name}`));
+// → ["Hello by Alice"]
+
+const firstComment = await addComment(post._id.toString(), bob._id, "Nice!");
+await addComment(post._id.toString(), alice._id, "Thanks");
+
+const page = await readPost(post._id.toString());
+console.log(page.comments.map((comment) => `${comment.author.name}: ${comment.text}`));
+// → ["Bob: Nice!", "Alice: Thanks"]
+
+console.log(await removeComment(firstComment._id.toString()));
+// → true
+
+await client.close();
+```
+
+```bash
+bun run src/main.ts
+```
+
+Обратите внимание на две вещи. Повторная регистрация с адресом `Alice@Example.com` отвергнута, хотя записан `alice@example.com`: `lowercase` приводит адрес к нижнему регистру до записи, поэтому уникальный индекс видит один и тот же адрес. А пост-черновик в ленту не попал: фильтр `published: true` отсёк его, поэтому первая лента пуста.
+
+Скрипт при повторном запуске упадёт на регистрации: пользователи уже есть, и `registerUser` бросит `__Conflict__` без обработки. Перед новым запуском удалите базу `blog`.
+
+## Как выбрать
+
+В приложении вы будете возвращаться к одному вопросу: **в каком виде вам нужны данные?** Если вы отдаёте их клиенту, как ответ `listPublished` и `readPost`, заканчивайте запрос [`.plain()`](../reference/query/reading.mdx#plain). Если собираетесь изменить и сохранить, читайте документ без `.plain()`. Если считаете что-то внутри приложения и наружу данные не уходят, подойдёт [`.lean()`](../reference/query/reading.mdx#lean). Подробное сравнение — в руководстве [Чтение данных](../queries/reading-data.mdx).
+
+## Когда это не нужно
+
+Пример учебный: в нём нет ни авторизации, ни защиты от чужих комментариев, ни страниц с курсором, ни транзакций. Если вам нужна выгрузка тысяч постов, вместо `skip` и `limit` возьмите [постраничную выдачу по ключу](../queries/keyset-pagination.mdx). Если несколько записей должны изменяться вместе, используйте [транзакции](../transactions/transactions.mdx).
+
+## Частые ошибки
+
+### Компилятор требует `Defaulted<T>`
+
+Поле с `default` объявлено обычным типом. Компилятор останавливает вас на самом декораторе, а не в месте, где вы забыли передать поле:
+
+```ts twoslash
+// @errors: 1240
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "posts" })
+export class Post extends Entity {
+  @Prop(() => Boolean, { default: false })
+  published!: boolean;
+}
+```
+
+Причина: Typemo выводит тип входных данных `create` из типа поля. У `boolean` поле обязательно, а у `Defaulted<boolean>` необязательно. Если объявить `default`, но оставить `boolean`, то `create` всё равно потребовал бы поле, и значение по умолчанию никогда не сработало бы, поэтому декоратор такую модель отвергает. Объявите `Defaulted<boolean>`, как в модели поста выше.
+
+### Идентификатор из адреса не подошёл
+
+Страница поста получает `id` из адреса, а пользователь может ввести что угодно. Строка, которая не выглядит как `ObjectId`, даёт [`CastError`](../reference/errors/data-errors.mdx#casterror), а правильный `id` несуществующего поста даёт [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#documentnotfounderror). Тексты получены запуском:
+
+```text
+CastError: Cast to ObjectId failed at path "_id" for "nope" (string): not a 24-character hex string [format]
+DocumentNotFoundError: Post.findById: no document matched the filter (orFail)
+```
+
+На границе приложения обе ошибки превращают в одну ответ «не найдено». Тип ошибки проверяют через `instanceof`:
+
+```ts twoslash title="src/posts.controller.ts"
+// @filename: user.model.ts
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, trim: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true, lowercase: true })
+  email!: string;
+
+  @Prop(() => String, { hidden: true })
+  passwordHash?: Hidden<string>;
+}
+// @filename: post.model.ts
+import { type Defaulted, Entity, Prop, type Ref, Schema, Timestamped, Types, Virtual, type VirtualRef } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "posts" })
+export class Post extends Timestamped(Entity) {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => Boolean, { default: false })
+  published!: Defaulted<boolean>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" })
+  comments?: VirtualRef<Comment>;
+}
+// @filename: comment.model.ts
+import { Entity, Prop, type Ref, Schema, Types } from "@venloc/typemo";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+@Schema({ collection: "comments" })
+export class Comment extends Entity {
+  @Prop(() => String, { required: true })
+  text!: string;
+
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true })
+  post!: Ref<Post>;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+// @filename: db.ts
+import { TypemoClient } from "@venloc/typemo";
+import { Comment } from "./comment.model.ts";
+import { Post } from "./post.model.ts";
+import { User } from "./user.model.ts";
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+
+export const Users = client.connection.model(User);
+export const Posts = client.connection.model(Post);
+export const Comments = client.connection.model(Comment);
+
+await client.connection.init();
+// @filename: posts.service.ts
+import { Posts } from "./db.ts";
+
+export const writePost = (authorId: string, title: string, body: string, tags: string[] = []) =>
+  Posts.create({ author: authorId, title, body, tags });
+
+export const publishPost = (id: string) => Posts.updateOne({ _id: id }, { $set: { published: true } });
+
+export const addTag = (id: string, tag: string) => Posts.updateOne({ _id: id }, { $addToSet: { tags: tag } });
+
+export const listPublished = (page: number, pageSize = 10) =>
+  Posts.find({ published: true })
+    .sort({ createdAt: -1, _id: 1 })
+    .skip((page - 1) * pageSize)
+    .limit(pageSize)
+    .select({ title: 1, tags: 1, author: 1, createdAt: 1 })
+    .populate({ path: "author", select: { name: 1 }, required: true })
+    .plain();
+
+export const readPost = (id: string) =>
+  Posts.findById(id)
+    .populate([
+      { path: "author", required: true },
+      { path: "comments", populate: { path: "author", select: { name: 1 }, required: true } },
+    ])
+    .orFail()
+    .plain();
+// @filename: posts.controller.ts
+// ---cut---
+import { CastError, DocumentNotFoundError } from "@venloc/typemo";
+import { readPost } from "./posts.service.ts";
+
+// код читателя: ошибка на границе приложения
+class __NotFound__ extends Error {}
+
+export const showPost = async (idFromUrl: string) => {
+  try {
+    return await readPost(idFromUrl);
+  } catch (error) {
+    if (error instanceof CastError || error instanceof DocumentNotFoundError) throw new __NotFound__("post not found");
+    throw error;
+  }
+};
+```
+
+### Опечатка в имени поля
+
+Если ключ с опечаткой приходит во время работы (например, из данных, а не из вашего кода), Typemo останавливает запись, а не молча создаёт лишнее поле. Пример, где ключ приведён к `any`:
+
+```text
+CastError: Cast to Post failed at path "pubished" for true (boolean): not a field of Post [unknown-key]
+```
+
+Так же ведёт себя и запись без обязательного поля: `ValidationError: Validation failed: "body": the field is required [required]`. Подробнее — в руководствах [Создать документы](../writes/create.mdx) и [Строгость](../concepts/strictness.mdx).
+
+## Полный пример
+
+Полный код проекта — это файлы, показанные выше: три модели, `db.ts`, три сервиса и скрипт `main.ts`. Скрипт запускает их вместе и печатает результаты, приведённые в комментариях `// →`.
+
+<Callout type="migration">
+
+В Mongoose `mongoose.connect(uri)` создаёт глобальное подключение, а модели привязываются к нему сами. В Typemo глобального подключения нет: вы держите клиент в `db.ts` и берёте модели из него. Ссылка описывается типом `Ref<T>`, а результат запроса с `populate` получает свой тип: компилятор знает, где `author` заполнен, а где нет.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Описать модель" href="../schemas/define-model.mdx">
+  Как устроены `@Schema` и `@Prop`, и откуда берётся тип документа.
+</Card>
+<Card title="Чтение данных" href="../queries/reading-data.mdx">
+  Документ, lean и plain: когда какой вид использовать.
+</Card>
+<Card title="Создать документы" href="../writes/create.mdx">
+  Значения по умолчанию, проверки и ошибки при создании.
+</Card>
+<Card title="Показать связанные данные" href="../populate/basics.mdx">
+  Всё про `populate`: выбор полей, виртуальные связи, число запросов.
+</Card>
+<Card title="Справочник" href="../reference/index.mdx">
+  Все модели, запросы, записи и ошибки с точными типами.
+</Card>
+</Cards>

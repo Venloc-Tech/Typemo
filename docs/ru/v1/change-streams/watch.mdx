@@ -1,0 +1,512 @@
+---
+title: Подписаться на изменения
+description: "Как получать события о вставке, обновлении и удалении документов, отобрать нужные, продолжить после остановки и не потерять события"
+icon: Radio
+---
+
+Чтобы другая часть системы узнала об изменении данных сразу, не опрашивая базу по таймеру, подпишитесь на **поток изменений** (change stream): MongoDB сама присылает событие о каждой вставке, обновлении, замене и удалении в коллекции. Так сбрасывают кеш, отправляют уведомления, обновляют внешний индекс поиска или пишут событие в очередь. В Typemo подписка называется [`Model.watch`](../reference/change-streams/watch.mdx#modelwatch), а события приходят типизированными: компилятор знает, какие поля есть у вставки, а какие у удаления.
+
+Если вы впервые работаете с MongoDB, запомните два ограничения. Поток изменений есть только на **реплика-сете** (группе серверов, хранящих копии данных) или шардированном кластере, на одиночном `mongod` его нет. И поток видит только то, что произошло **после** его открытия: прошлого он не показывает. Зато открыт он уже тогда, когда `await Model.watch()` завершился: событие, которое случилось сразу после, не потеряется, даже если вы начнёте читать позже (раздел «Не пропустить первые события»).
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель счёта из файла `accounts/account.ts`. У модели включены образы документов (`changeStreamPreAndPostImages`): без них MongoDB не хранит состояние «до изменения», и раздел про образы работать не будет.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { required: true })
+  balance!: number;
+}
+```
+
+## Быстрый путь
+
+Откройте поток, запишите что-нибудь и прочитайте событие. [`.next`](../reference/change-streams/watch.mdx#next) ждёт следующее событие, а [`.close`](../reference/change-streams/watch.mdx#close) закрывает поток:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const stream = await Accounts.watch();
+await Accounts.create({ owner: "alice", balance: 100 });
+
+const event = await stream.next();
+console.log(event.operationType);
+// → "insert"
+await stream.close();
+```
+
+В приложении события читают циклом `for await`, а нужные отбирают на стороне сервера:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const stream = await Accounts.watch((p) => p.match({ operationType: "insert" }));
+for await (const event of stream) {
+  if (event.operationType === "insert") console.log("new account of", event.fullDocument.owner);
+}
+```
+
+Остальная страница разбирает каждый шаг на реальных задачах.
+
+## Не пропустить первые события
+
+Поток видит всё, что произошло после его открытия, и открыт он к моменту, когда `await Accounts.watch()` вернул управление: курсор на сервере уже создан. Поэтому запись, сделанная сразу после `watch`, попадает в поток, даже если читать вы начнёте позже. Событие ждёт в потоке, и первое чтение его отдаст.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const stream = await Accounts.watch();
+await Accounts.create({ owner: "first", balance: 1 });
+
+console.log((await stream.next()).operationType);
+// → "insert"
+await stream.close();
+```
+
+Метод [`.tryNext`](../reference/change-streams/watch.mdx#trynext) возвращает `null` только тогда, когда события действительно нет. Если в потоке уже лежит событие, он вернёт его, даже если это первое чтение после открытия. Так скрипты и тесты, которые пишут сразу после `watch`, ничего не теряют, и вызывать `tryNext` «для открытия курсора» не нужно.
+
+Граница другая: событий, случившихся **до** `watch`, в потоке нет. Продолжить с места остановки можно только из сохранённого маркера (раздел «Не потерять события после остановки»).
+
+## Реагировать на каждое изменение
+
+Допустим, при любом изменении счёта нужно сбросить кеш. Откройте поток без аргументов и обработайте события в цикле [`for await`](../reference/change-streams/watch.mdx#symbolasynciterator). Тип события — объединение [`ChangeEvent`](../reference/change-streams/watch.mdx#changeevent), различаемое по `operationType`: сначала вы проверяете вид события, и только после этого компилятор открывает его поля.
+
+```ts twoslash title="accounts/cache-invalidation.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// код читателя: сброс записи кеша
+declare const __dropFromCache__: (id: string) => void;
+// ---cut---
+export const watchAccounts = async () => {
+  const stream = await Accounts.watch();
+  for await (const event of stream) {
+    switch (event.operationType) {
+      case "insert":
+      case "update":
+      case "replace":
+      case "delete":
+        __dropFromCache__(String(event.documentKey._id));
+        break;
+      default:
+        console.log("collection event:", event.operationType);
+    }
+  }
+};
+```
+
+Ветки `insert`, `update`, `replace` и `delete` — события документов: у каждой есть `documentKey._id`. Ветка `default` получает [`CollectionEvent`](../reference/change-streams/watch.mdx#collectionevent) — события самой коллекции (удаление, переименование), у них документа нет. Обрабатывать их нужно: после удаления коллекции поток заканчивается, и цикл выйдет.
+
+Цикл владеет потоком: `break`, `return` или ошибка внутри цикла закрывают его сами. Отдельно вызывать `close` нужно, только если вы читаете поток вручную.
+
+## Отобрать нужные события
+
+Большинство подписчиков интересуют не все события. Лишние события лучше отсечь на сервере: тогда они не идут по сети. Для этого `watch` принимает функцию, в которой вы описываете стадии `$match` — тот же язык условий, что и в фильтрах запросов, но по полям события: `operationType`, `fullDocument.<поле>`, `updateDescription.updatedFields.<поле>`.
+
+```ts twoslash title="accounts/big-deposits.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const stream = await Accounts.watch((p) =>
+  p.match({ operationType: "insert", "fullDocument.balance": { $gt: 5 } }),
+);
+
+await Accounts.create({ owner: "carl", balance: 1 });
+await Accounts.create({ owner: "dora", balance: 7 });
+
+const event = await stream.next();
+if (event.operationType === "insert") console.log(event.fullDocument.owner);
+// → "dora"
+await stream.close();
+```
+
+Событие о `carl` сервер не прислал: баланс 1 не больше 5. Пока стадии — только `$match`, события остаются типизированными, но тип не сужается по условию: `match` на `"insert"` не говорит компилятору, что других событий не будет, поэтому проверку `operationType` нужно оставить.
+
+Стадии, которые меняют форму события (`$project`, `$addFields`), тоже допустимы, но тогда строки потока — ваши, а не события Typemo: без преобразования, без гидратации, и с ограничением для скрытых полей (см. раздел про скрытые поля). Справочник: [`Model.watch`](../reference/change-streams/watch.mdx#modelwatch), построитель конвейера — [`Pipeline.watch`](../reference/aggregation/pipeline.mdx#pipelinewatch).
+
+## Узнать, что изменилось
+
+Событие обновления не содержит документа целиком. Оно говорит, **что** изменилось: в [`updateDescription`](../reference/change-streams/watch.mdx#updatedescription) лежат изменённые поля с новыми значениями и список удалённых. Этого обычно достаточно, чтобы отреагировать на конкретное поле, не читая документ.
+
+```ts twoslash title="accounts/balance-alerts.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const stream = await Accounts.watch((p) => p.match({ operationType: "update" }));
+const account = await Accounts.create({ owner: "alice", balance: 100 });
+await Accounts.updateOne({ _id: account._id }, { $inc: { balance: 50 } });
+
+const event = await stream.next();
+if (event.operationType === "update") {
+  console.log(event.updateDescription.updatedFields, event.updateDescription.removedFields);
+  // → { balance: 150 } []
+}
+await stream.close();
+```
+
+Пути в описании записаны кодовыми именами модели, а не именами в базе. Значение `150` — итог `$inc`: сервер присылает готовое новое значение, а не приращение.
+
+## Получить документ целиком
+
+Если реакции нужен весь документ, попросите его опцией [`fullDocument`](../reference/change-streams/watch.mdx#modelwatchoptions). Значение `"updateLookup"` заставляет сервер прочитать документ в момент отправки события. Обратите внимание на тонкость: вы получаете **текущее** состояние, а не состояние сразу после этого обновления. Если документ успели изменить или удалить, придёт его поздняя версия или `null`. Поэтому тип `fullDocument` при `updateLookup` — документ или `null`.
+
+```ts twoslash title="accounts/search-index.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const stream = await Accounts.watch({ fullDocument: "updateLookup" });
+const account = await Accounts.create({ owner: "bob", balance: 10 });
+await stream.next();
+await Accounts.updateOne({ _id: account._id }, { $set: { balance: 20 } });
+
+const event = await stream.next();
+if (event.operationType === "update") {
+  console.log(event.fullDocument?.balance);
+  //                          ^?
+  // → 20
+}
+await stream.close();
+```
+
+Когда важно состояние **ровно после** данного обновления, используйте образы: `fullDocument: "required"` или `"whenAvailable"`. Они берут документ из хранилища образов, которое ведёт сервер при включённой опции `changeStreamPreAndPostImages` у модели. Так же получают состояние **до** изменения — опцией [`fullDocumentBeforeChange`](../reference/change-streams/watch.mdx#документ-до-и-после):
+
+```ts twoslash title="accounts/history.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const stream = await Accounts.watch({
+  fullDocument: "required",
+  fullDocumentBeforeChange: "required",
+});
+const account = await Accounts.create({ owner: "kim", balance: 5 });
+await stream.next();
+await Accounts.updateOne({ _id: account._id }, { $inc: { balance: 1 } });
+
+const event = await stream.next();
+if (event.operationType === "update") {
+  console.log(event.fullDocumentBeforeChange.balance, "→", event.fullDocument.balance);
+  // → 5 → 6
+}
+await stream.close();
+```
+
+При `"required"` компилятор знает, что документы есть, и `null` в типе нет. При `"whenAvailable"` образа может не оказаться, и тип это учитывает.
+
+## Не потерять события после остановки
+
+Процесс перезапускают, он падает, подписчик деплоится заново. За это время в коллекции происходят изменения, и новый поток их не покажет. Чтобы продолжить с того места, где остановились, сохраняйте **маркер продолжения** — [`stream.resumeToken`](../reference/change-streams/watch.mdx#resumetoken) — и передайте его в [`resumeAfter`](../reference/change-streams/watch.mdx#modelwatchoptions) при следующем открытии: сервер продолжит после последнего прочитанного события. Маркер хранится ограниченное время (окно журнала операций сервера), поэтому сохранять его нужно после обработки каждого события или каждой их пачки.
+
+```ts twoslash title="accounts/durable-feed.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// код читателя: чтение и запись маркера в постоянное хранилище
+declare const __loadToken__: () => Promise<{ _data: string } | undefined>;
+declare const __saveToken__: (token: unknown) => Promise<void>;
+// ---cut---
+export const runFeed = async () => {
+  const token = await __loadToken__();
+  const stream = await Accounts.watch(token === undefined ? {} : { resumeAfter: token });
+  for await (const event of stream) {
+    console.log("handle", event.operationType);
+    await __saveToken__(stream.resumeToken);
+  }
+};
+```
+
+Ниже — то же на живых данных: первый поток прочитал одно событие и остановился, а второй продолжил после него и получил следующее:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const first = await Accounts.watch();
+await Accounts.create({ owner: "g1", balance: 1 });
+await Accounts.create({ owner: "g2", balance: 1 });
+await first.next();
+const token = first.resumeToken;
+await first.close();
+
+const resumed = await Accounts.watch({ resumeAfter: token });
+const event = await resumed.next();
+if (event.operationType === "insert") console.log(event.fullDocument.owner);
+// → "g2"
+await resumed.close();
+```
+
+Кратковременный разрыв соединения переживать самому не нужно: драйвер `mongodb` сам открывает поток заново с последнего маркера. Маркер вам нужен, когда останавливается **процесс**. Для потока, который закончился событием `invalidate` (коллекцию удалили), `resumeAfter` не подходит: сервер отвечает `ServerError: Attempting to resume a change stream using 'resumeAfter' is not allowed from an invalidate notification (code 260 InvalidResumeToken)`. Используйте `startAfter` с маркером этого события: поток продолжится, когда коллекция появится снова.
+
+## Передать поток в свою функцию
+
+Ситуация: несколько подписчиков читают потоки разных моделей одинаково, и общий код хочется вынести в функцию. [`ModelChangeStream`](../reference/change-streams/watch.mdx#modelchangestream) принимает тип события параметром, поэтому такая функция остаётся обобщённой и не теряет типов события: что бы вы ни передали, в результате те же события, что вернул бы поток.
+
+```ts twoslash title="accounts/read-events.ts"
+import { Entity, Prop, Schema, TypemoClient, type ModelChangeStream } from "@venloc/typemo";
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+export const take = async <E>(stream: ModelChangeStream<E>, count: number): Promise<E[]> => {
+  const events: E[] = [];
+  while (events.length < count) events.push(await stream.next());
+  return events;
+};
+
+const stream = await Accounts.watch({ fullDocument: "updateLookup" });
+await Accounts.create({ owner: "mia", balance: 1 });
+const [first] = await take(stream, 1);
+//     ^?
+await stream.close();
+```
+
+Тип `first` — событие с учётом опций потока, то есть `ChangeEvent<Account, …>` или `undefined` (индекс массива может выйти за границу). Проверка `operationType` сужает его так же, как в остальных примерах.
+
+## Остановить подписку
+
+Поток держит открытое соединение, поэтому процесс не завершится, пока он открыт. Закрыть его можно тремя способами: выйти из цикла `for await` (`break`, `return`), вызвать [`stream.close`](../reference/change-streams/watch.mdx#close) или дождаться `invalidate`. Закрытие снаружи, пока цикл ждёт событие, не считается ошибкой: цикл просто заканчивается. Поэтому при остановке приложения поток закрывают вызовом `close`, а цикл в фоновой задаче завершается сам.
+
+```ts twoslash title="accounts/feed-lifecycle.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+export const startFeed = async () => {
+  const stream = await Accounts.watch();
+  const loop = (async () => {
+    for await (const event of stream) console.log(event.operationType);
+  })();
+  return { stop: async () => { await stream.close(); await loop; } };
+};
+```
+
+Если нужно проверить, есть ли событие прямо сейчас, не ожидая, используйте [`stream.tryNext`](../reference/change-streams/watch.mdx#trynext): он возвращает событие или `null`.
+
+## Скрытые поля и секреты
+
+Поле, объявленное `hidden`, не попадает в событие: из `fullDocument` и `fullDocumentBeforeChange` его убирает сервер, а его путь Typemo вычёркивает из `updateDescription`. Подписчик на изменения — обычная точка утечки: событие уходит в очередь, в журнал, во внешний сервис, и хеш пароля не должен попасть туда только потому, что кто-то подписался. Если поле действительно нужно, назовите его в `include`: `Accounts.watch({ include: ["pin"] })`. Путь, который не является скрытым полем модели, вызывает `QueryError`, чтобы опечатка не превратилась в молчаливое отсутствие данных.
+
+Есть ограничение: поток со стадиями, отличными от `$match`, не проходит преобразование, и пути скрытых полей в `updateDescription` вычеркнуть нечем. Поэтому для модели со скрытыми полями такой поток отвергается, пока эти поля не перечислены в `include`. Откажитесь от `$project` или назовите скрытые поля явно.
+
+## Как выбрать, что просить у сервера
+
+Задайте себе один вопрос: **что подписчик будет делать с событием?** Если ему достаточно знать, что запись с таким `_id` изменилась (сбросить кеш, поставить задачу), берите поток без опций: он самый дешёвый, потому что сервер не читает документы. Если ему нужны изменённые поля, хватит `updateDescription`. Если нужен весь документ и допустимо текущее состояние, используйте `fullDocument: "updateLookup"`: он не требует настроек коллекции, но стоит чтения на каждое обновление и может вернуть более позднюю версию. Если нужно состояние ровно на момент изменения (журнал изменений, синхронизация, аудит), включите у модели `changeStreamPreAndPostImages` и используйте `"required"` или `"whenAvailable"`.
+
+## Когда это не нужно
+
+Поток изменений не нужен, если вы хотите просто прочитать данные за период: он показывает только будущее, а для прошлого есть обычный [`find`](../reference/query/reading.mdx#modelfind) по полю времени. Он не нужен и для одного процесса, который сам делает записи: реакцию проще вызвать в том же коде, где происходит запись. Потоки бесполезны на одиночном сервере без реплика-сета. Если события должны попасть в журнал изменений с автором операции, посмотрите руководство [Аудит](../policies/audit.mdx): поток изменений не знает, кто сделал запись.
+
+## Частые ошибки
+
+### События, случившиеся до `watch`, не приходят
+
+Вы записали документ, потом открыли поток и ждёте событие о нём, а `next` ждёт вечно. Поток показывает только будущее: курсор создаётся в момент `watch`, и всё, что было раньше, в нём не появится.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+// неправильно: запись раньше открытия, поток её не увидит
+await Accounts.create({ owner: "early", balance: 1 });
+const late = await Accounts.watch();
+console.log(await late.tryNext());
+// → null
+await late.close();
+
+// правильно: поток открыт до записи
+const stream = await Accounts.watch();
+await Accounts.create({ owner: "on time", balance: 1 });
+console.log((await stream.next()).operationType);
+// → "insert"
+await stream.close();
+```
+
+Прошлое можно получить, только продолжив с сохранённого маркера через `resumeAfter`.
+
+### Опция отвергнута до открытия потока
+
+Опечатка в имени опции или значение неверного вида не превращается в поток с настройками по умолчанию. `watch` проверяет опции до обращения к серверу и бросает [`QueryError`](../reference/errors/query-errors.mdx#queryerror) с названием опции:
+
+```text
+QueryError: watch: unknown option "bogus"
+QueryError: watch: fullDocument must be one of "default", "updateLookup", "whenAvailable", "required", got "nope" (string)
+QueryError: watch: batchSize must be a positive integer (0 would mean "the server default"; leave it out for the default), got 0 (number)
+```
+
+Ноль у `batchSize` и `maxAwaitTimeMS` тоже ошибка: драйвер читает ноль как «значение сервера по умолчанию», и такой ноль легко получить из пустой настройки. Хотите значение по умолчанию — не передавайте опцию.
+
+### `fullDocument` пришёл `null` или не такой, как вы записали
+
+При `"updateLookup"` сервер читает документ в момент отправки события, а не в момент обновления. Если между ними документ изменился или удалился, вы получите позднюю версию или `null`. Читайте события быстрее, чем меняются данные, или перейдите на образы: `fullDocument: "required"` вернёт состояние ровно после этого обновления.
+
+### Поток падает на первом обновлении: образа нет
+
+`fullDocumentBeforeChange: "required"` (как и `fullDocument: "required"`) на коллекции без `changeStreamPreAndPostImages` открывается без ошибки, а на первом же обновлении завершается. Поток при этом закрывается:
+
+```text
+ServerError: Change stream was configured to require a pre-image for all update, delete and replace events, but the pre-image was not found for event: {operationType: "update", ns: {db: "app", coll: "plain_things"}… (code 47 NoMatchingDocument)
+```
+
+Включите `changeStreamPreAndPostImages: true` в `@Schema` модели и приведите коллекцию в соответствие (см. [Создание коллекций](../collections/create.mdx)), либо используйте `"whenAvailable"`: тогда без образа придёт `null`.
+
+### Поток модели с арендаторами не открывается
+
+Для модели с политикой `tenant` вызов `watch()` отклоняется с `StrictModeError` и причиной `tenant`: событие удаления не несёт документа, по которому его можно было бы отнести к арендатору, и Typemo не может ограничить поток одним арендатором. Текст ошибки подсказывает выход (`watch inside PolicyContext.run({ allTenants: true }, () => Order.watch()) and filter the events yourself`): откройте поток явно для всех арендаторов через `PolicyContext.run({ allTenants: true }, () => Model.watch())` и фильтруйте события сами. Подробнее — в руководстве [Мультитенантность](../policies/tenants.mdx).
+
+### Цикл завершился, а событий больше нет
+
+Цикл `for await` заканчивается вместе с потоком: поток закрыт вызовом `close`, событием `invalidate` (коллекцию удалили) или выходом из цикла. Прочитать закрытый поток нельзя: `next` и `tryNext` бросают `DriverError: ChangeStream is closed`. Откройте новый поток и продолжите с маркера.
+
+## Полный пример
+
+Один файл собирает всё: отбор событий, образы, сохранение маркера, остановка. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="accounts/audit-feed.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { required: true })
+  balance!: number;
+}
+
+// код читателя: постоянное хранилище маркера и приёмник событий
+declare const __loadToken__: () => Promise<{ _data: string } | undefined>;
+declare const __saveToken__: (token: unknown) => Promise<void>;
+declare const __publish__: (message: string) => Promise<void>;
+
+export const runAuditFeed = async (client: TypemoClient) => {
+  const Accounts = client.db().model(Account);
+
+  // продолжаем с сохранённого места, если оно есть
+  const token = await __loadToken__();
+  const stream = await Accounts.watch(
+    // отбираем на сервере: изменения баланса и новые счета
+    (p) => p.match({ $or: [{ operationType: "insert" }, { "updateDescription.updatedFields.balance": { $exists: true } }] }),
+    {
+      // состояние до изменения и после него: только точные образы
+      fullDocument: "required",
+      fullDocumentBeforeChange: "whenAvailable",
+      ...(token === undefined ? {} : { resumeAfter: token }),
+    },
+  );
+
+  for await (const event of stream) {
+    if (event.operationType === "insert") {
+      await __publish__(`opened ${event.fullDocument.owner}`);
+    } else if (event.operationType === "update") {
+      const before = event.fullDocumentBeforeChange?.balance ?? "?";
+      await __publish__(`${event.fullDocument.owner}: ${before} → ${event.fullDocument.balance}`);
+    }
+    // маркер сохраняем после обработки: при перезапуске это событие не повторится
+    await __saveToken__(stream.resumeToken);
+  }
+};
+```
+
+<Callout type="migration">
+
+В Mongoose у потока не было `for await`, `tryNext` и `resumeToken`, а события не были типизированы. У Typemo события типизированы по виду операции, документы приходят в кодовых именах, скрытые поля из них убраны, а читать поток можно циклом `for await`. Опции потока проверяются: неизвестная опция вызывает `QueryError`, а не молча игнорируется.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник: Model.watch и события" href="../reference/change-streams/watch.mdx">
+  Все опции потока, методы `ModelChangeStream` и типы событий с точными типами и ошибками.
+</Card>
+<Card title="Мультитенантность" href="../policies/tenants.mdx">
+  Как политика арендаторов влияет на потоки изменений и как открыть поток для всех арендаторов.
+</Card>
+<Card title="Создание коллекций" href="../collections/create.mdx">
+  Как создать коллекцию с образами документов, чтобы работали `required` и `fullDocumentBeforeChange`.
+</Card>
+<Card title="Аудит" href="../policies/audit.mdx">
+  Журнал изменений с автором операции, когда потока изменений для этого недостаточно.
+</Card>
+</Cards>

@@ -1,0 +1,813 @@
+---
+title: Типизированные коллекции
+description: "StrictArray, SubdocumentArray, TypedMap и поддокумент: все методы, какой оператор MongoDB даёт каждый и что запрещено"
+icon: Layers
+---
+
+В гидратированном документе массивы, Map и вложенные объекты — не обычные `Array`, `Map` и `{}`, а **типизированные коллекции**: объекты, которые запоминают, что с ними делали, и по этому журналу собирают самое короткое обновление для [`$save`](./document-api.mdx#save). На этой странице описаны четыре вида: [`StrictArray`](#strictarray) для массивов значений, [`SubdocumentArray`](#subdocumentarray) для массивов поддокументов, [`TypedMap`](#typedmap) для Map и [`Subdocument`](#subdocument) для вложенного объекта.
+
+Обычный массив и обычная Map не знают, что их изменили, поэтому вслепую можно только перезаписать поле целиком. Это опасно: два клиента, изменившие один массив, затирают друг друга. Типизированная коллекция вместо перезаписи отправляет точную операцию (`$push`, `$pull`, `$set` одного элемента), и параллельные изменения не теряются. Взамен запись идёт только через методы коллекции: индексы и `length` для записи закрыты типами.
+
+Если вы только начинаете, сначала прочитайте руководства [Массивы и Map в документе](../../documents/typed-collections.mdx) и [Поддокументы](../../documents/subdocuments.mdx). Эта страница — справочник.
+
+Все примеры используют заказ из [API документа](./document-api.mdx): у него есть массив строк `tags`, массив поддокументов `lines`, вложенный объект `address` и Map `fees`.
+
+```ts twoslash title="models/order.ts"
+import { Entity, Prop, Schema, Spec, Versioned } from "@venloc/typemo";
+
+@Schema({ nested: true })
+export class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  street?: string;
+}
+
+@Schema()
+export class Line extends Entity {
+  @Prop(() => String, { required: true })
+  sku!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  qty!: number;
+}
+
+@Schema({ collection: "orders" })
+export class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => [Line])
+  lines!: Line[];
+
+  @Prop(() => Address)
+  address?: Address;
+
+  @Prop(() => Spec.map(Number))
+  fees?: Map<string, number>;
+}
+```
+
+Какой вид у какого поля, компилятор показывает в подсказке:
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+const order = Orders.new({ customer: "alice", tags: [], lines: [] });
+// ---cut---
+const tags = order.tags;
+//    ^?
+const lines = order.lines;
+//    ^?
+const fees = order.fees;
+//    ^?
+const address = order.address;
+//    ^?
+```
+
+Правило простое: массив классов — `SubdocumentArray`, любой другой массив — `StrictArray`, `Map` — `TypedMap`, класс — `Subdocument`. Скаляры (строки, числа, даты, `ObjectId`) остаются собой. Коллекции внутри `lean()`, `$toObject()`, `$toPlain()` и `$toJSON()` документа — обычные массивы и объекты: типизированными они бывают только в гидратированном документе.
+
+Так поле-массив выглядит в каждой форме. Для `tags!: string[]` и `renewals!: Date[]`:
+
+| Форма | `tags` | `renewals` |
+|---|---|---|
+| документ (гидратированный) | `StrictArray<string>` | `StrictArray<Date>` |
+| `.lean()` | `string[]` | `Date[]` |
+| `.plain()`, `$toPlain()`, `$toObject()` | `string[]` | `Date[]` |
+| `$toJSON()` | `string[]` | `string[]` |
+
+В JSON даты превращаются в ISO-строки, поэтому `renewals` там — `string[]`; во всех остальных формах остаётся `Date[]`. Формы для остальных типов — в справочнике [Формы значений](../values/value-forms.mdx).
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "subscriptions" })
+class Subscription extends Entity {
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Date]) renewals!: Date[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Subscriptions = client.db().model(Subscription);
+// ---cut---
+const sub = await Subscriptions.create({ tags: ["gift"], renewals: [new Date("2026-01-02T03:04:05Z")] });
+const hydrated = sub.renewals;
+//    ^?
+const lean = (await Subscriptions.findById(sub._id).orFail().lean()).renewals;
+//    ^?
+const json = sub.$toJSON().renewals;
+//    ^?
+console.log(json);
+// → ["2026-01-02T03:04:05.000Z"]
+```
+
+Поле-массив без `required` и без `default` при `create` и `Model.new` получает `[]`, а гидратированное чтение документа, в котором ключа нет, тоже даёт `[]`, и следующий `$save` его запишет. `lean()` отдаёт документ как хранится: без ключа. У массива с `required: true` умолчания нет, и без значения `create` откажет.
+
+Методы и опции, которых здесь нет, — на странице [API документа](./document-api.mdx).
+
+---
+
+## StrictArray
+
+`StrictArray<T>` — массив значений в документе. Он **является** `ReadonlyArray<T>`: читать, перебирать, копировать и сериализовать его можно как обычный массив — `for…of`, `map`, `filter`, спред, `JSON.stringify`, `structuredClone` работают. `map` и `filter` возвращают обычные массивы. Писать можно только методами ниже: каждый приводит входные значения к типу элемента сразу (ошибка [`CastError`](../errors/data-errors.mdx#casterror) приходит на вызове метода, а не при сохранении) и записывает изменение в журнал массива.
+
+Присваивание по индексу и запись `length` не компилируются, а метода `fill` у типа нет:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+const order = Orders.new({ customer: "alice", tags: ["gift"] });
+// ---cut---
+// @errors: 2542
+order.tags[0] = "express";
+```
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+const order = Orders.new({ customer: "alice", tags: ["gift"] });
+// ---cut---
+// @errors: 2540
+order.tags.length = 0;
+```
+
+Вместо этого есть [`set`](#strictarrayset) и [`clear`](#strictarrayclear). Так сделано потому, что запись по индексу не сообщает, что вы имели в виду: заменить элемент, вставить или сдвинуть. Метод сообщает, и Typemo отправляет ровно то, что вы сказали.
+
+Что Typemo отправит в базу при `$save`, зависит от метода:
+
+<TypeTable
+  type={{
+    "push(...items)": { description: "Добавляет в конец. Оператор `$push` с `$each`.", type: "number" },
+    "unshift(...items)": { description: "Добавляет в начало. `$push` с `$each` и `$position: 0`.", type: "number" },
+    "addToSet(...items)": { description: "Добавляет только отсутствующие значения. `$addToSet` с `$each`.", type: "T[]" },
+    "pull(...values)": { description: "Убирает все элементы, равные значениям. `$pullAll`.", type: "T[]" },
+    "pop()": { description: "Убирает последний. `$pop: 1`; второй `pop` в одном сохранении переписывает массив.", type: "T | undefined" },
+    "shift()": { description: "Убирает первый. `$pop: -1`.", type: "T | undefined" },
+    "set(index, value)": { description: "Заменяет существующий элемент. `$set` пути `tags.<index>`.", type: "this" },
+    "splice(start, deleteCount?, ...items)": { description: "Как `Array#splice`. `$set` всего массива.", type: "T[]" },
+    "sort(compare?)": { description: "Сортирует на месте. `$set` всего массива.", type: "this" },
+    "reverse()": { description: "Переворачивает на месте. `$set` всего массива.", type: "this" },
+    "clear()": { description: "Убирает всё. `$set` пустого массива.", type: "this" },
+    "replace(values)": { description: "Заменяет содержимое целиком. `$set` всего массива.", type: "this" },
+    "$toObject()": { description: "Копия без отслеживания: массив с элементами в их объектной форме.", type: "ObjectData<T>[]" },
+    "$toPlain(options?)": { description: "То же, что `$toPlain()` документа по этому пути.", type: "PlainFormOf<T, false>[]" },
+  }}
+/>
+
+Обратите внимание на слова «второй `pop`». Один `$pop` означает «убери последний **в момент записи**». Второй `pop` нельзя записать тем же оператором по тому же пути, поэтому Typemo пишет массив целиком. Тот же принцип действует и в остальном: если за одно сохранение вы смешали разные методы (`push` и `pull`), Typemo не пытается их склеить, а записывает весь массив.
+
+### StrictArray.push
+
+`push(...items)` добавляет элементы в конец и, как `Array#push`, возвращает новую длину. Значения приводятся к типу элемента при вызове.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: ["a", "b", "c"] });
+
+console.log(order.tags.push("d", "e"));
+// → 5
+console.log(order.$getChanges());
+// → { $push: { tags: { $each: ["d", "e"] } } }
+```
+
+### StrictArray.unshift
+
+`unshift(...items)` добавляет элементы в начало и возвращает новую длину. В базу уходит `$push` с `$position: 0`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: ["a", "b", "c"] });
+
+order.tags.unshift("z");
+console.log(order.$getChanges());
+// → { $push: { tags: { $each: ["z"], $position: 0 } } }
+```
+
+### StrictArray.addToSet
+
+`addToSet(...items)` добавляет только те значения, которых в массиве ещё нет, и возвращает добавленные. Значения сравниваются по содержимому (для значений BSON — через `equals`). Оператор в базе — `$addToSet`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: ["a", "b", "c"] });
+
+console.log(order.tags.addToSet("a", "q"));
+// → ["q"]
+console.log(order.$getChanges());
+// → { $addToSet: { tags: { $each: ["q"] } } }
+```
+
+### StrictArray.pull
+
+`pull(...values)` убирает все элементы, равные значениям, и возвращает убранные. Оператор — `$pullAll`: он убирает по значению, а не по позиции, поэтому не зависит от того, что другой клиент успел сдвинуть массив.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: ["a", "b", "c"] });
+
+console.log(order.tags.pull("a", "missing"));
+// → ["a"]
+console.log(order.$getChanges());
+// → { $pullAll: { tags: ["a"] } }
+```
+
+### StrictArray.pop
+
+`pop()` убирает последний элемент и возвращает его (`undefined` для пустого массива). Оператор — `$pop: 1`. Два вызова `pop` до сохранения превращаются в запись всего массива.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: ["a", "b", "c"] });
+
+console.log(order.tags.pop());
+// → "c"
+console.log(order.$getChanges());
+// → { $pop: { tags: 1 } }
+
+order.tags.pop();
+console.log(order.$getChanges());
+// → { $set: { tags: ["a"] } }
+```
+
+### StrictArray.shift
+
+`shift()` убирает первый элемент и возвращает его. Оператор — `$pop: -1`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: ["a", "b", "c"] });
+
+console.log(order.tags.shift());
+// → "a"
+console.log(order.$getChanges());
+// → { $pop: { tags: -1 } }
+```
+
+### StrictArray.set
+
+`set(index, value)` заменяет существующий элемент. Это замена записи `tags[1] = value`, которую тип не пропускает. Индекс обязан существовать: чтобы добавить элемент, используйте [`push`](#strictarraypush).
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: ["a", "b", "c"] });
+
+order.tags.set(1, "B");
+console.log(order.$getChanges());
+// → { $set: { "tags.1": "B" } }
+```
+
+Индекс вне массива — ошибка [`TypemoError`](../errors/hierarchy.mdx#typemoerror):
+
+```text
+TypemoError: set(10) on "tags": the index must be an existing position 0..2 (use push() to append)
+```
+
+### StrictArray.splice
+
+`splice(start, deleteCount?, ...items)` работает как `Array#splice` и возвращает убранные элементы. Позиции меняются, поэтому в базу уходит `$set` всего массива.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: ["a", "b", "c"] });
+
+console.log(order.tags.splice(1, 1, "X"));
+// → ["b"]
+console.log(order.$getChanges());
+// → { $set: { tags: ["a", "X", "c"] } }
+```
+
+### StrictArray.sort
+
+`sort(compare?)` сортирует на месте и возвращает тот же массив. Сохранение перепишет массив целиком: порядок изменился у всех элементов.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: ["a", "b", "c"] });
+
+order.tags.sort((left, right) => right.localeCompare(left));
+console.log([...order.tags]);
+// → ["c", "b", "a"]
+```
+
+### StrictArray.reverse
+
+`reverse()` переворачивает массив на месте и возвращает его. В базу уходит `$set` всего массива.
+
+### StrictArray.clear
+
+`clear()` убирает все элементы и возвращает массив. Это замена `length = 0`; в базу уходит `$set` пустого массива.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: ["a", "b", "c"] });
+
+order.tags.clear();
+console.log(order.$getChanges());
+// → { $set: { tags: [] } }
+```
+
+### StrictArray.replace
+
+`replace(values)` заменяет содержимое целиком и возвращает массив. Новые значения приводятся при вызове, в базу уходит `$set` всего массива.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: ["a", "b", "c"] });
+
+order.tags.replace(["x", "y"]);
+console.log(order.$getChanges());
+// → { $set: { tags: ["x", "y"] } }
+```
+
+### Ошибки при работе с массивом
+
+Значение неверного типа сообщается при вызове метода:
+
+```text
+CastError: Cast to string failed at path "tags.3" for 5 (number): expected a string [type]
+```
+
+Запись в обход методов (через приведение типа к `any` или обычный JavaScript) Typemo находит при `$save`: у каждой коллекции есть теневая копия, с которой сверяется её состояние. Угадывать, что вы имели в виду, Typemo не берётся, поэтому `$save` отказывает с [`DirectWriteError`](../errors/data-errors.mdx#directwriteerror) и подсказкой, какой метод использовать. [`$getChanges`](./document-api.mdx#getchanges) при этом не бросает ошибку, а записывает тот же текст в ключ `$problems`:
+
+```text
+DirectWriteError: "tags" was changed around its methods: position 0 was assigned directly (use set(0, value))
+DirectWriteError: "tags" was changed around its methods: its length is 0 instead of 3 (use push(), pop(), splice(), clear() or replace())
+DirectWriteError: "tags" was changed around its methods: the field was replaced by assignment; use $set("tags", value) or the container's methods
+```
+
+Если массив загружен частично (проекция `$slice`, позиционная или `$elemMatch`), любое изменение, которое перезаписало бы незагруженные элементы, — [`PartialArrayError`](../errors/data-errors.mdx#partialarrayerror): это `splice`, `sort`, `reverse`, `replace`, `clear`, `set` по индексу, `pop` и `shift`. Операции, не зависящие от позиций, — `push`, `unshift`, `addToSet`, `pull` — разрешены.
+
+```text
+PartialArrayError: "tags" was loaded partially (projection); a $set of the whole array would overwrite the elements that were not loaded
+PartialArrayError: "tags" was loaded partially (projection); a positional $set would overwrite the elements that were not loaded
+PartialArrayError: "tags" was loaded partially (projection); $pop would overwrite the elements that were not loaded
+```
+
+Тексты `PartialArrayError`, как и `DirectWriteError`, `$getChanges` показывает в `$problems`, не бросая. Почему такие ограничения нужны, объясняет руководство [Массивы и Map в документе](../../documents/typed-collections.mdx).
+
+---
+
+## SubdocumentArray
+
+`SubdocumentArray<T>` — массив поддокументов, то есть элементов, описанных классом. Все правила [`StrictArray`](#strictarray) действуют и здесь: запись только методами, один журнал, проверка теневой копии при сохранении. Отличия в том, что элементы — [`Subdocument<T>`](#subdocument) с собственными `$`-методами, методы принимают поддокумент, экземпляр класса или обычные данные для создания, а массив умеет искать по `_id`.
+
+Изменение поля внутри элемента записывается как `$set` по пути с индексом (`lines.0.qty`), причём индекс вычисляется в момент сохранения, а не при присваивании: если между изменением и сохранением порядок элементов поменялся, запись попадёт в тот же элемент, к которому вы обращались.
+
+Методы `push`, `unshift`, `addToSet`, `pop`, `shift`, `splice`, `sort`, `reverse`, `set`, `clear`, `replace` работают как у `StrictArray` и дают те же операторы; там, где `StrictArray` принимает значение, `SubdocumentArray` принимает поддокумент или данные для него. Если же в базе у элементов есть поля, которых нет в схеме, записать массив заново нельзя: `reverse`, `sort`, `splice`, `clear`, `replace` и `set` отвечают [`UnknownFieldsError`](../errors/data-errors.mdx#unknownfieldserror), а `push`, `pull`, `pop`, `shift` проходят. Подробности — в справочнике [Неизвестные поля](./unknown-fields.mdx). Ниже — только то, что отличается.
+
+### SubdocumentArray.create
+
+`create(input)` создаёт новый поддокумент класса, ни к чему не прикреплённый. Данные проходят приведение типов при вызове; `_id` создаётся сразу, если у класса он есть. Чтобы поддокумент оказался в массиве, передайте его в `push`, `unshift`, `set` и подобные методы.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [Line]) lines!: Line[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", lines: [{ sku: "A1", qty: 2 }] });
+
+const line = order.lines.create({ sku: "C3", qty: 1 });
+console.log(order.lines.length, line.$parent());
+// → 1 undefined
+
+order.lines.push(line);
+console.log(order.lines.length, order.$getChanges().$push !== undefined);
+// → 2 true
+```
+
+### SubdocumentArray.id
+
+`id(id)` возвращает элемент с таким `_id` или `undefined`. Аргумент — `ObjectId` или его шестнадцатеричная запись строкой: значение приводится по типу `_id` элемента, поэтому идентификатор из адреса запроса не нужно оборачивать в `ObjectId` вручную. Метод есть в типе только у массивов классов с полем `_id`: для класса без `_id` вызов не компилируется.
+
+```ts twoslash
+import { ObjectId } from "mongodb";
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [Line]) lines!: Line[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", lines: [{ sku: "A1", qty: 2 }, { sku: "B2", qty: 1 }] });
+const id = order.lines[0]!._id;
+
+console.log(order.lines.id(id)?.sku, order.lines.id(String(id))?.sku, order.lines.id(new ObjectId())?.sku);
+// → "A1" "A1" undefined
+```
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => [Address]) places!: Address[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+const order = Orders.new({ customer: "alice", lines: [], places: [] });
+// ---cut---
+// @errors: 2684
+order.places.id(order.lines[0]!._id);
+```
+
+### SubdocumentArray.pull
+
+`pull(...items)` убирает элементы, заданные поддокументами этого массива или их `_id` (`ObjectId` или его строковая запись), и возвращает убранные. Оператор — `$pull` по `_id`: он не зависит от позиций, поэтому безопасен при параллельных изменениях. Идентификатор для элементов без `_id` — [`TypemoError`](../errors/hierarchy.mdx#typemoerror).
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [Line]) lines!: Line[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", lines: [{ sku: "A1", qty: 2 }, { sku: "B2", qty: 1 }] });
+
+const removed = order.lines.pull(order.lines[0]!._id);
+console.log(removed.map((line) => line.sku), Object.keys(order.$getChanges()));
+// → ["A1"] ["$pull"]
+```
+
+### Изменение поля внутри элемента
+
+Присвоение поля элемента записывается точечно, а замена элемента целиком через `set` — как `$set` элемента. Если же в одном сохранении сошлись правка поля внутри элемента и операция над самим массивом (например, `push`), оба оператора затрагивают один путь, и Typemo записывает массив целиком.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [Line]) lines!: Line[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", lines: [{ sku: "A1", qty: 2 }, { sku: "B2", qty: 1 }] });
+
+order.lines[1]!.qty = 9;
+order.lines[0]!.sku = "Z";
+console.log(order.$getChanges());
+// → { $set: { "lines.0.sku": "Z", "lines.1.qty": 9 } }
+```
+
+Если поддокумент неверен (`qty: -1`), `push` его примет, а [`$validate`](./document-api.mdx#validate) и `$save` отклонят: приведение типов идёт при вызове, а правила `min`, `max` и другие проверяются при валидации. Значение неверного типа (`sku: 5`) — `CastError` на вызове.
+
+```text
+CastError: Cast to string failed at path "lines.2.sku" for 5 (number): expected a string [type]
+```
+
+Для поддокументов класса с `_id` метод `addToSet` сравнивает элементы **по значению вместе с `_id`**: поскольку у нового поддокумента `_id` свой, он всегда считается отсутствующим и добавляется.
+
+---
+
+## TypedMap
+
+`TypedMap<V>` — поле-Map документа (объявляется как `Map<string, V>` с `Spec.map`). Он **является** `ReadonlyMap<string, V>`: читать, перебирать и получать значения можно как обычной Map. Записывают только `set`, `delete` и `clear`. В базе Map хранится как вложенный объект, поэтому изменения превращаются в операции по путям `fees.<ключ>`.
+
+Ключи проверяются при вызове: непустая строка, без точки (точка читалась бы как путь), не начинается с `$` (зарезервировано для операторов) и не `__proto__`. Значения приводятся через тип значения при вызове: ошибка приходит сразу как [`CastError`](../errors/data-errors.mdx#casterror).
+
+### TypedMap.set
+
+`set(key, value)` задаёт значение и возвращает Map. В базу уходит `$set` пути `fees.<ключ>`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", fees: { delivery: 5, gift: 3 } });
+
+order.fees?.set("insurance", 7);
+console.log(order.$getChanges());
+// → { $set: { "fees.insurance": 7 } }
+```
+
+Ошибки ключа и значения:
+
+```text
+CastError: Cast to Map key failed at path "fees.a.b" for "a.b" (string): a key cannot contain "." (it would be read as a path) [key]
+CastError: Cast to Map key failed at path "fees.$a" for "$a" (string): a key cannot start with "$" (reserved for operators) [key]
+CastError: Cast to Map key failed at path "fees" for "" (string): an empty key cannot be addressed by a path [key]
+CastError: Cast to Map key failed at path "fees.__proto__" for "__proto__" (string): "__proto__" is never stored [key]
+CastError: Cast to number failed at path "fees.x" for "abc" (string): expected a number [type]
+```
+
+### TypedMap.delete
+
+`delete(key)` убирает ключ и возвращает `true`, если он был. В базу уходит `$unset` пути `fees.<ключ>`. Удаление отсутствующего ключа ничего не меняет и возвращает `false`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", fees: { delivery: 5, gift: 3 } });
+
+console.log(order.fees?.delete("gift"), order.fees?.delete("missing"));
+// → true false
+console.log(order.$getChanges());
+// → { $unset: { "fees.gift": "" } }
+```
+
+### TypedMap.clear
+
+`clear()` убирает все записи. Значение в обновлении — пустая `Map`, а в базу уходит пустой объект на месте всей Map. Если значения Map — поддокументы, у которых в базе есть поля вне схемы, `clear()` (как и `set` по уже существующему ключу) отвечает [`UnknownFieldsError`](../errors/data-errors.mdx#unknownfieldserror): записать Map заново значило бы стереть эти поля. `delete(key)` разрешён.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", fees: { delivery: 5 } });
+
+order.fees?.clear();
+console.log(order.$getChanges());
+// → { $set: { fees: Map {} } }
+```
+
+### Запись в обход методов
+
+`Map.prototype.set.call(order.fees, …)` и любая другая запись мимо методов при сохранении отклоняется:
+
+```text
+DirectWriteError: "fees" was changed around its methods: entries were added or removed around set()/delete()
+```
+
+---
+
+## Subdocument
+
+`Subdocument<T>` — вложенный объект документа или элемент [`SubdocumentArray`](#subdocumentarray): поля класса `T` (с их гидратированными типами) плюс набор `$`-методов. Ссылку на родителя поддокумент хранит один раз, а путь и позицию вычисляет в момент вызова, поэтому они не устаревают после `unshift` или `splice`.
+
+Поле поддокумента присваивается обычным образом (`order.address.city = "Rome"` даёт `$set` пути `address.city`). Само поле-поддокумент присваиванием не заменить: замена идёт через [`$set`](./document-api.mdx#set) документа или `$set` родителя.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Address) address?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", address: { city: "Oslo" } });
+
+order.address!.city = "Rome";
+console.log(order.$getChanges());
+// → { $set: { "address.city": "Rome" } }
+```
+
+<TypeTable
+  type={{
+    "$parent()": { description: "Ближайший владелец: другой поддокумент или корневой документ. `undefined` у открепленного.", type: "object | undefined" },
+    "$parentArray()": { description: "Массив, в котором лежит поддокумент. `undefined` у одиночного поддокумента и у открепленного.", type: "SubdocumentArray<T> | undefined" },
+    "$index()": { description: "Текущая позиция в массиве, вычисляется при вызове. `-1`, если поддокумент не в массиве.", type: "number" },
+    "$fullPath()": { description: "Полный путь внутри корневого документа (`lines.1`, `address`). `undefined` у открепленного.", type: "string | undefined" },
+    "$ownerDocument()": { description: "Корневой документ. `undefined` у открепленного.", type: "object | undefined" },
+    "$isNew()": { description: "Ответ документа, которому принадлежит поддокумент: `true`, пока он не вставлен. У открепленного — `true`.", type: "boolean" },
+    "$isModified(path?)": { description: "Изменились ли поля самого поддокумента (или `path` внутри него) с последней загрузки или сохранения.", type: "boolean" },
+    "$isRoot()": { description: "Всегда `false`: это поддокумент. У корневого документа — `true`; в хуке документа сужает `this` до `HydratedDoc<T>`.", type: "this is HydratedDoc<T>" },
+    "$set(key, value)": { description: "Заменяет одно поле с приведением типа. Единственный способ заменить контейнер или поддокумент в поле.", type: "this" },
+    "$toObject()": { description: "Копия без отслеживания: обычные объекты и массивы, значения BSON как есть.", type: "ObjectDoc<T>" },
+    "$toPlain(options?)": { description: "То же, что `$toPlain()` документа по этому пути; `{ hidden: true }` добавляет скрытые поля поддокументов.", type: "Plain<T, false>" },
+  }}
+/>
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [Line]) lines!: Line[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", lines: [{ sku: "A1", qty: 2 }, { sku: "B2", qty: 1 }] });
+const line = order.lines[1]!;
+
+console.log(line.$fullPath(), line.$index());
+// → "lines.1" 1
+console.log(Object.is(line.$parentArray(), order.lines), Object.is(line.$ownerDocument(), order));
+// → true true
+```
+
+Методы `$isNew()`, `$isModified()` и `$isRoot()` есть и у корневого документа, поэтому хук документа, объявленный в классе поддокумента, может вызывать их, не зная, где он запущен. `$isNew()` поддокумента повторяет ответ его документа: проводки нового заказа новые, проводки прочитанного — нет, даже только что добавленные. `$isModified()` смотрит только на поля самого поддокумента, поэтому только что добавленная и ещё не изменённая проводка отвечает `false`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [Line]) lines!: Line[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = Orders.new({ customer: "alice", lines: [{ sku: "A1", qty: 2 }] });
+const line = order.lines[0]!;
+console.log(line.$isNew(), line.$isRoot(), order.$isRoot());
+// → true false true
+
+await order.$save();
+line.qty = 3;
+console.log(line.$isNew(), line.$isModified("qty"), line.$isModified("sku"));
+// → false true false
+```
+
+Значение неверного типа в `$set` — `CastError` сразу, как у `$set` документа:
+
+```text
+CastError: Cast to string failed at path "lines.0.sku" for 5 (number): expected a string [type]
+```

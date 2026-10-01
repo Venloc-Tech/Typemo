@@ -1,0 +1,1735 @@
+---
+title: "Выражения: преобразование типов"
+description: "fn.toInt, fn.toLong, fn.toDate, fn.convert, fn.typeOf, fn.hexHash и другие операторы преобразования, проверки типа и размера"
+icon: Replace
+---
+
+Эта страница описывает **выражения** — операторы, которые внутри конвейера считают новое значение из полей документа, — для преобразования значения в другой BSON-тип, проверки типа и вычисления хешей и размеров. Операторы лежат в объекте `fn` и вызываются в колбэке `(f) => …` стадий [`project`](./stages.mdx#project), [`addFields`](./stages.mdx#addfields) и других. Что такое BSON-типы и почему `int64` и `Decimal128` не равны обычному числу JavaScript, объясняет страница [BSON-типы](../../concepts/bson-types.mdx).
+
+Если вы только начинаете, прочитайте руководство [Выражения](../../aggregation/expressions.mdx). Эта страница — справочник по операторам этой группы.
+
+Все примеры используют одну модель заказа магазина. Кроме чисел и даты в ней есть вложенный адрес доставки, он нужен для `fn.bsonSize`.
+
+```ts twoslash title="shop/order.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ nested: true })
+export class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+```
+
+В примерах стоят стадии `sort` по дате и `limit(2)`, чтобы остались два первых заказа, и `project`. Заказ Alice на 120 оплачен, у него есть скидка 10 и адрес доставки Oslo с индексом 0150. Заказ Alice на 80 оплачен, адрес Oslo без индекса. Числа 120 и 80 хранятся в базе как `int`: драйвер записывает целое число JavaScript именно так. Строки получены методом [`.plain()`](./pipeline.mdx#plain).
+
+В таком виде результат отличается от типов в компиляторе. Тип результата оператора соответствует lean-виду BSON-типа (`int64` — это `bigint`, `Decimal128` — это `Decimal128`), а `.plain()` отдаёт `int64` и `Decimal128` строками (тип `${bigint}` для `int64`), которые безопасно отправить клиенту. Ниже это видно на `fn.toLong`.
+
+Оператор преобразования пропускает `null` и отсутствующее поле: результат тогда `null`, и тип результата это учитывает. Если преобразовать нельзя (строка `"abc"` в число), сервер бросает ошибку; чтобы этого не было, используйте [`fn.convert`](#fnconvert) с `onError`.
+
+Операторы, которым нужен сервер новее, помечены. `fn.toUUID` требует MongoDB 8.0, а `fn.toArray`, `fn.toObject`, `fn.subtype`, `fn.hash`, `fn.hexHash`, `fn.createObjectId`, `fn.serializeEJSON` и `fn.deserializeEJSON` — 8.3 (так сказано в описании операторов в коде). Проверялось на MongoDB 9.0.0-rc0.
+
+## Преобразование
+
+### fn.toString_
+
+`fn.toString_` превращает любое значение в строку. Имя с подчёркиванием в конце нужно, потому что `toString` уже занят в каждом объекте JavaScript.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, text: fn.toString_(f.total) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, text: "120" },
+//   { total: 80, text: "80" },
+// ]
+```
+
+Дата становится строкой в формате ISO:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, when: fn.toString_(f.placedAt) })),
+).plain();
+console.log(rows);
+// → [
+//   { when: "2026-01-05T00:00:00.000Z" },
+//   { when: "2026-01-12T00:00:00.000Z" },
+// ]
+```
+
+### fn.toBool
+
+`fn.toBool` превращает любое значение в `boolean`. Правило сервера неочевидно: `0` даёт `false`, а любая непустая строка, даже `"false"`, — `true`. Для `null` результат `null`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, flag: fn.toBool(f.total) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, flag: true },
+//   { total: 80, flag: true },
+// ]
+```
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      a: fn.toBool(0),
+      b: fn.toBool("false"),
+      c: fn.toBool(null),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, a: false, b: true, c: null },
+//   { total: 80, a: false, b: true, c: null },
+// ]
+```
+
+### fn.toInt
+
+`fn.toInt` превращает число, строку, `boolean` или дату в `int32`; в TypeScript это `number`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, n: fn.toInt("42") })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, n: 42 },
+//   { total: 80, n: 42 },
+// ]
+```
+
+Строку, в которой не число, оператор не преобразует, и сервер отвечает ошибкой:
+
+```text
+ServerError: Failed to parse number 'abc' in $convert with no onError value: Did not consume whole string. (code 241 ConversionFailure)
+```
+
+### fn.toLong
+
+`fn.toLong` возвращает `int64`. В типе это `bigint`, а в plain-виде значение приходит строкой, чтобы клиент не потерял точность:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, n: fn.toLong(f.total) })),
+).plain();
+console.log(rows);
+//          ^?
+// → [
+//   { total: 120, n: "120" },
+//   { total: 80, n: "80" },
+// ]
+```
+
+Строка с числом преобразуется так же:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, n: fn.toLong("42") })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, n: "42" },
+//   { total: 80, n: "42" },
+// ]
+```
+
+### fn.toDouble
+
+`fn.toDouble` возвращает число с плавающей точкой. Принимает строку, число, `boolean` или дату.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, n: fn.toDouble("3.5") })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, n: 3.5 },
+//   { total: 80, n: 3.5 },
+// ]
+```
+
+### fn.toDecimal
+
+`fn.toDecimal` возвращает `Decimal128` — десятичное число для денег и других значений, где нельзя терять точность. В plain-виде это строка.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, n: fn.toDecimal(f.total) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, n: "120" },
+//   { total: 80, n: "80" },
+// ]
+```
+
+### fn.toDate
+
+`fn.toDate` превращает строку, число (миллисекунды с 1970 года), `ObjectId` или `Timestamp` в дату.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, d: fn.toDate("2026-03-01T00:00:00Z") })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, d: "2026-03-01T00:00:00.000Z" },
+//   { total: 80, d: "2026-03-01T00:00:00.000Z" },
+// ]
+```
+
+Целочисленный литерал в дату не превращается: драйвер отправляет его серверу как `int32`, а сервер не умеет превращать `int32` в дату. Поэтому `fn.toDate(0)` не компилируется: `Argument of type '0' is not assignable to parameter of type '0 & PathError<"fn.toDate: an int32 cannot be converted to a date (the server refuses it); use fn.toLong(n) or a double">'`. Если типы обошли приведением, ошибку даёт сервер: `ServerError: Unsupported conversion from int to date in $convert with no onError value (code 241 ConversionFailure)`. Сначала приведите число к `int64` через [`fn.toLong`](#fntolong): `fn.toDate(fn.toLong(0))` возвращает `"1970-01-01T00:00:00.000Z"`. Поле типа `number` (`fn.toDate(f.total)`) и нецелый литерал (`fn.toDate(86400000.5)`) компилятор пропускает: сервер читает их как `double`.
+
+### fn.toObjectId
+
+`fn.toObjectId` превращает строку из 24 шестнадцатеричных символов в `ObjectId`. В plain-виде значение снова строка.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      id: fn.toObjectId("65f000000000000000000001"),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, id: "65f000000000000000000001" },
+//   { total: 80, id: "65f000000000000000000001" },
+// ]
+```
+
+### fn.toUUID
+
+`fn.toUUID` превращает строку с UUID в значение типа `UUID` (бинарные данные подтипа 4).
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      id: fn.toUUID("0b9c8a4e-6a3c-4d0f-9d3b-2d0c1d5c9e11"),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, id: "0b9c8a4e-6a3c-4d0f-9d3b-2d0c1d5c9e11" },
+//   { total: 80, id: "0b9c8a4e-6a3c-4d0f-9d3b-2d0c1d5c9e11" },
+// ]
+```
+
+### fn.toArray
+
+`fn.toArray` разбирает строку с JSON-массивом или бинарный вектор в массив.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, list: fn.toArray("[1, 2, 3]") })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, list: [1, 2, 3] },
+//   { total: 80, list: [1, 2, 3] },
+// ]
+```
+
+### fn.toObject
+
+`fn.toObject` разбирает строку с JSON-объектом в документ.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, doc: fn.toObject('{"a": 1}') })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, doc: { a: 1 } },
+//   { total: 80, doc: { a: 1 } },
+// ]
+```
+
+### fn.convert
+
+`fn.convert` — общее преобразование. Принимает `input`, целевой тип `to` и необязательные `format`, `onError` и `onNull`. Тип результата зависит от `to`, а `onError` и `onNull` добавляются к нему, если вы их задали.
+
+`to` — это имя типа (`"int"`, `"long"`, `"decimal"`, `"date"`, `"objectId"`, `"string"`, `"bool"`, `"double"`, `"binData"`, `"array"`, `"object"`), его номер BSON или объект `{ type: "binData", subtype }`. Формат `format` нужен для перевода между строкой и бинарными данными: `"base64"`, `"base64url"`, `"utf8"`, `"hex"`, `"uuid"`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      n: fn.convert({ input: "42", to: "int", onError: -1 }),
+    })),
+).plain();
+console.log(rows);
+//          ^?
+// → [
+//   { total: 120, n: 42 },
+//   { total: 80, n: 42 },
+// ]
+```
+
+Главное преимущество перед `fn.toInt` — `onError`: значение, которое вернётся вместо ошибки. Строка `"abc"` в число не превращается, но запрос не падает:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      n: fn.convert({ input: "abc", to: "int", onError: -1 }),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, n: -1 },
+//   { total: 80, n: -1 },
+// ]
+```
+
+Поэтому для данных, которым нельзя доверять (импорт, поля, куда писали руками), используйте `fn.convert` с `onError`.
+
+## Проверка типа
+
+### fn.isNumber
+
+`fn.isNumber` проверяет, что значение — число (`int`, `long`, `double` или `decimal`). Никогда не возвращает `null`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      num: fn.isNumber(f.total),
+      notNum: fn.isNumber(f.status),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, num: true, notNum: false },
+//   { total: 80, num: true, notNum: false },
+// ]
+```
+
+### fn.isArray
+
+`fn.isArray` проверяет, что значение — массив.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      arr: fn.isArray(f.prices),
+      notArr: fn.isArray(f.total),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, arr: true, notArr: false },
+//   { total: 80, arr: true, notArr: false },
+// ]
+```
+
+### fn.typeOf
+
+`fn.typeOf` возвращает имя BSON-типа значения. Для отсутствующего поля возвращает `"missing"`: это единственный способ отличить пропуск от `null`. Тип результата — `TypeName`, то есть имя типа из таблицы BSON-типов или `"missing"`. Оператор называется `$type` на сервере, но в `fn` он `typeOf`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: fn.typeOf(f.total),
+      discount: fn.typeOf(f.discount),
+      prices: fn.typeOf(f.prices),
+      placedAt: fn.typeOf(f.placedAt),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: "int", discount: "int", prices: "array", placedAt: "date" },
+//   { total: "int", discount: "missing", prices: "array", placedAt: "date" },
+// ]
+```
+
+### fn.subtype
+
+`fn.subtype` возвращает подтип бинарного значения (`binData`). UUID имеет подтип 4.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      s: fn.subtype(fn.toUUID("0b9c8a4e-6a3c-4d0f-9d3b-2d0c1d5c9e11")),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, s: 4 },
+//   { total: 80, s: 4 },
+// ]
+```
+
+## Хеши и размеры
+
+### fn.hash
+
+`fn.hash` считает хеш строки или бинарных данных и возвращает бинарное значение. Принимает `{ input, algorithm }`, где `algorithm` — `"md5"`, `"sha256"` или `"xxh64"` (тип `HashAlgorithm`). Хеш sha256 занимает 32 байта:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      bytes: fn.binarySize(fn.hash({ input: "abc", algorithm: "sha256" })),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, bytes: 32 },
+//   { total: 80, bytes: 32 },
+// ]
+```
+
+### fn.hexHash
+
+`fn.hexHash` считает тот же хеш и возвращает его строкой из шестнадцатеричных цифр в верхнем регистре.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      h: fn.hexHash({ input: "abc", algorithm: "sha256" }),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, h: "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD" },
+//   { total: 80, h: "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD" },
+// ]
+```
+
+### fn.createObjectId
+
+`fn.createObjectId` создаёт новый `ObjectId` для каждого документа. Принимает ничего.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, kind: fn.typeOf(fn.createObjectId()) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, kind: "objectId" },
+//   { total: 80, kind: "objectId" },
+// ]
+```
+
+### fn.toHashedIndexKey
+
+`fn.toHashedIndexKey` возвращает ключ хешированного индекса для значения: `int64`, никогда не `null`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, k: fn.toHashedIndexKey(f.customer) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, k: "1401033089107329125" },
+//   { total: 80, k: "1401033089107329125" },
+// ]
+```
+
+### fn.binarySize
+
+`fn.binarySize` возвращает размер строки или бинарных данных в байтах.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, bytes: fn.binarySize(f.customer) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, bytes: 5 },
+//   { total: 80, bytes: 5 },
+// ]
+```
+
+### fn.bsonSize
+
+`fn.bsonSize` возвращает размер документа в байтах в виде BSON. Принимает документ.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, bytes: fn.bsonSize(f.shipTo) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, bytes: 34 },
+//   { total: 80, bytes: 20 },
+// ]
+```
+
+## Extended JSON
+
+**Extended JSON** — запись BSON-типов в обычном JSON: дата превращается в объект с ключом `$date`, число `int64` — в `$numberLong`. Так значения безопасно проходят через текст.
+
+### fn.serializeEJSON
+
+`fn.serializeEJSON` записывает значение в Extended JSON. Принимает `{ input, relaxed, onError }`. Тип результата `unknown`, потому что форма зависит от значения. По умолчанию запись «расслабленная» (relaxed): дата остаётся объектом `$date` со строкой ISO.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      json: fn.serializeEJSON({ input: f.placedAt }),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, json: { $date: "2026-01-05T00:00:00.000Z" } },
+//   { total: 80, json: { $date: "2026-01-12T00:00:00.000Z" } },
+// ]
+```
+
+С `relaxed: false` запись строгая: дата хранится числом миллисекунд.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      json: fn.serializeEJSON({ input: f.placedAt, relaxed: false }),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, json: { $date: { $numberLong: "1767571200000" } } },
+//   { total: 80, json: { $date: { $numberLong: "1768176000000" } } },
+// ]
+```
+
+### fn.deserializeEJSON
+
+`fn.deserializeEJSON` делает обратное: читает Extended JSON и возвращает BSON-значение. Принимает `{ input, onError }`, тип результата `unknown`. Объект с `$numberLong` нужно передавать через [`fn.literal`](./expr-logic.mdx#fnliteral), иначе сервер прочтёт `$numberLong` как оператор выражения и откажет:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      value: fn.typeOf(
+        fn.deserializeEJSON({ input: fn.literal({ $numberLong: "5" }) }),
+      ),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, value: "long" },
+//   { total: 80, value: "long" },
+// ]
+```
+
+Тип значения после разбора — `long`.
+
+## Когда не подходит
+
+- Нужно превратить значение при записи в базу, а не в конвейере: задайте тип поля в схеме, приведение выполнит модель.
+- Нужно обработать значения разных типов в одном поле: проверьте тип через `fn.typeOf` и выберите ветвь [`fn.switch`](./expr-logic.mdx#fnswitch).
+- Нужны арифметика и округление после преобразования: смотрите [арифметические операторы](./expr-arithmetic.mdx).

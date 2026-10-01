@@ -1,0 +1,632 @@
+---
+title: Загрузить связи у готового документа
+description: "Как подгрузить связанные данные у уже прочитанного документа, узнать исходные идентификаторы и вернуть документ к идентификаторам"
+icon: RefreshCw
+---
+
+Если документ у вас уже есть, а связанные данные понадобились позже, вызовите у него [`$populate`](../reference/documents/document-api.mdx#populate): он дочитывает связь и подставляет её прямо в этот документ. Так бывает в обработчике, который получил пост из общего кода, а имя автора нужно только в одной ветке. Обратное действие — [`$depopulate`](../reference/documents/document-api.mdx#depopulate): он возвращает на место идентификаторы. А [`$populated`](../reference/documents/document-api.mdx#populated) показывает, какие идентификаторы стоят за загруженным полем.
+
+Методы работают только с документом, у которого есть схема, то есть с результатом обычного чтения без `.lean()` и `.plain()`. Простые объекты не имеют методов, поэтому для них связь загружается в самом запросе: об этом руководство [Показать связанные данные](./basics.mdx).
+
+## Что предполагается
+
+Примеры используют клиент и модели блога из руководства [Показать связанные данные](./basics.mdx): у поста есть `author` (одна ссылка) и `tags` (массив ссылок). В базе два пользователя, Alice и Bob, теги `db` и `ts` и пост «Hello», который написала Alice с тегами `db` и `ts`.
+
+## Быстрый путь
+
+Прочитать пост, загрузить автора, посмотреть исходный идентификатор и вернуть его обратно:
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+import { ObjectId } from "mongodb";
+const post = await Posts.findOne({ title: "Hello" }).orFail();
+
+const loaded = await post.$populate("author");
+console.log(loaded.author?.name);
+// → "Alice"
+
+console.log(post.$populated("author") instanceof ObjectId);
+// → true
+
+const back = post.$depopulate("author");
+console.log(back.author instanceof ObjectId);
+// → true
+```
+
+Остальная страница разбирает каждый метод и то, что происходит при сохранении и сериализации.
+
+## Загрузить связь: $populate
+
+Ситуация: вы получили пост, а для ответа нужен автор. Метод принимает те же аргументы, что и [`.populate`](../reference/populate/populate.mdx#populate) в запросе: путь или объект с опциями (`select`, `match`, вложенный `populate`).
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" }).orFail();
+const loaded = await post.$populate({ path: "tags", select: { label: 1 } });
+console.log(loaded.tags.map((tag) => tag.label));
+// → ["db", "ts"]
+```
+
+Метод меняет сам документ и возвращает его же (это тот же объект), только с новым типом: у `loaded` поле `tags` — документы тегов, а у `post` компилятор по-прежнему видит идентификаторы. Поэтому пользуйтесь возвращённым значением, а не исходной переменной. Метод принимает один путь, один объект или список путей и объектов: список загружает все связи за один вызов, а тип результата показывает все загруженные поля.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, Types, type Ref } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Posts = client.db().model(Post);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" }).orFail();
+const loaded = await post.$populate(["author", { path: "tags", select: { label: 1 } }]);
+console.log(loaded.author?.name, loaded.tags.map((tag) => tag.label));
+// → Ann ["db", "ts"]
+```
+
+Подзапросы идут теми же правилами, что и в `.populate`: это обычные операции целевой модели.
+
+## Узнать, какие идентификаторы стоят за полем: $populated
+
+Ситуация: загруженное поле показывает документы, а вам нужны исходные идентификаторы: например, чтобы записать их в журнал или сравнить. Метод возвращает копию исходного значения: один `ObjectId` для одной ссылки и массив для массива ссылок. Если путь не загружен, вернётся `undefined`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" }).populate("tags").orFail();
+const ids = post.$populated("tags");
+console.log(Array.isArray(ids) ? ids.length : 0, post.$populated("author"));
+// → 2 undefined
+```
+
+Метод возвращает копию, поэтому изменить через неё документ нельзя. Возвращаемый тип — `unknown`: метод не знает, какой путь вы спросите, поэтому сужайте значение сами (`Array.isArray`, `instanceof ObjectId`). Вернувшийся `undefined` означает «не загружен». Если вам нужно не значение, а ответ «да или нет» вместе с сужением типа, есть [`isPopulated`](../reference/populate/populate-types.mdx#ispopulated), а если нужно потребовать загрузку, — [`$assertPopulated`](./type-checks.mdx#потребовать-загрузку-assertpopulated). Он принимает тот же список путей, что и `$populate`: после `$populate(["author", "tags"])` можно потребовать оба пути одним вызовом `$assertPopulated(["author", "tags"])`.
+
+## Вернуть идентификаторы: $depopulate
+
+Ситуация: документ с загруженными связями нужно менять и сохранять, а держать в нём чужие документы неудобно. [`$depopulate`](../reference/documents/document-api.mdx#depopulate) без аргумента возвращает идентификаторы во всех загруженных путях, с ключом — только под этим ключом. Метод меняет тот же документ и возвращает его с типом, где поле снова `Ref<User>`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" }).populate(["author", "tags"]).orFail();
+post.$depopulate("author");
+const ids = post.$populated("tags");
+console.log(post.$populated("author"), Array.isArray(ids) ? ids.length : 0);
+// → undefined 2
+post.$depopulate();
+console.log(post.$populated("tags"));
+// → undefined
+```
+
+Обратите внимание на порядок: сначала `$depopulate("author")` вернул только автора, теги остались загруженными, и лишь вызов без аргумента вернул остальное.
+
+## Повторно загрузить путь
+
+Загруженный путь можно загрузить ещё раз: `$populate` не отказывает, а читает связь заново и заменяет загруженное значение новым. Это нужно, чтобы перечитать автора после того, как его изменили, или загрузить тот же путь с другим `select`. Второй вызов заменяет первый целиком, вместе с его `select` и вложенными путями: если в первый раз вы выбрали только имя, а во второй не задали `select`, документ получит все поля. Возвращается тот же документ, а тип результата описывает второй вызов.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" }).orFail();
+
+const slim = await post.$populate({ path: "author", select: { name: 1 } });
+console.log(slim.author?.name);
+// → "Alice"
+
+const full = await post.$populate("author");
+console.log(full.author?.email, full === slim);
+// → "a@example.com" true
+```
+
+Вызывать `$depopulate` ради перезагрузки не нужно: он нужен, чтобы вернуть идентификаторы. Единственное, что компилятор не пропустит, — путь **ниже** уже загруженного поля: после `$populate("author")` вызов `$populate("author.posts")` остановит ошибка `"author" is populated already: $depopulate("author") first`. Вложенную связь загружают опцией `populate` (так `author` перечитывается вместе с нею) или возвращают идентификаторы через `$depopulate("author")` и начинают заново.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" }).orFail();
+await post.$populate("author");
+
+const nested = await post.$populate({ path: "author", populate: "posts" });
+console.log(nested.author?.posts.length);
+// → 2
+```
+
+## Сохранение документа с загруженными связями
+
+Загруженные документы не мешают `$save`: в базу уходят идентификаторы, а не вложенные копии. Если вы изменили только заголовок поста, `author` в базе остаётся идентификатором, а `$getChanges` не считает загрузку изменением.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+import { ObjectId } from "mongodb";
+const post = await Posts.findOne({ title: "Hello" }).populate("author").orFail();
+post.title = "Hello, world";
+console.log(post.$getChanges());
+// → { $set: { title: "Hello, world" } }
+await post.$save();
+const stored = await Posts.findById(post._id).lean().orFail();
+console.log(stored.author instanceof ObjectId, stored.title);
+// → true "Hello, world"
+```
+
+Здесь `stored.author` — по-прежнему идентификатор `ObjectId`, а не пользователь. Документ, найденный для нескольких владельцев, по умолчанию один общий объект (см. [`clone`](../reference/populate/populate.mdx#clone)): изменение через один пост видно через другой.
+
+## Заменить связь
+
+Чтобы сменить автора поста, присвойте полю нового автора: документ или его идентификатор. В базу всегда уходит `_id`, а не вложенная копия документа. Если поле загружено, присвоенный документ остаётся в нём загруженным значением, и `$populated` показывает новый идентификатор. До сохранения `$getChanges` показывает присвоенный объект (как любое прямое присваивание), а после `$save` изменений нет.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+import { ObjectId } from "mongodb";
+const bob = await Users.findOne({ name: "Bob" }).orFail();
+const post = await Posts.findOne({ title: "Hello" }).populate("author").orFail();
+
+post.author = bob;
+await post.$save();
+console.log(post.author?.name, post.$populated("author") instanceof ObjectId, post.$isModified());
+// → "Bob" true false
+
+const stored = await Posts.findById(post._id).lean().orFail();
+console.log(String(stored.author) === String(bob._id));
+// → true
+```
+
+Прямое присваивание документа компилируется только у загруженного поля: у поля с идентификатором тип `Ref<User>` документ не принимает. Там пользуйтесь [`$set`](../reference/documents/document-api.mdx#set): он принимает документ (гидратированный или lean) или идентификатор и приводит значение сразу, поэтому `$getChanges` показывает идентификатор. Lean-документ непосредственно загруженному полю не присвоить, но через `$set` можно.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const bob = await Users.findOne({ name: "Bob" }).orFail().lean();
+const post = await Posts.findOne({ title: "Hello" }).orFail();
+
+post.$set("author", bob);
+console.log(post.$getChanges());
+// → { $set: { author: ObjectId("…") } }
+```
+
+## Отдать загруженный документ клиенту
+
+Ситуация: пост с загруженным автором нужно отправить как JSON. [`$toPlain`](../reference/documents/document-api.mdx#toplain) и [`$toJSON`](../reference/documents/document-api.mdx#tojson) превращают и сам документ, и загруженного автора в простые объекты, а [`$toObject`](../reference/documents/document-api.mdx#toobject) — в обычные объекты драйвера.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" }).populate("author").orFail();
+console.log(post.$toPlain().author);
+// → { _id: "…", name: "Alice", email: "a@example.com" }
+console.log(post.$toJSON().author);
+// → { _id: "…", name: "Alice", email: "a@example.com" }
+```
+
+Загруженные документы сериализуются вместе с основным, поэтому клиент получает пользователя целиком. Чтобы клиенту не ушло лишнее (например, почта), загрузите автора с `select` — и в ответе будет только выбранное.
+
+## Как выбрать между запросом и методом документа
+
+Задайте себе один вопрос: **у вас уже есть документ или вы собираетесь его читать?** Если вы читаете, добавьте `.populate` в запрос: он не делает лишнего запроса и сразу даёт правильный тип. Если документ уже есть (пришёл из другой функции, из кэша транзакции, из цикла) и связь нужна не всегда, вызывайте `$populate` по месту. Если связь нужна для целого списка документов, лучше загрузить её в запросе, а не вызывать `$populate` у каждого документа по циклу: цикл даст по запросу на документ.
+
+## Когда это не нужно
+
+Если вы отдаёте данные наружу и менять документ не будете, читайте с [`.plain()`](../reference/query/reading.mdx#plain) и грузите связи в запросе: простые объекты дешевле, а методы документа вам не нужны. Если документ вы прочитали только ради связи, обычный запрос со [`.populate`](../reference/populate/populate.mdx#populate) короче. И если связей много и они нужны всем документам списка, не грузите их в цикле, а используйте один запрос.
+
+## Частые ошибки
+
+### Поле осталось идентификатором после $populate
+
+Вы вызвали `await post.$populate("author")`, а дальше работаете с типом переменной `post`, где `author` всё ещё `Ref<User>`. Документ действительно изменился, но тип исходной переменной — нет: `Property 'name' does not exist on type 'Ref<User>'`. Используйте возвращённое значение: `const loaded = await post.$populate("author")`, либо [`$assertPopulated`](./type-checks.mdx#потребовать-загрузку-assertpopulated).
+
+### Ошибка: путь не найден
+
+```text
+QueryError: populate "nope": "nope" is not a field of Post
+QueryError: $depopulate: a field name or a populate path
+```
+
+Первая ошибка — путь, которого нет в модели (если компилятор его не видел). Вторая — в `$depopulate` передано не строка, а что-то другое. Метод принимает только имя поля или путь.
+
+## Полный пример
+
+```ts twoslash title="blog/post-page.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+import { ObjectId } from "mongodb";
+
+// обработчик получил пост из общего кода; автор нужен только для ответа
+export const authorName = async (title: string) => {
+  const post = await Posts.findOne({ title }).orFail();
+  const loaded = await post.$populate({ path: "author", select: { name: 1 } });
+  return loaded.author?.name;
+};
+
+// сменить заголовок, не трогая связи: сохраняются идентификаторы
+export const rename = async (title: string, next: string) => {
+  const post = await Posts.findOne({ title }).populate("author").orFail();
+  post.title = next;
+  await post.$save();
+  const id = post.$populated("author");
+  return id instanceof ObjectId ? id.toHexString().length : 0;
+};
+
+console.log(await authorName("Hello"));
+// → "Alice"
+console.log(await rename("Hello", "Hello again"));
+// → 24
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Проверка типа" href="./type-checks.mdx">
+  `isPopulated`, `$assertPopulated` и сужение типа: как принять документ в любом состоянии и потребовать загрузку.
+</Card>
+<Card title="Показать связанные данные" href="./basics.mdx">
+  Загрузка связей в самом запросе: короче и без лишних запросов.
+</Card>
+<Card title="API документа" href="../reference/documents/document-api.mdx">
+  Полное описание `$populate`, `$depopulate`, `$populated` и остальных методов документа.
+</Card>
+</Cards>

@@ -1,0 +1,701 @@
+---
+title: Выбор полей и тип результата
+description: "Как вернуть только нужные поля, прочитать скрытое поле и получить точный тип ответа"
+icon: ListChecks
+---
+
+**Проекция** говорит базе, какие поля документа вернуть. Её задаёт [`.select`](../reference/query/reading.mdx#select), и она нужна по двум причинам. Данных идёт меньше: список статей для меню не должен тащить за собой тексты и комментарии. И тип результата сужается вместе с выбором, поэтому компилятор не даст обратиться к полю, которое вы не загрузили.
+
+Если вы впервые работаете с MongoDB, запомните главное: проекция — это либо **включение** («вернуть только эти поля»), либо **исключение** («вернуть всё, кроме этих»). Смешивать их база не позволяет, и Typemo сообщает об этом ошибкой до отправки запроса.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель статьи блога. В ней есть текст, счётчик, массив тегов, массив вложенных документов-комментариев и скрытое поле:
+
+```ts twoslash title="articles/article.ts"
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema()
+export class Comment {
+  @Prop(() => String, { required: true })
+  author!: string;
+
+  @Prop(() => String, { required: true })
+  text!: string;
+
+  @Prop(() => Number, { required: true })
+  likes!: number;
+}
+
+@Schema({ collection: "articles" })
+export class Article extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => Number, { required: true })
+  views!: number;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => [Comment])
+  comments!: Comment[];
+
+  @Prop(() => String, { hidden: true })
+  editorNote?: Hidden<string>;
+}
+```
+
+В коллекции одна статья `Intro`: 120 просмотров, теги `news`, `typemo` и `mongo`, три комментария (`bob` с 3 отметками, `eve` с 0 и `dan` с 9), заметка редактора `check facts`. Результаты в комментариях `// →` получены на ней, идентификаторы сокращены до `"…"`. Поле `editorNote` скрыто: об этом рассказано в разделе [Прочитать скрытое поле](#прочитать-скрытое-поле).
+
+## Быстрый путь
+
+Три формы проекции: включить поля, исключить поля, убрать `_id`:
+
+```ts twoslash
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+const included = await Articles.findOne({ title: "Intro" }).select({ title: 1, views: 1 }).plain().orFail();
+//    ^?
+// → { _id: "…", title: "Intro", views: 120 }
+
+const excluded = await Articles.findOne({ title: "Intro" }).select({ body: 0, comments: 0 }).plain().orFail();
+// → { _id: "…", title: "Intro", views: 120, tags: ["news", "typemo", "mongo"] }
+
+const noId = await Articles.findOne({ title: "Intro" }).select({ title: 1, _id: 0 }).plain().orFail();
+// → { title: "Intro" }
+```
+
+Остальная страница разбирает каждую форму на реальных задачах. Полное описание метода — в справочнике [Чтение](../reference/query/reading.mdx#select).
+
+## Вернуть только нужные поля
+
+Когда вы знаете, какие поля нужны, перечислите их со значением `1`. Вернутся эти поля и `_id`, а всё остальное база даже не отправит по сети. Это самая частая форма: список для страницы, выпадающее меню, карточка в поиске.
+
+```ts twoslash title="articles/articles.service.ts"
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+export const listTitles = () =>
+  Articles.find().sort({ views: -1 }).limit(20).select({ title: 1, views: 1 }).plain();
+
+const titles = await listTitles();
+//    ^?
+```
+
+Тип результата сужен до выбранных полей: у элементов есть `_id`, `title` и `views`, а полей `body` и `tags` нет, и обратиться к ним не получится. Это работает и в lean-, и в plain-виде, и в документе: [`.select`](../reference/query/reading.mdx#select) не зависит от того, в каком виде вы получаете результат, и порядок вызовов значения не имеет.
+
+```ts twoslash
+// @errors: 2339
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+const titles = await Articles.find().select({ title: 1 }).plain();
+titles[0]?.body;
+```
+
+`_id` вернётся всегда, пока вы его не исключите. Это удобно: по `_id` клиент потом запросит конкретную запись.
+
+## Вернуть всё, кроме нескольких полей
+
+Если нужны почти все поля, а лишние — тяжёлые, перечислите лишние со значением `0`. Вернётся всё остальное. Так удобно скрыть текст статьи и комментарии в списке, не выписывая все остальные поля.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+const rows = await Articles.find().select({ body: 0, comments: 0 }).plain();
+//    ^?
+// → [{ _id: "…", title: "Intro", views: 120, tags: ["news", "typemo", "mongo"] }]
+```
+
+Исключение хуже включения в одном: новое поле, которое вы добавите в модель позже, автоматически попадёт в такой ответ. Для ответов наружу перечисляйте нужное, а исключение оставляйте для внутреннего кода.
+
+## Убрать `_id`
+
+`_id` — единственное поле, которое можно исключить внутри включения. Это нужно, например, для выгрузки в таблицу, где идентификатор не нужен:
+
+```ts twoslash
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+const names = await Articles.find().select({ title: 1, _id: 0 }).plain();
+//    ^?
+// → [{ title: "Intro" }]
+```
+
+## Прочитать скрытое поле
+
+Поля с опцией [`hidden`](../reference/schemas/prop.mdx#hidden) и типом `Hidden<T>` Typemo не читает из базы, пока вы о них не попросите: заметка редактора не должна оказаться в памяти приложения, когда она не нужна. Поэтому обычное чтение статьи заметку не вернёт:
+
+```ts twoslash
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+const lean = await Articles.findOne({ title: "Intro" }).lean().orFail();
+console.log("editorNote" in lean);
+// → false
+```
+
+Чтобы прочитать скрытое поле, поставьте перед его именем `+`. Знак `+` не превращает выбор во включение: вы получите все обычные поля и в дополнение к ним скрытое.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+const article = await Articles.findOne({ title: "Intro" }).select({ "+editorNote": true }).lean().orFail();
+console.log(article.editorNote);
+// → "check facts"
+```
+
+Если вы назвали скрытое поле в обычном включении (`{ title: 1, editorNote: 1 }`), оно тоже прочитается, но тогда в ответе будут только эти два поля и `_id`. Прочитать поле ещё не значит отдать его клиенту: в plain-виде и в `$toPlain()` загруженное скрытое поле не попадёт в результат, пока вы отдельно не скажете `{ hidden: true }`. Так проверка автора, который добавил `+editorNote` в общий запрос, не превратится в утечку. Подробнее об этом — в руководстве [Чтение данных](./reading-data.mdx#не-отдать-секретные-поля).
+
+## Взять часть массива
+
+Массив можно вернуть не целиком, а его частью: первые элементы, последние или диапазон. Для этого вместо флага передайте [`$slice`](../reference/query/reading.mdx#select). Число `n` возвращает первые `n` элементов, `-n` — последние `n`, а пара `[пропустить, взять]` — диапазон.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+const first = await Articles.findOne({ title: "Intro" }).select({ title: 1, comments: { $slice: 2 } }).plain().orFail();
+// → { _id: "…", title: "Intro", comments: [ { author: "bob", … }, { author: "eve", … } ] }
+
+const last = await Articles.findOne({ title: "Intro" }).select({ title: 1, tags: { $slice: -1 } }).plain().orFail();
+// → { _id: "…", title: "Intro", tags: ["mongo"] }
+
+const middle = await Articles.findOne({ title: "Intro" }).select({ title: 1, tags: { $slice: [1, 1] } }).plain().orFail();
+// → { _id: "…", title: "Intro", tags: ["typemo"] }
+```
+
+Это нужно для списка, в котором у каждой статьи показываются два последних комментария: остальные десятки тысяч не поедут по сети.
+
+`$slice` не превращает проекцию во включение. Если написать только `select({ comments: { $slice: 1 } })`, вернутся **все** остальные поля статьи и один комментарий: срез меняет только сам массив. Если нужны только некоторые поля, перечислите их рядом, как в примерах выше.
+
+## Взять один подходящий элемент массива
+
+Проекция [`$elemMatch`](../reference/query/reading.mdx#select) возвращает из массива первый элемент, который подходит под условие, а не весь массив. Она полезна, когда вам нужен только один нужный вложенный документ.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+const article = await Articles.findOne({ title: "Intro" })
+  .select({ title: 1, comments: { $elemMatch: { author: "eve" } } })
+  .plain()
+  .orFail();
+// → { _id: "…", title: "Intro", comments: [ { author: "eve", text: "hm", likes: 0 } ] }
+```
+
+В отличие от `$slice`, `$elemMatch` включает поле: остальные поля статьи, которые вы не назвали, не вернутся. Если подходящих элементов нет, массив в результате пустой. Не путайте эту проекцию с одноимённым оператором фильтра: проекция выбирает, что вернуть, а [оператор фильтра](../reference/query/filter-operators.mdx#elemmatch) выбирает, какие документы найти.
+
+## Выбрать поля вложенных документов
+
+Поля вложенных документов выбираются через точку. Для массива вложенных документов проекция применяется к каждому элементу:
+
+```ts twoslash
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+const authors = await Articles.findOne({ title: "Intro" }).select({ "comments.author": 1 }).plain().orFail();
+// → { _id: "…", comments: [ { author: "bob" }, { author: "eve" }, { author: "dan" } ] }
+```
+
+## Собрать проекцию по частям
+
+Если вызвать `.select` несколько раз, выборы складываются. Это удобно, когда запрос собирается в разных местах кода: базовый запрос выбирает общие поля, а вызывающий добавляет свои.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+const base = Articles.find().select({ title: 1 });
+
+const withViews = await base.select({ views: 1 }).plain();
+//    ^?
+// → [{ _id: "…", title: "Intro", views: 120 }]
+```
+
+Складываться могут только выборы одной формы. Включение вместе с исключением — ошибка, о которой сказано в разделе [Включение и исключение вместе](#включение-и-исключение-вместе). Один и тот же ключ дважды тоже не выбирается: `select({ title: 1 }).select({ title: 1 })` бросает `QueryError` с текстом `projection: "title" is selected twice`, чтобы повторный вызов не оказался незаметно бесполезным.
+
+## Проекция, которая приходит извне
+
+До сих пор проекция была литералом, и компилятор видел каждый её ключ. Но бывает, что поля выбирает не ваш код: функция принимает проекцию параметром, а клиент API сам просит `?fields=title,views`. Тогда компилятор ключей не знает. [`.select`](../reference/query/reading.mdx#select) принимает такую проекцию без приведений типов и без обходов: значение объявленного типа [`Projection<Article>`](../reference/values/query-types.mdx#projection) или словарь `Record<string, 0 | 1>`.
+
+```ts twoslash title="articles/articles.service.ts"
+import { Entity, type Hidden, Prop, type Projection, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+export const pick = (id: string, fields: Projection<Article>) =>
+  Articles.findById(id).select(fields).plain().orFail();
+
+const intro = await Articles.findOne({ title: "Intro" }).plain().orFail();
+const card = await pick(intro._id, { title: 1, views: 1 });
+//    ^?
+// → { _id: "…", title: "Intro", views: 120 }
+declare const fields: Record<string, 0 | 1>;
+const doc = await Articles.findOne({ title: "Intro" }).select(fields).orFail();
+//    ^?
+```
+
+Компилятор не знает, какие ключи окажутся в `fields`, поэтому результат описан самым широким образом: все поля модели, каждое необязательное (необязательны только поля верхнего уровня, вложенные документы остаются такими, какие они в модели). Документ без `.plain()` редактор показывает как `HydratedDoc<Partial<Article>>`: класс модели, все поля которого необязательны. Тот же самый широкий результат получается, если проекция вообще имеет тип `any`: в типе результата остаются поля модели, а не `any`. Зато то, что литерал проверил бы при компиляции, проверяется при запуске, до обращения к базе: неизвестный путь даёт `StrictModeError`, а включение вместе с исключением — `QueryError`, те же, что описаны в разделе [Частые ошибки](#частые-ошибки).
+
+### Поля, которые выбирает клиент
+
+Если набор полей строится из данных запроса, оберните его в [`untrusted(fields, "projection")`](../reference/policies/soft-delete-and-untrusted.mdx#untrusted). Функция возвращает ту же проекцию, но отказывается принимать ключи, которые начинаются с `$` или `+`. Через `$` клиент превратил бы проекцию в вычисляемое выражение, а через `+` прочитал бы скрытое поле, например заметку редактора.
+
+```ts twoslash title="articles/articles.controller.ts"
+import { Entity, type Hidden, Prop, Schema, TypemoClient, untrusted } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+// код читателя: разбор ?fields=title,views в словарь { title: 1, views: 1 }
+declare const __parseFields__: (raw: string) => Record<string, 0 | 1>;
+
+export const listArticles = (rawFields: string) =>
+  Articles.find().select(untrusted(__parseFields__(rawFields), "projection")).plain();
+
+const rows = await listArticles("title,views");
+//    ^?
+// → [{ _id: "…", title: "Intro", views: 120 }]
+```
+
+Если клиент прислал запрещённый ключ, запрос не строится:
+
+```text
+StrictModeError: untrusted value: "+editorNote" at "+editorNote" — a "+path" key inside data from outside would select a Hidden field; validate the input and build the projection yourself [sanitize]
+```
+
+`untrusted` — лишь дополнительная страховка, а не проверка входных данных: он не знает, какие поля вы готовы отдать. Сверяйте поля клиента со списком разрешённых и собирайте проекцию сами: в примере выше за это отвечает функция читателя `__parseFields__`. Без второго аргумента `untrusted` пишет в тексте ошибки про фильтр, с `"projection"` — про проекцию.
+
+## Описать форму ответа
+
+Тип результата можно назвать. Когда функция сервиса возвращает выборку, её тип пишут в сигнатуре, чтобы обработчик и клиентская часть знали форму ответа. Вручную переписывать поля не нужно: тип [`Selected`](../reference/query/contracts.mdx#selected) описывает plain-строку по модели и списку полей.
+
+```ts twoslash title="articles/articles.service.ts"
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+export type ArticlePreview = Selected<Article, "title" | "views">;
+//          ^?
+
+export const previewArticle = (idFromUrl: string): Promise<ArticlePreview> =>
+  Articles.findById(idFromUrl).select({ title: 1, views: 1 }).plain().orFail();
+```
+
+Функции не нужен `async`: строитель запроса сам ведёт себя как `Promise`, и его можно вернуть прямо из функции с типом `Promise`. `_id` входит в `Selected` по умолчанию, а `"-_id"` среди полей убирает его. Если выборка и объявленный тип разойдутся, компилятор скажет об этом сразу: допустим, вы убрали `views` из проекции, а в типе оставили.
+
+```ts twoslash
+// @errors: 2322
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+type ArticlePreview = Selected<Article, "title" | "views">;
+
+export const previewArticle = (idFromUrl: string): Promise<ArticlePreview> =>
+  Articles.findById(idFromUrl).select({ title: 1 }).plain().orFail();
+```
+
+Чтобы такая проверка шла не только при компиляции, но и на реальных данных, используйте [`.expect`](../reference/query/contracts.mdx#expect) и [`.parse`](../reference/query/contracts.mdx#parse): они описаны в руководстве [Проверка формы ответа](./contracts.mdx).
+
+## Как выбрать
+
+Задайте себе один вопрос: **что нужно, а не что лишнее?** Если вы знаете, какие поля нужны, перечисляйте их: ответ не разрастётся, когда в модель добавят поле. Исключение выбирайте, когда нужны почти все поля, а два-три тяжёлых мешают. Скрытое поле читайте через `+` и только там, где оно действительно нужно, например в проверке пароля. Для части массива берите `$slice`, для одного элемента — `$elemMatch`. Если поля выбирает клиент, принимайте их словарём и оборачивайте в `untrusted(fields, "projection")`.
+
+## Когда это не нужно
+
+Если вам нужно только число документов или проверка, что документ есть, читать поля не нужно: используйте [`countDocuments`](../reference/query/reading.mdx#modelcountdocuments) и [`exists`](../reference/query/reading.mdx#modelexists). Если поле нужно спрятать от клиента совсем, а не просто не читать, объявите его скрытым в модели: проекция защищает не от утечки, а только от лишней работы. Если значение нужно показать частично, например номер карты с четырьмя последними цифрами, используйте [`.mask`](../reference/query/masks.mdx#mask), см. руководство [Маски ответа](./response-masks.mdx).
+
+## Частые ошибки
+
+### Включение и исключение вместе
+
+Вы выбрали одни поля и исключили другие. Компилятор останавливает такой код:
+
+```ts twoslash
+// @errors: 2345
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+Articles.find().select({ title: 1, body: 0 });
+```
+
+Если проекция собралась во время работы, [`.select`](../reference/query/reading.mdx#select) бросает [`QueryError`](../reference/errors/query-errors.mdx#queryerror) сразу при вызове:
+
+```text
+QueryError: projection: cannot mix inclusion (title) and exclusion (body); the server refuses it
+```
+
+MongoDB не принимает такую проекцию: непонятно, что делать с полями, которые не названы. Единственное исключение — `_id`. Выберите одну форму: либо `{ title: 1 }`, либо `{ body: 0 }`.
+
+### Опечатка в имени поля
+
+Компилятор не пропускает поле, которого нет в модели. Ошибка компилятора одна и та же на любой модели и называет поле: `unknown field "nope"` в свойстве `"projection error"`. Во время работы Typemo бросает `StrictModeError`:
+
+```ts twoslash
+// @errors: 2345
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+Articles.find().select({ nope: 1 });
+```
+
+```text
+StrictModeError: projection: "nope" is not a field of Article [unknown-path]
+```
+
+Опечатка в имени поля не должна превращаться в ответ, в котором нужного поля просто нет. Typemo сообщает о ней сразу, до обращения к базе. Так же проверяется и имя скрытого поля: `select({ "+nope": true })` не компилируется, а в коде без типов даёт ту же ошибку при запуске. Ключ `+имя` у поля, которое не скрыто (`select({ "+title": true })`), тоже ошибка: он предназначен только для скрытых полей и ничего бы не менял, поэтому запрос останавливается с `StrictModeError` и отдельной причиной [`not-hidden`](../reference/policies/violations.mdx#not-hidden): `projection: "+title" adds a Hidden field back, and "title" is not Hidden; select it without the "+" [not-hidden]`. Поле при этом существует, и причина отличается от `unknown-path`, чтобы обработчик мог сказать клиенту, что именно не так.
+
+### Поле, которого нет в выборке
+
+Вы выбрали `title`, а в коде обратились к `body`. Это ошибка компиляции (пример в разделе [Вернуть только нужные поля](#вернуть-только-нужные-поля)), а не `undefined` в проде: тип результата не содержит поля, которого не было в проекции.
+
+### Скрытое поле не попало в ответ
+
+Вы добавили `+editorNote` и вызвали `.plain()`, но в ответе поля нет. Так и задумано: скрытое поле нужно прочитать (`+`) и отдельно разрешить отдать. Если оно действительно нужно во внутреннем сервисе, вызовите `.plain({ hidden: true })`.
+
+## Полный пример
+
+Сервис статей, в котором собраны сценарии страницы:
+
+```ts twoslash title="articles/articles.service.ts"
+import { Entity, type Hidden, Prop, type Selected, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Comment {
+  @Prop(() => String, { required: true }) author!: string;
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Number, { required: true }) likes!: number;
+}
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Comment]) comments!: Comment[];
+  @Prop(() => String, { hidden: true }) editorNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Articles = client.db().model(Article);
+// ---cut---
+// список для страницы: только нужные поля, два последних комментария
+export const listArticles = () =>
+  Articles.find()
+    .sort({ views: -1 })
+    .limit(20)
+    .select({ title: 1, views: 1, comments: { $slice: -2 } })
+    .plain();
+
+// карточка статьи с описанным типом ответа
+export type ArticlePreview = Selected<Article, "title" | "views">;
+export const previewArticle = (idFromUrl: string): Promise<ArticlePreview> =>
+  Articles.findById(idFromUrl).select({ title: 1, views: 1 }).plain().orFail();
+
+// выгрузка без идентификатора
+export const exportTitles = () => Articles.find().select({ title: 1, _id: 0 }).plain();
+
+// внутренний сервис: заметка редактора нужна, отдаём её явно
+export const forEditors = (idFromUrl: string) =>
+  Articles.findById(idFromUrl).select({ "+editorNote": true }).plain({ hidden: true }).orFail();
+```
+
+<Callout type="migration">
+
+В Mongoose `select` принимает и строку (`"title -body"`), и объект, а для скрытых полей (`select: false`) используется `"+field"`. В Typemo проекция — только объект, типы результата следуют за выбором, а скрытое поле читается через ключ `"+field"`. Включение вместе с исключением в Mongoose можно было написать так, что побеждало последнее слово; в Typemo это ошибка. Типы Mongoose про скрытые поля не знали, а здесь их нет в типе, пока вы не запросили.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник: чтение" href="../reference/query/reading.mdx">
+  `.select`, `.sort`, `.lean`, `.plain` и остальные методы строителя с точными типами и ошибками.
+</Card>
+<Card title="Проверка формы ответа" href="./contracts.mdx">
+  `.expect`, `.parse` и типы `Selected`: как проверить форму ответа при компиляции и во время работы.
+</Card>
+<Card title="Маски ответа" href="./response-masks.mdx">
+  Как показать клиенту только часть значения.
+</Card>
+<Card title="Скрытые и чувствительные поля" href="../schemas/hidden-and-sensitive.mdx">
+  `hidden` и `sensitive` подробно.
+</Card>
+<Card title="Связанные данные" href="../populate/basics.mdx">
+  `populate` и выбор полей связанного документа.
+</Card>
+</Cards>

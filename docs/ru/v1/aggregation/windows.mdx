@@ -1,0 +1,354 @@
+---
+title: Оконные функции
+description: "Как посчитать нарастающий итог, место в рейтинге и предыдущее значение, не теряя отдельных строк, и как заполнить пропуски в рядах данных"
+icon: Rows3
+---
+
+`group` сворачивает много строк в одну и теряет детали. Но для «нарастающего итога по клиенту», «места заказа в списке» или «разницы с предыдущим заказом» нужны и детали, и значение, которое зависит от соседей. Для этого есть **окно** — набор строк вокруг текущей: стадия [`setWindowFields`](../reference/aggregation/stages.mdx#setwindowfields) считает значение по окну для каждой строки и **добавляет** его в строку, ничего не убирая. Две соседние стадии чинят ряды данных: [`densify`](../reference/aggregation/stages.mdx#densify) добавляет недостающие точки ряда, [`fill`](../reference/aggregation/stages.mdx#fill) заполняет пустые значения.
+
+Типы следят за правилами сервера. Функция, которой нужен порядок (`fn.rank`, `fn.shift`), не скомпилируется без `sortBy`, окно с границами не скомпилируется без порядка, а ранги и `fn.linearFill` не скомпилируются, если порядок задан больше чем по одному полю.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и запуск агрегации из руководства [Первая агрегация](first-aggregation.mdx). В `orders` пять заказов: `alice` — 120 (5 января), 80 (10 февраля) и 30 (1 марта); `bob` — 50 (11 февраля) и 200 (2 марта). В `daily_sales` продажи по дням: день 1 — 10, день 2 — без значения, день 4 — 40, день 5 — без значения, дня 3 нет вообще.
+
+```ts twoslash title="shop/models.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+
+@Schema({ collection: "daily_sales" })
+export class DailySales extends Entity {
+  @Prop(() => Number, { required: true })
+  day!: number;
+
+  @Prop(() => Number)
+  amount?: number;
+}
+```
+
+## Быстрый путь
+
+Разделите строки на группы (`partitionBy`), упорядочьте внутри группы (`sortBy`) и опишите результат для каждой строки. Нарастающий итог — сумма, обёрнутая в [`withWindow`](../reference/aggregation/window-operators.mdx#withwindow), а место в списке — [`fn.rank`](../reference/aggregation/window-operators.mdx#fnrank):
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+@Schema({ collection: "daily_sales" })
+class DailySales extends Entity {
+  @Prop(() => Number, { required: true }) day!: number;
+  @Prop(() => Number) amount?: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Sales = client.connection.model(DailySales);
+// ---cut---
+const query = Orders.aggregate((p) =>
+  p.setWindowFields({
+    partitionBy: (f) => f.customer,
+    sortBy: { placedAt: 1 },
+    output: (f) => ({
+      running: withWindow(fn.sum(f.total), { documents: ["unbounded", "current"] }),
+      rank: fn.rank(),
+    }),
+  }),
+);
+const rows = await query;
+//    ^?
+// → alice: (120, running 120, rank 1), (80, 200, 2), (30, 230, 3); bob: (50, 50, 1), (200, 250, 2)
+```
+
+Остальная страница разбирает окна, соседние значения и ремонт рядов.
+
+## Нарастающий итог
+
+`withWindow(fn.sum(f.total), { documents: ["unbounded", "current"] })` читается так: сумма по строкам от начала группы до текущей. Границы окна — число (сдвиг относительно текущей строки), `"current"` (текущая) или `"unbounded"` (край группы). Окно по значению `sortBy` вместо позиции записывается как `{ range: [-7, "current"], unit: "day" }`: например, сумма за последние семь дней.
+
+Строки исходных данных сохранились, к ним добавились `running` и `rank`. Порядок нужен окну с границей: без `sortBy` нарастающий итог не имеет смысла, и компилятор не даст его написать.
+
+## Итог по группе без потери строк
+
+Если окно не задано, оно охватывает всю группу. Тогда каждая строка получает общий итог своей группы — то, что не сделать `group`, не потеряв строки.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+@Schema({ collection: "daily_sales" })
+class DailySales extends Entity {
+  @Prop(() => Number, { required: true }) day!: number;
+  @Prop(() => Number) amount?: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Sales = client.connection.model(DailySales);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p.setWindowFields({
+    partitionBy: (f) => f.customer,
+    output: (f) => ({ customerTotal: fn.sum(f.total) }),
+  }),
+);
+// → alice: 120, 80, 30 → customerTotal 230 у каждой; bob: 50, 200 → 250
+```
+
+Здесь `sortBy` не нужен, потому что порядок не влияет на сумму по всей группе.
+
+## Взять предыдущее значение
+
+[`fn.shift`](../reference/aggregation/window-operators.mdx#fnshift) берёт значение со сдвигом по порядку: `by: -1` — у предыдущей строки. У первой строки предыдущей нет, поэтому получается `null`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+@Schema({ collection: "daily_sales" })
+class DailySales extends Entity {
+  @Prop(() => Number, { required: true }) day!: number;
+  @Prop(() => Number) amount?: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Sales = client.connection.model(DailySales);
+// ---cut---
+const query = Orders.aggregate((p) =>
+  p
+    .setWindowFields({ sortBy: { placedAt: 1 }, output: (f) => ({ prev: fn.shift({ output: f.total, by: -1 }) }) })
+    .project({ total: 1, prev: 1, _id: 0 }),
+);
+const rows = await query;
+//    ^?
+// → [{ total: 120, prev: null }, { total: 80, prev: 120 }, { total: 50, prev: 80 }, { total: 30, prev: 50 }, { total: 200, prev: 30 }]
+```
+
+Разница с предыдущим — `fn.subtract(f.total, f.prev)` в следующей стадии. Все оконные операторы (`rank`, `denseRank`, `documentNumber`, `derivative`, `integral`, `expMovingAvg` и другие) перечислены в справочнике [Оконные операторы](../reference/aggregation/window-operators.mdx).
+
+## Добавить пропущенные точки ряда
+
+В `daily_sales` нет дня 3: график продаж покажет провал. [`densify`](../reference/aggregation/stages.mdx#densify) создаёт недостающие строки с шагом. Созданные строки содержат только поле ряда (и поля группировки), поэтому остальные поля в типе становятся необязательными.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+@Schema({ collection: "daily_sales" })
+class DailySales extends Entity {
+  @Prop(() => Number, { required: true }) day!: number;
+  @Prop(() => Number) amount?: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Sales = client.connection.model(DailySales);
+// ---cut---
+const query = Sales.aggregate((p) => p.densify({ field: "day", range: { step: 1, bounds: "full" } }));
+const rows = await query;
+//    ^?
+// → [{ day: 1, amount: 10 }, { day: 2 }, { day: 3 }, { day: 4, amount: 40 }, { day: 5 }]
+```
+
+Для дат добавьте `unit` (`"day"`, `"month"` и т. д.); `bounds` — `"full"` (от минимума до максимума), `"partition"` (в пределах группы) или явная пара значений.
+
+## Заполнить пустые значения
+
+Строки с днём 2 и днём 5 остались без суммы. [`fill`](../reference/aggregation/stages.mdx#fill) заполняет их: способом `method` (`"locf"` — последнее известное значение, `"linear"` — линейная интерполяция) или значением из выражения. Способу нужен порядок `sortBy`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+@Schema({ collection: "daily_sales" })
+class DailySales extends Entity {
+  @Prop(() => Number, { required: true }) day!: number;
+  @Prop(() => Number) amount?: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Sales = client.connection.model(DailySales);
+// ---cut---
+const filled = await Sales.aggregate((p) =>
+  p.fill({ sortBy: { day: 1 }, output: { amount: { method: "locf" } } }).project({ day: 1, amount: 1, _id: 0 }),
+);
+// → [{ day: 1, amount: 10 }, { day: 2, amount: 10 }, { day: 4, amount: 40 }, { day: 5, amount: 40 }]
+
+const zeros = await Sales.aggregate((p) =>
+  p.fill({ output: { amount: { value: () => 0 } } }).project({ day: 1, amount: 1, _id: 0 }),
+);
+// → [{ day: 1, amount: 10 }, { day: 2, amount: 0 }, { day: 4, amount: 40 }, { day: 5, amount: 0 }]
+```
+
+Чтобы получить непрерывный ряд без пустот, сначала `densify`, потом `fill`.
+
+## Как выбрать
+
+Задайте вопрос: нужны ли исходные строки после расчёта? Если нужны, а значение зависит от других строк (сумма до текущей, место, предыдущее), берите окно. Если строки можно свернуть, берите [`group`](grouping.mdx): он проще и быстрее. Для дыр в ряду — `densify` (нет самих строк) и `fill` (есть строка, нет значения).
+
+## Когда это не нужно
+
+Если нужен один итог на группу, а не на каждую строку, используйте [`group`](grouping.mdx). Если нужна нумерация страниц, а не расчёт по соседям, смотрите [`sort`, `skip` и `limit`](../reference/aggregation/stages.mdx#skip) или [ключевую постраничную выдачу](../queries/keyset-pagination.mdx).
+
+## Частые ошибки
+
+### Функции порядка без `sortBy`
+
+`fn.rank()` без `sortBy` не имеет смысла: ранг считается по порядку. Компилятор отвергает это.
+
+```ts twoslash
+// @errors: 2769
+import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+@Schema({ collection: "daily_sales" })
+class DailySales extends Entity {
+  @Prop(() => Number, { required: true }) day!: number;
+  @Prop(() => Number) amount?: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Sales = client.connection.model(DailySales);
+// ---cut---
+await Orders.aggregate((p) => p.setWindowFields({ output: () => ({ rank: fn.rank() }) }));
+```
+
+Добавьте `sortBy: { placedAt: 1 }`.
+
+### Ранг по нескольким полям
+
+Сервер считает `rank`, `denseRank`, `documentNumber` и `linearFill` только по порядку из одного поля: «место по клиенту и сумме вместе» ему не объяснить. Typemo останавливает такой вызов при компиляции.
+
+```ts twoslash
+// @errors: 2769
+import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+await Orders.aggregate((p) =>
+  p.setWindowFields({ sortBy: { customer: 1, total: 1 }, output: () => ({ place: fn.rank() }) }),
+);
+```
+
+Ошибка называет поле результата и правило: `$setWindowFields output "place" needs a sortBy with exactly one field (rank, denseRank, documentNumber and linearFill: a server rule)`. Оставьте один ключ порядка: `sortBy: { total: -1 }`. Если типы обойдены приведением, ту же причину бросает построитель стадии: `ConfigurationError: $setWindowFields: $rank needs a sortBy with exactly one field (server rule)`.
+
+### Аккумулятор без окна там, где нужен нарастающий итог
+
+`fn.sum(f.total)` без `withWindow` считает сумму по всей группе, а не нарастающую. Оберните её в `withWindow` с границами.
+
+## Полный пример
+
+```ts twoslash title="reports/customers.ts"
+import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+@Schema({ collection: "daily_sales" })
+class DailySales extends Entity {
+  @Prop(() => Number, { required: true }) day!: number;
+  @Prop(() => Number) amount?: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Sales = client.connection.model(DailySales);
+// ---cut---
+export const orderTimeline = () =>
+  Orders.aggregate((p) =>
+    p
+      .setWindowFields({
+        partitionBy: (f) => f.customer,
+        sortBy: { placedAt: 1 },
+        output: (f) => ({
+          running: withWindow(fn.sum(f.total), { documents: ["unbounded", "current"] }),
+          rank: fn.rank(),
+          previous: fn.shift({ output: f.total, by: -1 }),
+        }),
+      })
+      .project({ customer: 1, total: 1, running: 1, rank: 1, previous: 1, _id: 0 }),
+  ).plain();
+
+export const continuousSales = () =>
+  Sales.aggregate((p) =>
+    p
+      .densify({ field: "day", range: { step: 1, bounds: "full" } })
+      .fill({ sortBy: { day: 1 }, output: { amount: { method: "locf" } } })
+      .project({ day: 1, amount: 1, _id: 0 }),
+  );
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник: оконные операторы" href="../reference/aggregation/window-operators.mdx">
+  Все оконные функции, `withWindow` и `WindowSpec`.
+</Card>
+<Card title="Группировка и отчёты" href="./grouping.mdx">
+  Когда строки можно свернуть, а не считать по окну.
+</Card>
+<Card title="Сохранить результат" href="./output.mdx">
+  Как записать посчитанный ряд в коллекцию.
+</Card>
+</Cards>

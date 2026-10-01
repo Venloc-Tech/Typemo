@@ -1,0 +1,573 @@
+---
+title: Пакетная запись
+description: "Как выполнить много разных операций записи одним запросом, разобрать частичные ошибки и сохранить много документов сразу"
+icon: Layers
+---
+
+Когда записей много, вызывать метод в цикле неудобно: каждый вызов — отдельный обмен с сервером. [`bulkWrite`](../reference/writes/writes.mdx#bulkwrite) собирает вставки, изменения, замены и удаления в **один запрос**, а [`bulkSave`](../reference/writes/writes.mdx#bulksave) делает то же для документов, которые вы загрузили и изменили в памяти. Взамен вы получаете новую заботу: часть операций может выполниться, а часть — нет, и результат нужно разобрать.
+
+Если операции однотипны, пакетный метод не нужен: [`insertMany`](../reference/writes/writes.mdx#insertmany), [`updateMany`](../reference/writes/writes.mdx#updatemany) и [`deleteMany`](../reference/writes/writes.mdx#deletemany) проще. `bulkWrite` нужен, когда операции разные и их порядок важен: синхронизация с внешним источником, пакет событий, «вставить это, изменить то, удалить третье».
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель счёта из руководства [Создать документы](./create.mdx). В коллекции есть счёт `Main` с владельцем `alice`.
+
+```ts twoslash title="accounts/account.ts"
+import { type Defaulted, Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { min: 0, default: 0 })
+  balance!: Defaulted<number>;
+
+  @Prop(() => String)
+  note?: string;
+}
+```
+
+## Быстрый путь
+
+`bulkWrite` принимает список операций, `bulkSave` — список документов:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const result = await Accounts.bulkWrite([
+  { insertOne: { document: { title: "Bulk", owner: "gina" } } },
+  { updateOne: { filter: { title: "Main" }, update: { $set: { note: "bulk" } } } },
+]);
+console.log(result.insertedCount, result.modifiedCount);
+// → 1 1
+
+const main = await Accounts.findOne({ title: "Main" }).orFail();
+main.owner = "hank";
+const saved = await Accounts.bulkSave([main]);
+console.log(saved?.modifiedCount);
+// → 1
+```
+
+Остальная страница разбирает разные операции, порядок выполнения, ошибки и сохранение документов.
+
+## Смешать разные операции
+
+Ситуация: вы получили пакет изменений от внешней системы: что-то новое, что-то изменилось, что-то пропало. Каждая операция — объект с **одним** ключом-именем: `insertOne`, `updateOne`, `updateMany`, `replaceOne`, `deleteOne` или `deleteMany`. Внутри ключа — данные операции.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+export const applyBatch = async () => {
+  return Accounts.bulkWrite([
+    { insertOne: { document: { title: "B1", owner: "o" } } },
+    { updateOne: { filter: { title: "Main" }, update: { $set: { owner: "bulk" } } } },
+    { updateMany: { filter: { owner: "o" }, update: { $set: { note: "batch" } } } },
+    { replaceOne: { filter: { title: "B1" }, replacement: { title: "B1", owner: "rep" } } },
+    { updateOne: { filter: { title: "Ghost" }, update: { $set: { owner: "g" } }, upsert: true } },
+    { deleteOne: { filter: { title: "Ghost" } } },
+  ]);
+};
+```
+
+Что произошло. Операции выполнились по порядку. Результат — [`BulkWriteResult`](../reference/writes/writes.mdx#bulkwriteresult): вставлен 1 документ, найдено и изменено по 3 документа (`Main`, затем `B1` дважды), 1 документ вставлен через `upsert`, 1 удалён. Идентификаторы вставленных документов лежат в `insertedIds`, а вставленных через `upsert` — в `upsertedIds`. Ключ — **индекс операции** во входном списке: здесь `upsertedIds` содержит ключ `4`, потому что `upsert` — пятая операция.
+
+Каждая операция проходит те же проверки, что отдельный метод: фильтр, обновление и значения проверяются перед отправкой, а входной массив не меняется. Typemo копирует операции перед отправкой, так что вы можете использовать тот же список повторно.
+
+Обновление у `updateOne` и `updateMany` — это объект операторов (`{ $set: … }`) или функция-конвейер, как у отдельных методов [`updateOne`](../reference/writes/writes.mdx#updateone) и [`updateMany`](../reference/writes/writes.mdx#updatemany): так новое значение вычисляется из полей самого документа. Массив стадий не принимается (ни типами, ни во время работы): конвейер строят строителем, то есть функцией.
+
+```ts twoslash
+import { Entity, fn, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const result = await Accounts.bulkWrite([
+  {
+    updateOne: {
+      filter: { title: "Main" },
+      update: (p) => p.set((f) => ({ note: fn.concat(f.owner, "-", f.title) })),
+    },
+  },
+]);
+console.log(result.modifiedCount, (await Accounts.findOne({ title: "Main" }).orFail()).note);
+// → 1 ann-Main
+```
+
+## Порядок выполнения и остановка
+
+По умолчанию запись **упорядоченная**: операции идут по порядку, и на первой ошибке выполнение останавливается. Всё, что выполнено до ошибки, остаётся записанным: пакет не транзакция.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+try {
+  await Accounts.bulkWrite([
+    { insertOne: { document: { title: "B2", owner: "o" } } },
+    { insertOne: { document: { title: "B1", owner: "o" } } }, // B1 уже есть
+    { insertOne: { document: { title: "B3", owner: "o" } } },
+  ]);
+} catch (error) {
+  console.log(await Accounts.countDocuments({ title: { $in: ["B2", "B3"] } }));
+  // → 1
+}
+```
+
+Что произошло. `B2` записан, на `B1` база отказала, `B3` не выполнялся. Если порядок не важен, а вам нужно сделать всё, что можно, передайте `ordered: false`: тогда ошибки собираются, а остальные операции выполняются.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+try {
+  await Accounts.bulkWrite(
+    [
+      { insertOne: { document: { title: "B4", owner: "o" } } },
+      { insertOne: { document: { title: "B1", owner: "o" } } }, // B1 уже есть
+      { insertOne: { document: { title: "B5", owner: "o", balance: -3 } } }, // не пройдёт проверку
+      { insertOne: { document: { title: "B6", owner: "o" } } },
+    ],
+    { ordered: false },
+  );
+} catch (error) {
+  if (error instanceof BulkWriteError) {
+    console.log(error.result.insertedCount);
+    // → 2
+  }
+}
+```
+
+Если нужно «всё или ничего», выполните пакет внутри транзакции: [Транзакции](../transactions/transactions.mdx).
+
+## Разобрать ошибки пакета
+
+Любой сбой приходит одной ошибкой [`BulkWriteError`](../reference/errors/server-errors.mdx#bulkwriteerror). Она несёт три вещи: `writeErrors` — список неудач, `result` — что уже записано, `ordered` — режим. Каждая неудача в `writeErrors` называет индекс операции, код сервера (`undefined` для ошибок проверки в Typemo) и классифицированную ошибку.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+export const importAccounts = async (rows: { title: string; owner: string }[]) => {
+  try {
+    await Accounts.bulkWrite(
+      rows.map((document) => ({ insertOne: { document } })),
+      { ordered: false },
+    );
+    return [];
+  } catch (error) {
+    if (error instanceof BulkWriteError) {
+      return error.writeErrors.map((failure) => ({
+        row: failure.index,
+        reason: failure.error.name,
+      }));
+    }
+    throw error;
+  }
+};
+```
+
+Что произошло. Для загрузки списка выбран неупорядоченный режим: одна плохая строка не должна блокировать остальные. Функция возвращает, какие строки не записаны и почему: `DuplicateKeyError` для дубликата, `ValidationError` для строки, не прошедшей проверку. Ошибка Typemo и ошибка сервера лежат в одном списке, потому что для вызывающего кода это одно и то же: строка не записана. Так работает неупорядоченный режим. В упорядоченном режиме неверное значение останавливает пакет ещё до отправки: вы получаете саму ошибку, `ValidationError` или `CastError`, а не `BulkWriteError`, и ничего не записано. Нарушение политики, например пустой фильтр, останавливает пакет в обоих режимах.
+
+```text
+BulkWriteError: Account.bulkWrite: 1 write(s) failed (first at index 1: duplicate key on title_1 (code 11000 DuplicateKey))
+BulkWriteError: Account.bulkWrite: 2 write(s) failed (first at index 2: Validation failed: "balance": must be at least 0 [min])
+```
+
+«First at index» называет неудачу с наименьшим индексом во вводе, то есть первый элемент `writeErrors`, независимо от того, кто её нашёл раньше: Typemo до отправки или сервер. Текст отказа сервера в ней короткий, без значения ключа: полный лежит в `serverMessage` ошибки.
+
+## Сохранить много документов
+
+Ситуация: вы загрузили сто счетов, изменили в памяти часть из них, добавили несколько новых и хотите записать всё. Цикл с [`$save`](../reference/documents/document-api.mdx#save) сделал бы сто обменов с сервером. [`bulkSave`](../reference/writes/writes.mdx#bulksave) записывает их одним запросом, а каждый документ проходит ту же подготовку, что при `$save`: хуки, валидаторы (в том числе асинхронные) и версия.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const existing = await Accounts.findOne({ title: "Main" }).orFail();
+existing.owner = "hank";
+const fresh = Accounts.new({ title: "BulkSaved", owner: "hank" });
+
+const result = await Accounts.bulkSave([existing, fresh]);
+console.log(result?.insertedCount, result?.modifiedCount);
+// → 1 1
+```
+
+Что произошло. Новый документ (`fresh`) вставлен, изменённый (`existing`) обновлён. Неизменённые документы пропускаются: если список состоит из них или пуст, запрос не уходит, а результат равен `undefined`.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const unchanged = await Accounts.findOne({ title: "Main" }).orFail();
+console.log(await Accounts.bulkSave([unchanged]));
+// → undefined
+```
+
+Документ, который не проходит проверку, останавливает всю запись до отправки: ни один документ списка не записывается.
+
+## Хуки операций внутри bulkWrite
+
+Ситуация: у модели есть хуки, и они должны работать и тогда, когда записи идут пакетом. Каждая операция пакета запускает хуки своего отдельного аналога. `insertOne` запускает [хуки документа](../hooks/document-hooks.mdx) `document.validate` и `document.save`, как [`create`](./create.mdx): изменение, которое сделал `@Pre`, попадёт в базу. `updateOne`, `updateMany`, `replaceOne`, `deleteOne` и `deleteMany` запускают [хуки операций](../hooks/operation-hooks.mdx) `query.updateOne`, `query.updateMany` и так далее. Над самим пакетом выполняются хуки `model.bulkWrite`.
+
+```ts twoslash title="accounts/account.ts"
+import { type Defaulted, Entity, Post, PostError, Pre, Prop, Schema, type OperationHookContext } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { min: 0, default: 0 })
+  balance!: Defaulted<number>;
+
+  @Prop(() => String)
+  note?: string;
+
+  // Для операции внутри bulkWrite дописываем в обновление её номер.
+  @Pre("query.updateOne")
+  markNote(this: OperationHookContext<Account, "query.updateOne">): void {
+    if (this.bulkIndex !== undefined) this.modify({ update: { $set: { note: `bulk #${this.bulkIndex}` } } });
+  }
+
+  @Post("query.updateOne")
+  logUpdate(this: OperationHookContext<Account, "query.updateOne">, result: { readonly upsertedId: unknown }): void {
+    console.log("post updateOne", this.bulkIndex, result.upsertedId === null ? "no upsert" : "upsert");
+  }
+
+  @Post("query.deleteOne")
+  logDelete(this: OperationHookContext<Account, "query.deleteOne">, result: { readonly deletedCount: number | null }): void {
+    console.log("post deleteOne", this.bulkIndex, result.deletedCount);
+  }
+
+  @Post("model.bulkWrite")
+  logBulk(this: OperationHookContext<Account, "model.bulkWrite">, result: { readonly matchedCount: number }): void {
+    console.log("post bulkWrite, matched", result.matchedCount);
+  }
+
+  @PostError("model.bulkWrite")
+  failBulk(this: OperationHookContext<Account, "model.bulkWrite">, error: unknown): void {
+    console.log("postError bulkWrite", error instanceof Error ? error.name : error);
+  }
+
+  @Post("document.save")
+  saved(this: Account): void {
+    console.log("post save", this.title);
+  }
+
+  @PostError("document.save")
+  notSaved(this: Account, error: unknown): void {
+    console.log("postError save", this.title, error instanceof Error ? error.name : error);
+  }
+
+  @PostError("query.deleteOne")
+  notDeleted(this: OperationHookContext<Account, "query.deleteOne">, error: unknown): void {
+    console.log("postError deleteOne", this.bulkIndex, error instanceof Error ? error.name : error);
+  }
+}
+```
+
+Хук одной операции узнаёт, для какой он выполняется, по `this.bulkIndex`: это номер операции в списке, а у обычного вызова он `undefined`. Вызовем пакет из четырёх операций:
+
+```ts twoslash
+import { type Defaulted, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.bulkWrite([
+  { updateOne: { filter: { title: "Main" }, update: { $set: { owner: "bulk" } } } },
+  { insertOne: { document: { title: "H1", owner: "o" } } },
+  { updateOne: { filter: { title: "Ghost" }, update: { $set: { owner: "g" } }, upsert: true } },
+  { deleteOne: { filter: { title: "H1" } } },
+]);
+// → post bulkWrite, matched 1
+// → post updateOne 0 no upsert
+// → post save H1
+// → post updateOne 2 upsert
+// → post deleteOne 3 null
+```
+
+Что произошло. Порядок задан правилом: перед отправкой выполняются `@Pre` хуки документов вставок, затем `@Pre` хуки операций по порядку списка, затем `@Pre` хуки `model.bulkWrite`, затем уходит запрос. После запроса `@Post` хука `model.bulkWrite` идёт первым, а следом `@Post` хуки операций и вставок по порядку списка. Хук `markNote` изменил обновление нулевой операции через [`modify`](../reference/hooks/operation-context.mdx#modify): у `Main` в поле `note` стало `bulk #0`. Для `updateOne` с `upsert` сервер сообщил идентификатор вставленного документа, поэтому второй хук увидел `upsert`. `upsert` не запускает хуков документа: документа до ответа сервера нет.
+
+Хук `@Post` операции получает [`BulkOperationResult`](../reference/hooks/operation-context.mdx#bulkoperationresult), а не обычный результат. Пакет — один запрос, и по каждой отдельной операции сервер называет только идентификатор документа, вставленного через `upsert`. Сколько документов нашла, изменила или удалила каждая операция, неизвестно, поэтому `matchedCount`, `modifiedCount` и `deletedCount` в этом результате равны `null`, а не нулю: ноль означал бы «ничего не найдено». Итоги всего пакета приходят в хук `model.bulkWrite`: в примере `matched 1`.
+
+Хук одной операции пакета не может её пропустить: `this.skip(...)` в нём запрещён, потому что результат одной операции из пакета подменить нельзя. Пакет целиком пропускает хук `@Pre("model.bulkWrite")`.
+
+```text
+QueryError: Account.deleteOne (bulkWrite[0]): skip() cannot replace one operation of a bulkWrite with a result; skip the whole bulkWrite from a model.bulkWrite pre hook
+```
+
+Исключение, которое бросил `@Pre` хук одной операции, пакет обрабатывает так же, как ошибку проверки схемы этой операции. В **упорядоченном** пакете он останавливается до отправки: ничего не записано, приходит само исключение хука. В **неупорядоченном** операция не отправляется и попадает в `writeErrors` под своим индексом (в `error` лежит `TypemoError` с исходным исключением в `cause`, `code` — `undefined`), а остальные операции записываются; для самой операции выполняются `@PostError` хуки.
+
+```text
+BulkWriteError: Account.bulkWrite: 1 write(s) failed (first at index 1: Account.updateOne (bulkWrite[1]): a pre hook threw: sku X-1 is reserved)
+```
+
+### Если пакет не удался
+
+Когда сервер отказал одной из операций, хуки заканчиваются так: операции, которые сервер успел применить, заканчиваются `@Post`, все остальные — `@PostError`. В **упорядоченном** пакете применены все операции до первой неудачи, а неудачная и все после неё не применены. Вставка `Main` нарушает уникальность, поэтому `deleteOne` после неё не выполнялся:
+
+```ts twoslash
+import { BulkWriteError, type Defaulted, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+try {
+  await Accounts.bulkWrite([
+    { insertOne: { document: { title: "O1", owner: "o" } } },
+    { insertOne: { document: { title: "Main", owner: "dup" } } }, // Main уже есть
+    { deleteOne: { filter: { title: "O1" } } },
+  ]);
+} catch (error) {
+  if (error instanceof BulkWriteError) {
+    console.log(Object.keys(error.result.insertedIds), error.writeErrors.map((failure) => failure.index));
+    // → ["0"] [1]
+  }
+}
+// → postError bulkWrite BulkWriteError
+// → post save O1
+// → postError save Main BulkWriteError
+// → postError deleteOne 2 BulkWriteError
+```
+
+Что произошло. `O1` записан, и его хук закончился `@Post`. Вставка `Main` не прошла: у неё `@PostError`. Удаление не выполнялось, но и у него `@PostError`: операция не применена. В **неупорядоченном** пакете `@PostError` получают только операции с ошибкой записи, а все остальные, включая выполненные после неудачной, заканчиваются `@Post`:
+
+```ts twoslash
+import { BulkWriteError, type Defaulted, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+try {
+  await Accounts.bulkWrite(
+    [
+      { insertOne: { document: { title: "U1", owner: "o" } } },
+      { insertOne: { document: { title: "Main", owner: "dup" } } },
+      { deleteOne: { filter: { title: "U1" } } },
+    ],
+    { ordered: false },
+  );
+} catch (error) {
+  if (error instanceof BulkWriteError) {
+    console.log(Object.keys(error.result.insertedIds), error.writeErrors.map((failure) => failure.index));
+    // → ["0"] [1]
+  }
+}
+// → postError bulkWrite BulkWriteError
+// → post save U1
+// → postError save Main BulkWriteError
+// → post deleteOne 2 null
+```
+
+В обоих случаях в `error.result.insertedIds` только записанные вставки: идентификатора неудачной вставки там нет. Хук `@PostError` документа получает ошибку пакета, `BulkWriteError`, а индекс неудачи читайте в `writeErrors`.
+
+Если пакет отвергла проверка Typemo (неверное значение в упорядоченном пакете, пустой фильтр), в базу ничего не уходит, и все хуки заканчиваются `@PostError` с самой ошибкой проверки.
+
+## Неверные операции и ограничения
+
+Неверно составленную операцию Typemo отвергает по индексу, до отправки:
+
+```text
+QueryError: bulkWrite[0]: one of insertOne, updateOne, updateMany, replaceOne, deleteOne, deleteMany (got insertOne, deleteOne)
+QueryError: bulkWrite[0]: one of insertOne, updateOne, updateMany, replaceOne, deleteOne, deleteMany (got foo)
+```
+
+Пустой фильтр отвергается у `updateOne`, `updateMany`, `replaceOne`, `deleteOne` и `deleteMany` так же, как в отдельном методе, см. [Пустые фильтры в записи](./empty-filters.mdx). Замена с `_id` отвергается, как у [`replaceOne`](../reference/writes/writes.mdx#replaceone), а `updateOne` с `upsert: true` проверяет, что вставляемый документ получит все обязательные поля. Пустой список допустим: запрос не уходит, результат — нули.
+
+Есть одно ограничение, которое стоит знать заранее. `$inc` и `$mul` на поле с `min` или `max` в `bulkWrite` **не принимаются**: чтобы отличить сработавшую защиту границы от отсутствующего документа, нужно знать, сколько документов нашла каждая операция, а пакет этого не сообщает.
+
+```text
+ValidationError: Validation failed: "balance": $inc on a field with min/max cannot be guarded in bulkWrite (no per-operation match count tells a failed guard from a missing document); use updateOne/updateMany [min]
+```
+
+Правильно: для таких полей вызывайте [`updateOne`](../reference/writes/writes.mdx#updateone) или [`updateMany`](../reference/writes/writes.mdx#updatemany).
+
+## Как выбрать
+
+Задайте себе один вопрос: **откуда взялись данные?** Если это операции, которые вы описываете сами (вставить, изменить, удалить вперемешку), берите [`bulkWrite`](../reference/writes/writes.mdx#bulkwrite). Если это документы, которые вы загрузили и изменили как объекты, берите [`bulkSave`](../reference/writes/writes.mdx#bulksave): он сам решит, что вставить, а что обновить, и отправит только изменённое. Второй вопрос — важен ли порядок: если операция зависит от предыдущей, оставьте упорядоченный режим; если операции независимы, `ordered: false` выполнит больше.
+
+## Когда это не нужно
+
+Если операции однотипны, используйте [`insertMany`](../reference/writes/writes.mdx#insertmany), [`updateMany`](../reference/writes/writes.mdx#updatemany) или [`deleteMany`](../reference/writes/writes.mdx#deletemany): они проще и проверяются точнее. Если нужно «всё или ничего», пакета недостаточно: нужна [транзакция](../transactions/transactions.mdx). Если вы изменяете один документ, пакет не нужен вовсе.
+
+## Частые ошибки
+
+### После ошибки часть записана
+
+Симптом: `BulkWriteError`, а в коллекции часть операций уже видна. Причина: пакет не откатывается, в упорядоченном режиме записано всё до ошибки, а в неупорядоченном всё, кроме неудачных операций. Правильно: разберите `error.result` и `error.writeErrors`, чтобы понять, что записано, а при необходимости выполните пакет в транзакции.
+
+### Две операции в одном объекте
+
+Неправильно: `{ insertOne: { … }, deleteOne: { … } }`. Операция — это один ключ. Typemo сообщает об этом по индексу: `bulkWrite[0]: one of insertOne, updateOne, updateMany, replaceOne, deleteOne, deleteMany (got insertOne, deleteOne)`. Правильно: разделите на два объекта в списке.
+
+### $inc с границей в пакете
+
+Неправильно: `{ updateOne: { filter: {…}, update: { $inc: { balance: -1 } } } }` для поля с `min`. Ошибка описана выше. Правильно: `updateOne` вне пакета.
+
+## Полный пример
+
+Файл собирает описанное: применить пакет операций, загрузить строки с разбором ошибок и сохранить изменённые документы.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+// Применить пакет изменений от внешней системы
+export const applyBatch = async (changes: { title: string; owner: string }[]) => {
+  return Accounts.bulkWrite(
+    changes.map(({ title, owner }) => ({
+      updateOne: { filter: { title }, update: { $set: { owner } }, upsert: true },
+    })),
+    { ordered: false },
+  );
+};
+
+// Загрузить строки и вернуть номера тех, что не записались
+export const importRows = async (rows: { title: string; owner: string }[]): Promise<number[]> => {
+  try {
+    await Accounts.bulkWrite(rows.map((document) => ({ insertOne: { document } })), { ordered: false });
+    return [];
+  } catch (error) {
+    if (error instanceof BulkWriteError) return error.writeErrors.map((failure) => failure.index);
+    throw error;
+  }
+};
+
+// Сохранить изменённые в памяти документы одним запросом
+export const saveAll = async (owner: string) => {
+  const accounts = await Accounts.find({ owner });
+  for (const account of accounts) account.note = "reviewed";
+  return Accounts.bulkSave(accounts);
+};
+```
+
+<Callout type="migration">
+
+Mongoose подменял документы, фильтры и обновления внутри вашего массива операций приведёнными значениями, а `bulkWrite([])` пропускал часть хуков. В Typemo вход не меняется: операции копируются и проверяются, а пустой список проходит через тот же конвейер, что и любой другой: хуки `model.bulkWrite` выполняются, результат — нули. Каждая операция пакета запускает хуки своего отдельного аналога. Код сервера сохраняется в `writeErrors`, а индекс всегда указывает на позицию во входном списке.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Создать документы" href="./create.mdx">
+  Одна вставка или список с проверками, значения по умолчанию, дубликаты.
+</Card>
+<Card title="Вмешаться в операцию" href="../hooks/operation-hooks.mdx">
+  Хуки `query.*`, которые запускает каждая операция пакета.
+</Card>
+<Card title="Транзакции" href="../transactions/transactions.mdx">
+  Как сделать пакет «всё или ничего».
+</Card>
+<Card title="Запись: справочник" href="../reference/writes/writes.mdx#bulkwrite">
+  Формы операций, опции и результат `bulkWrite` и `bulkSave`.
+</Card>
+<Card title="Ошибки сервера" href="../reference/errors/server-errors.mdx#bulkwriteerror">
+  Поля `BulkWriteError` и другие ошибки записи.
+</Card>
+</Cards>

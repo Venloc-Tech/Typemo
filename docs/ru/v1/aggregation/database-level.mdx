@@ -1,0 +1,293 @@
+---
+title: Запросы уровня базы
+description: "Как выполнить агрегацию без коллекции: литеральные документы, операции сервера и сессии через connection.aggregate и client.aggregate"
+icon: Database
+---
+
+Обычная агрегация читает документы одной коллекции и запускается через модель. Но у некоторых стадий нет коллекции: [`documents`](../reference/aggregation/stages.mdx#documents) выдаёт документы, которые вы пишете прямо в конвейере, [`currentOp`](../reference/aggregation/stages.mdx#currentop) перечисляет операции, которые сервер выполняет сейчас, а [`listLocalSessions`](../reference/aggregation/stages.mdx#listlocalsessions) показывает открытые сессии. Такие агрегации называются **запросами уровня базы**: у них нет модели, зато есть база (или весь сервер), к которой они обращаются. Typemo выполняет их методами [`connection.aggregate`](../reference/connection/connection.mdx#connectionaggregate) и [`client.aggregate`](../reference/connection/typemo-client.mdx#clientaggregate): они дают те же возможности, что и `Model.aggregate` (курсор, план сервера, транзакции, `timeoutMS`, ошибки Typemo), только без хуков, потому что хуки регистрируются на моделях.
+
+Если вы впервые строите конвейеры, сначала прочитайте руководство [Первая агрегация](./first-aggregation.mdx): здесь предполагается, что вы знаете, что такое стадия и план.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель аккаунта с мягким удалением. В коллекции `accounts` два аккаунта, `ann@example.com` и `bob@example.com`, и второй из них удалён.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts", softDelete: true })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  email!: string;
+
+  @Prop(() => Date, { nullable: true })
+  deletedAt?: Date | null;
+}
+```
+
+## Быстрый путь
+
+Запрос уровня базы состоит из двух частей: план, который строит [`Pipeline.database`](../reference/aggregation/pipeline.mdx#pipelinedatabase), [`Pipeline.admin`](../reference/aggregation/pipeline.mdx#pipelineadmin) или [`Pipeline.sessions`](../reference/aggregation/pipeline.mdx#pipelinesessions), и вызов `client.aggregate(plan)`, который его выполняет.
+
+```ts twoslash
+import { Pipeline, TypemoClient } from "@venloc/typemo";
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+const numbers = await client.aggregate(
+  Pipeline.database()
+    .documents([{ n: 1 }, { n: 2 }, { n: 3 }])
+    .match({ n: { $gt: 1 } })
+    .plan(),
+);
+console.log(numbers);
+// → [{ n: 2 }, { n: 3 }]
+
+const operations = await client.aggregate(Pipeline.admin().currentOp({ idleConnections: false }).limit(1).plan());
+console.log(operations.length);
+// → 1
+
+const sessions = await client.aggregate(Pipeline.sessions().listSessions({ allUsers: true }).plan());
+//    ^?
+```
+
+Остальная страница разбирает, где выполняется каждый план, на каких задачах это нужно и чем запрос уровня базы отличается от запроса модели.
+
+## Выбрать, где выполнить план
+
+Место выполнения задаёт сам план, а не метод, которым вы его запускаете. [`Pipeline.database()`](../reference/aggregation/pipeline.mdx#pipelinedatabase) работает в базе подключения: [`connection.aggregate`](../reference/connection/connection.mdx#connectionaggregate) берёт базу этого подключения, а [`client.aggregate`](../reference/connection/typemo-client.mdx#clientaggregate) — базу клиента по умолчанию. [`Pipeline.admin()`](../reference/aggregation/pipeline.mdx#pipelineadmin) всегда выполняется в базе `admin`, потому что именно там сервер разрешает служебные стадии вроде `currentOp`. [`Pipeline.sessions()`](../reference/aggregation/pipeline.mdx#pipelinesessions) всегда читает коллекцию `config.system.sessions`: это единственное место, где сервер принимает стадию [`listSessions`](../reference/aggregation/stages.mdx#listsessions). Какое бы подключение вы ни взяли, `admin` и `config.system.sessions` останутся теми же.
+
+Этим же задаётся выбор метода. `client.aggregate` короче, когда подключение у вас одно и база по умолчанию вас устраивает. `connection.aggregate` нужен, когда вы работаете с несколькими базами одного клиента и `Pipeline.database()` должен выполниться в конкретной:
+
+```ts twoslash
+import { Pipeline, TypemoClient } from "@venloc/typemo";
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+const archive = client.db("archive");
+const plan = Pipeline.database().documents([{ n: 1 }]).plan();
+
+const inShop = await client.aggregate(plan);
+const inArchive = await archive.aggregate(plan);
+console.log(inShop, inArchive);
+// → [{ n: 1 }] [{ n: 1 }]
+```
+
+План один, а выполнен он в разных базах: `shop` и `archive`. Для литеральных документов разницы не видно, но стадии, которые читают базу (`listClusterCatalog`), покажут содержимое именно той базы, где выполнились.
+
+## Проверить список значений по коллекции
+
+Допустим, вы импортируете список адресов и хотите узнать, какие из них уже есть среди аккаунтов. Составить такой список в базе негде: он пришёл от пользователя. Стадия [`documents`](../reference/aggregation/stages.mdx#documents) превращает массив в строки конвейера, а [`lookup`](../reference/aggregation/stages.mdx#lookup) присоединяет к ним аккаунты; план выполняет [`client.aggregate`](../reference/connection/typemo-client.mdx#clientaggregate).
+
+```ts twoslash
+import { Entity, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts", softDelete: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => Date, { nullable: true }) deletedAt?: Date | null;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+const plan = Pipeline.database()
+  .documents([{ email: "ann@example.com" }, { email: "bob@example.com" }, { email: "cid@example.com" }])
+  .lookup({ from: Account, localField: "email", foreignField: "email", as: "found" })
+  .plan();
+const rows = await client.aggregate(plan);
+console.log(rows.map((row) => [row.email, row.found.length]));
+// → [["ann@example.com", 1], ["bob@example.com", 0], ["cid@example.com", 0]]
+```
+
+Bob в списке есть, и в коллекции его документ тоже лежит, но он удалён мягко, поэтому присоединённых аккаунтов у него ноль. Политики присоединённой коллекции Typemo берёт из класса `Account`, который назван в `from`, и они действуют так же, как при обычном чтении: мягкое удаление, поле тенанта и скрытые поля работают, даже если конвейер начался без коллекции. Создавать модель `Account` на подключении для этого не нужно. У тенантской коллекции план без тенанта Typemo отвергает до обращения к серверу, как и запрос модели. А вот хуки не вызываются: у запроса уровня базы нет модели, на которой они висят.
+
+## Посмотреть, что выполняется на сервере
+
+Когда сервер тормозит, первым делом смотрят, что он делает: какие запросы выполняются и сколько они длятся. Стадия [`currentOp`](../reference/aggregation/stages.mdx#currentop) отвечает на этот вопрос, и работает она только в базе `admin`, поэтому её план строит [`Pipeline.admin()`](../reference/aggregation/pipeline.mdx#pipelineadmin).
+
+```ts twoslash title="ops/current-ops.ts"
+import { Pipeline, TypemoClient } from "@venloc/typemo";
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+export const activeOperations = async () => {
+  const plan = Pipeline.admin()
+    .currentOp({ idleConnections: false, allUsers: true })
+    .match({ active: true })
+    .project({ type: 1, op: 1, ns: 1, _id: 0 })
+    .plan();
+  return client.aggregate(plan).timeoutMS(5_000);
+};
+```
+
+Строка `currentOp` описывает одну операцию: `type`, `active`, `op` (вид операции), `ns` (коллекция) и другие поля, которых у разных операций разный набор, поэтому остальные поля имеют тип `unknown`. Параметры `allUsers`, `idleConnections`, `idleCursors`, `idleSessions`, `localOps` и `backtrace` включают соответствующие сведения.
+
+## Увидеть сессии
+
+**Сессия** — это контекст, в котором сервер учитывает операции клиента, в том числе транзакции. Список сессий показывают две разные стадии, и им нужны разные места. [`listLocalSessions`](../reference/aggregation/stages.mdx#listlocalsessions) показывает сессии, которые сервер держит в памяти прямо сейчас, и работает в [`Pipeline.database()`](../reference/aggregation/pipeline.mdx#pipelinedatabase) или [`Pipeline.admin()`](../reference/aggregation/pipeline.mdx#pipelineadmin). [`listSessions`](../reference/aggregation/stages.mdx#listsessions) читает то, что сервер записал в `config.system.sessions`, и для неё есть отдельный [`Pipeline.sessions()`](../reference/aggregation/pipeline.mdx#pipelinesessions).
+
+```ts twoslash
+import { Pipeline, TypemoClient } from "@venloc/typemo";
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+const live = await client.aggregate(Pipeline.database().listLocalSessions({ allUsers: true }).plan());
+console.log(live.length > 0);
+// → true
+
+const stored = await client.aggregate(Pipeline.sessions().listSessions({ allUsers: true }).plan());
+console.log(stored.length);
+// → 0
+```
+
+Второй результат пуст не из-за ошибки. Сервер записывает сессии в `config.system.sessions` примерно раз в пять минут, поэтому на только что запущенном сервере там ещё ничего нет. Живые сессии, включая сессию самого запроса, показывает `listLocalSessions`. Строка той и другой стадии — `SessionRow`: `_id` с идентификатором сессии (`id`) и пользователя (`uid`), время последнего использования `lastUse` и, если сессия аутентифицирована, `user`.
+
+## Читать результат так же, как у модели
+
+[`client.aggregate`](../reference/connection/typemo-client.mdx#clientaggregate) возвращает тот же запрос, что и [`Model.aggregate`](../reference/aggregation/pipeline.mdx#modelaggregate), поэтому всё, что вы знаете о запросе агрегации, работает и здесь. [`.plain()`](../reference/aggregation/pipeline.mdx#plain) превращает идентификаторы и `bigint` в строки для ответа клиенту, [`.cursor()`](../reference/aggregation/pipeline.mdx#cursor) отдаёт строки по одной, а [`.explain()`](../reference/aggregation/pipeline.mdx#explain) показывает план сервера.
+
+```ts twoslash
+import { Pipeline, TypemoClient } from "@venloc/typemo";
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+const query = client.aggregate(Pipeline.database().documents([{ n: 1 }, { n: 2 }, { n: 3 }]).plan());
+
+const seen: number[] = [];
+for await (const row of query.cursor()) seen.push(row.n);
+console.log(seen);
+// → [1, 2, 3]
+```
+
+Параметры запуска передаются вторым аргументом или цепочкой: `client.aggregate(plan, { timeoutMS: 5_000 })` и `client.aggregate(plan).timeoutMS(5_000)` делают одно и то же. Принимаются `session`, `timeoutMS` и `policy`. Отрицательное или нецелое время — `QueryError: timeoutMS must be a non-negative integer, got -5 (number)`, неизвестный ключ политики — `QueryError: options.policy: unknown policy value "nope" (known: tenant, allTenants, actor, includeDeleted, onlyDeleted, hardDelete)`.
+
+Внутри [`transaction`](../reference/connection/typemo-client.mdx#clienttransaction) запрос участвует в транзакции сам, как запрос модели. Настройки чтения транзакции действуют целиком, поэтому свой `readConcern` внутри неё запрещён:
+
+```text
+StrictModeError: client.aggregate: readConcern "majority" inside a transaction — the transaction's own settings apply (set them on transaction()) [transaction-option]
+```
+
+Ошибка называет вызванный метод, `client.aggregate` или `connection.aggregate`: так видно, что именно в вашем коде её вызвало. Ошибки сервера приходят как [`ServerError`](../reference/errors/server-errors.mdx#servererror) с исходной ошибкой драйвера в `cause`. Например, `currentOp` в обычной базе (в обход типов) даёт `ServerError: $currentOp must be run against the 'admin' database with {aggregate: 1} (code 73 InvalidNamespace)`.
+
+## Что видят подписчики событий
+
+Запрос уровня базы проходит через тот же конвейер операций, поэтому подписчики [`client.instrument`](../reference/connection/typemo-client.mdx#clientinstrument) получают его события. Отличие одно: модели нет, поэтому поля `model`, `collection` и `schema` события равны `null`, а `database` называет базу, в которой запрос выполнился. У плана `Pipeline.sessions()` коллекция называется `"system.sessions"`, а база — `"config"`.
+
+```ts twoslash
+import { Pipeline, TypemoClient } from "@venloc/typemo";
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+const events: string[] = [];
+const subscription = client.instrument({
+  handle: (event) => {
+    if (event.type === "operation.end") {
+      events.push(`${event.operation} model=${event.model} collection=${event.collection} database=${event.database}`);
+    }
+  },
+});
+
+await client.aggregate(Pipeline.database().documents([{ n: 1 }]).plan());
+await client.aggregate(Pipeline.sessions().listSessions({ allUsers: true }).plan());
+subscription.unsubscribe();
+console.log(events);
+// → ["aggregate model=null collection=null database=shop", "aggregate model=null collection=system.sessions database=config"]
+```
+
+Подписчик, который группирует операции по моделям, должен учитывать `null`: такие события нельзя отнести ни к одной модели. Поля события описаны в справочнике [`OperationInfo`](../reference/observability/events.mdx#operationinfo).
+
+## Как выбрать
+
+Задайте себе вопрос: чьи документы вы читаете? Если документы модели, берите [`Model.aggregate`](../reference/aggregation/pipeline.mdx#modelaggregate): он применяет политики модели, а скрытые поля убирает первой стадией. Если документов модели нет (список значений от пользователя, состояние сервера, сессии), берите [`client.aggregate`](../reference/connection/typemo-client.mdx#clientaggregate) или [`connection.aggregate`](../reference/connection/connection.mdx#connectionaggregate). Между ними выбирает база: `client.aggregate` работает с базой клиента по умолчанию, `connection.aggregate` — с базой своего подключения.
+
+## Когда это не нужно
+
+Если вам нужна не агрегация, а команда сервера, которой в Typemo нет, возьмите [`client.unsafeDriver()`](../reference/connection/typemo-client.mdx#clientunsafedriver): он отдаёт настоящий `MongoClient`. Помните, что на такие вызовы политики Typemo не действуют, и событий операции не будет. Для данных моделей запрос уровня базы не нужен: статистику и индексы коллекции показывают [служебные стадии](./system.mdx) через саму модель.
+
+## Частые ошибки
+
+### План коллекции передан `client.aggregate`
+
+План от [`Pipeline.from(Order)`](../reference/aggregation/pipeline.mdx#pipelinefrom) читает коллекцию модели, и выполнять его должна модель, чтобы действовали её политики. [`client.aggregate`](../reference/connection/typemo-client.mdx#clientaggregate) отвергает такой план сразу, до обращения к базе:
+
+```text
+ConfigurationError: client.aggregate: the plan reads the collection "orders"; run it with the model's aggregate()
+```
+
+Выполните его через [`Orders.aggregate(plan)`](../reference/aggregation/pipeline.mdx#modelaggregate).
+
+### План базы передан модели
+
+Обратная ошибка: [`Model.aggregate`](../reference/aggregation/pipeline.mdx#modelaggregate) принимает только план своей коллекции. План [`Pipeline.database()`](../reference/aggregation/pipeline.mdx#pipelinedatabase) или [`Pipeline.sessions()`](../reference/aggregation/pipeline.mdx#pipelinesessions) он отвергает:
+
+```text
+ConfigurationError: Order.aggregate: the plan reads a database, not this model's collection "orders"; run it with connection.aggregate(plan) or client.aggregate(plan)
+ConfigurationError: Order.aggregate: the plan reads config.system.sessions, not this model's collection "orders"; run it with connection.aggregate(plan) or client.aggregate(plan)
+```
+
+Текст сам называет нужный метод.
+
+### Стадия не в том плане
+
+У каждой служебной стадии своё место, и компилятор следит за этим. [`currentOp`](../reference/aggregation/stages.mdx#currentop) есть только у [`Pipeline.admin()`](../reference/aggregation/pipeline.mdx#pipelineadmin): в плане базы пользователя сервер отверг бы её, поэтому метода там нет.
+
+```ts twoslash
+// @errors: 2684
+import { Pipeline } from "@venloc/typemo";
+// ---cut---
+Pipeline.database().currentOp();
+```
+
+Так же `listSessions` есть только у `Pipeline.sessions()`, а `out` и `merge` у него нет вовсе: план сессий только читает.
+
+## Полный пример
+
+```ts twoslash title="ops/monitoring.ts"
+import { Entity, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts", softDelete: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => Date, { nullable: true }) deletedAt?: Date | null;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+// 1. Какие адреса из списка уже зарегистрированы (удалённые не считаются).
+export const registered = async (emails: string[]) => {
+  const [first, ...rest] = emails.map((email) => ({ email }));
+  if (first === undefined) return [];
+  const rows = await client.aggregate(
+    Pipeline.database()
+      .documents([first, ...rest])
+      .lookup({ from: Account, localField: "email", foreignField: "email", as: "found" })
+      .plan(),
+  );
+  return rows.filter((row) => row.found.length > 0).map((row) => row.email);
+};
+
+// 2. Что сейчас выполняет сервер (только активные операции, с ограничением по времени).
+export const activeOperations = () =>
+  client
+    .aggregate(Pipeline.admin().currentOp({ idleConnections: false }).match({ active: true }).plan())
+    .timeoutMS(5_000);
+
+// 3. Сколько сессий открыто на этом узле.
+export const openSessions = async () =>
+  (await client.aggregate(Pipeline.database().listLocalSessions({ allUsers: true }).plan())).length;
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Служебные агрегации" href="./system.mdx">
+  Статистика коллекции и индексов, планы запросов и другие служебные стадии.
+</Card>
+<Card title="Справочник: Pipeline и Model.aggregate" href="../reference/aggregation/pipeline.mdx#pipelinedatabase">
+  Все три точки входа, `AggregatePlan` и `AggregateExecutionPlan`.
+</Card>
+<Card title="Справочник: connection.aggregate" href="../reference/connection/connection.mdx#connectionaggregate">
+  Параметры, ошибки и тексты сообщений метода подключения.
+</Card>
+<Card title="События операций" href="../observability/events.mdx">
+  Как подписаться на операции и что значит `model: null`.
+</Card>
+</Cards>

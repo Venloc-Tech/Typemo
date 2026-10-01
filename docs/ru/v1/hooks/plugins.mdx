@@ -1,0 +1,285 @@
+---
+title: Переиспользовать поведение в нескольких моделях
+description: "Как написать плагин схемы и подключить его к модели, базе или всему приложению, добавить методы модели и включить политику"
+icon: Puzzle
+---
+
+**Плагин** — это объект с именем и функцией `apply`, которая при компиляции схемы добавляет в неё поля, индексы, хуки, виртуальные поля, методы модели и политики. Плагин нужен, когда одно и то же поведение требуется многим моделям: общий хук журнала, мягкое удаление, набор индексов, общие методы. Вместо копирования кода в каждый класс вы пишете плагин один раз и подключаете его.
+
+Если вам нужен один хук на одной модели, плагин не нужен: объявите метод класса с [`@Pre`](../reference/hooks/pre-post.mdx#pre). Если нужно только хранить свои настройки у поля, смотрите [Свои опции полей и схем](../extensions/custom-options.mdx).
+
+## Что предполагается
+
+Примеры используют модель счёта и клиент из руководства [Подключиться к базе](../connection/connect.mdx). `Accounts` — модель счёта, полученная у клиента после подключения плагинов.
+
+## Быстрый путь
+
+Плагин — объект `{ name, apply }`. Подключить его к модели можно декоратором [`@Plugin`](../reference/hooks/plugins.mdx#plugin), к базе — через `connection.plugins.use`, ко всему приложению — через [`Typemo.plugin`](../reference/connection/typemo.mdx#typemoplugin):
+
+```ts twoslash title="plugins/read-log.ts"
+import { Entity, Plugin, Prop, Schema, type SchemaPlugin } from "@venloc/typemo";
+
+export const readLog: SchemaPlugin = {
+  name: "read-log",
+  apply: (builder) => {
+    builder.addHook("post", "query.find", function () {
+      console.log(`прочитан список ${builder.target.name}`);
+    });
+  },
+};
+
+@Plugin(readLog)
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+}
+```
+
+Запуск: `find()` этой модели вывел `прочитан список Account`. Остальная страница разбирает, что плагин может добавить и как выбрать уровень.
+
+## Написать плагин
+
+Функция `apply` получает [`PluginBuilder`](../reference/hooks/plugins.mdx#pluginbuilder): узкий интерфейс, через который плагин меняет схему. Он вызывается один раз для каждой схемы и знает, какую модель компилирует (`builder.target`) и какие поля в ней уже есть (`builder.fieldKeys`).
+
+Плагин может добавить поле, индекс, хук, виртуальную связь, статический метод и политику. Хуки плагина вешаются на те же [события](../reference/hooks/pre-post.mdx#hook_events), что и хуки класса. Их функция объявляется как `function (this: unknown)`: построитель не знает, для какого события какой `this`, поэтому при необходимости приведите его сами. Хуки плагина выполняются после хуков класса.
+
+```ts twoslash
+import { type SchemaPlugin } from "@venloc/typemo";
+// ---cut---
+export const inspect: SchemaPlugin = {
+  name: "inspect",
+  apply: (builder) => {
+    console.log(builder.target.name, builder.fieldKeys);
+    // → Account [ "_id", "title" ]
+  },
+};
+```
+
+Плагин, подключённый к модели с полями `_id` и `title`, вывел `Account [ "_id", "title" ]`.
+
+## Подключить к модели, базе или приложению
+
+Уровней три, и они отличаются тем, каким моделям плагин достанется. Порядок применения: сначала глобальные, затем плагины базы, затем плагины модели.
+
+К одной модели плагин подключается декоратором `@Plugin` над классом. Несколько плагинов применяются в порядке сверху вниз:
+
+```ts twoslash
+import { Entity, Plugin, Prop, Schema, type SchemaPlugin } from "@venloc/typemo";
+const readLog: SchemaPlugin = { name: "read-log", apply: () => {} };
+const stamped: SchemaPlugin = { name: "stamped", apply: () => {} };
+// ---cut---
+@Plugin(readLog)
+@Plugin(stamped)
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+}
+```
+
+Ко всем моделям одной базы плагин подключается через реестр базы, ко всем моделям приложения — через `Typemo.plugin`. Оба вызова нужно сделать **до первой модели**:
+
+```ts twoslash
+import { Typemo, TypemoClient, type SchemaPlugin } from "@venloc/typemo";
+const readLog: SchemaPlugin = { name: "read-log", apply: () => {} };
+const stamped: SchemaPlugin = { name: "stamped", apply: () => {} };
+// ---cut---
+Typemo.plugin(readLog); // все клиенты, все модели
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+client.db().plugins.use(stamped); // только модели этой базы
+```
+
+Один и тот же плагин, подключённый на двух уровнях с одинаковыми настройками, применяется один раз, на месте первого появления. Запуск: плагин базы `conn`, тот же `both` на уровне базы и модели дали порядок `conn`, `both`. Если настройки различаются или два разных плагина названы одинаково, вы получаете `ConfigurationError` (тексты в разделе «Частые ошибки»).
+
+## Плагин с настройками
+
+Настройки передаются вторым аргументом и приходят в `apply`. Тип настроек — первый параметр `SchemaPlugin<O>`: компилятор потребует их при подключении, если они обязательны.
+
+```ts twoslash
+import { Entity, Plugin, Prop, Schema, type SchemaPlugin } from "@venloc/typemo";
+// ---cut---
+export const noted: SchemaPlugin<{ readonly field: string }> = {
+  name: "noted",
+  apply: (builder, options) => {
+    builder.addField(options.field, () => String);
+  },
+};
+
+@Plugin(noted, { field: "note" })
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+}
+```
+
+Запуск: плагин такого же вида с полем `seenAt` (`addField("seenAt", () => Date)`) сохранил переданное значение в документе. Тип модели такого поля не знает: плагин добавляет его при компиляции, а компилятор видит только объявленный класс. Записать и прочитать его можно с приведением типа, а если поле нужно в типах, объявите его в самом классе.
+
+## Добавить модели методы
+
+Плагин может добавить статические методы, которые получат все его модели. Они объявляются в объекте `statics` плагина, и `this` в них — модель. Типизированный доступ даёт метод [`Model.statics`](../reference/hooks/plugins.mdx#modelstatics): он возвращает ту же модель с типами методов плагина.
+
+```ts twoslash
+import { Entity, Plugin, Prop, Schema, TypemoClient, type Model, type SchemaPlugin } from "@venloc/typemo";
+
+const statics = {
+  async byTitle(this: Model<Account>, title: string): Promise<number> {
+    return this.countDocuments({ title });
+  },
+};
+
+export const tools: SchemaPlugin<undefined, typeof statics> = {
+  name: "tools",
+  apply: () => {},
+  statics,
+};
+
+@Plugin(tools)
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const count = await Accounts.statics(tools).byTitle("Main");
+//    ^?
+```
+
+Запуск: после вставки счёта `w` вызов `byTitle("w")` вернул `1`. Метод привязан к модели, поэтому в типе у него нет параметра `this`.
+
+Проверка на модели, к которой плагин не подключён, происходит во время работы: тип не обещает метод, которого нет.
+
+```text
+ConfigurationError: Account: plugin "tools" is not applied to this model's schema
+```
+
+Метод, чьё имя совпадает с членом модели (`find`, `create`), не затеняет его молча: при создании модели вы получаете `ConfigurationError` с текстом `the plugin static "find" would shadow a member of the model`.
+
+## Включить политику
+
+Плагин может включить политику: `tenant`, `softDelete` или `audit`, с теми же опциями, что у [`@Schema`](../reference/schemas/schema.mdx). Так плагин «мягкое удаление» подключается одной строкой ко всем моделям с полем `deletedAt`.
+
+```ts twoslash
+import { Entity, Plugin, Prop, Schema, type SchemaPlugin } from "@venloc/typemo";
+// ---cut---
+export const softly: SchemaPlugin = {
+  name: "softly",
+  apply: (builder) => builder.enablePolicy("softDelete", true),
+};
+
+@Plugin(softly)
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Date, { nullable: true })
+  deletedAt?: Date | null;
+}
+```
+
+Запуск: после `deleteOne({ title: "w" })` `countDocuments()` вернул 0, а в самой коллекции документ остался. Если политика уже включена в `@Schema` с другими опциями, а плагин включает её иначе, это `ConfigurationError` вида `declared by @Schema and enabled by plugin "other"`. Подробнее о самой политике — в руководстве [Мягкое удаление](../policies/soft-delete.mdx).
+
+## Как выбрать
+
+Задайте себе один вопрос: **сколько моделей должны это получить?** Одна модель — метод класса или `@Plugin` над ней. Все модели одной базы — реестр базы. Все модели приложения, включая созданные библиотеками, — `Typemo.plugin`. Чем шире уровень, тем строже порядок: глобальные плагины и плагины базы закрываются первой успешно скомпилированной схемой, а `@Plugin` привязан к классу и порядка запуска не требует.
+
+## Когда это не нужно
+
+Один хук на одной модели плагином не оформляйте. Изменить операции плагин напрямую не может: у него есть только хуки, которые проходят все политики. Если нужно наблюдать за операциями всех моделей, используйте [события операций](../observability/events.mdx): подписчик глобален и ничего не ломает. Если нужны свои опции поля и их проверка, используйте [расширение](../extensions/custom-options.mdx).
+
+## Частые ошибки
+
+### Плагин зарегистрирован слишком поздно
+
+```text
+ConfigurationError: plugin "late": the global plugins are fixed once a schema is compiled (Account was); register plugins before the first model
+```
+
+Реестр закрывается первой **успешно** скомпилированной схемой: иначе плагин достался бы не всем моделям. Реестр базы закрывает первая модель этой базы, а глобальный реестр (`Typemo.plugin`) — первая модель на любом клиенте приложения. Схема, которая не скомпилировалась, реестры не закрывает: после такой ошибки плагин ещё можно зарегистрировать. Перенесите регистрацию в самое начало запуска, до создания моделей. Для базы текст тот же со словами `the connection plugins`; расширения закрываются по тому же правилу, подробнее в руководстве [Несколько клиентов и расширения](../connection/clients-and-extensions.mdx#регистрировать-до-первой-модели).
+
+### Один плагин с разными настройками
+
+```text
+ConfigurationError: Account: plugin "stamped" is registered twice (connection and model) with different options
+```
+
+Один и тот же плагин на двух уровнях с разными настройками неоднозначен. Оставьте одно подключение или сделайте настройки одинаковыми.
+
+### Два плагина с одним именем
+
+```text
+ConfigurationError: Account: two different plugins are named "both"
+```
+
+Имя плагина уникально. Переименуйте один из них.
+
+### Плагин без имени
+
+```text
+ConfigurationError: a plugin is an object { name, apply(builder, options) }
+```
+
+## Полный пример
+
+Файл с плагином, который добавляет методы и хук, и моделью, которая его использует:
+
+```ts twoslash title="plugins/tools.ts"
+import { Entity, Plugin, Prop, Schema, TypemoClient, type Model, type SchemaPlugin } from "@venloc/typemo";
+
+const statics = {
+  async byTitle(this: Model<Account>, title: string): Promise<number> {
+    return this.countDocuments({ title });
+  },
+};
+
+// Плагин: метод модели и хук чтения.
+export const tools: SchemaPlugin<undefined, typeof statics> = {
+  name: "tools",
+  apply: (builder) => {
+    builder.addHook("post", "query.find", function () {
+      console.log(`прочитан список ${builder.target.name}`);
+    });
+  },
+  statics,
+};
+
+@Plugin(tools)
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+
+await Accounts.create({ title: "Main" });
+await Accounts.find(); // → прочитан список Account
+console.log(await Accounts.statics(tools).byTitle("Main"));
+// → 1
+```
+
+<Callout type="migration">
+
+В Mongoose глобальные плагины применяются в момент `model()`, поэтому регистрация после создания части моделей молча не действует на них. В Typemo это [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configurationerror). Статические методы там добавляются как `schema.statics.x = …` без типов; здесь они типизируются через `statics` плагина и `model.statics(plugin)`, а совпадение имени с методом модели — ошибка, а не тихое затенение.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Плагины (справочник)" href="../reference/hooks/plugins.mdx">
+  `SchemaPlugin`, `PluginBuilder`, реестры и `Model.statics` с точными сигнатурами.
+</Card>
+<Card title="Несколько клиентов и расширения" href="../connection/clients-and-extensions.mdx">
+  Где регистрировать плагины и расширения, когда в приложении несколько клиентов.
+</Card>
+<Card title="Свои опции полей и схем" href="../extensions/custom-options.mdx">
+  Как хранить и проверять свои настройки у полей, не меняя схему.
+</Card>
+</Cards>

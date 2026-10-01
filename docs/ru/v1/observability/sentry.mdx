@@ -1,0 +1,98 @@
+---
+title: Sentry
+description: "Как отправлять ошибки операций Typemo в Sentry с понятным контекстом и breadcrumbs без данных пользователей"
+icon: Bug
+---
+
+Пакет `@venloc/typemo-sentry` отправляет в Sentry ошибки операций с контекстом (модель, коллекция, шаг, вид сбоя) и оставляет **breadcrumbs**: короткие записи о том, что происходило перед ошибкой. По событию в Sentry вы сразу видите, какая операция какой модели упала и можно ли её повторить. Адаптер использует только `@sentry/core`, поэтому одинаково работает с `@sentry/node` и `@sentry/bun`.
+
+Трассировка здесь не нужна: спаны в Sentry приходят из OpenTelemetry, см. [OpenTelemetry](./opentelemetry.mdx). Справочник — [`@venloc/typemo-sentry`](../reference/observability/sentry.mdx).
+
+## Что предполагается
+
+Sentry уже инициализирован в приложении (DSN и остальное), клиент создан как в [быстром старте](../getting-started/quick-start.mdx). Блоки кода на странице не компилируются сборкой документации (она не подключает Sentry); работа адаптера проверена запуском на настоящей базе.
+
+## Быстрый путь
+
+```package-install
+@venloc/typemo-sentry @sentry/node
+```
+
+```ts title="monitoring.ts"
+import * as Sentry from "@sentry/node";
+import { TypemoClient } from "@venloc/typemo";
+import { TypemoSentry } from "@venloc/typemo-sentry";
+
+Sentry.init({ dsn: "https://public@example.test/1" });
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank" });
+const subscription = TypemoSentry.instrument(client);
+```
+
+Для всех клиентов процесса вызовите `TypemoSentry.instrument(Typemo)`. Отписка — `subscription.unsubscribe()`.
+
+## Разобрать ошибку в Sentry
+
+Ситуация: в Sentry пришло событие `DuplicateKeyError`. Адаптер прикрепил к нему контекст `typemo` и четыре тега. Запуск повторной вставки с тем же уникальным `title` дал теги `typemo.error_class: DuplicateKeyError`, `typemo.classification: duplicate-key`, `typemo.operation: insertOne`, `typemo.model: Account`, а в контексте: `database: "bank"`, `failedStep: "execute"`, `serverCode: 11000`, `retryable: false`, `transient: false`. Теги удобны для фильтров и правил оповещения, контекст — для разбора.
+
+Сообщение ошибки в Sentry уже замаскировано: `duplicate key on title_1: { title: "?" } (code 11000 DuplicateKey)`, а вызвавший код получил настоящее значение. Так номер счёта или e-mail не уходят наружу.
+
+## Понять, что было перед ошибкой
+
+Каждая закончившаяся операция оставляет breadcrumb `Typemo.find (Account)` с категорией `typemo`. В `data` — модель, коллекция, база, длительность, число документов и форма запроса без значений: `{ filter: { balance: { $gt: "?" } } }`. У операции уровня базы ([`connection.aggregate`](../reference/connection/connection.mdx#connectionaggregate)) нет модели и коллекции: сообщение такое же, как у спана OpenTelemetry, `Typemo.aggregate (database bank)`, а в `data` остаются база, длительность и форма конвейера. У упавшей операции запись уровня `error` с `failedStep` и `errorKind`. Повтор и откат транзакции — тоже breadcrumbs (`Typemo.transaction retry`, `Typemo.transaction abort`), в них только имя класса ошибки, потому что сообщение драйвера может цитировать значения.
+
+## Только breadcrumbs или только ошибки
+
+Ситуация: ошибки вы уже отправляете сами. Отключите отправку:
+
+```ts
+TypemoSentry.instrument(client, { captureErrors: false });
+```
+
+Или наоборот, `breadcrumbs: false` оставит только ошибки. Оба `false` не дают в Sentry ничего (проверено запуском). Фильтровать ошибки по виду адаптер не умеет: отправляются все; шум отсекайте в Sentry (`beforeSend`).
+
+## Одна ошибка — одно событие
+
+Две регистрации адаптера или ваш собственный `captureException` той же ошибки не создают дубликатов: `@sentry/core` помечает уже отправленные исключения.
+
+## Не отдать данные пользователей
+
+По умолчанию (`sensitive: "mask"`) значения в сводке и в ошибках `CastError`, `ValidationError`, `DuplicateKeyError`, `ServerValidationError` заменены на `"?"`. Настоящие значения уходят только при `sensitive: "show"` или через вашу `{ mask }`, и то не для полей, помеченных `sensitive` в схеме. Режимы описаны в [справочнике событий](../reference/observability/events.mdx#subscribersensitive).
+
+Тенант по умолчанию в Sentry не уходит: тенант — данные ваших клиентов. Если он вам нужен для разбора ошибок, включите `includeTenant: true`: у отправленной ошибки появятся тег `typemo.tenant` и поле `tenant` в контексте `typemo`. Для операций без тенанта и для breadcrumbs ничего не меняется: в breadcrumbs тенанта нет никогда.
+
+```ts
+TypemoSentry.instrument(client, { includeTenant: true });
+```
+
+## Как выбрать
+
+Один вопрос: **где вы хотите видеть ошибки?** Если в Sentry — этот адаптер; спаны — OpenTelemetry (их можно и то и другое). Если ошибки нужны в другом трекере, напишите подписчика: [Своя интеграция](./custom-integration.mdx).
+
+## Когда это не нужно
+
+Если ошибки вы уже ловите на границе приложения и отправляете сами с нужным контекстом, адаптер даст дубли контекста; включите только breadcrumbs. Ошибку в хуке `pre('save')` до операции адаптер не видит: она вне операции.
+
+## Частые ошибки
+
+### В Sentry нет ошибок валидации
+
+`create`, `$save` и `bulkSave` проверяют внутри своей операции, поэтому `ValidationError` доходит. Не доходит только ошибка, брошенная в хуке `pre('save')` до операции.
+
+### Ошибки приходят, но без значений
+
+Так и задумано: `"?"` вместо значений. Включите `sensitive: "show"` осознанно, зная, что данные уйдут в Sentry.
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник Sentry" href="../reference/observability/sentry.mdx">
+  Опции, контекст, теги и экспорты пакета.
+</Card>
+<Card title="OpenTelemetry" href="./opentelemetry.mdx">
+  Спаны и метрики для Sentry и не только.
+</Card>
+<Card title="События операций" href="./events.mdx">
+  Что адаптер получает от ядра.
+</Card>
+</Cards>

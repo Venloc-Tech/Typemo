@@ -1,0 +1,226 @@
+---
+title: BsonGuards и BsonTypeTable
+description: "Проверки значений BSON во время работы, таблица типов, из которой строятся формы, и настройки BSON, которые Typemo фиксирует"
+icon: ScanSearch
+---
+
+`BsonGuards` отвечает на вопрос «что это за значение?» во время работы: `ObjectId`, `UUID`, дата, карта, обычный объект. `BsonTypeTable` — таблица, в которой у каждого типа MongoDB записано, как он выглядит в документе, в lean, в plain и в JSON; из неё строятся и типы, и формы значений. Обе части нужны, когда вы пишете код над значениями, о типе которых компилятор ничего не знает: разбор данных из внешнего источника, собственный сериализатор, функция, которая принимает `unknown`. В обычной работе с моделями они не нужны: приведение типов и формы делает сам Typemo.
+
+Если вам нужно понять, как выглядит значение в каждой форме, прочитайте [Формы значений](./value-forms.mdx). Эта страница — справочник по классам, которые лежат под ними, и по настройкам BSON, которые Typemo фиксирует у клиента.
+
+Элементы на странице: [`BsonGuards`](#bsonguards), [`BsonTypeTag`](#bsontypetag), [`BsonTypeTable`](#bsontypetable) и [`BsonOptions`](#bsonoptions).
+
+---
+
+## BsonGuards
+
+`BsonGuards` — набор статических проверок значений, которые сужают тип. Главное свойство проверок: они узнают значения BSON по служебной метке, которую ставит пакет `bson`, а не через `instanceof`. Причина в том, что в одном проекте бывает две копии `bson` (в монорепозитории, во вложенной зависимости), их классы разные, а метки одинаковые: `instanceof` от одной копии не узнает значение из другой, а проверка по метке узнает. Встроенные типы (`Date`, `RegExp`, `Map`) проверяются по строковому тегу `Object.prototype.toString` по той же причине: значение может прийти из другого контекста выполнения.
+
+```ts twoslash
+import { ObjectId, UUID } from "mongodb";
+import { BsonGuards } from "@venloc/typemo";
+
+const describe = (value: unknown): string => {
+  if (BsonGuards.isUuid(value)) return `uuid ${value.toHexString(true)}`;
+  if (BsonGuards.isObjectId(value)) return `objectId ${value.toHexString()}`;
+  if (BsonGuards.isDate(value)) return "date";
+  return "other";
+};
+
+console.log(describe(new ObjectId("6abcfeb2f9f532dbc77418c1")), describe(new Date()), describe(1));
+// → "objectId 6abcfeb2f9f532dbc77418c1" "date" "other"
+console.log(describe(new UUID("0f8fad5b-d9cb-469f-a165-70867728950e")));
+// → "uuid 0f8fad5b-d9cb-469f-a165-70867728950e"
+```
+
+Обратите внимание на порядок проверок: `UUID` в BSON — это двоичное значение особого вида, поэтому `isBinary` для него тоже возвращает `true`, и более узкую проверку `isUuid` нужно ставить раньше.
+
+<Returns type="boolean">
+
+Каждая проверка возвращает `true`, если значение подходит, и сужает тип в ветке `if`. Проверки не бросают ошибок ни на каком входе, включая `null` и `undefined`.
+
+</Returns>
+
+<Params>
+<Param name="value" type="unknown" required>
+
+Любое значение. Все проверки принимают его одним аргументом.
+
+</Param>
+</Params>
+
+Проверки на значения пакета `bson`:
+
+<TypeTable
+  type={{
+    "BsonGuards.tagOf": { description: "Имя BSON-класса значения (`\"ObjectId\"`, `\"Binary\"`, `\"Long\"`, …) или `undefined`, если значение не из `bson`. Старое имя `ObjectID` приводится к `ObjectId`.", type: "(value: unknown) => BsonTypeTag | undefined" },
+    "BsonGuards.isBsonValue": { description: "Значение любого класса пакета `bson`: `tagOf` его узнаёт.", type: "(value: unknown) => boolean" },
+    "BsonGuards.isObjectId": { description: "`ObjectId`.", type: "(value: unknown) => value is ObjectId" },
+    "BsonGuards.isDecimal128": { description: "`Decimal128`.", type: "(value: unknown) => value is Decimal128" },
+    "BsonGuards.isLong": { description: "Обёртка `Long`. Драйвер с настройками Typemo отдаёт int64 как `bigint`, поэтому в данных из базы `Long` не встречается.", type: "(value: unknown) => value is Long" },
+    "BsonGuards.isInt32": { description: "Обёртка `Int32`.", type: "(value: unknown) => value is Int32" },
+    "BsonGuards.isDouble": { description: "Обёртка `Double`.", type: "(value: unknown) => value is Double" },
+    "BsonGuards.isTimestamp": { description: "`Timestamp`.", type: "(value: unknown) => value is Timestamp" },
+    "BsonGuards.isBsonRegExp": { description: "`BSONRegExp`: не родное регулярное выражение.", type: "(value: unknown) => value is BSONRegExp" },
+    "BsonGuards.isBsonSymbol": { description: "`BSONSymbol`.", type: "(value: unknown) => value is BSONSymbol" },
+    "BsonGuards.isCode": { description: "`Code`.", type: "(value: unknown) => value is Code" },
+    "BsonGuards.isDbRef": { description: "`DBRef`.", type: "(value: unknown) => value is DBRef" },
+    "BsonGuards.isMinKey": { description: "`MinKey`.", type: "(value: unknown) => value is MinKey" },
+    "BsonGuards.isMaxKey": { description: "`MaxKey`.", type: "(value: unknown) => value is MaxKey" },
+    "BsonGuards.isBinary": { description: "`Binary` любого подтипа. Значения `UUID` и векторы тоже проходят.", type: "(value: unknown) => value is Binary" },
+    "BsonGuards.isUuid": { description: "`Binary` подтипа 4 ровно из 16 байт: то, что при чтении становится `UUID`.", type: "(value: unknown) => value is UUID" },
+    "BsonGuards.isVector": { description: "`Binary` подтипа 9 (вектор). Заголовок вектора (тип элементов, заполнение) здесь не проверяется.", type: "(value: unknown) => value is Binary" },
+  }}
+/>
+
+Проверки на встроенные типы и на форму объекта:
+
+<TypeTable
+  type={{
+    "BsonGuards.isDate": { description: "`Date`, в том числе неверная (`Invalid Date`).", type: "(value: unknown) => value is Date" },
+    "BsonGuards.isValidDate": { description: "`Date`, у которой время — число.", type: "(value: unknown) => value is Date" },
+    "BsonGuards.isRegExp": { description: "Родное `RegExp`.", type: "(value: unknown) => value is RegExp" },
+    "BsonGuards.isMap": { description: "`Map`.", type: "(value: unknown) => value is Map<unknown, unknown>" },
+    "BsonGuards.isSet": { description: "`Set`. В таблице типов для него строки нет, значение хранить нельзя.", type: "(value: unknown) => value is Set<unknown>" },
+    "BsonGuards.isUint8Array": { description: "`Uint8Array`, в том числе `Buffer`.", type: "(value: unknown) => value is Uint8Array" },
+    "BsonGuards.isOpaqueValue": { description: "Значение, которое хранится как одно целое и в которое путь не заходит: значение `bson`, типизированный массив, `Date`, `RegExp`, `Map`, `Set`, `ArrayBuffer`. Обычные объекты и массивы — нет.", type: "(value: unknown) => boolean" },
+    "BsonGuards.isPlainObject": { description: "Объект, в который путь заходит как во встроенный документ: обычный объект или экземпляр вашего класса. Массивы, функции и непрозрачные значения не подходят.", type: "(value: unknown) => value is Readonly<Record<string, unknown>>" },
+    "BsonGuards.isPojo": { description: "Объектный литерал: прототип `Object.prototype` или `null` (`{ a: 1 }`, результат `JSON.parse`). Экземпляры классов не подходят. Нужна там, где вход принимает запись «ключ → значение», например для поля-карты.", type: "(value: unknown) => value is Readonly<Record<string, unknown>>" },
+  }}
+/>
+
+Различие между двумя последними проверкам легко увидеть на примере: экземпляр вашего класса `Foo` для `isPlainObject` — встроенный документ, а для `isPojo` — нет.
+
+```ts twoslash
+import { BsonGuards } from "@venloc/typemo";
+
+class Foo {
+  a = 1;
+}
+
+console.log(BsonGuards.isPlainObject({ a: 1 }), BsonGuards.isPojo({ a: 1 }));
+// → true true
+console.log(BsonGuards.isPlainObject(new Foo()), BsonGuards.isPojo(new Foo()));
+// → true false
+console.log(BsonGuards.isPlainObject(new Map()), BsonGuards.isOpaqueValue(new Map()));
+// → false true
+```
+
+### Когда не подходит
+
+Чтобы проверить, что значение — экземпляр вашей модели, используйте сам класс и `instanceof`: `BsonGuards` не знает ваших классов. Чтобы проверить структуру входных данных (обязательные поля, формат), используйте схему валидации; проверки на этой странице отвечают только на вопрос о типе значения.
+
+## BsonTypeTag
+
+`BsonTypeTag` — объединение имён BSON-классов, которые узнаёт `tagOf`: `"ObjectId"`, `"Binary"`, `"Long"`, `"Decimal128"`, `"Double"`, `"Int32"`, `"Timestamp"`, `"BSONRegExp"`, `"BSONSymbol"`, `"Code"`, `"DBRef"`, `"MinKey"` и `"MaxKey"`. `UUID` отдельного тега не имеет: это `Binary` подтипа 4.
+
+```ts twoslash
+import { ObjectId, UUID } from "mongodb";
+import { BsonGuards, type BsonTypeTag } from "@venloc/typemo";
+
+const tag: BsonTypeTag | undefined = BsonGuards.tagOf(new ObjectId());
+console.log(tag, BsonGuards.tagOf(new UUID()), BsonGuards.tagOf({}));
+// → "ObjectId" "Binary" undefined
+```
+
+## BsonTypeTable
+
+`BsonTypeTable` — единственная таблица «тип MongoDB ↔ тип TypeScript» на все четыре формы: документ, lean, JSON и plain. Тип и поведение каждой формы берутся из одной строки: строка не может существовать только на стороне типов или только на стороне рантайма, поэтому тип результата не расходится с данными. Класс даёт и данные таблицы, и функции преобразования между формами.
+
+<TypeTable
+  type={{
+    "BsonTypeTable.scalars": { description: "Строки скалярных типов по ключам таблицы: `objectId`, `string`, `double`, `int32`, `long`, `decimal128`, `bool`, `date`, `binary`, `uuid`, `vector`, `regex`, `timestamp`, `minKey`, `maxKey`, `null`. У строки есть `key`, `bsonType` (числовой код), `alias` (имя для `$type`), `forms` (текст типов в четырёх формах), проверка `is` и преобразования `toJson` и `toPlain`.", type: "{ [K in BsonScalarKey]: BsonScalarRow<K> }" },
+    "BsonTypeTable.containers": { description: "Строки контейнеров: `array`, `object`, `map`.", type: "{ [K in BsonContainerKey]: BsonTypeRow<K> }" },
+    "BsonTypeTable.keys": { description: "Все ключи строк: сначала скаляры, затем контейнеры, в порядке таблицы.", type: "readonly BsonTypeKey[]" },
+    "BsonTypeTable.kindOf": { description: "Ключ строки, к которой относится значение, как решает сериализатор. Число — `int32`, если это целое в диапазоне int32 (и не `-0`), иначе `double`; `bigint` — `long`; `Binary` — `uuid`, `vector` или `binary`. `undefined` для значений, которых в таблице нет.", type: "(value: unknown) => BsonTypeKey | undefined" },
+    "BsonTypeTable.toLean": { description: "Из hydrated в lean: карты превращаются в объекты, изменяемые значения (`Date`, `Binary`, `RegExp`) копируются.", type: "<T>(value: T, path?: string) => LeanValue<T>" },
+    "BsonTypeTable.toJson": { description: "Из hydrated в JSON-форму.", type: "<T>(value: T, path?: string) => JsonValue<T>" },
+    "BsonTypeTable.toPlain": { description: "Из hydrated в plain-форму.", type: "<T>(value: T, path?: string) => PlainValue<T>" },
+    "BsonTypeTable.scalarToPlain": { description: "Plain-форма одного скаляра, без контейнеров: быстрый путь для чтения по схеме.", type: "(value: unknown, path: string) => unknown" },
+  }}
+/>
+
+Что получается на разных значениях, показывают вызовы `kindOf` и преобразований:
+
+```ts twoslash
+import { ObjectId, UUID } from "mongodb";
+import { BsonTypeTable } from "@venloc/typemo";
+
+console.log(BsonTypeTable.kindOf(4), BsonTypeTable.kindOf(4.5), BsonTypeTable.kindOf(4n), BsonTypeTable.kindOf(new UUID()));
+// → "int32" "double" "long" "uuid"
+
+const plain = BsonTypeTable.toPlain({ id: new ObjectId("6abd0031bc77f4bc3599f62f"), big: 5n, nested: [1] });
+console.log(plain);
+// → { id: "6abd0031bc77f4bc3599f62f", big: "5", nested: [1] }
+
+const json = BsonTypeTable.toJson({ big: 5n, re: /a/i, tags: new Map([["a", 1n]]) });
+console.log(json);
+// → { big: "5", re: "/a/i", tags: { a: "1" } }
+```
+
+Параметр `path` — необязательный путь значения в документе; он попадает в текст ошибки, чтобы было видно, где нашлось неподходящее значение.
+
+### Ошибки
+
+Значение, которого нет в таблице (функция, `undefined`, символ, `Set`, «сырые» обёртки `Long`, `Int32` и `Double`, устаревшие `Code`, `DBRef`, `BSONSymbol`), приводит к [`CastError`](../errors/data-errors.mdx#casterror) с причиной `type`. Это верно на любой глубине и для всех трёх преобразований (`toLean`, `toPlain`, `toJson`): ошибка называет путь к значению, а не молчит там, где функцию можно было бы просто пропустить. Текст получен запуском:
+
+```text
+CastError: Cast to a value of the BSON type table failed at path "doc" for a function: this value has no row in BsonTypeTable (undefined, a function, a raw Long/Int32/Double or a legacy type) [type]
+```
+
+Функция внутри вложенного объекта, массива или Map получает тот же ответ, а в пути видно, где она лежит:
+
+```text
+CastError: Cast to a value of the BSON type table failed at path "doc.a.b" for a function: this value has no row in BsonTypeTable (undefined, a function, a raw Long/Int32/Double or a legacy type) [type]
+```
+
+`toJson` кроме того отвергает `NaN` и бесконечности, которых нет в JSON: `CastError: Cast to JSON number failed at path "doc.n" for NaN (number): JSON has no NaN or Infinity [json]`. `toPlain` и `toLean` оставляют `NaN` и `Infinity` числами: в JavaScript это обычные числа, и отвергать их нечем. Поэтому plain-данные с `NaN` в `JSON.stringify` превратятся в `null`, а `$toJSON()` честно откажет; если `NaN` у вас возможен, проверьте его до сериализации.
+
+### Когда не подходит
+
+Если вам нужна форма документа модели, вызывайте методы документа ([`$toPlain`](../documents/document-api.mdx#toplain), [`$toJSON`](../documents/document-api.mdx#tojson)) или `.plain()` у запроса: они знают схему (карты, скрытые поля, связи), а `BsonTypeTable` работает с одним значением без схемы.
+
+## BsonOptions
+
+`BsonOptions` хранит настройки BSON, которые Typemo навязывает драйверу, чтобы данные из базы совпадали с таблицей: `int64` всегда `bigint`, двоичные данные остаются `Binary`, регулярные выражения читаются как родные `RegExp`, `undefined` не молчит. Настройки не отключаются: конфликтующее значение — ошибка, а не выбор. Клиент `TypemoClient` применяет их сам; сюда вы приходите, если создаёте драйверный клиент вручную и хотите передать его в Typemo, или проверяете свои опции.
+
+```ts twoslash
+import { BsonOptions } from "@venloc/typemo";
+
+console.log(BsonOptions.REQUIRED);
+// → { useBigInt64: true, promoteValues: true, promoteLongs: true, promoteBuffers: false, bsonRegExp: false, ignoreUndefined: false, serializeFunctions: false, raw: false, enableUtf8Validation: true }
+console.log(BsonOptions.apply({ appName: "app" }));
+// → { appName: "app", useBigInt64: true, promoteValues: true, … }
+```
+
+<TypeTable
+  type={{
+    "BsonOptions.REQUIRED": { description: "Зафиксированные значения (`RequiredBsonOptions`): `useBigInt64: true`, `promoteValues: true`, `promoteLongs: true`, `promoteBuffers: false`, `bsonRegExp: false`, `ignoreUndefined: false`, `serializeFunctions: false`, `raw: false`, `enableUtf8Validation: true`.", type: "RequiredBsonOptions" },
+    "BsonOptions.apply": { description: "Новый объект опций с обязательными настройками; вход не изменяется. Ключ, заданный другим значением, — `ConfigurationError`.", type: "<T extends object>(options: T) => Omit<T, FixedKey> & RequiredBsonOptions" },
+    "BsonOptions.verify": { description: "Проверяет уже вычисленные опции клиента, базы или коллекции (`.bsonOptions`): каждая обязательная настройка должна быть задана и равна требуемой.", type: "(resolved: BSONSerializeOptions, where: string) => void" },
+  }}
+/>
+
+Компилятор тоже следит за конфликтами: тип `CompatibleBsonOptions<T>` разрешает обязательному ключу быть только отсутствующим или равным требуемому значению. Во время работы конфликт даёт [`ConfigurationError`](../errors/configuration-errors.mdx#configurationerror):
+
+```text
+ConfigurationError: options: BSON options conflict with Typemo — raw: true (required: false)
+```
+
+`verify` требует, чтобы каждая настройка была задана явно, поэтому на опциях, которые вы не заполняли, она перечисляет все ключи: `ConfigurationError: users: BSON options conflict with Typemo — useBigInt64: false (required: true), promoteValues: undefined (required: true), …`. Настройка `fieldsAsRaw` не поддерживается вовсе: сырые поля обходят таблицу типов.
+
+Из-за настройки `bsonRegExp: false` регулярные выражения читаются как родные `RegExp`, а у них нет флагов BSON `x`, `l`, `u`, и BSON-флаг `s` возвращается как JavaScript-флаг `g`; поэтому Typemo записывает у регулярного выражения только флаги `i` и `m`.
+
+## Что дальше
+
+<Cards>
+<Card title="Формы значений" href="./value-forms.mdx">
+  Как выглядит каждый тип MongoDB в документе, lean, plain и JSON.
+</Card>
+<Card title="Типы форм" href="./form-types.mdx">
+  Типы, которыми записаны формы, в TypeScript.
+</Card>
+<Card title="Ошибки данных" href="../errors/data-errors.mdx">
+  `CastError` и причины, по которым приведение значения не удаётся.
+</Card>
+</Cards>

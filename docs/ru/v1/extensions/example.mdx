@@ -1,0 +1,199 @@
+---
+title: Пример расширения от начала до конца
+description: "Расширение label целиком: объявление типа, проверка, использование в модели и таблица столбцов для интерфейса, собранная из описания схемы"
+icon: Blocks
+---
+
+Эта страница проходит путь расширения от начала до конца на одной задаче: интерфейсу администратора нужна таблица счетов, где заголовки столбцов и формат значений задаются прямо в модели, а не дублируются в коде интерфейса. Расширение `label` хранит у поля подпись и необязательную функцию форматирования, проверяет их при компиляции схемы, а интерфейс читает их из описания схемы.
+
+Общие правила расширений — в руководстве [Свои опции полей и схем](./custom-options.mdx), полное описание элементов — в справочнике [Расширения](../reference/extensions/extensions.mdx). Здесь только сборка.
+
+## Что предполагается
+
+Клиент подключён так, как описано в руководстве [Подключиться к базе](../connection/connect.mdx). Расширение регистрируется на клиенте: таблицу столбцов строят только его модели. В коллекции один счёт: название `Main`, владелец `alice`, баланс `12.5`.
+
+## Быстрый путь
+
+Расширение — три файла: объявление и проверка, модель, чтение. Вот результат для счёта из коллекции:
+
+```text
+Название: Main | Баланс: 12.50
+```
+
+Остальная страница разбирает каждый файл.
+
+## Шаг 1. Объявить тип и написать проверку
+
+Файл расширения содержит две части. Объявление модуля добавляет ключ `label` в `ext` у поля и у схемы, а `TypemoExtension` проверяет значения. Адрес поля к ошибке проверки Typemo добавляет сам, поэтому неверная подпись найдётся при запуске приложения и будет названа по полю, а не обнаружится тогда, когда таблица отрисуется пустой.
+
+```ts twoslash title="extensions/label.ts"
+import { type TypemoExtension } from "@venloc/typemo";
+
+declare module "@venloc/typemo" {
+  interface PropExtensions<V> {
+    label?: { readonly text: string; readonly format?: (value: V) => string };
+  }
+  interface SchemaExtensions {
+    label?: { readonly title: string };
+  }
+}
+
+export const label: TypemoExtension<"label"> = {
+  name: "label",
+  validateProp: (value, field) => {
+    const text = (value as { text?: unknown }).text;
+    if (typeof text !== "string" || text === "") {
+      throw new TypeError(`text must be a non-empty string (${field.kind})`);
+    }
+  },
+  validateSchema: (value) => {
+    if (typeof (value as { title?: unknown }).title !== "string") throw new TypeError("title must be a string");
+  },
+};
+```
+
+## Шаг 2. Использовать ключ в модели
+
+Модель описывает счёт обычными `@Prop`, а подписи задаёт в `ext`. У баланса есть `format`: компилятор знает, что `value` — число, потому что тип взят из поля.
+
+```ts twoslash title="accounts/account.ts"
+import { type Defaulted, Entity, Prop, Schema } from "@venloc/typemo";
+declare module "@venloc/typemo" {
+  interface PropExtensions<V> {
+    label?: { readonly text: string; readonly format?: (value: V) => string };
+  }
+  interface SchemaExtensions {
+    label?: { readonly title: string };
+  }
+}
+// ---cut---
+@Schema({ collection: "accounts", ext: { label: { title: "Счета" } } })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, ext: { label: { text: "Название" } } })
+  title!: string;
+
+  @Prop(() => Number, { default: 0, ext: { label: { text: "Баланс", format: (value) => value.toFixed(2) } } })
+  balance!: Defaulted<number>;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+}
+```
+
+У поля `owner` расширения нет, и в таблицу оно не попадёт.
+
+## Шаг 3. Прочитать столбцы из схемы
+
+Функция `columns` обходит пути схемы из `describe()` и берёт опции каждого через `extOf`. Пути без `label` пропускаются. Так интерфейс узнаёт заголовки и форматы из модели, а новый столбец появляется добавлением `ext` у поля, без правок интерфейса.
+
+```ts twoslash title="admin/columns.ts"
+import { type SchemaInfo } from "@venloc/typemo";
+
+export type Column = {
+  readonly path: string;
+  readonly header: string;
+  readonly format: (value: unknown) => string;
+};
+
+export const columns = (schema: SchemaInfo): Column[] => {
+  const out: Column[] = [];
+  for (const path of Object.keys(schema.describe().paths)) {
+    const ext = schema.extOf(path)?.label as { text: string; format?: (value: never) => string } | undefined;
+    if (ext === undefined) continue;
+    const format = ext.format as ((value: unknown) => string) | undefined;
+    out.push({ path, header: ext.text, format: format ?? String });
+  }
+  return out;
+};
+```
+
+Что произошло. `describe()` вернул все пути модели, включая `_id` и `owner`, а `extOf` оставил только те, у которых есть `label`. Значения `extOf` приходят как `unknown`: компилятор не знает, что ключ `label` объявлен, поэтому функция сужает его сама, а проверка `validateProp` при регистрации уже гарантировала форму. Функция `format` доступна только через `extOf`: в JSON-описании `describe()` функции пропадают.
+
+## Собрать всё вместе
+
+Файл запуска регистрирует расширение **до первой модели**, создаёт модель и печатает таблицу:
+
+```ts twoslash title="bootstrap.ts"
+import { type Defaulted, Entity, Prop, Schema, TypemoClient, type SchemaInfo, type TypemoExtension } from "@venloc/typemo";
+
+declare module "@venloc/typemo" {
+  interface PropExtensions<V> {
+    label?: { readonly text: string; readonly format?: (value: V) => string };
+  }
+  interface SchemaExtensions {
+    label?: { readonly title: string };
+  }
+}
+
+const label: TypemoExtension<"label"> = {
+  name: "label",
+  validateProp: (value) => {
+    if (typeof (value as { text?: unknown }).text !== "string") throw new TypeError("text must be a string");
+  },
+};
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, ext: { label: { text: "Название" } } })
+  title!: string;
+
+  @Prop(() => Number, { default: 0, ext: { label: { text: "Баланс", format: (value) => value.toFixed(2) } } })
+  balance!: Defaulted<number>;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+}
+
+const columns = (schema: SchemaInfo): { path: string; header: string; format: (value: unknown) => string }[] => {
+  const out = [];
+  for (const path of Object.keys(schema.describe().paths)) {
+    const ext = schema.extOf(path)?.label as { text: string; format?: (value: never) => string } | undefined;
+    if (ext === undefined) continue;
+    const format = ext.format as ((value: unknown) => string) | undefined;
+    out.push({ path, header: ext.text, format: format ?? String });
+  }
+  return out;
+};
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+client.use(label); // до первой модели
+const Accounts = client.db().model(Account);
+
+const table = columns(Accounts.schema);
+for (const row of await Accounts.find().plain()) {
+  console.log(table.map((column) => `${column.header}: ${column.format((row as Record<string, unknown>)[column.path])}`).join(" | "));
+}
+// → Название: Main | Баланс: 12.50
+```
+
+## Как выбрать
+
+Расширение подходит, когда данные нужны **снаружи** ядра, а ядру они не нужны: читатель — ваш код или интеграция. Если значение должно менять запросы, вместо расширения понадобится [хук](../hooks/operation-hooks.mdx).
+
+## Когда это не нужно
+
+Одному приложению с одной моделью хватит обычной таблицы подписей рядом с кодом. Расширение оправдано, когда подписи должны жить у поля, а набор моделей растёт.
+
+## Частые ошибки
+
+### Расширение зарегистрировано после `model`
+
+`client.use` после первого `connection.model` бросает `ConfigurationError`: `extension "label": extensions are fixed once a schema is compiled (Account was); call client.use() before the first model`. Перенесите регистрацию выше.
+
+### Пустая подпись
+
+Проверка бросает ошибку при компиляции схемы, а не при отрисовке: `ConfigurationError: Bad.a: ext "label" is invalid: text must be a non-empty string (scalar)`; адрес `Bad.a` добавил Typemo.
+
+## Что дальше
+
+<Cards>
+<Card title="Свои опции полей и схем" href="./custom-options.mdx">
+  Общие правила расширений: типы, проверка, регистрация и чтение.
+</Card>
+<Card title="Расширения (справочник)" href="../reference/extensions/extensions.mdx">
+  Все элементы расширений с точными сигнатурами и текстами ошибок.
+</Card>
+<Card title="Схема во время работы" href="../schemas/runtime-schema.mdx">
+  Что ещё можно прочитать из `model.schema`.
+</Card>
+</Cards>

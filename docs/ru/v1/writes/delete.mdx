@@ -1,0 +1,330 @@
+---
+title: Удалить документы
+description: "Как удалить один или много документов, получить удалённый документ и как удаление работает вместе с мягким удалением"
+icon: Trash2
+---
+
+Чтобы удалить документ, вызовите [`deleteOne`](../reference/writes/writes.mdx#deleteone): он удаляет первый документ, подошедший под фильтр, и возвращает счётчик. Для нескольких документов есть [`deleteMany`](../reference/writes/writes.mdx#deletemany), а если удалённый документ ещё нужен — [`findOneAndDelete`](../reference/writes/writes.mdx#findoneanddelete) и [`findByIdAndDelete`](../reference/writes/writes.mdx#findbyidanddelete). Удаление необратимо, поэтому у него больше защит, чем у остальных записей: каждый метод удаления требует непустой фильтр, а модель с мягким удалением не стирает документ физически.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель счёта из руководства [Создать документы](./create.mdx). В коллекции три счёта: `Main` и `Second` у `alice`, `Other` у `bob`. Каждый пример выполняется на этих данных заново.
+
+```ts twoslash title="accounts/account.ts"
+import { type Defaulted, Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { min: 0, default: 0 })
+  balance!: Defaulted<number>;
+}
+```
+
+## Быстрый путь
+
+Один документ, много документов и удаление с получением документа:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const one = await Accounts.deleteOne({ title: "Second" });
+console.log(one.deletedCount);
+// → 1
+
+const many = await Accounts.deleteMany({ owner: "bob" });
+console.log(many.deletedCount);
+// → 1
+
+const removed = await Accounts.findOneAndDelete({ title: "Main" }).plain();
+console.log(removed?.title);
+// → "Main"
+```
+
+Остальная страница разбирает каждый способ и мягкое удаление.
+
+## Удалить один документ
+
+Ситуация: пользователь закрыл счёт. Вызовите `deleteOne` с фильтром, который выбирает нужный счёт.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+export const closeAccount = async (title: string): Promise<boolean> => {
+  const result = await Accounts.deleteOne({ title });
+  return result.deletedCount === 1;
+};
+```
+
+Что произошло. Метод вернул [`DeleteResult`](../reference/writes/writes.mdx#deleteresult): `deletedCount` — сколько документов удалено. Если ничего не подошло, метод **не бросает ошибку** и возвращает `deletedCount: 0`: «нечего удалять» — обычный результат. Если для вашей задачи это сбой, добавьте [`.orFail()`](../reference/writes/writes.mdx#orfail).
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+try {
+  await Accounts.deleteOne({ title: "Nope" }).orFail();
+} catch (error) {
+  console.log(error instanceof DocumentNotFoundError);
+  // → true
+}
+```
+
+```text
+DocumentNotFoundError: Account.deleteOne: no document matched the filter (orFail)
+```
+
+Фильтр у `deleteOne` обязателен и непуст: «первый подошедший документ» при пустом фильтре — произвольный документ коллекции, а не тот, который вы имели в виду. Пустой литерал `{}` не скомпилируется, а пустой объект, собранный во время работы, вызовет `StrictModeError` с причиной `empty-filter`. Чтобы удалить произвольный документ намеренно, передайте [`Filters.all()`](../reference/policies/violations.mdx#filtersall).
+
+## Удалить много документов
+
+Ситуация: владелец закрыт, и нужно убрать все его счета. `deleteMany` удаляет все документы, подошедшие под фильтр.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const result = await Accounts.deleteMany({ owner: "alice" });
+console.log(result.deletedCount);
+// → 2
+```
+
+Фильтр у `deleteMany` тоже обязателен и не пуст. Пустой фильтр в MongoDB подходит любому документу, а фильтр часто собирается из данных: одна опечатка, и коллекция очищена. Поэтому Typemo отказывается:
+
+```text
+StrictModeError: deleteMany with an empty filter would affect every document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]
+```
+
+Как удалить всё намеренно, описано в руководстве [Пустые фильтры в записи](./empty-filters.mdx). Если фильтр вы собираете из необязательного параметра, помните, что значение `undefined` в фильтре тоже ошибка: `QueryError: filter: undefined at "owner" (use $exists: false / $unset; undefined is never a value)`. Так оно не превратится в «удалить любой».
+
+## Удалить и получить документ
+
+Ситуация: перед удалением нужно сохранить копию, показать клиенту «запись удалена» или взять задачу из очереди с одновременным удалением. [`findOneAndDelete`](../reference/writes/writes.mdx#findoneanddelete) удаляет документ и возвращает его таким, каким он был. Изменение и чтение выполняются одной командой, поэтому между ними никто не вклинится.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const removed = await Accounts.findOneAndDelete({ title: "Second" }).plain();
+console.log(removed?.title);
+// → "Second"
+```
+
+Результат — строитель запроса, как у [`find`](../reference/query/reading.mdx#modelfind): к нему добавляются [`.plain`](../reference/query/reading.mdx#plain), [`.select`](../reference/query/reading.mdx#select), [`.orFail`](../reference/query/reading.mdx#orfail). Если ничего не найдено, результат `null`.
+
+Фильтр у `findOneAndDelete` обязателен и непуст: метод выбирает документ для удаления, и пустой фильтр выбрал бы произвольный. Если известен `_id`, есть [`findByIdAndDelete`](../reference/writes/writes.mdx#findbyidanddelete): он принимает `ObjectId` или его строку из 24 шестнадцатеричных символов, а для несуществующего документа возвращает `null`.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+export const removeById = async (id: string) => {
+  return Accounts.findByIdAndDelete(id).plain();
+};
+```
+
+## Мягкое удаление
+
+Ситуация: удалённые счета нужно хранить для аудита, но не показывать. Для этого у модели включается **мягкое удаление**: документ не стирается, а помечается отметкой времени, и все выборки перестают его видеть. Включается оно в схеме, а `deleteOne` и `deleteMany` продолжают работать как раньше.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "notes", softDelete: true })
+class Note extends Entity {
+  @Prop(() => String, { required: true })
+  text!: string;
+
+  @Prop(() => Date, { nullable: true })
+  deletedAt?: Date | null;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Notes = client.db().model(Note);
+// ---cut---
+await Notes.deleteOne({ text: "first" });
+
+console.log(await Notes.countDocuments());
+// → 1
+console.log(await Notes.countDocuments().policy({ includeDeleted: true }));
+// → 2
+```
+
+Что произошло. Из двух заметок (`first` и `second`) первая помечена удалённой. Обычный запрос видит одну, а с `.policy({ includeDeleted: true })` — обе. Чтобы стереть документ физически, добавьте `.policy({ hardDelete: true })`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "notes", softDelete: true })
+class Note extends Entity {
+  @Prop(() => String, { required: true })
+  text!: string;
+
+  @Prop(() => Date, { nullable: true })
+  deletedAt?: Date | null;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Notes = client.db().model(Note);
+// ---cut---
+await Notes.deleteMany({ text: "second" }).policy({ hardDelete: true });
+
+console.log(await Notes.countDocuments());
+// → 0
+console.log(await Notes.countDocuments().policy({ includeDeleted: true }));
+// → 1
+```
+
+Физически удалена вторая заметка, а первая осталась помеченной. Как включить мягкое удаление, вернуть документы и вычистить старые, описано в руководстве [Мягкое удаление](../policies/soft-delete.mdx).
+
+## Как выбрать
+
+Задайте себе один вопрос: **нужны ли вам данные после удаления?** Если нужны только вызывающему коду (показать, положить в архив), берите [`findOneAndDelete`](../reference/writes/writes.mdx#findoneanddelete): вы получаете данные и удаляете их одной командой. Если данные нужны для аудита и восстановления, включайте мягкое удаление в схеме, а не пишите собственное поле «удалено». Если данные не нужны никому, берите [`deleteOne`](../reference/writes/writes.mdx#deleteone) или [`deleteMany`](../reference/writes/writes.mdx#deletemany). Второй вопрос — сколько документов: один — `deleteOne`, много — `deleteMany`.
+
+## Когда это не нужно
+
+Если вы хотите лишь убрать документ из выборок и позже, возможно, вернуть, физическое удаление не подходит: используйте мягкое удаление. Если документ уже загружен как объект, у него есть метод [`$deleteOne`](../reference/documents/document-api.mdx#deleteone). Если нужно удалить вместе с другими записями «всё или ничего», выполните удаления в транзакции: [Транзакции](../transactions/transactions.mdx).
+
+## Частые ошибки
+
+### Пустой фильтр в deleteMany
+
+Неправильно:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const filter: { owner?: string } = {};
+await Accounts.deleteMany(filter);
+```
+
+Тип с необязательным полем компилируется, но Typemo останавливает запись во время работы: `StrictModeError: deleteMany with an empty filter would affect every document; … [empty-filter]`. Пустой литерал `{}` остановил бы уже компилятор. Правильно: передайте настоящее условие или, если удалить нужно всё, [явно](./empty-filters.mdx) `Filters.all()`.
+
+### deleteOne молча ничего не удалил
+
+Симптом: код продолжает работать, а документ остался. Причина: `deleteOne` при отсутствии совпадения возвращает `deletedCount: 0`, а не ошибку. Правильно: проверьте `deletedCount` или добавьте `.orFail()`.
+
+### Фильтр из необязательного параметра
+
+Неправильно: `Accounts.deleteMany({ owner })`, где `owner` может быть `undefined`. Typemo отвергает `undefined` в фильтре: `QueryError: filter: undefined at "owner" …`. Правильно: проверьте параметр до вызова и не передавайте фильтр, если условия нет.
+
+## Полный пример
+
+Файл собирает описанное: закрыть счёт с проверкой результата, убрать все счета владельца и вернуть удалённый счёт вызывающему коду.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+// Закрыть счёт; false, если такого не было
+export const closeAccount = async (title: string): Promise<boolean> => {
+  const result = await Accounts.deleteOne({ title });
+  return result.deletedCount === 1;
+};
+
+// Убрать все счета владельца и вернуть, сколько удалено
+export const closeOwner = async (owner: string): Promise<number> => {
+  const result = await Accounts.deleteMany({ owner });
+  return result.deletedCount;
+};
+
+// Удалить счёт по id и отдать его данные
+export const removeById = async (id: string) => {
+  return Accounts.findByIdAndDelete(id).plain();
+};
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Пустые фильтры в записи" href="./empty-filters.mdx">
+  Почему методы удаления не принимают `{}` и как удалить всё намеренно.
+</Card>
+<Card title="Мягкое удаление" href="../policies/soft-delete.mdx">
+  Как включить мягкое удаление, вернуть документы и вычистить старые.
+</Card>
+<Card title="Пакетная запись" href="./bulk.mdx">
+  Удаления вместе со вставками и изменениями одним запросом.
+</Card>
+<Card title="Запись: справочник" href="../reference/writes/writes.mdx#deleteone">
+  Все методы удаления, результаты и ошибки.
+</Card>
+</Cards>

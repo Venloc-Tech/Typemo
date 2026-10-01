@@ -1,0 +1,867 @@
+---
+title: TypedView
+description: "Типизированное представление MongoDB: define, of, isView, find, findOne, countDocuments, distinct, aggregate, ensure и drop"
+icon: Eye
+---
+
+**Представление** (view) в MongoDB — это «виртуальная коллекция»: сервер хранит не документы, а конвейер агрегации над другой коллекцией и выполняет его при каждом чтении. `TypedView` — типизированная обёртка над таким представлением. Вы описываете строки представления обычным классом, как модель, а Typemo проверяет, что конвейер действительно выдаёт такие строки, и даёт методы чтения с теми же типами, что у модели.
+
+Представление только читается. Поэтому у `TypedView` есть `find`, `findOne`, `countDocuments`, `distinct` и `aggregate`, а `create`, `updateOne` и подобных нет: сервер всё равно отказал бы, а тип, который обещает запись, был бы обманом. Все чтения возвращают строки в lean-виде — обычные объекты, а не документы, которые можно сохранить.
+
+Если вы впервые работаете с представлениями, сначала прочитайте руководство [Представления](../../collections/views.mdx). Эта страница — справочник.
+
+Примеры используют счета. В коллекции `accounts` три документа: Main (владелец alice, баланс 120, счёт открыт), Old (alice, 0, закрыт) и Savings (bob, 500, открыт). Представление `open_accounts` показывает только открытые счета и только три поля.
+
+```ts twoslash title="accounts/models.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { required: true })
+  balance!: number;
+
+  @Prop(() => Boolean, { required: true })
+  closed!: boolean;
+}
+
+@Schema({ collection: "open_accounts" })
+export class OpenAccount extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { required: true })
+  balance!: number;
+}
+```
+
+Класс представления описан как обычная сущность: `@Schema({ collection: … })` называет представление, поля — это строки, которые оно отдаёт, а `_id` объявляется, как у любой модели (здесь его даёт `Entity`).
+
+---
+
+## TypedView.define
+
+`define` описывает представление, но **ничего не создаёт в базе**: представление появится на сервере только после [`ensure`](#typedviewensure) (или после [`connection.init`](../connection/connection.mdx#connectioninit) и [`connection.syncAll`](../connection/connection.mdx#connectionsyncall), которые вызывают его сами). Вы передаёте подключение, класс представления и определение: из какой модели читать и какой конвейер применить.
+
+Конвейер собирается тем же строителем, что и обычная агрегация, но с двумя отличиями. Он проверяется на соответствие классу представления: если конвейер не выдаёт какое-то поле класса, компилятор указывает на него. И в нём нет `$out` и `$merge`: представление не может писать.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => Boolean, { required: true }) closed!: boolean;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+// ---cut---
+export const openAccounts = TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.match({ closed: false }).project({ title: 1, owner: 1, balance: 1 }),
+});
+console.log(openAccounts.definition);
+// → { name: "open_accounts", viewOn: "accounts",
+//     pipeline: [{ $match: { closed: false } }, { $project: { title: 1, owner: 1, balance: 1 } }] }
+```
+
+<Returns type="TypedView<InstanceType<View>>">
+
+Объект `TypedView` с методами чтения. Он содержит `definition` ([`ViewInfo`](#viewinfo): имя, источник, конвейер, правило сортировки) и `entity` — класс представления. Определение заморожено.
+
+</Returns>
+
+<Params>
+<Param name="connection" type="Connection" required>
+
+Подключение, к которому относится представление. Класс представления регистрируется на нём как модель (`connection.model`), поэтому представление видно в [`connection.models`](../connection/connection.mdx#connectionmodels), но при синхронизации для него не создаётся коллекция и индексы.
+
+</Param>
+<Param name="view" type="EntityClass" required>
+
+Класс строки представления. Имя представления берётся из его `@Schema({ collection })`.
+
+</Param>
+<Param name="definition.on" type="EntityClass" required>
+
+Модель, из которой читает представление. Она должна быть в той же базе.
+
+</Param>
+<Param name="definition.pipeline" type="(p) => StagedPipeline" required>
+
+Функция, которая получает пустой строитель и возвращает конвейер. Строки конвейера должны содержать все поля класса представления с совместимыми типами.
+
+</Param>
+<Param name="definition.collation" type="CollationOptions">
+
+Правило сортировки строк, общее для представления. Для представления над представлением оно должно совпадать с правилом источника.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static define<View extends abstract new () => object, const Src extends SourceInput, R extends StagedPipeline>(
+  connection: Connection,
+  view: View,
+  definition: TypedViewDefinition<Src, R> & { readonly pipeline: (…) => R & ViewRowCheck<…> },
+): TypedView<InstanceType<View>>
+```
+
+</FullType>
+
+### Что Typemo кладёт в сохранённый конвейер
+
+Сервер хранит и выполняет конвейер при каждом чтении, поэтому он должен быть безопасным. Typemo добавляет в начало конвейера защиту, которая есть у обычной агрегации. Если у модели-источника есть **скрытое поле** ([`hidden`](../schemas/prop.mdx#hidden)), первой стадией ставится `$unset` этого поля: строка представления его не содержит, даже если конвейер про него ничего не знает. Если источник — наследник по дискриминатору, добавляется `$match` по ключу дискриминатора.
+
+Допустим, в `Account` появилось скрытое поле `pin`:
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => Boolean, { required: true }) closed!: boolean;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>; // [!code ++]
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+// ---cut---
+const openAccounts = TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.match({ closed: false }).project({ title: 1, owner: 1, balance: 1 }),
+});
+console.log(openAccounts.definition.pipeline[0]);
+// → { $unset: ["pin"] }
+```
+
+### Конвейер не совпадает с классом
+
+Если конвейер не выдаёт поле класса, компилятор отклоняет определение. Здесь `project` оставляет только `title`, а класс требует ещё `owner` и `balance`:
+
+```ts twoslash
+// @errors: 2322
+import { Entity, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => Boolean, { required: true }) closed!: boolean;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+// ---cut---
+TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.match({ closed: false }).project({ title: 1 }),
+});
+```
+
+### Ошибки во время работы
+
+Проверку компилятора можно обойти, поэтому те же условия проверяются и при вызове. `define` бросает [`ConfigurationError`](../errors/configuration-errors.mdx#configurationerror) в четырёх случаях: представление читает само себя (`view "open_accounts" cannot read from itself`), в конвейере есть `$out` или `$merge`, источник хранит поля под другими именами (`dbName`), либо имя уже определено на этом подключении с другим определением. Последний случай проверен запуском:
+
+```text
+ConfigurationError: view "open_accounts" is already defined on this connection with another definition
+```
+
+Определить то же представление ещё раз с тем же определением можно: это не ошибка.
+
+Попытка добавить в конвейер `$out` останавливается уже компилятором, потому что у строителя представления нет метода `.out()`:
+
+```ts twoslash
+// @errors: 2322 2769
+import { Entity, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+// ---cut---
+TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.project({ title: 1, balance: 1 }).out(OpenAccount),
+});
+```
+
+Если вам нужно **сохранить** результат конвейера, а не пересчитывать его на каждом чтении, используйте [`Materialized`](./materialized.mdx).
+
+---
+
+## TypedView.of
+
+`of` возвращает все представления, определённые на подключении, в порядке определения. Его вызывает [`connection.syncAll`](../connection/connection.mdx#connectionsyncall), чтобы создать их все; в своём коде он полезен для служебных проверок.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.project({ title: 1, balance: 1 }),
+});
+// ---cut---
+console.log(TypedView.of(connection).map((view) => view.definition.name));
+// → ["open_accounts"]
+```
+
+<Returns type="readonly TypedView<object>[]">
+
+Представления подключения. Для подключения без представлений — пустой массив.
+
+</Returns>
+
+<Params>
+<Param name="connection" type="Connection" required>
+
+Подключение, представления которого нужны.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static of(connection: Connection): readonly TypedView<object>[]
+```
+
+</FullType>
+
+---
+
+## TypedView.isView
+
+`isView` отвечает, определено ли на подключении представление с таким именем коллекции. Он нужен, чтобы отличить представление от обычной коллекции: например, синхронизация по нему пропускает представления при создании коллекций и индексов.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.project({ title: 1, balance: 1 }),
+});
+// ---cut---
+console.log(TypedView.isView(connection, "open_accounts"), TypedView.isView(connection, "accounts"));
+// → true false
+```
+
+<Returns type="boolean">
+
+`true`, если имя коллекции принадлежит определённому представлению. Проверка идёт по определениям в вашем коде, а не по серверу: представление на сервере, которого вы не определяли, даст `false`.
+
+</Returns>
+
+<Params>
+<Param name="connection" type="Connection" required>
+
+Подключение.
+
+</Param>
+<Param name="collection" type="string" required>
+
+Имя коллекции.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static isView(connection: Connection, collection: string): boolean
+```
+
+</FullType>
+
+---
+
+## typedView.find
+
+`find` читает строки представления, подходящие под фильтр. Он работает как [`Model.find`](./../query/reading.mdx#modelfind): возвращает строитель запроса, к которому можно добавить [`.sort`](../query/reading.mdx#sort), [`.select`](../query/reading.mdx#select), [`.limit`](../query/reading.mdx#limit) и остальные методы, а запрос уходит в базу на `await`. Отличие одно: результат всегда в lean-виде ([`.lean`](../query/reading.mdx#lean)), то есть обычные объекты со всеми полями класса представления.
+
+Фильтр проверяется по полям класса представления, а не источника: поле, которого в строке нет, компилятор не пропустит.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => Boolean, { required: true }) closed!: boolean;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+const openAccounts = TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.match({ closed: false }).project({ title: 1, owner: 1, balance: 1 }),
+});
+await openAccounts.ensure();
+// ---cut---
+const rows = await openAccounts.find({ owner: "alice" });
+//    ^?
+console.log(rows.map((row) => [row.title, row.balance]));
+// → [["Main", 120]]
+```
+
+<Returns type="QueryBuilder">
+
+Строитель запроса в lean-виде. После `await` вы получаете массив строк; если ничего не подошло, массив пустой. Если представления ещё нет на сервере, а это первая операция с ним, вы получаете не пустой массив, а [`ConfigurationError`](#чтение-несуществующего-представления).
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<V>">
+
+Условия поиска по полям класса представления. Без аргумента находятся все строки.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+find<F extends Filter<V, true>>(
+  filter?: F & NoInfer<FilterCheck<V, F>>,
+): QueryBuilder<V, "find", undefined, never, true, false, NoNarrowing, never>
+```
+
+</FullType>
+
+Строки нельзя изменить и сохранить: это не документы. Попытка вызвать `create` у представления не скомпилируется, потому что такого метода нет:
+
+```ts twoslash
+// @errors: 2339
+import { Entity, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+const openAccounts = TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.project({ title: 1, balance: 1 }),
+});
+// ---cut---
+await openAccounts.create({ title: "x", balance: 1 });
+```
+
+---
+
+## typedView.findOne
+
+`findOne` возвращает первую строку, подходящую под фильтр, или `null`. Как и у [`find`](#typedviewfind), результат в lean-виде. Если строка обязана быть, добавьте [`.orFail()`](../query/reading.mdx#orfail): тогда вместо `null` вы получите [`DocumentNotFoundError`](../errors/query-errors.mdx#documentnotfounderror).
+
+```ts twoslash
+import { Entity, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => Boolean, { required: true }) closed!: boolean;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+const openAccounts = TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.match({ closed: false }).project({ title: 1, owner: 1, balance: 1 }),
+});
+await openAccounts.ensure();
+// ---cut---
+const savings = await openAccounts.findOne({ title: "Savings" });
+//    ^?
+console.log(savings?.owner, await openAccounts.findOne({ title: "Old" }));
+// → "bob" null
+```
+
+Закрытый счёт `Old` в представление не попал, поэтому `findOne` вернул для него `null`.
+
+<Returns type="QueryBuilder">
+
+Строитель запроса. После `await` — строка или `null`.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<V>">
+
+Условия поиска. Без аргумента подойдёт любая строка.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+findOne<F extends Filter<V, true>>(
+  filter?: F & NoInfer<FilterCheck<V, F>>,
+): QueryBuilder<V, "findOne", undefined, never, true, false, NoNarrowing, never>
+```
+
+</FullType>
+
+---
+
+## typedView.countDocuments
+
+`countDocuments` считает строки представления, подходящие под фильтр. Как и [`Model.countDocuments`](../query/reading.mdx#modelcountdocuments), он считает точно, а не по оценке.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => Boolean, { required: true }) closed!: boolean;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+const openAccounts = TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.match({ closed: false }).project({ title: 1, owner: 1, balance: 1 }),
+});
+await openAccounts.ensure();
+// ---cut---
+console.log(await openAccounts.countDocuments());
+// → 2
+console.log(await openAccounts.countDocuments({ balance: { $gt: 200 } }));
+// → 1
+```
+
+<Returns type="CountQuery">
+
+Запрос, который после `await` даёт число строк.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<V>">
+
+Условия поиска. Без аргумента считаются все строки.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+countDocuments<F extends Filter<V, true>>(filter?: F & NoInfer<FilterCheck<V, F>>): CountQuery
+```
+
+</FullType>
+
+---
+
+## typedView.distinct
+
+`distinct` возвращает различные значения одного поля по строкам представления. Порядок значений сервер не гарантирует: на представлении он может быть любым, поэтому при необходимости сортируйте результат сами.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => Boolean, { required: true }) closed!: boolean;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+const openAccounts = TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.match({ closed: false }).project({ title: 1, owner: 1, balance: 1 }),
+});
+await openAccounts.ensure();
+// ---cut---
+const owners = await openAccounts.distinct("owner");
+//    ^?
+console.log(owners.sort());
+// → ["alice", "bob"]
+```
+
+<Returns type="OptionQuery<DistinctValue<V, P>[]>">
+
+Запрос, который после `await` даёт массив различных значений поля; тип элементов выводится из типа поля.
+
+</Returns>
+
+<Params>
+<Param name="path" type="FilterPaths<V>" required>
+
+Поле класса представления.
+
+</Param>
+<Param name="filter" type="Filter<V>">
+
+Ограничивает строки, по которым собираются значения.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+distinct<const P extends FilterPaths<V>, F extends Filter<V, true>>(
+  path: P,
+  filter?: F & NoInfer<FilterCheck<V, F>>,
+): OptionQuery<DistinctValue<V, P>[]>
+```
+
+</FullType>
+
+---
+
+## typedView.aggregate
+
+`aggregate` запускает агрегацию над строками представления: конвейер начинается с документов представления, а поля в нём проверяются по классу представления. Это способ посчитать итоги над готовой выборкой, не повторяя её условий.
+
+```ts twoslash
+import { Entity, fn, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => Boolean, { required: true }) closed!: boolean;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+const openAccounts = TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.match({ closed: false }).project({ title: 1, owner: 1, balance: 1 }),
+});
+await openAccounts.ensure();
+// ---cut---
+const totals = await openAccounts.aggregate((p) => p.group((f) => ({ _id: f.owner, total: fn.sum(f.balance) })));
+console.log(totals.find((row) => row._id === "alice")?.total);
+// → 120
+```
+
+<Returns type="AggregateQuery">
+
+Запрос агрегации. После `await` — массив строк результата; их форму задаёт последняя стадия конвейера. Подробно о запросе агрегации — в [справочнике по агрегациям](../aggregation/pipeline.mdx).
+
+</Returns>
+
+<Params>
+<Param name="build" type="(p) => AggregateResult" required>
+
+Функция, которая получает строитель конвейера над строками представления и возвращает конвейер.
+
+</Param>
+<Param name="options" type="ModelAggregateOptions">
+
+Опции агрегации: `session`, `timeoutMS`, `policy`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+aggregate<B extends AggregateResult>(
+  build: AggregateBuild<V, B>,
+  options?: ModelAggregateOptions,
+): AggregateQuery<AggregateRows<B>>
+```
+
+</FullType>
+
+---
+
+## typedView.ensure
+
+`ensure` делает так, чтобы представление на сервере существовало и совпадало с определением: создаёт его, если нет, оставляет как есть, если совпадает, и меняет командой `collMod`, если отличаются источник или конвейер. Как и у [`ensureCollection`](./collection-manager.mdx#modelensurecollection), по умолчанию любое различие — ошибка, а менять существующее представление нужно явно опцией `update`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => Boolean, { required: true }) closed!: boolean;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+const openAccounts = TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.match({ closed: false }).project({ title: 1, owner: 1, balance: 1 }),
+});
+// ---cut---
+console.log((await openAccounts.ensure({ dryRun: true })).result);
+// → "created"
+console.log((await openAccounts.ensure()).result);
+// → "created"
+console.log((await openAccounts.ensure()).result);
+// → "unchanged"
+```
+
+Первый вызов с `dryRun` только сообщил, что представление было бы создано; второй создал его; третий увидел совпадение. Настоящий `ensure` заодно отмечает, что представление существует, и чтения из него больше не проверяют это сами (см. [Чтение несуществующего представления](#чтение-несуществующего-представления)); `dryRun` ничего не отмечает.
+
+<Returns type="Promise<EnsureCollectionReport>">
+
+Отчёт [`EnsureCollectionReport`](./collection-manager.mdx#ensurecollectionreport): `result` (`"created"`, `"unchanged"` или `"updated"`) и `differences`.
+
+</Returns>
+
+<Params>
+<Param name="options.update" type="boolean" default="false">
+
+Применить изменённые источник или конвейер командой `collMod`. Без опции такое различие — [`CollectionOptionsError`](../errors/configuration-errors.mdx#collectionoptionserror).
+
+</Param>
+<Param name="options.dryRun" type="boolean" default="false">
+
+Только сообщить, что произошло бы.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+ensure(options?: EnsureCollectionOptions): Promise<EnsureCollectionReport>
+```
+
+</FullType>
+
+### Определение изменилось
+
+Допустим, представление уже создано на сервере, но с другим условием (`closed: true`), а в коде — `closed: false`. Без `update` метод отказывается менять представление:
+
+```text
+CollectionOptionsError: collection "open_accounts": the view exists with another definition (source or pipeline): run ensure({ update: true }) to change it
+```
+
+`ensure({ dryRun: true })` в такой ситуации возвращает `result: "updated"` и различие с `option: "pipeline"` и `mutable: true`, а `ensure({ update: true })` меняет конвейер представления. Оба результата получены запуском: после `update` следующий `ensure` вернул `"unchanged"`.
+
+### Правило сортировки и обычная коллекция под именем
+
+Правило сортировки (`collation`) представления изменить нельзя: `ensure` бросает `CollectionOptionsError`, а чтобы исправить, представление нужно удалить и создать заново ([`drop`](#typedviewdrop)). Если под именем представления лежит **обычная коллекция**, `ensure` её не трогает и бросает ошибку:
+
+```text
+CollectionOptionsError: collection "open_accounts": exists as a collection, not a view: drop it or rename the view
+```
+
+---
+
+## typedView.drop
+
+`drop` удаляет представление. Он удаляет только представления: если под этим именем лежит обычная коллекция, метод откажется, чтобы не потерять данные. Данные источника не затрагиваются: представление хранит только конвейер.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => Boolean, { required: true }) closed!: boolean;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+const openAccounts = TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.match({ closed: false }).project({ title: 1, owner: 1, balance: 1 }),
+});
+await openAccounts.ensure();
+// ---cut---
+console.log(await openAccounts.drop());
+// → true
+console.log(await openAccounts.drop());
+// → false
+```
+
+<Returns type="Promise<boolean>">
+
+`true`, если представление удалено; `false`, если его не было. Если под именем лежит обычная коллекция, бросает [`CollectionOptionsError`](../errors/configuration-errors.mdx#collectionoptionserror): `is a collection, not a view: drop() only drops views`.
+
+</Returns>
+
+Принимает ничего.
+
+<FullType>
+
+```ts
+drop(): Promise<boolean>
+```
+
+</FullType>
+
+---
+
+## Чтение несуществующего представления
+
+Если представления нет на сервере, MongoDB не сообщает об этом: чтение из него возвращает пустой результат, как из пустой коллекции. Представление, которое вы определили, но забыли создать, выглядело бы как «в нём ничего нет», и ошибку в развёртывании пришлось бы искать по пустым ответам. Поэтому первая операция с представлением на подключении (`find`, `findOne`, `countDocuments`, `distinct` или `aggregate`) проверяет, что оно существует, и при отсутствии бросает [`ConfigurationError`](../errors/configuration-errors.mdx#configurationerror).
+
+```ts twoslash
+import { ConfigurationError, Entity, Prop, Schema, TypedView, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Boolean, { required: true }) closed!: boolean;
+}
+@Schema({ collection: "open_accounts" })
+class OpenAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+connection.model(Account);
+const openAccounts = TypedView.define(connection, OpenAccount, {
+  on: Account,
+  pipeline: (p) => p.match({ closed: false }).project({ title: 1 }),
+});
+// ---cut---
+try {
+  await openAccounts.find();
+} catch (error) {
+  if (error instanceof ConfigurationError) console.log(error.message);
+  // → OpenAccount.find: the view "open_accounts" does not exist in the database "app" (the server would read it as empty); create it first: await connection.init(), or await view.ensure()
+}
+
+await connection.init();
+console.log(await openAccounts.find());
+// → []
+```
+
+Если под именем представления лежит обычная коллекция, ошибка другая: `OpenAccount.find: "open_accounts" is a collection, not the view; drop it or rename the view, then create the view`.
+
+Найденное представление Typemo запоминает: проверка стоит одного запроса `listCollections` на представление и подключение, дальше чтения идут без неё. Поэтому представление, которое кто-то удалил в обход Typemo уже после первой проверки, снова читается как пустое: сервер ничего не скажет, а повторной проверки нет. Представление, удалённое через [`drop`](#typedviewdrop), запоминание сбрасывает: следующая операция проверит заново и бросит ошибку. [`ensure`](#typedviewensure) и [`connection.init`](../connection/connection.mdx#connectioninit), создавшие представление, проверку делают ненужной. Для проверки не используется сессия: `listCollections` внутри транзакции запрещена.
+
+---
+
+## ViewInfo
+
+Определение представления, как его хранит сервер: поле `definition` у `TypedView`.
+
+<TypeTable
+  type={{
+    name: { type: "string", required: true, description: "Имя представления (имя его коллекции)." },
+    viewOn: { type: "string", required: true, description: "Коллекция или представление, которые оно читает." },
+    pipeline: { type: "readonly PipelineStage[]", required: true, description: "Сохранённый конвейер: с уже добавленными защитой от скрытых полей и условием дискриминатора." },
+    collation: { type: "CollationOptions", description: "Правило сортировки строк представления, если задано." },
+  }}
+/>
+
+## TypedViewDefinition
+
+Что принимает [`TypedView.define`](#typedviewdefine) третьим аргументом: `on` (модель-источник), `pipeline` (функция конвейера) и необязательное `collation`. Поля описаны в разделе о [`define`](#typedviewdefine).
+
+---
+
+## Когда не подходит
+
+Представление пересчитывается при каждом чтении, поэтому для тяжёлых агрегаций оно медленное. Если результат нужен часто, а точная свежесть не обязательна, сохраните его — [`Materialized`](./materialized.mdx): результат лежит на диске, его можно индексировать, а обновляете вы его сами. Если данные нужно ещё и записывать, нужна обычная коллекция и её [модель](../connection/connection.mdx#connectionmodel).
+
+Руководство с реальными задачами — [Представления](../../collections/views.mdx).

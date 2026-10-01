@@ -1,0 +1,740 @@
+---
+title: Связи внутри вложенных данных
+description: "Как загрузить вложенные связи, ссылки внутри поддокументов и карт, разные модели по refPath и цепочки через виртуальные поля"
+icon: Network
+---
+
+Когда связь не лежит прямо в поле документа, а спрятана глубже, [`.populate`](../reference/populate/populate.mdx#populate) следует за ней по пути. Пост ссылается на автора, автор — на другие посты, комментарий — на пост; ссылка бывает внутри массива поддокументов, внутри карты или указывает на модель, которая зависит от данных. Для каждого случая у пути своя запись: точки для вложенности, `$*` для значений карты, `refPath` для выбора модели.
+
+Если вы ещё не загружали простые связи, сначала прочитайте руководство [Показать связанные данные](./basics.mdx).
+
+## Что предполагается
+
+Примеры используют клиент и модели блога из руководства [Показать связанные данные](./basics.mdx). Здесь модель расширена: у поста есть вложения с автором загрузки, карта рецензентов и лента событий с полиморфной ссылкой. В базе те же два пользователя, два тега и три поста. У поста «Hello» три вложения (`a.png` загрузил Bob, `b.png` загрузила Alice, у `c.png` загрузившего нет), рецензенты `lead` (Bob) и `second` (Alice), комментарии `c1` (Bob) и `c2` (Alice). В ленте два события: одно указывает на пост «Hello», другое на комментарий `c1`.
+
+## Быстрый путь
+
+Запись пути зависит от того, где спрятана ссылка. Точка — переход внутрь (в поддокумент или в связанную модель), `$*` — значения карты. Каждый вариант — одна строка.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema()
+class Attachment {
+  @Prop(() => String, { required: true }) file!: string;
+  @Prop(() => Types.ObjectId, { ref: () => User }) uploader?: Ref<User>;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Prop(() => [Attachment]) attachments!: Attachment[];
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+@Schema({ collection: "activities" })
+class Activity extends Entity {
+  @Prop(() => String, { required: true, enum: ["Post", "Comment"] }) kind!: "Post" | "Comment";
+  @Prop(() => Types.ObjectId, { refPath: "kind", required: true }) target!: Ref<Post | Comment>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+const Activities = client.db().model(Activity);
+// ---cut---
+// ссылка внутри массива поддокументов
+const attachments = await Posts.findOne({ title: "Hello" }).populate("attachments.uploader").orFail().plain();
+console.log(attachments.attachments.map((item) => item.uploader?.name ?? null));
+// → ["Bob", "Alice", null]
+
+// значения карты ссылок
+const reviewers = await Posts.findOne({ title: "Hello" }).populate("reviewers.$*").orFail().plain();
+console.log(reviewers.reviewers?.get("lead")?.name);
+// → "Bob"
+
+// цепочка через несколько моделей
+const comment = await Comments.findOne({ text: "c1" }).populate("post.author").orFail().plain();
+console.log(comment.post?.author?.name);
+// → "Alice"
+```
+
+Остальная страница разбирает каждый случай отдельно.
+
+## Вложенная связь: пост комментария и его автор
+
+Ситуация: для комментария нужны пост, а для поста — его автор. Запись через точку `post.author` говорит: сначала загрузи `post`, затем у загруженных постов загрузи `author`. Typemo выполняет это как два последовательных запроса, потому что идентификаторы авторов известны только после загрузки постов.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema()
+class Attachment {
+  @Prop(() => String, { required: true }) file!: string;
+  @Prop(() => Types.ObjectId, { ref: () => User }) uploader?: Ref<User>;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Prop(() => [Attachment]) attachments!: Attachment[];
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+@Schema({ collection: "activities" })
+class Activity extends Entity {
+  @Prop(() => String, { required: true, enum: ["Post", "Comment"] }) kind!: "Post" | "Comment";
+  @Prop(() => Types.ObjectId, { refPath: "kind", required: true }) target!: Ref<Post | Comment>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+const Activities = client.db().model(Activity);
+// ---cut---
+const comment = await Comments.findOne({ text: "c1" }).populate("post.author").orFail().plain();
+console.log(comment.post?.title, comment.post?.author?.name);
+// → "Hello" "Alice"
+```
+
+Когда для вложенного пути нужны свои опции, используйте опцию [`populate`](../reference/populate/populate.mdx#опция-populate) внутри объекта. Тогда `select` относится к автору, а не к посту:
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema()
+class Attachment {
+  @Prop(() => String, { required: true }) file!: string;
+  @Prop(() => Types.ObjectId, { ref: () => User }) uploader?: Ref<User>;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Prop(() => [Attachment]) attachments!: Attachment[];
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+@Schema({ collection: "activities" })
+class Activity extends Entity {
+  @Prop(() => String, { required: true, enum: ["Post", "Comment"] }) kind!: "Post" | "Comment";
+  @Prop(() => Types.ObjectId, { refPath: "kind", required: true }) target!: Ref<Post | Comment>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+const Activities = client.db().model(Activity);
+// ---cut---
+const comment = await Comments.findOne({ text: "c1" })
+  .populate({ path: "post", populate: { path: "author", select: { name: 1 } } })
+  .orFail()
+  .plain();
+console.log(comment.post?.author);
+// → { _id: "…", name: "Alice" }
+```
+
+Записи `post.author` и `{ path: "post", populate: "author" }` равноценны. Выбирайте точечную запись, пока опции не нужны, а объект — когда нужны. Компилятор проверяет путь по сегментам до семи уровней, а подсказывает первые три.
+
+## Ссылки внутри массива поддокументов
+
+Ситуация: у поста есть вложения, и в каждом хранится, кто его загрузил. Путь идёт через массив: `attachments.uploader`. Typemo собирает идентификаторы из всех элементов массива и загружает их одним запросом.
+
+```ts twoslash title="blog/models.ts"
+import { Entity, Prop, Schema, Types, type Ref } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+}
+
+@Schema()
+export class Attachment {
+  @Prop(() => String, { required: true })
+  file!: string;
+
+  @Prop(() => Types.ObjectId, { ref: () => User })
+  uploader?: Ref<User>;
+}
+
+@Schema({ collection: "posts" })
+export class Post extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => [Attachment]) // [!code ++]
+  attachments!: Attachment[]; // [!code ++]
+}
+```
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema()
+class Attachment {
+  @Prop(() => String, { required: true }) file!: string;
+  @Prop(() => Types.ObjectId, { ref: () => User }) uploader?: Ref<User>;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Prop(() => [Attachment]) attachments!: Attachment[];
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+@Schema({ collection: "activities" })
+class Activity extends Entity {
+  @Prop(() => String, { required: true, enum: ["Post", "Comment"] }) kind!: "Post" | "Comment";
+  @Prop(() => Types.ObjectId, { refPath: "kind", required: true }) target!: Ref<Post | Comment>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+const Activities = client.db().model(Activity);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" }).populate("attachments.uploader").orFail().plain();
+console.log(post.attachments.map((item) => [item.file, item.uploader?.name ?? null]));
+// → [["a.png", "Bob"], ["b.png", "Alice"], ["c.png", null]]
+```
+
+У вложения без загрузившего `uploader` остаётся без значения: ссылки нет, значит, заполнять нечего. Если загруженный документ виден и в других элементах, он общий для всех мест, где встречается: изменение через одно вложение видно через другое, пока вы не попросите [`clone: true`](../reference/populate/populate.mdx#clone).
+
+Тот же путь работает через вложенный объект (`shipping.carrier`) и через вложенный массив. Правило одно: сегменты, ведущие через встроенные документы, записываются как обычные поля, а последний сегмент — поле со ссылкой.
+
+## Карта ссылок
+
+Ситуация: рецензенты поста хранятся в карте `Map<string, Ref<User>>` по роли (`lead`, `second`). Путь к значениям карты записывается со звёздочкой: `reviewers.$*`. Без неё Typemo не поймёт, что вы имеете в виду ключи или значения, и остановится.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema()
+class Attachment {
+  @Prop(() => String, { required: true }) file!: string;
+  @Prop(() => Types.ObjectId, { ref: () => User }) uploader?: Ref<User>;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Prop(() => [Attachment]) attachments!: Attachment[];
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+@Schema({ collection: "activities" })
+class Activity extends Entity {
+  @Prop(() => String, { required: true, enum: ["Post", "Comment"] }) kind!: "Post" | "Comment";
+  @Prop(() => Types.ObjectId, { refPath: "kind", required: true }) target!: Ref<Post | Comment>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+const Activities = client.db().model(Activity);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" }).populate("reviewers.$*").orFail();
+console.log(post.reviewers?.get("lead")?.name, post.reviewers?.get("second")?.name);
+// → "Bob" "Alice"
+```
+
+В документе такая карта — `ReadonlyMap<string, HydratedDoc<User> | null>`: значение, документа которого нет, остаётся в карте как `null`, поэтому к нему обращаются через `?.`. `get` работает, а `set` компилятор не даст: замену карты вы делаете через идентификаторы и [`$set`](../reference/documents/document-api.mdx#set). В plain и lean карта остаётся картой (plain) или обычным объектом (lean). Если значение карты — не ссылка, а поддокумент со ссылкой внутри, путь продолжается после `$*`: `notes.$*.author`.
+
+## Одна ссылка на разные модели
+
+Ситуация: лента событий хранит ссылку, которая указывает то на пост, то на комментарий. В схеме такая ссылка называется **полиморфной**: модель выбирается по данным. Опция `refPath` называет соседнее поле (`kind`), в котором записано имя модели.
+
+```ts twoslash title="blog/models.ts"
+import { Entity, Prop, Schema, Types, type Ref } from "@venloc/typemo";
+
+@Schema({ collection: "posts" })
+export class Post extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+}
+
+@Schema({ collection: "comments" })
+export class Comment extends Entity {
+  @Prop(() => String, { required: true })
+  text!: string;
+}
+
+@Schema({ collection: "activities" })
+export class Activity extends Entity {
+  @Prop(() => String, { required: true, enum: ["Post", "Comment"] })
+  kind!: "Post" | "Comment";
+
+  @Prop(() => Types.ObjectId, { refPath: "kind", required: true })
+  target!: Ref<Post | Comment>;
+}
+```
+
+Загрузка не отличается от обычной.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema()
+class Attachment {
+  @Prop(() => String, { required: true }) file!: string;
+  @Prop(() => Types.ObjectId, { ref: () => User }) uploader?: Ref<User>;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Prop(() => [Attachment]) attachments!: Attachment[];
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+@Schema({ collection: "activities" })
+class Activity extends Entity {
+  @Prop(() => String, { required: true, enum: ["Post", "Comment"] }) kind!: "Post" | "Comment";
+  @Prop(() => Types.ObjectId, { refPath: "kind", required: true }) target!: Ref<Post | Comment>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+const Activities = client.db().model(Activity);
+// ---cut---
+const feed = await Activities.find().sort({ kind: 1 }).populate("target").plain();
+console.log(feed.map((event) => event.kind));
+// → ["Comment", "Post"]
+```
+
+Тип `target` после populate — объединение постов и комментариев (и `null`, если документа нет), поэтому перед чтением полей сузьте его. Есть и вариант выбора модели функцией (`refModel`): о нём — в руководстве [Ссылки на другие модели](../schemas/references.mdx). Ниже полиморфной ссылки заполнить ничего нельзя, потому что цель не одна модель: `populate("target.author")` даёт `QueryError: populate "target.author": "target" is a polymorphic reference (refPath/refModel); nothing below it can be populated`.
+
+## Цепочки через виртуальные поля
+
+Ситуация: для автора нужны его посты, для постов — комментарии, для комментариев — их авторы. Виртуальные поля ([`@Virtual`](../reference/schemas/virtual.mdx)) участвуют в путях наравне со ссылками. Цепочку можно записать одним путём или вложенными объектами.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema()
+class Attachment {
+  @Prop(() => String, { required: true }) file!: string;
+  @Prop(() => Types.ObjectId, { ref: () => User }) uploader?: Ref<User>;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Prop(() => [Attachment]) attachments!: Attachment[];
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+@Schema({ collection: "activities" })
+class Activity extends Entity {
+  @Prop(() => String, { required: true, enum: ["Post", "Comment"] }) kind!: "Post" | "Comment";
+  @Prop(() => Types.ObjectId, { refPath: "kind", required: true }) target!: Ref<Post | Comment>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+const Activities = client.db().model(Activity);
+// ---cut---
+const alice = await Users.findOne({ name: "Alice" }).populate("posts.comments.author").orFail().plain();
+console.log(alice.posts.map((post) => [post.title, post.comments.map((comment) => comment.author?.name)]));
+// → [["Hello", ["Bob", "Alice"]], ["Second", ["Bob"]]]
+```
+
+Вложенный объект нужен, когда на одном из звеньев требуются опции, например лимит комментариев:
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema()
+class Attachment {
+  @Prop(() => String, { required: true }) file!: string;
+  @Prop(() => Types.ObjectId, { ref: () => User }) uploader?: Ref<User>;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Prop(() => [Attachment]) attachments!: Attachment[];
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+@Schema({ collection: "activities" })
+class Activity extends Entity {
+  @Prop(() => String, { required: true, enum: ["Post", "Comment"] }) kind!: "Post" | "Comment";
+  @Prop(() => Types.ObjectId, { refPath: "kind", required: true }) target!: Ref<Post | Comment>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+const Activities = client.db().model(Activity);
+// ---cut---
+const alice = await Users.findOne({ name: "Alice" })
+  .populate({ path: "posts", populate: { path: "comments", perDocumentLimit: 1 } })
+  .orFail()
+  .plain();
+console.log(alice.posts.map((post) => post.comments.length));
+// → [1, 1]
+```
+
+Каждое звено — отдельный запрос: по цепочке из трёх звеньев вы платите тремя запросами плюс основной. Если цепочка длиннее двух-трёх звеньев или считает что-то по пути, подумайте об агрегации: см. [Производительность populate](./performance.mdx).
+
+## Как выбрать запись пути
+
+Задайте себе вопрос: **где находится ссылка относительно корня документа?** Если ссылка в самом документе, достаточно имени поля. Если она внутри встроенного документа или массива таких документов, пишите путь через точку. Если это значение карты, добавьте `$*`. Если ссылка в связанной модели, продолжайте путь через точку, а когда для звена нужны свои опции, вкладывайте объект в `populate`.
+
+## Когда это не нужно
+
+Если вам нужна только часть цепочки, не загружайте её всю: каждое звено — запрос и объём данных. Если основной документ фильтруется по полю глубоко в цепочке (найти комментарии, у постов которых автор из Москвы), populate не поможет, потому что он работает после чтения: используйте агрегацию с [`$lookup`](../reference/aggregation/stages.mdx#lookup). Если полиморфных целей много и они нужны как список, часто проще хранить `kind` и загружать каждую группу своим запросом.
+
+## Частые ошибки
+
+### Карта не заполняется: нужен `$*`
+
+Вы указали имя поля карты без звёздочки.
+
+```ts twoslash
+// @errors: 2345
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema()
+class Attachment {
+  @Prop(() => String, { required: true }) file!: string;
+  @Prop(() => Types.ObjectId, { ref: () => User }) uploader?: Ref<User>;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Prop(() => [Attachment]) attachments!: Attachment[];
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+@Schema({ collection: "activities" })
+class Activity extends Entity {
+  @Prop(() => String, { required: true, enum: ["Post", "Comment"] }) kind!: "Post" | "Comment";
+  @Prop(() => Types.ObjectId, { refPath: "kind", required: true }) target!: Ref<Post | Comment>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+const Activities = client.db().model(Activity);
+// ---cut---
+Posts.find().populate("reviewers");
+```
+
+Компилятор отвечает `TS2345`, а причина стоит в типе параметра: `Argument of type '"reviewers"' is not assignable to parameter of type 'PopulateObject | "Invalid populate path \"reviewers\": \"reviewers\" is not a reference"'`. Если путь пришёл из данных и компилятор его не видел, во время работы `QueryError` называет правильный путь: `populate "reviewers": "reviewers" is a Map: its values are "reviewers.$*"`.
+
+### Populate ниже полиморфной ссылки
+
+`populate("target.author")` запрещён: под `refPath` нет одной модели. Загрузите `target`, а связи целей загружайте отдельным вызовом для каждой модели, после сужения типа.
+
+### Опечатка в середине пути
+
+```ts twoslash
+// @errors: 2345
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema()
+class Attachment {
+  @Prop(() => String, { required: true }) file!: string;
+  @Prop(() => Types.ObjectId, { ref: () => User }) uploader?: Ref<User>;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Prop(() => [Attachment]) attachments!: Attachment[];
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+@Schema({ collection: "activities" })
+class Activity extends Entity {
+  @Prop(() => String, { required: true, enum: ["Post", "Comment"] }) kind!: "Post" | "Comment";
+  @Prop(() => Types.ObjectId, { refPath: "kind", required: true }) target!: Ref<Post | Comment>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+const Activities = client.db().model(Activity);
+// ---cut---
+Comments.find().populate("post.autor");
+```
+
+Компилятор называет сегмент: `Invalid populate path "post.autor": unknown field "autor"` (в тексте ошибки `TS2345`, как выше). Путь проверяется по сегментам, поэтому ошибка указывает на первый неверный.
+
+## Полный пример
+
+```ts twoslash title="blog/feed.service.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema()
+class Attachment {
+  @Prop(() => String, { required: true }) file!: string;
+  @Prop(() => Types.ObjectId, { ref: () => User }) uploader?: Ref<User>;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Prop(() => [Attachment]) attachments!: Attachment[];
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+@Schema({ collection: "activities" })
+class Activity extends Entity {
+  @Prop(() => String, { required: true, enum: ["Post", "Comment"] }) kind!: "Post" | "Comment";
+  @Prop(() => Types.ObjectId, { refPath: "kind", required: true }) target!: Ref<Post | Comment>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+const Activities = client.db().model(Activity);
+// ---cut---
+// страница поста: автор, теги, вложения с авторами загрузки и рецензенты
+export const readPostPage = async (title: string) => {
+  const post = await Posts.findOne({ title })
+    .populate(["author", "tags", "attachments.uploader", "reviewers.$*"])
+    .orFail()
+    .plain();
+  return {
+    title: post.title,
+    author: post.author?.name,
+    tags: post.tags.map((tag) => tag.label),
+    files: post.attachments.map((item) => `${item.file} (${item.uploader?.name ?? "unknown"})`),
+    reviewers: [...(post.reviewers?.keys() ?? [])],
+  };
+};
+
+// лента: событие с целью, чья модель зависит от kind
+export const readFeed = async () => {
+  const feed = await Activities.find().sort({ kind: 1 }).populate("target").plain();
+  return feed.map((event) => event.kind);
+};
+
+console.log(await readPostPage("Hello"));
+// → { title: "Hello", author: "Alice", tags: ["db", "ts"], files: ["a.png (Bob)", "b.png (Alice)", "c.png (unknown)"], reviewers: ["lead", "second"] }
+console.log(await readFeed());
+// → ["Comment", "Post"]
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Populate у документа" href="./document-populate.mdx">
+  Загрузить связь у уже прочитанного документа и убрать её обратно.
+</Card>
+<Card title="Проверка типа" href="./type-checks.mdx">
+  Сузить тип полиморфной цели и убедиться, что связь загружена.
+</Card>
+<Card title="Производительность populate" href="./performance.mdx">
+  Сколько стоят цепочки и когда пора переходить на `$lookup`.
+</Card>
+<Card title=".populate в справочнике" href="../reference/populate/populate.mdx">
+  Все опции: `match`, `options`, `justOne`, `retainNullValues`, `required`, `clone`, `transform`.
+</Card>
+</Cards>

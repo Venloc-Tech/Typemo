@@ -1,0 +1,379 @@
+---
+title: Модели в модулях
+description: "forFeature в NestJS: модели по классу, другая база, дискриминаторы, статики плагинов, представления и создание коллекций при старте"
+icon: Layers
+---
+
+Модуль NestJS получает модели через `TypemoModule.forFeature`: вы перечисляете классы сущностей, а модуль делает из каждого провайдер, который внедряется через `@InjectModel`. Эта страница разбирает всё, что можно перечислить: обычные сущности, сущности в другой базе, потомков-дискриминаторы, сущности со статиками плагинов, представления и материализованные результаты, — и то, как при старте создать для них коллекции и индексы.
+
+## Что предполагается
+
+Приложение из руководства [Подключить Typemo к NestJS](./setup.mdx) с сущностью счёта:
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  balance!: number;
+}
+```
+
+## Быстрый путь
+
+Перечислите сущности модуля и включите создание недостающих коллекций при старте:
+
+```ts twoslash title="app.module.ts"
+import { Module } from "@nestjs/common";
+import { Entity, Prop, Schema } from "@venloc/typemo";
+import { TypemoModule } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+// ---cut---
+@Module({
+  imports: [
+    TypemoModule.forRoot("mongodb://localhost:27017", { dbName: "bank", sync: "init" }),
+    TypemoModule.forFeature([Account]),
+  ],
+})
+export class AppModule {}
+```
+
+Остальная страница разбирает каждый вид записи и выбор `sync`.
+
+## Одна сущность в нескольких модулях
+
+Ситуация: счета нужны и модулю счетов, и модулю отчётов. Перечислите `Account` в [`forFeature`](../../reference/integrations/nestjs.mdx#typemomoduleforfeature) каждого из них. Провайдер модели вызывает `connection.model(Account)` ядра, а ядро возвращает один объект на сущность и базу, поэтому оба модуля получают **один и тот же** объект: запуск сравнил внедрённые модели двух модулей через `toBe` и получил одну.
+
+Регистрация по классу закрывает ошибку, которую не ловила регистрация по строке: два разных класса `Account` в двух модулях — это две модели с двумя токенами, а не одна, молча занявшая место другой.
+
+## Сущность в другой базе
+
+Ситуация: архивные счета лежат в базе `archive` того же кластера. Второй аргумент `forFeature` — цель записи: `{ db }` для базы, `{ client }` для другого клиента.
+
+```ts twoslash title="archive/archive.service.ts"
+import { Injectable, Module } from "@nestjs/common";
+import { Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, TypemoModule } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+// ---cut---
+@Injectable()
+export class ArchiveService {
+  constructor(@InjectModel(Account, { db: "archive" }) private readonly archived: Model<Account>) {}
+}
+
+@Module({ imports: [TypemoModule.forFeature([Account], { db: "archive" })], providers: [ArchiveService] })
+export class ArchiveModule {}
+```
+
+Цель входит в токен: `@InjectModel(Account)` и `@InjectModel(Account, { db: "archive" })` — две разные модели, которые пишут в разные базы. Имени коллекции в `forFeature` нет: оно задаётся на сущности (`@Schema({ collection })`), и две регистрации одной сущности с разными коллекциями противоречили бы друг другу.
+
+## Потомки-дискриминаторы
+
+Ситуация: у события есть виды — переход по ссылке и регистрация, — и все они лежат в одной коллекции. Потомки описываются [`@Discriminator`](../../reference/schemas/discriminator.mdx) как обычно, а в `forFeature` их перечисляют в любом порядке:
+
+```ts twoslash title="events/events.module.ts"
+import { Module } from "@nestjs/common";
+import { Discriminator, type DiscriminatorValue, Entity, Prop, Schema } from "@venloc/typemo";
+import { TypemoModule } from "@venloc/typemo-nestjs";
+// ---cut---
+@Schema({ collection: "events" })
+export class Event extends Entity {
+  declare readonly __t?: DiscriminatorValue<"click" | "signup">;
+
+  @Prop(() => Date, { required: true })
+  time!: Date;
+}
+
+@Discriminator("click")
+export class ClickEvent extends Event {
+  declare readonly __t: DiscriminatorValue<"click">;
+
+  @Prop(() => String, { required: true })
+  url!: string;
+}
+
+@Module({ imports: [TypemoModule.forFeature([ClickEvent, Event])] })
+export class EventsModule {}
+```
+
+Ядро само знает, что `ClickEvent` — потомок `Event`, и создаёт его модель в коллекции базы. Запуск трёх порядков списка дал одну коллекцию `events`, а у созданного перехода `__t` равно `"click"`. Если в списке только потомок, база компилируется для него в той же коллекции, но провайдера у неё нет: чтобы внедрить модель базы, перечислите и её.
+
+## Модель со статиками плагина
+
+Ситуация: плагин добавляет моделям статический метод, и сервис хочет вызывать его на внедрённой модели с типом. Запись `{ entity, statics }` внедряет модель, к которой применён [`Model.statics(plugin)`](../../reference/hooks/plugins.mdx#modelstatics):
+
+```ts twoslash title="notes/notes.module.ts"
+import { Injectable, Module } from "@nestjs/common";
+import { Entity, type Model, Plugin, type PluginStatics, Prop, Schema, type SchemaPlugin } from "@venloc/typemo";
+import { InjectModel, TypemoModule } from "@venloc/typemo-nestjs";
+// ---cut---
+const countPlugin = {
+  name: "count",
+  apply: () => undefined,
+  statics: {
+    countTitled(this: Model<object>, title: string): Promise<number> {
+      return (this as unknown as Model<Note>).countDocuments({ title });
+    },
+  },
+} satisfies SchemaPlugin<undefined, object>;
+
+@Plugin(countPlugin)
+@Schema({ collection: "notes" })
+export class Note extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+}
+
+@Injectable()
+export class NotesService {
+  constructor(@InjectModel(Note) private readonly notes: Model<Note> & PluginStatics<typeof countPlugin>) {}
+
+  count(title: string) {
+    return this.notes.countTitled(title);
+  }
+}
+
+@Module({ imports: [TypemoModule.forFeature([{ entity: Note, statics: countPlugin }])], providers: [NotesService] })
+export class NotesModule {}
+```
+
+Тип параметра пишете вы: `Model<Note> & PluginStatics<typeof countPlugin>`. Модуль проверяет при старте, что плагин действительно применён к схеме, иначе тип обещал бы метод, которого нет: без `@Plugin(countPlugin)` на сущности старт падает с `ConfigurationError: Note: plugin "count" is not applied to this model's schema`.
+
+## Представление
+
+Ситуация: сервису нужны только счета с деньгами, и это условие должно жить в одном месте. Представление описывают через [`TypemoModule.view`](../../reference/integrations/nestjs.mdx#typemomoduleview) и перечисляют в том же `forFeature`:
+
+```ts twoslash title="accounts/accounts.module.ts"
+import { Injectable, Module } from "@nestjs/common";
+import { Entity, Prop, Schema, type TypedView } from "@venloc/typemo";
+import { InjectModel, TypemoModule } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+// ---cut---
+@Schema({ collection: "funded_accounts" })
+export class FundedAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+
+const funded = TypemoModule.view(FundedAccount, {
+  on: Account,
+  pipeline: (p) => p.match({ balance: { $gt: 0 } }).project({ title: 1, balance: 1 }),
+});
+
+@Injectable()
+export class FundedService {
+  constructor(@InjectModel(FundedAccount) private readonly funded: TypedView<FundedAccount>) {}
+
+  titles() {
+    return this.funded.find({}).then((rows) => rows.map((row) => row.title));
+  }
+}
+
+@Module({ imports: [TypemoModule.forFeature([Account, funded])], providers: [FundedService] })
+export class AccountsModule {}
+```
+
+Внедряется [`TypedView`](../../reference/collections/typed-view.mdx) — у него только чтения. Конвейер проверяется по классу при компиляции: если `project` не даст `balance`, определение не скомпилируется. Запуск: два счёта (`Main` с балансом 5 и `Empty` с 0), представление вернуло только `Main`. Создаёт представление в базе `sync` при старте (раздел ниже); пока его нет, чтение бросает [`ConfigurationError`](../../reference/errors/configuration-errors.mdx#configurationerror), а не возвращает пустой список.
+
+Класс — что-то одно в базе: модель или представление. Если зарегистрировать `FundedAccount` как модель в одном модуле и как представление в другом, старт упадёт с `ConfigurationError`, иначе в приложении были бы два разных объекта одной коллекции.
+
+## Материализованный результат
+
+Ситуация: сводка по счетам дорогая, и её достаточно пересчитывать по расписанию. [`TypemoModule.materialized`](../../reference/integrations/nestjs.mdx#typemomodulematerialized) описывает обычную коллекцию, которую заполняет конвейер:
+
+```ts twoslash title="reports/reports.module.ts"
+import { Injectable, Module } from "@nestjs/common";
+import { Entity, EntityWithId, fn, type Materialized, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, TypemoModule } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+// ---cut---
+@Schema({ collection: "title_totals" })
+export class TitleTotal extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true }) total!: number;
+}
+
+const totals = TypemoModule.materialized(TitleTotal, {
+  from: Account,
+  pipeline: (p) => p.match({ balance: { $gt: 0 } }).group((f) => ({ _id: f.title, total: fn.sum(f.balance) })),
+  mode: "replace",
+});
+
+@Injectable()
+export class TotalsService {
+  constructor(@InjectModel(TitleTotal) private readonly totals: Materialized<TitleTotal>) {}
+
+  async rebuild() {
+    await this.totals.refresh();
+    return this.totals.model.find({}).lean();
+  }
+}
+
+@Module({ imports: [TypemoModule.forFeature([Account, totals])], providers: [TotalsService] })
+export class ReportsModule {}
+```
+
+Запуск `rebuild()` на тех же двух счетах вернул `[{ _id: "Main", total: 5 }]`. Сам по себе результат не пересчитывается: `refresh()` вызывает ваш код (задача по расписанию, обработчик).
+
+## Создать коллекции при старте
+
+Ситуация: новое окружение, базы ещё нет, а уникальный индекс должен существовать до первой записи. Опция [`sync`](../../reference/integrations/nestjs.mdx#sync) корневого `forRoot` решает, что модуль делает с базой при старте:
+
+- `false` (по умолчанию) — ничего; база не меняется от запуска приложения;
+- `"init"` — [`connection.init()`](../../reference/connection/connection.mdx#connectioninit): создаёт недостающие коллекции, индексы и представления, ничего не меняя и не удаляя;
+- `"sync"` — [`connection.syncAll()`](../../reference/connection/connection.mdx#connectionsyncall): приводит всё к схемам, в том числе заменяет индекс, объявленный иначе.
+
+Синхронизация идёт после того, как все модули зарегистрировали модели, для каждой базы, в которой есть модели `forFeature`. Запуск с `sync: "init"` и сущностью с уникальным полем создал коллекцию и индексы `_id_` и `code_1`; с `sync: false` база осталась пустой. Если индекс в базе объявлен иначе, `"init"` роняет старт с [`SyncError`](../../reference/errors/configuration-errors.mdx#syncerror), а `"sync"` заменяет индекс.
+
+## Как выбрать `sync`
+
+Спросите себя: кто в вашем окружении отвечает за схему базы? Если есть шаг развёртывания или миграции, оставьте `false` и вызывайте `connection.init()` или `syncAll()` там: запуск десяти копий приложения не должен десять раз перестраивать индексы. Если отдельного шага нет (разработка, тесты, небольшое приложение), `"init"` безопасен: он только добавляет недостающее. `"sync"` выбирайте, когда приложение — единственный владелец схемы и замена индекса при выкладке ожидаема: перестроение большого индекса нагружает сервер.
+
+## Когда это не нужно
+
+Модуль, которому нужен только сервис другого модуля, `forFeature` не импортирует: модель — внутреннее дело модуля-владельца. Разовую сводку, которую не нужно хранить, считайте агрегацией в сервисе ([`Model.aggregate`](../../reference/aggregation/pipeline.mdx#modelaggregate)), а не материализованным результатом.
+
+## Частые ошибки
+
+### Сущность перечислена дважды
+
+`forFeature([Account, Account])` или `[Account, { entity: Account, statics }]` — ошибка в момент вызова: `ConfigurationError: TypemoModule.forFeature: Account is listed twice`. Оставьте одну запись; статики дайте ей.
+
+### `collection` в записи forFeature
+
+`forFeature([{ entity: Account, collection: "x" }])` не компилируется и при обходе типов падает: `unknown key "collection" in { entity: Account } (known: entity, statics)`. Коллекция задаётся на сущности.
+
+### Класс без `@Schema`
+
+Старт падает: `ConfigurationError: NotASchema: not a schema; decorate the class with @Schema()`. Потомку-дискриминатору, наоборот, `@Schema` не нужен: он берёт опции базы.
+
+## Полный пример
+
+Модуль счетов: сущность с потомком, представление, сводка и создание коллекций при старте.
+
+```ts twoslash title="accounts/accounts.module.ts"
+import { Injectable, Module } from "@nestjs/common";
+import {
+  Discriminator,
+  type DiscriminatorValue,
+  Entity,
+  EntityWithId,
+  fn,
+  type Materialized,
+  type Model,
+  Prop,
+  Schema,
+  type TypedView,
+} from "@venloc/typemo";
+import { InjectModel, TypemoModule } from "@venloc/typemo-nestjs";
+
+// сущности
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  declare readonly __t?: DiscriminatorValue<"savings">;
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+
+@Discriminator("savings")
+export class SavingsAccount extends Account {
+  declare readonly __t: DiscriminatorValue<"savings">;
+  @Prop(() => Number, { required: true }) rate!: number;
+}
+
+// представление и сводка
+@Schema({ collection: "funded_accounts" })
+export class FundedAccount extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const funded = TypemoModule.view(FundedAccount, {
+  on: Account,
+  pipeline: (p) => p.match({ balance: { $gt: 0 } }).project({ title: 1, balance: 1 }),
+});
+
+@Schema({ collection: "title_totals" })
+export class TitleTotal extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true }) total!: number;
+}
+const totals = TypemoModule.materialized(TitleTotal, {
+  from: Account,
+  pipeline: (p) => p.group((f) => ({ _id: f.title, total: fn.sum(f.balance) })),
+  mode: "replace",
+});
+
+// сервис
+@Injectable()
+export class AccountsService {
+  constructor(
+    @InjectModel(Account) private readonly accounts: Model<Account>,
+    @InjectModel(SavingsAccount) private readonly savings: Model<SavingsAccount>,
+    @InjectModel(FundedAccount) private readonly funded: TypedView<FundedAccount>,
+    @InjectModel(TitleTotal) private readonly totals: Materialized<TitleTotal>,
+  ) {}
+
+  openSavings(title: string, rate: number) {
+    return this.savings.create({ title, rate, balance: 0 });
+  }
+
+  fundedTitles() {
+    return this.funded.find({}).then((rows) => rows.map((row) => row.title));
+  }
+
+  refreshTotals() {
+    return this.totals.refresh();
+  }
+}
+
+// модули
+@Module({
+  imports: [TypemoModule.forFeature([Account, SavingsAccount, funded, totals])],
+  providers: [AccountsService],
+})
+export class AccountsModule {}
+
+@Module({
+  imports: [TypemoModule.forRoot("mongodb://localhost:27017", { dbName: "bank", sync: "init" }), AccountsModule],
+})
+export class AppModule {}
+```
+
+<Callout type="migration" title="Если вы пришли из @nestjs/mongoose">
+
+`forFeature([{ name, schema, discriminators }])` → `forFeature([Сущность, Потомок])`: потомки — обычные записи. `forFeatureAsync` (схема из фабрики с внедрением) нет: плагины подключаются декоратором `@Plugin` или в `onClientCreate`. Представления регистрируются в том же `forFeature`, а не отдельным списком.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Транзакции и политики в запросе" href="./transactions-and-policies.mdx">
+  Как менять несколько моделей в одной транзакции и брать тенанта из запроса.
+</Card>
+<Card title="Представления без Nest" href="../../collections/views.mdx">
+  Как устроены представления: определение, создание, обновление.
+</Card>
+<Card title="Синхронизация коллекций" href="../../collections/index-sync.mdx">
+  Что делают `init` и `syncAll` и как читать их отчёт.
+</Card>
+<Card title="Справочник: forFeature" href="../../reference/integrations/nestjs.mdx#typemomoduleforfeature">
+  Все виды записей, цель записи и ошибки.
+</Card>
+</Cards>

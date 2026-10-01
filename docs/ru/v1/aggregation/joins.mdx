@@ -1,0 +1,544 @@
+---
+title: Соединения
+description: "Как присоединить данные из другой коллекции, объединить две коллекции в один список и пройти по дереву связей"
+icon: Merge
+---
+
+Данные редко лежат в одной коллекции: заказы ссылаются на клиентов, категории на родительские категории, архив хранится отдельно от живых заказов. MongoDB не соединяет коллекции при обычном чтении, но агрегация умеет три вещи. [`lookup`](../reference/aggregation/stages.mdx#lookup) присоединяет к каждой строке документы из другой коллекции, [`unionWith`](../reference/aggregation/stages.mdx#unionwith) дописывает к строкам документы другой коллекции, а [`graphLookup`](../reference/aggregation/stages.mdx#graphlookup) рекурсивно идёт по связям, например вверх по дереву категорий.
+
+Typemo выводит тип присоединённых документов из модели, которую вы передаёте в `from`, и проверяет поля соединения по обеим моделям. Опечатка в `localField` или `foreignField` — ошибка компиляции.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и запуск агрегации из руководства [Первая агрегация](first-aggregation.mdx). В магазине четыре коллекции. Клиенты: `alice` из DE и `bob` из FR. Заказы: два заказа `alice` (120 и 80), заказ `bob` (50) и заказ `dave` (10), которого нет среди клиентов. Архив заказов: один заказ `bob` на 300. Категории: `Electronics`, вложенная `Phones` и вложенная в неё `Smartphones`.
+
+```ts twoslash title="shop/models.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "customers" })
+export class Customer extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => String, { required: true })
+  country!: string;
+}
+
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+}
+
+@Schema({ collection: "archived_orders" })
+export class ArchivedOrder extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Date, { required: true })
+  archivedAt!: Date;
+}
+
+@Schema({ collection: "categories" })
+export class Category extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String)
+  parent?: string;
+}
+```
+
+## Быстрый путь
+
+Чтобы у каждого заказа появился клиент, укажите коллекцию `from`, поле заказа `localField`, поле клиента `foreignField` и имя нового поля `as`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) country!: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+
+@Schema({ collection: "archived_orders" })
+class ArchivedOrder extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) archivedAt!: Date;
+}
+
+@Schema({ collection: "categories" })
+class Category extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String) parent?: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Customers = client.connection.model(Customer);
+const Categories = client.connection.model(Category);
+// ---cut---
+const query = Orders.aggregate((p) =>
+  p.lookup({ from: Customer, localField: "customer", foreignField: "name", as: "buyer" }),
+);
+const rows = await query;
+//    ^?
+```
+
+Присоединённое поле — всегда **массив**: клиентов с таким именем может быть несколько или ни одного. Чтобы получить один объект, добавьте [`unwind`](../reference/aggregation/stages.mdx#unwind). Остальная страница разбирает этот и другие способы.
+
+## Присоединить документы по совпадению поля
+
+Допустим, в отчёте по заказам нужна страна клиента. `lookup` ищет в `customers` документы, у которых `name` равен `customer` заказа, и кладёт их в `buyer`. Тип строки растёт: к полям заказа добавляется массив клиентов.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) country!: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+
+@Schema({ collection: "archived_orders" })
+class ArchivedOrder extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) archivedAt!: Date;
+}
+
+@Schema({ collection: "categories" })
+class Category extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String) parent?: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Customers = client.connection.model(Customer);
+const Categories = client.connection.model(Category);
+// ---cut---
+const joined = Pipeline.from(Order).lookup({
+  from: Customer,
+  localField: "customer",
+  foreignField: "name",
+  as: "buyer",
+});
+type Row = RowOf<typeof joined>;
+//   ^?
+```
+
+Заказ `dave` не пропал: у него `buyer` — пустой массив. Это поведение сервера: `lookup` работает как левое соединение, строки слева остаются всегда. Поля проверяются по обеим моделям: `localField: "custmer"` или `foreignField: "nam"` не скомпилируются.
+
+Политики присоединяемой коллекции Typemo берёт из класса, который вы передали в `from`. Если у `Customer` включено мягкое удаление, удалённые клиенты не попадут в `buyer`. Если коллекция разделена по тенантам, `lookup` присоединяет только документы тенанта операции, а запрос без тенанта Typemo отвергает до обращения к серверу. Поля `Hidden` из присоединённых документов тоже убираются. Создавать модель `Customer` на подключении для этого не нужно: Typemo сам компилирует схему класса. Так же работают [`unionWith`](../reference/aggregation/stages.mdx#unionwith) и [`graphLookup`](../reference/aggregation/stages.mdx#graphlookup).
+
+## Получить один объект вместо массива
+
+Массив из одного элемента неудобен. Стадия [`unwind`](../reference/aggregation/stages.mdx#unwind) разворачивает массив: на каждый элемент получается отдельная строка, а поле становится объектом. Заказы без клиента при этом исчезают, потому что разворачивать нечего.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) country!: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+
+@Schema({ collection: "archived_orders" })
+class ArchivedOrder extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) archivedAt!: Date;
+}
+
+@Schema({ collection: "categories" })
+class Category extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String) parent?: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Customers = client.connection.model(Customer);
+const Categories = client.connection.model(Category);
+// ---cut---
+const query = Orders.aggregate((p) =>
+  p
+    .lookup({ from: Customer, localField: "customer", foreignField: "name", as: "buyer" })
+    .unwind("$buyer")
+    .project((f) => ({ customer: 1, country: f.buyer.country, _id: 0 })),
+);
+const rows = await query;
+//    ^?
+// → [{ customer: "alice", country: "DE" }, { customer: "alice", country: "DE" }, { customer: "bob", country: "FR" }]
+```
+
+После `unwind` `f.buyer` — уже объект, поэтому `f.buyer.country` подсказывается редактором. Чтобы оставить заказы без клиента, используйте форму `unwind({ path: "$buyer", preserveNullAndEmptyArrays: true })`.
+
+## Присоединить с условием
+
+Совпадения одного поля бывает мало: нужны только крупные заказы клиента, а в результате достаточно суммы. Для этого у `lookup` есть форма с **подконвейером**: вы передаёте переменные из текущей строки через `let` и строите вложенный конвейер над присоединяемой коллекцией. Переменные в подконвейере — типизированные, как `f`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) country!: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+
+@Schema({ collection: "archived_orders" })
+class ArchivedOrder extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) archivedAt!: Date;
+}
+
+@Schema({ collection: "categories" })
+class Category extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String) parent?: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Customers = client.connection.model(Customer);
+const Categories = client.connection.model(Category);
+// ---cut---
+const query = Customers.aggregate((p) =>
+  p
+    .lookup({
+      from: Order,
+      as: "big",
+      let: (f) => ({ who: f.name }),
+      pipeline: (o, v) =>
+        o
+          .match((x) => fn.and(fn.eq(x.customer, v.who), fn.gte(x.total, 80)))
+          .project({ total: 1, _id: 0 }),
+    })
+    .project({ name: 1, big: 1, _id: 0 }),
+);
+const rows = await query;
+//    ^?
+// → [{ name: "alice", big: [{ total: 120 }, { total: 80 }] }, { name: "bob", big: [] }]
+```
+
+Первый аргумент колбэка — строитель над `Order`, второй — переменные. Тип присоединённых строк определяется подконвейером: после `project` это только `total`. Подконвейер обязан содержать хотя бы одну стадию, иначе `ConfigurationError`.
+
+## Дописать документы другой коллекции
+
+Иногда нужен один список из двух коллекций: живые заказы и архив. [`unionWith`](../reference/aggregation/stages.mdx#unionwith) добавляет к строкам все документы другой коллекции. Тип строки становится **объединением** двух типов: компилятор не позволит обратиться к `archivedAt`, не проверив, что строка из архива.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) country!: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+
+@Schema({ collection: "archived_orders" })
+class ArchivedOrder extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) archivedAt!: Date;
+}
+
+@Schema({ collection: "categories" })
+class Category extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String) parent?: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Customers = client.connection.model(Customer);
+const Categories = client.connection.model(Category);
+// ---cut---
+const query = Orders.aggregate((p) => p.match({ customer: "bob" }).unionWith(ArchivedOrder));
+const rows = await query;
+//    ^?
+```
+
+Если из добавляемой коллекции нужна только часть данных или они должны совпадать по форме, передайте объект с подконвейером `{ coll, pipeline }`: тогда добавляются строки, которые вернул подконвейер.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) country!: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+
+@Schema({ collection: "archived_orders" })
+class ArchivedOrder extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) archivedAt!: Date;
+}
+
+@Schema({ collection: "categories" })
+class Category extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String) parent?: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Customers = client.connection.model(Customer);
+const Categories = client.connection.model(Category);
+// ---cut---
+const query = Orders.aggregate((p) =>
+  p
+    .match({ customer: "bob" })
+    .project({ customer: 1, total: 1, _id: 0 })
+    .unionWith({
+      coll: ArchivedOrder,
+      pipeline: (a) => a.project({ customer: 1, total: 1, _id: 0 }),
+    }),
+);
+const rows = await query;
+//    ^?
+// → [{ customer: "bob", total: 50 }, { customer: "bob", total: 300 }]
+```
+
+Теперь обе части имеют один тип, и объединение сводится к нему. Порядок: сначала строки текущего конвейера, потом добавленные.
+
+## Пройти по дереву связей
+
+Категория хранит имя родителя, родитель — своего. Чтобы найти всех предков `Smartphones`, не зная глубины дерева, нужен [`graphLookup`](../reference/aggregation/stages.mdx#graphlookup): он повторяет поиск, пока находит новые связи. `startWith` — с чего начать, `connectFromField` и `connectToField` — как перейти от найденного документа к следующему, `depthField` — под каким именем записать шаг, на котором документ найден.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) country!: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+
+@Schema({ collection: "archived_orders" })
+class ArchivedOrder extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) archivedAt!: Date;
+}
+
+@Schema({ collection: "categories" })
+class Category extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String) parent?: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Customers = client.connection.model(Customer);
+const Categories = client.connection.model(Category);
+// ---cut---
+const query = Categories.aggregate((p) =>
+  p
+    .match({ title: "Smartphones" })
+    .graphLookup({
+      from: Category,
+      startWith: (f) => f.parent,
+      connectFromField: "parent",
+      connectToField: "title",
+      as: "ancestors",
+      depthField: "level",
+    })
+    .project((f) => ({ title: 1, ancestors: fn.map({ input: f.ancestors, in: (a) => a.title }), _id: 0 })),
+);
+const rows = await query;
+//    ^?
+// → [{ title: "Smartphones", ancestors: ["Phones", "Electronics"] }]
+```
+
+Порядок найденных предков сервер не гарантирует (в запуске выше первым пришёл ближайший предок, но полагаться на это нельзя): для порядка используйте `level` (номер шага, число типа int64). Ограничить глубину можно через `maxDepth`, а отобрать подходящие документы на каждом шаге — через `restrictSearchWithMatch`.
+
+## Как выбрать
+
+Задайте вопрос: чего не хватает строкам? Если к каждой строке нужны связанные документы другой коллекции, берите `lookup` (простая форма, когда хватает равенства двух полей, и форма с подконвейером, когда нужны условия или свёртка). Если нужно больше строк, а не больше полей, — `unionWith`. Если глубина связи заранее неизвестна, — `graphLookup`.
+
+## Когда это не нужно
+
+Если вам нужны документы одной коллекции с подставленными связанными документами и вы работаете с моделью в целом, используйте [populate](../populate/index.mdx): он возвращает связанные документы с типами и методами. Соединение в агрегации нужно, когда результат — отчёт: с группировкой, суммами и новой формой строки. И помните о цене: `lookup` выполняется для каждой строки, поэтому фильтруйте и сокращайте строки стадиями [`match`](../reference/aggregation/stages.mdx#match) и [`limit`](../reference/aggregation/stages.mdx#limit) до него.
+
+## Частые ошибки
+
+### Опечатка в поле соединения
+
+`localField` и `foreignField` проверяются по моделям, поэтому неправильное имя видно сразу.
+
+```ts twoslash
+// @errors: 2769
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) country!: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+
+@Schema({ collection: "archived_orders" })
+class ArchivedOrder extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) archivedAt!: Date;
+}
+
+@Schema({ collection: "categories" })
+class Category extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String) parent?: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Customers = client.connection.model(Customer);
+const Categories = client.connection.model(Category);
+// ---cut---
+await Orders.aggregate((p) =>
+  p.lookup({ from: Customer, localField: "custmer", foreignField: "name", as: "buyer" }),
+);
+```
+
+Исправьте имя на `customer`.
+
+### Строка пропала после `unwind`
+
+Заказ `dave` был в результате `lookup`, но исчез после `unwind`. Так работает сервер: строка с пустым массивом при развороте не даёт ни одной строки. Используйте `preserveNullAndEmptyArrays: true` или не разворачивайте массив.
+
+### Обращение к полю добавленной коллекции
+
+После `unionWith` тип строки — объединение, и поле, которого нет в одной из частей, недоступно без проверки. Сведите обе части к одной форме подконвейером `project`, как выше.
+
+## Полный пример
+
+```ts twoslash title="reports/orders.ts"
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) country!: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+
+@Schema({ collection: "archived_orders" })
+class ArchivedOrder extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) archivedAt!: Date;
+}
+
+@Schema({ collection: "categories" })
+class Category extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String) parent?: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Customers = client.connection.model(Customer);
+const Categories = client.connection.model(Category);
+// ---cut---
+// 1. Заказы со страной клиента; заказы без клиента отбрасываются.
+export const ordersWithCountry = () =>
+  Orders.aggregate((p) =>
+    p
+      .lookup({ from: Customer, localField: "customer", foreignField: "name", as: "buyer" })
+      .unwind("$buyer")
+      .project((f) => ({ customer: 1, total: 1, country: f.buyer.country, _id: 0 })),
+  ).plain();
+
+// 2. История клиента: живые заказы и архив в одном списке.
+export const history = (customer: string) =>
+  Orders.aggregate((p) =>
+    p
+      .match({ customer })
+      .project({ customer: 1, total: 1, _id: 0 })
+      .unionWith({
+        coll: ArchivedOrder,
+        pipeline: (a) => a.match({ customer }).project({ customer: 1, total: 1, _id: 0 }),
+      }),
+  ).plain();
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Несколько отчётов за один запрос" href="./facets.mdx">
+  Как посчитать сводку, страницу и распределение за один проход.
+</Card>
+<Card title="Связанные данные (populate)" href="../populate/index.mdx">
+  Подстановка связанных документов при обычном чтении.
+</Card>
+<Card title="Справочник: стадии" href="../reference/aggregation/stages.mdx">
+  Все параметры `lookup`, `graphLookup` и `unionWith`.
+</Card>
+</Cards>

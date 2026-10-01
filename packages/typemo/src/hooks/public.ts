@@ -1,0 +1,20 @@
+/* The public API of hooks, re-exported by `src/index.ts`. */
+export {
+  type BulkOperationResult,
+  type ChangeKeys,
+  type DocumentHookEvent,
+  HOOK_EVENTS,
+  type HookArgs,
+  type HookEvent,
+  type HookPhase,
+  type HookThis,
+  type HookThisOf,
+  type ModelHookEvent,
+  type OperationChange,
+  type OperationChanges,
+  type OperationHookContext,
+  type OperationHookEvent,
+  type PostResult,
+  type QueryHookEvent,
+  type SkipResult,
+} from "./hook-events.ts";

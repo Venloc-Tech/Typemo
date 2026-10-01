@@ -1,0 +1,1365 @@
+---
+title: Операторы фильтра
+description: "Все операторы фильтра, которые принимает Typemo: к каким полям они применимы, что означают и какие ошибки бросают"
+icon: Filter
+---
+
+Фильтр — это объект, который говорит базе, какие документы нужны: `{ price: { $gte: 20 } }`. Ключ — поле модели, значение — либо само значение поля, либо **объект операторов**: ключи с `$`, каждый из которых задаёт одно условие. На этой странице описан каждый оператор, который принимает Typemo: к каким полям он применим, что означает и в каких случаях Typemo откажется его выполнять.
+
+Если вы только начинаете, сначала прочитайте руководство [Фильтры](../../queries/filters.mdx). Эта страница — справочник. Методы, которые принимают фильтр, описаны в справочнике [Чтение](./reading.mdx), а цепочки условий вроде `.where("price").gte(20)` — в справочнике [Условия цепочкой](./conditions.mdx).
+
+Все примеры используют одну модель товара. В ней есть обязательные числа, массив строк, необязательная дата, поле, которое может быть `null`, массив вложенных документов, числовое поле для битовых масок и точка на карте:
+
+```ts twoslash title="models/product.ts"
+import { Entity, Index, Prop, Schema } from "@venloc/typemo";
+
+@Schema()
+export class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] })
+  type!: "Point";
+
+  @Prop(() => [Number], { required: true })
+  coordinates!: number[];
+}
+
+@Schema()
+export class Variant {
+  @Prop(() => String, { required: true })
+  sku!: string;
+
+  @Prop(() => Number, { required: true })
+  qty!: number;
+}
+
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+export class Product extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => Number, { required: true })
+  price!: number;
+
+  @Prop(() => Number, { required: true })
+  stock!: number;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => Date)
+  released?: Date;
+
+  @Prop(() => String, { nullable: true })
+  note!: string | null;
+
+  @Prop(() => [Variant])
+  variants!: Variant[];
+
+  @Prop(() => Number)
+  flags?: number;
+
+  @Prop(() => GeoPoint)
+  place?: GeoPoint;
+}
+```
+
+В коллекции три товара. `Keyboard`: цена 50, на складе 10, теги `office` и `usb`, дата выхода 10 января 2025, `note` равен `null`, две вариации (`K-1` в количестве 4 и `K-2` в количестве 0), `flags` равен 5, точка в Париже. `Mouse`: цена 20, на складе 0, тег `usb`, дата выхода 1 июня 2025, `note` равен `"sale"`, одна вариация (`M-1`, 7 штук), `flags` равен 2, точка в Берлине. `Monitor`: цена 300, на складе 3, тегов нет, даты выхода и точки нет, `note` равен `null`, вариаций нет, `flags` равен 7. Результаты в комментариях `// →` — это имена найденных товаров, отсортированные по алфавиту.
+
+---
+
+## Как записывается условие
+
+Условие на поле пишется в одной из двух форм. Короткая форма — само значение: `{ price: 50 }` означает «`price` равно 50», то есть то же, что [`$eq`](#eq). Длинная форма — объект операторов: `{ price: { $gte: 20, $lt: 300 } }`. Несколько операторов в одном объекте работают вместе, как «и».
+
+Компилятор знает тип каждого поля и предлагает только подходящие операторы: у строки есть `$regex`, у числа есть `$mod` и битовые операторы, у массива есть `$all`, `$size` и `$elemMatch`. Оператор, который полю не подходит, не скомпилируется. Во время работы Typemo проверяет то же самое ещё раз, потому что фильтр часто собирается из данных, которых компилятор не видит. Поэтому три вещи он отвергает всегда.
+
+Во-первых, неизвестный оператор. MongoDB в такой ситуации ответила бы ошибкой сервера или, хуже, поняла бы фильтр иначе, чем вы ожидали. Typemo бросает [`StrictModeError`](../errors/data-errors.mdx#strictmodeerror) до отправки запроса:
+
+```text
+StrictModeError: "$foo" is not a query operator (at "filter.price.$foo") [sanitize]
+```
+
+Во-вторых, оператор там, где ожидается значение. Так выглядит попытка подсунуть оператор через данные клиента: например, клиент прислал в поле пароля не строку, а объект `{ "$gt": "" }`, чтобы условие выполнилось для любого пароля. Typemo отвергает такой фильтр:
+
+```text
+StrictModeError: "$foo" inside a value at "filter.name.$gt": an operator where a value is expected (query selector injection) [sanitize]
+```
+
+В-третьих, `$where`. Он запускает JavaScript на сервере, и Typemo не поддерживает его вообще. Причин три, и текст ошибки называет их все: код в запросе выполняется с правами базы, его нельзя проверить по схеме, а данные клиента, попавшие в такую строку, становятся исполняемым кодом. Так работала уязвимость CVE-2025-23061 в Mongoose: `$where` в populate:
+
+```text
+StrictModeError: "$where" runs JavaScript on the server and is not supported (at "filter.$where"): JavaScript code in a query runs with the rights of the database, cannot be checked against the schema, and turns injected input into executed code (Mongoose CVE-2025-23061, $where in populate); write the condition with query or aggregation operators ($expr) instead [sanitize]
+```
+
+Для условий, которые нельзя записать обычными операторами, используйте [`$expr`](#expr): он принимает типизированные выражения вместо строки с кодом.
+
+---
+
+## Сравнение
+
+### $eq
+
+`$eq` проверяет, что поле равно значению. Короткая запись `{ price: 50 }` делает то же самое, поэтому `$eq` пишут, когда хотят показать это явно или когда оператор нужен внутри [`$not`](#not) или [`.where`](./conditions.mdx#where).
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const exact = await Products.find({ price: { $eq: 50 } }).plain();
+console.log(exact.map((product) => product.name));
+// → ["Keyboard"]
+```
+
+Применим к полям любого типа. Для поля-массива значение может быть элементом (`{ tags: "usb" }` найдёт товары, у которых среди тегов есть `usb`) или всем массивом целиком (`{ tags: ["usb"] }` найдёт только те, у которых тегов ровно один и это `usb`). `null` можно сравнивать только с полем, которое может быть `null`: сравнение с обязательным или необязательным полем отвергается, потому что отсутствие поля проверяют через [`$exists`](#exists).
+
+### $ne
+
+`$ne` проверяет, что поле не равно значению. Документы, у которых поля нет совсем, тоже подходят: для базы «нет поля» значит «не равно».
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const others = await Products.find({ price: { $ne: 50 } }).sort({ name: 1 }).plain();
+console.log(others.map((product) => product.name));
+// → ["Monitor", "Mouse"]
+```
+
+Применим к полям любого типа, как [`$eq`](#eq).
+
+### $gt, $gte, $lt, $lte
+
+`$gt` значит «больше», `$gte` — «больше или равно», `$lt` — «меньше», `$lte` — «меньше или равно». Вместе они задают диапазон: `{ price: { $gte: 20, $lt: 300 } }`.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const range = await Products.find({ price: { $gte: 20, $lt: 300 } }).sort({ name: 1 }).plain();
+console.log(range.map((product) => product.name));
+// → ["Keyboard", "Mouse"]
+
+const late = await Products.find({ released: { $gt: new Date("2025-03-01") } }).plain();
+console.log(late.map((product) => product.name));
+// → ["Mouse"]
+```
+
+Применимы к значениям, у которых есть порядок: числам (`number`, `bigint`), строкам, датам, идентификаторам `ObjectId`, `Decimal128`, `Timestamp` и `Binary`. У логического поля порядка нет, и `{ flag: { $gt: 1 } }` не скомпилируется. Документы, у которых поля нет, в результат не попадают.
+
+---
+
+## Наборы значений
+
+### $in
+
+`$in` проверяет, что поле равно одному из значений списка. Это короткая запись длинного `$or` из нескольких равенств: выбрать товары по списку имён или пользователей по списку идентификаторов.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const picked = await Products.find({ name: { $in: ["Mouse", "Monitor"] } }).sort({ name: 1 }).plain();
+console.log(picked.map((product) => product.name));
+// → ["Monitor", "Mouse"]
+
+const withTag = await Products.find({ tags: { $in: ["office", "x"] } }).plain();
+console.log(withTag.map((product) => product.name));
+// → ["Keyboard"]
+```
+
+Применим к полям любого типа. Для поля-массива условие выполняется, если хотя бы один элемент массива входит в список. Операнд обязан быть массивом: `{ price: { $in: 5 } }` не скомпилируется, а если такой фильтр пришёл во время работы, Typemo бросает [`CastError`](../errors/data-errors.mdx#casterror):
+
+```text
+CastError: Cast to Array failed at path "price.$in" for 5 (number): $in takes an array [type]
+```
+
+### $nin
+
+`$nin` — обратный к [`$in`](#in): поле не равно ни одному значению из списка. Документы без этого поля подходят, как и у [`$ne`](#ne).
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const rest = await Products.find({ name: { $nin: ["Mouse"] } }).sort({ name: 1 }).plain();
+console.log(rest.map((product) => product.name));
+// → ["Keyboard", "Monitor"]
+```
+
+---
+
+## Наличие и тип
+
+### $exists
+
+`$exists` проверяет, есть ли в документе поле. `{ $exists: true }` — поле есть, `{ $exists: false }` — поля нет. Это единственный правильный способ найти документы, у которых поле не задано: сравнение с `undefined` Typemo запрещает.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const unreleased = await Products.find({ released: { $exists: false } }).plain();
+console.log(unreleased.map((product) => product.name));
+// → ["Monitor"]
+```
+
+Поле со значением `null` существует: `{ note: { $exists: true } }` вернёт все три товара, включая те, у которых `note` равен `null`. Чтобы найти именно `null` (и заодно документы без поля), сравните с `null` напрямую:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const noNote = await Products.find({ note: null }).sort({ name: 1 }).plain();
+console.log(noNote.map((product) => product.name));
+// → ["Keyboard", "Monitor"]
+```
+
+Сравнение с `null` разрешено только для полей, которые могут быть `null`. Для поля `released` фильтр `{ released: null }` не скомпилируется; если такой фильтр пришёл во время работы, Typemo бросает `CastError`:
+
+```text
+CastError: Cast to Date failed at path "released" for null: null is not a value of this path (it is not nullable); an absent field is { $exists: false } [null]
+```
+
+Применим к полям любого типа.
+
+### $type
+
+`$type` проверяет BSON-тип значения в базе: полезно, когда в одном поле исторически лежали значения разных типов. Принимает алиас типа (`"string"`, `"date"`, `"null"`, `"long"`, `"objectId"` и другие), слово `"number"` для любого числового типа, номер типа или непустой список из них.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const strings = await Products.find({ note: { $type: "string" } }).plain();
+console.log(strings.map((product) => product.name));
+// → ["Mouse"]
+
+const stringOrNull = await Products.find({ note: { $type: ["string", "null"] } }).sort({ name: 1 }).plain();
+console.log(stringOrNull.map((product) => product.name));
+// → ["Keyboard", "Monitor", "Mouse"]
+```
+
+Применим к полям любого типа. Неизвестный алиас приводит к `CastError`: `Cast to BSON type alias failed at path "name.$type" for "nope" (string): $type takes a BSON type alias or number (or a list of them) [type]`.
+
+---
+
+## Строки
+
+### $regex
+
+`$regex` проверяет строку по регулярному выражению. Принимает строку-шаблон или `RegExp`; флаги (`i`, `m`, `x`, `s`, `u`) для строки-шаблона задаются в соседнем `$options`. Для `RegExp` флаги пишутся в самом выражении.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const byPattern = await Products.find({ name: { $regex: "^m", $options: "i" } }).sort({ name: 1 }).plain();
+console.log(byPattern.map((product) => product.name));
+// → ["Monitor", "Mouse"]
+
+const byRegExp = await Products.find({ name: /^Mo/ }).sort({ name: 1 }).plain();
+console.log(byRegExp.map((product) => product.name));
+// → ["Monitor", "Mouse"]
+```
+
+Применим только к строковым полям, в том числе к строкам в массиве. `{ price: { $regex: "5" } }` не скомпилируется, а во время работы Typemo бросает `StrictModeError`:
+
+```text
+StrictModeError: $regex applies to strings only (at "price.$regex") [sanitize]
+```
+
+`$options` без `$regex` тоже ошибка:
+
+```text
+StrictModeError: $options without $regex (at "name.$options") [sanitize]
+```
+
+Не вставляйте в шаблон строку от клиента без экранирования: специальные символы в ней станут частью выражения.
+
+---
+
+## Числа и биты
+
+### $mod
+
+`$mod` проверяет остаток от деления: `{ $mod: [делитель, остаток] }`. Например, выбрать цены, кратные 100.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const round = await Products.find({ price: { $mod: [100, 0] } }).plain();
+console.log(round.map((product) => product.name));
+// → ["Monitor"]
+```
+
+Применим к числовым полям (`number`, `bigint`). Делитель и остаток — целые числа; нулевой делитель отвергается:
+
+```text
+CastError: Cast to [divisor, remainder] failed at path "price.$mod" for [array of 2]: $mod by 0 [type]
+```
+
+### $bitsAllSet, $bitsAnySet, $bitsAllClear, $bitsAnyClear
+
+Четыре битовых оператора проверяют отдельные биты целого числа. `$bitsAllSet` — все указанные биты установлены, `$bitsAnySet` — установлен хотя бы один, `$bitsAllClear` — все сброшены, `$bitsAnyClear` — хотя бы один сброшен. Биты можно указать списком позиций (позиция 0 — младший бит), одним числом-маской или значением `Binary`.
+
+В модели поле `flags` хранит права битами: у `Keyboard` 5 (биты 0 и 2), у `Mouse` 2 (бит 1), у `Monitor` 7 (биты 0, 1 и 2).
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const bits02 = await Products.find({ flags: { $bitsAllSet: [0, 2] } }).sort({ name: 1 }).plain();
+console.log(bits02.map((product) => product.name));
+// → ["Keyboard", "Monitor"]
+
+const anyOf1 = await Products.find({ flags: { $bitsAnySet: 2 } }).sort({ name: 1 }).plain();
+console.log(anyOf1.map((product) => product.name));
+// → ["Monitor", "Mouse"]
+
+const bit0Clear = await Products.find({ flags: { $bitsAllClear: [0] } }).plain();
+console.log(bit0Clear.map((product) => product.name));
+// → ["Mouse"]
+
+const someClear = await Products.find({ flags: { $bitsAnyClear: [0, 1] } }).sort({ name: 1 }).plain();
+console.log(someClear.map((product) => product.name));
+// → ["Keyboard", "Mouse"]
+```
+
+Применимы к целым числам и к полям `Binary`. Для остальных полей Typemo бросает `StrictModeError`, а операнд, который не маска, — `CastError`:
+
+```text
+StrictModeError: $bitsAllSet applies to integer or binary fields (at "name.$bitsAllSet") [sanitize]
+CastError: Cast to bitmask failed at path "flags.$bitsAllSet" for "x" (string): $bitsAllSet takes a non-negative integer, a list of bit positions or a Binary [type]
+```
+
+---
+
+## Массивы
+
+Поле-массив принимает всё, что принимает его элемент: `{ tags: "usb" }`, `{ tags: { $in: [...] } }`, `{ tags: { $regex: "^u" } }` проверяют, подходит ли хотя бы один элемент. Отдельные операторы для массивов — три.
+
+### $all
+
+`$all` проверяет, что массив содержит все перечисленные значения, в любом порядке и, возможно, вместе с другими.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const both = await Products.find({ tags: { $all: ["usb", "office"] } }).plain();
+console.log(both.map((product) => product.name));
+// → ["Keyboard"]
+```
+
+Применим только к массивам. Для поля, которое не массив, — `StrictModeError`, а операнд, который не массив, — `CastError`:
+
+```text
+StrictModeError: $all applies to arrays (at "price.$all") [sanitize]
+CastError: Cast to Array failed at path "tags.$all" for "x" (string): $all takes an array [type]
+```
+
+### $size
+
+`$size` проверяет длину массива: `{ tags: { $size: 0 } }` находит товары без тегов. Число должно быть целым и не меньше нуля.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const untagged = await Products.find({ tags: { $size: 0 } }).plain();
+console.log(untagged.map((product) => product.name));
+// → ["Monitor"]
+```
+
+Применим только к массивам. Для поля-числа `{ price: { $size: 1 } }` не скомпилируется, а во время работы:
+
+```text
+StrictModeError: $size applies to arrays (at "price.$size") [sanitize]
+```
+
+`$size` проверяет только точную длину. Условия вроде «не меньше трёх элементов» через него не записать: для них сохраняйте длину в отдельном поле или используйте [`$expr`](#expr).
+
+### $elemMatch
+
+`$elemMatch` требует, чтобы **один и тот же элемент** массива удовлетворял всем условиям сразу. Без него условия по вложенным полям проверяются независимо и могут выполниться на разных элементах, и это одна из самых частых ловушек.
+
+У `Keyboard` две вариации: `K-1` в количестве 4 и `K-2` в количестве 0. Нужен товар, у которого есть вариация `K-1` с нулевым остатком. Запись без `$elemMatch` находит `Keyboard`, хотя такой вариации нет: `sku` совпал у одного элемента, а `qty` — у другого.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const wrong = await Products.find({ "variants.sku": "K-1", "variants.qty": 0 }).plain();
+console.log(wrong.map((product) => product.name));
+// → ["Keyboard"]  (K-1 и qty 0 — это два разных элемента)
+
+const right = await Products.find({ variants: { $elemMatch: { sku: "K-1", qty: 0 } } }).plain();
+console.log(right.map((product) => product.name));
+// → []
+
+const second = await Products.find({ variants: { $elemMatch: { sku: "K-2", qty: 0 } } }).plain();
+console.log(second.map((product) => product.name));
+// → ["Keyboard"]
+```
+
+Для массива вложенных документов операнд — фильтр этих документов. Для массива скаляров — объект операторов над элементом: `{ scores: { $elemMatch: { $gte: 8, $lt: 10 } } }`. Применим только к массивам; пустой объект операнда отвергается.
+
+---
+
+## Логика
+
+### $not
+
+`$not` меняет условие на обратное. Принимает объект операторов (без вложенного `$not`) или `RegExp`. Внимание: документы, у которых поля нет, под `$not` подходят, потому что условие к ним не выполнилось.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const cheap = await Products.find({ price: { $not: { $gt: 30 } } }).plain();
+console.log(cheap.map((product) => product.name));
+// → ["Mouse"]
+
+const notK = await Products.find({ name: { $not: /^K/ } }).sort({ name: 1 }).plain();
+console.log(notK.map((product) => product.name));
+// → ["Monitor", "Mouse"]
+```
+
+Применим к полям любого типа; `RegExp` — только к строковым. Если условие можно выразить обратным оператором, используйте его: `$lte` вместо `$not` с `$gt`.
+
+### $and
+
+`$and` требует, чтобы выполнились все условия списка. Список не может быть пустым. Обычно `$and` не нужен: несколько ключей в одном фильтре уже работают как «и». Он нужен, когда условие на одно и то же поле или один и тот же оператор надо повторить.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const inStock = await Products.find({ $and: [{ price: { $gt: 10 } }, { stock: { $gt: 0 } }] })
+  .sort({ name: 1 })
+  .plain();
+console.log(inStock.map((product) => product.name));
+// → ["Keyboard", "Monitor"]
+```
+
+### $or
+
+`$or` требует, чтобы выполнилось хотя бы одно условие из списка.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const picked = await Products.find({ $or: [{ name: "Mouse" }, { price: { $gt: 100 } }] })
+  .sort({ name: 1 })
+  .plain();
+console.log(picked.map((product) => product.name));
+// → ["Monitor", "Mouse"]
+```
+
+### $nor
+
+`$nor` требует, чтобы не выполнилось ни одно условие списка.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const neither = await Products.find({ $nor: [{ name: "Mouse" }, { price: { $gt: 100 } }] }).plain();
+console.log(neither.map((product) => product.name));
+// → ["Keyboard"]
+```
+
+Пустой список у `$and`, `$or` и `$nor` не допускается. Сервер отвергает пустой список у всех трёх, а список условий часто собирается из данных клиента и может оказаться пустым, поэтому Typemo проверяет его заранее и называет оператор. Он бросает [`QueryError`](../errors/query-errors.mdx#queryerror) сразу при вызове метода:
+
+```text
+QueryError: filter: $or must be a non-empty array (at "$or")
+```
+
+Для `$and` и `$nor` текст тот же с их именем; при вызове `.and([])`, `.or([])` и `.nor([])` цепочки он начинается с имени метода (`and:`, `or:`, `nor:`).
+
+---
+
+## Выражения, схема, выборка
+
+### $expr
+
+`$expr` сравнивает поля документа друг с другом или с вычисленным значением. Он принимает функцию, которая строит выражение через `fn` (те же выражения, что и в агрегациях): компилятор проверяет, что поля существуют и что операции подходят их типам. Строкой с кодом, как `$where`, выражение не пишется.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const pricey = await Products.find({ $expr: (f) => fn.gt(f.price, fn.multiply(f.stock, 10)) })
+  .sort({ name: 1 })
+  .plain();
+console.log(pricey.map((product) => product.name));
+// → ["Monitor", "Mouse"]
+```
+
+Здесь цена товара сравнивается с десятикратным остатком на складе; такое условие обычными операторами записать нельзя, потому что оба операнда — поля документа. Подробнее о выражениях — в справочнике [Выражения агрегаций](../aggregation/index.mdx).
+
+### $jsonSchema
+
+`$jsonSchema` оставляет только документы, которые соответствуют JSON-схеме. Пригодится, чтобы найти документы с нарушенной структурой: например, оставшиеся от старой версии модели.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const dated = await Products.find({ $jsonSchema: { bsonType: "object", required: ["released"] } })
+  .sort({ name: 1 })
+  .plain();
+console.log(dated.map((product) => product.name));
+// → ["Keyboard", "Mouse"]
+```
+
+### $sampleRate
+
+`$sampleRate` выбирает случайную долю документов: число от 0 до 1. Используется для быстрой оценки на выборке, например для отладки на большой коллекции. Значение 1 выбирает все документы.
+
+### $comment
+
+`$comment` прикрепляет к запросу комментарий, который виден в профилировщике и логах сервера, и не влияет на результат. Он допустим только на верхнем уровне фильтра. На уровне поля Typemo его отвергает:
+
+```text
+StrictModeError: "$comment" is a top-level operator, not an operator of a field (at "filter.price.$comment") [sanitize]
+```
+
+Комментарий ко всему запросу, а не только к фильтру, задаёт метод [`.comment`](./options.mdx#comment).
+
+### $text
+
+`$text` ищет слова по текстовому индексу. Для него нужен текстовый индекс на коллекции: без индекса запрос завершается ошибкой сервера `ServerError: text index required for $text query (code 27 IndexNotFound)`. Полный разбор, включая оценку релевантности `textScore`, — в справочнике [Поиск и план запроса](./search-and-explain.mdx#textscore).
+
+---
+
+## Гео-запросы
+
+Гео-операторы работают с полями, которые хранят точку или фигуру в формате GeoJSON, и с парами координат `[долгота, широта]`. `$near` и `$nearSphere` требуют индекс `2dsphere` на поле. В модели он объявлен декоратором `@Index({ place: "2dsphere" })`, а создаётся при [синхронизации индексов](../../collections/index-sync.mdx). Координаты — конечные числа: строка вместо числа отвергается `CastError`:
+
+```text
+CastError: Cast to GeoJSON failed at path "place.$near.$geometry.coordinates.0" for "1" (string): a geo operand holds numbers, arrays of numbers and GeoJSON objects [type]
+```
+
+Фигуры с координатами проще всего строить помощником [`GeoJson`](#geojson): он проверяет диапазон и замкнутость кольца раньше, чем запрос уйдёт в базу.
+
+### $near
+
+`$near` возвращает документы, отсортированные от ближней к дальней точке. Опция `$maxDistance` ограничивает расстояние в метрах, `$minDistance` задаёт нижнюю границу. Результат уже отсортирован по расстоянию, поэтому `.sort` к нему обычно не добавляют.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const nearParis = await Products.find({
+  place: { $near: { $geometry: { type: "Point", coordinates: [2.3, 48.8] }, $maxDistance: 20_000 } },
+}).plain();
+console.log(nearParis.map((product) => product.name));
+// → ["Keyboard"]
+```
+
+Без `$maxDistance` вернутся все документы с точкой, от ближнего к дальнему: `["Keyboard", "Mouse"]`.
+
+### $nearSphere
+
+`$nearSphere` делает то же, что [`$near`](#near), но считает расстояния по сфере. Для полей GeoJSON результат совпадает с `$near`; отличие видно у старых полей с парами координат.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const nearBerlin = await Products.find({
+  place: { $nearSphere: { $geometry: { type: "Point", coordinates: [13, 52] }, $maxDistance: 100_000 } },
+}).plain();
+console.log(nearBerlin.map((product) => product.name));
+// → ["Mouse"]
+```
+
+### $geoWithin
+
+`$geoWithin` оставляет документы, фигура которых целиком лежит внутри заданной области. Индекс не обязателен.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const inFrance = await Products.find({
+  place: {
+    $geoWithin: {
+      $geometry: {
+        type: "Polygon",
+        coordinates: [[[2, 48], [3, 48], [3, 49], [2, 49], [2, 48]]],
+      },
+    },
+  },
+}).plain();
+console.log(inFrance.map((product) => product.name));
+// → ["Keyboard"]
+```
+
+### $geoIntersects
+
+`$geoIntersects` оставляет документы, фигура которых пересекается с заданной. Для точки это то же, что «точка лежит внутри».
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+  @Prop(() => Number) flags?: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const crossing = await Products.find({
+  place: {
+    $geoIntersects: {
+      $geometry: {
+        type: "Polygon",
+        coordinates: [[[13, 52], [14, 52], [14, 53], [13, 53], [13, 52]]],
+      },
+    },
+  },
+}).plain();
+console.log(crossing.map((product) => product.name));
+// → ["Mouse"]
+```
+
+---
+
+## GeoJson
+
+`GeoJson` — класс со статическими методами, которые строят значения GeoJSON для гео-операторов: точку, линию и многоугольник. Они нужны в двух ситуациях. Первая: фигура собирается не литералом прямо в фильтре, а отдельно, в переменной или функции. Тогда TypeScript выводит `coordinates` как `number[]`, а гео-операторы принимают только точную пару или кольцо нужной длины. Вторая: координаты приходят из данных, и их нужно проверить до запроса, а не после ответа сервера.
+
+```ts twoslash
+import { Entity, GeoJson, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { required: true, enum: ["Point"] }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Index({ place: "2dsphere" })
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => GeoPoint) place?: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const paris = GeoJson.point(2.3, 48.8);
+//    ^?
+
+const near = await Products.find({ place: { $near: { $geometry: paris, $maxDistance: 20_000 } } }).plain();
+console.log(near.map((product) => product.name));
+// → ["Keyboard"]
+```
+
+Возвращаемое значение подходит везде, где гео-оператор или поле модели ждёт GeoJSON: в `$near`, `$nearSphere`, `$geoIntersects`, в `$geoWithin` (многоугольник) и в значении поля при [`create`](../writes/writes.mdx#create). Методы ничего не отправляют в базу и не зависят от модели.
+
+Каждая позиция проверяется так, как это делает индекс `2dsphere`: два числа (третье — необязательная высота), все конечные, долгота от −180 до 180, широта от −90 до 90. Порядок всегда **долгота, затем широта**: помощник не может угадать, что вы перепутали числа местами, если оба лежат в допустимых пределах.
+
+### GeoJson.point
+
+Строит точку `{ type: "Point", coordinates: [долгота, широта] }`.
+
+<Returns type="GeoJsonPoint">
+
+Новый объект точки. Массив координат — копия: изменение ваших чисел после вызова на него не влияет.
+
+</Returns>
+
+<Params>
+<Param name="longitude" type="number" required>
+
+Долгота, число от −180 до 180.
+
+</Param>
+<Param name="latitude" type="number" required>
+
+Широта, число от −90 до 90.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static point(longitude: number, latitude: number): GeoJsonPoint
+```
+
+</FullType>
+
+### GeoJson.lineString
+
+Строит линию `{ type: "LineString", coordinates: [...] }` из двух и более позиций: маршрут, дорогу, границу. Подходит для `$geoIntersects` и для значения поля.
+
+```ts twoslash
+import { CastError, GeoJson } from "@venloc/typemo";
+// ---cut---
+const route = GeoJson.lineString([2.29, 48.85], [2.33, 48.86]);
+console.log(route.coordinates.length);
+// → 2
+```
+
+<Returns type="GeoJsonLineString">
+
+Новый объект линии. Позиции копируются.
+
+</Returns>
+
+<Params>
+<Param name="...positions" type="[GeoPosition, GeoPosition, ...GeoPosition[]]" required>
+
+Позиции линии, каждая — `[долгота, широта]`. Компилятор требует не меньше двух: вызов с одной позицией не компилируется.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static lineString(...positions: readonly [GeoPosition, GeoPosition, ...GeoPosition[]]): GeoJsonLineString
+```
+
+</FullType>
+
+### GeoJson.polygon
+
+Строит многоугольник `{ type: "Polygon", coordinates: [кольца] }`. Первое кольцо — внешняя граница, следующие — дыры внутри неё. Подходит для `$geoWithin`, `$geoIntersects` и значения поля.
+
+```ts twoslash
+import { CastError, GeoJson } from "@venloc/typemo";
+// ---cut---
+const square = GeoJson.polygon([[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]]);
+const withHole = GeoJson.polygon(
+  [[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]],
+  [[1, 1], [2, 1], [2, 2], [1, 1]],
+);
+console.log(square.coordinates.length, withHole.coordinates.length);
+// → 1 2
+```
+
+<Returns type="GeoJsonPolygon">
+
+Новый объект многоугольника. Кольца и позиции копируются.
+
+</Returns>
+
+<Params>
+<Param name="...rings" type="[GeoLinearRing, ...GeoLinearRing[]]" required>
+
+Кольца: внешнее первым, затем дыры. Кольцо замкнуто (последняя позиция равна первой) и состоит не меньше чем из четырёх позиций. Компилятор проверяет число позиций, а замкнутость проверяется при вызове.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static polygon(...rings: readonly [GeoLinearRing, ...GeoLinearRing[]]): GeoJsonPolygon
+```
+
+</FullType>
+
+### Ошибки
+
+Недопустимая позиция или кольцо — [`CastError`](../errors/data-errors.mdx#casterror), который бросается сразу при вызове метода, до любого запроса:
+
+```text
+CastError: Cast to GeoJSON position failed at path "coordinates" for [array of 2]: the longitude is in [-180, 180] and the latitude in [-90, 90] (longitude first) [range]
+CastError: Cast to GeoJSON position failed at path "coordinates" for [array of 2]: a position is [longitude, latitude] (an optional altitude), finite numbers [type]
+CastError: Cast to GeoJSON linear ring failed at path "coordinates.0" for [array of 4]: a ring is closed: its last position equals the first [format]
+CastError: Cast to GeoJSON linear ring failed at path "coordinates.0" for [array of 3]: a ring has four positions at least [format]
+CastError: Cast to GeoJSON line string failed at path "coordinates" for [array of 1]: a line string has two positions at least [format]
+```
+
+Первая строка — долгота или широта вне пределов (`GeoJson.point(200, 10)`), вторая — нечисловая или бесконечная координата (`GeoJson.point(Number.NaN, 1)`), третья — незамкнутое кольцо, четвёртая — слишком короткое, пятая — линия меньше чем из двух позиций (`GeoJson.lineString` из кода без типов с одной позицией: сервер отверг бы такую линию только при записи). В пути ошибки для линии и многоугольника стоит номер позиции или кольца: `coordinates.1`, `coordinates.0.3`. Ту же проверку компилятор делает по числу позиций: `GeoJson.lineString([0, 0])` и многоугольник с тремя позициями в кольце не компилируются, а в коде без типов их останавливает `CastError`.
+
+```ts twoslash
+import { CastError, GeoJson } from "@venloc/typemo";
+// ---cut---
+// @errors: 2555
+GeoJson.lineString([0, 0]);
+```
+
+`CastError` можно перехватить на границе приложения и ответить клиенту, что координаты неверны.
+
+### Когда `GeoJson` не нужен
+
+Если фигура записана литералом прямо в фильтре, как в примерах выше, компилятор уже выводит для неё точный тип, и помощник ничего не добавляет. Он нужен, когда фигура живёт отдельно от запроса или когда координаты надо проверить. Обычный объект `{ type: "Point", coordinates: [200, 100] }` Typemo пропустит: диапазон проверит только сервер при записи документа, и ответ придёт ошибкой `ServerError`.
+
+Руководство по гео-запросам с индексами и типами GeoJSON — [Гео-запросы](../../queries/geo.mdx).

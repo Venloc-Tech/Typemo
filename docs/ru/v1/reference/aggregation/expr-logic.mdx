@@ -1,0 +1,1049 @@
+---
+title: "Выражения: логика и сравнение"
+description: "fn.and, fn.eq, fn.gt, fn.cond, fn.switch, fn.ifNull и другие операторы сравнения, логики и выбора значения"
+icon: GitBranch
+---
+
+Эта страница описывает **выражения** — операторы, которые внутри конвейера считают новое значение из полей документа — для трёх задач: сравнить значения, соединить условия и выбрать один из вариантов. Выражение записывается внутри колбэка `(f) => …` стадии [`project`](./stages.mdx#project), [`addFields`](./stages.mdx#addfields), [`group`](./stages.mdx#group) и других: `f` — прокси полей модели, а операторы лежат в объекте `fn`.
+
+Если вы только начинаете, прочитайте руководство [Выражения](../../aggregation/expressions.mdx): оно объясняет, зачем колбэк вместо строк с `$` и почему сырой `$expr` запрещён. Эта страница — справочник по операторам этой группы.
+
+Все примеры используют модель заказа магазина: число, необязательное число, массив чисел, строка со списком допустимых значений и дата.
+
+```ts twoslash title="shop/order.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+```
+
+В примерах стоят две стадии: `sort` по дате и `limit(2)`, чтобы в результате остались два первых заказа, а `project` показывает `total` и вычисленное поле. Заказ Alice на 120 оплачен, у него есть скидка 10 и позиции 20 и 100. Заказ Alice на 80 оплачен, скидки у него нет. Строки получены методом [`.plain()`](./pipeline.mdx#plain).
+
+Сравнения в Typemo строже, чем в MongoDB. Сервер умеет сравнивать значения разных типов: он упорядочивает их по фиксированному порядку BSON-типов, так что число «меньше» строки, а отсутствующее поле «меньше» любого числа. Для запроса, который вы пишете осознанно, это почти всегда ошибка. Поэтому оба аргумента сравнения должны иметь один тип, и компилятор отказывает, если это не так. Он сообщает `TS2345: Argument of type '"x"' is not assignable to parameter of type 'Arg<Nullable<number>>'.`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+// @errors: 2345
+Orders.aggregate((p) => p.project((f) => ({ _id: 0, big: fn.gt(f.total, "x") })));
+```
+
+Единственное исключение — `null`: его можно поставить с любой стороны, потому что `fn.eq(x, null)` — способ проверить значение на `null`.
+
+## Логика
+
+### fn.and
+
+`fn.and` возвращает `true`, если все аргументы истинны. Принимает один или больше аргументов, возвращает `boolean`. `null` в аргументах считается ложью, поэтому результат никогда не `null`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      big: fn.and(fn.gt(f.total, 100), fn.eq(f.status, "paid")),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, big: true },
+//   { total: 80, big: false },
+// ]
+```
+
+### fn.or
+
+`fn.or` возвращает `true`, если истинен хотя бы один аргумент. Число аргументов и результат такие же, как у `fn.and`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      special: fn.or(fn.gt(f.total, 100), fn.eq(f.status, "new")),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, special: true },
+//   { total: 80, special: false },
+// ]
+```
+
+Как оба оператора обращаются с `null`, показано ниже, после `fn.not`.
+
+### fn.not
+
+`fn.not` меняет `boolean` на противоположное. Принимает одно значение, которое может быть `null`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, small: fn.not(fn.gt(f.total, 100)) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, small: false },
+//   { total: 80, small: true },
+// ]
+```
+
+С `null` три оператора логики обращаются одинаково: считают его ложью. `fn.and(true, null)` даёт `false`, `fn.or(false, null)` — тоже `false`, а `fn.not(null)` даёт `true`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      both: fn.and(true, null),
+      either: fn.or(false, null),
+      negated: fn.not(null),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, both: false, either: false, negated: true },
+//   { total: 80, both: false, either: false, negated: true },
+// ]
+```
+
+## Сравнение
+
+Все шесть операторов сравнения принимают ровно два аргумента одного типа и возвращают `boolean`. Тип аргумента определяется по обоим значениям вместе, поэтому число нельзя сравнить со строкой, а дату — с числом.
+
+### fn.eq
+
+`fn.eq` проверяет равенство.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, is120: fn.eq(f.total, 120) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, is120: true },
+//   { total: 80, is120: false },
+// ]
+```
+
+Проверка на `null` не находит отсутствующее поле: у второго заказа `discount` не задан, и `fn.eq(f.discount, null)` даёт `false`. Пропущенное поле и `null` — разные значения. Чтобы поймать оба, используйте [`fn.ifNull`](#fnifnull) или сравните [`fn.typeOf`](./expr-conversion.mdx#fntypeof) с `"missing"`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      discount: 1,
+      isNull: fn.eq(f.discount, null),
+      isTen: fn.eq(f.discount, 10),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { discount: 10, isNull: false, isTen: true },
+//   { isNull: false, isTen: false },
+// ]
+```
+
+### fn.ne
+
+`fn.ne` проверяет неравенство.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, not120: fn.ne(f.total, 120) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, not120: false },
+//   { total: 80, not120: true },
+// ]
+```
+
+### fn.gt
+
+`fn.gt` проверяет «строго больше». Дату можно сравнить с датой.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, over100: fn.gt(f.total, 100) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, over100: true },
+//   { total: 80, over100: false },
+// ]
+```
+
+### fn.gte
+
+`fn.gte` проверяет «больше или равно».
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, from120: fn.gte(f.total, 120) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, from120: true },
+//   { total: 80, from120: false },
+// ]
+```
+
+### fn.lt
+
+`fn.lt` проверяет «строго меньше».
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, under100: fn.lt(f.total, 100) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, under100: false },
+//   { total: 80, under100: true },
+// ]
+```
+
+Оператор не сообщает о пропущенном поле: сервер считает отсутствующее значение меньше любого числа. У второго заказа `discount` не задан, но `fn.lt(f.discount, 0)` даёт `true`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      discount: 1,
+      gtZero: fn.gt(f.discount, 0),
+      ltZero: fn.lt(f.discount, 0),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { discount: 10, gtZero: true, ltZero: false },
+//   { gtZero: false, ltZero: true },
+// ]
+```
+
+Если поле необязательное, сначала проверьте его отдельно или подставьте значение через [`fn.ifNull`](#fnifnull).
+
+### fn.lte
+
+`fn.lte` проверяет «меньше или равно».
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, upTo80: fn.lte(f.total, 80) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, upTo80: false },
+//   { total: 80, upTo80: true },
+// ]
+```
+
+### fn.cmp
+
+`fn.cmp` сравнивает два значения и возвращает `-1`, `0` или `1`. Тип результата — именно `-1 | 0 | 1`, а не `number`, поэтому им удобно разбирать случаи. 
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, vs100: fn.cmp(f.total, 100) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, vs100: 1 },
+//   { total: 80, vs100: -1 },
+// ]
+```
+
+Заказ на 120 больше 100, поэтому `1`; заказ на 80 меньше, поэтому `-1`. Даты сравниваются так же: заказ Alice от 5 января раньше 10 января (`-1`), а от 12 января — позже (`1`).
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      older: fn.cmp(f.placedAt, new Date("2026-01-10T00:00:00Z")),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, older: -1 },
+//   { total: 80, older: 1 },
+// ]
+```
+
+### fn.isIn
+
+`fn.isIn` проверяет, что значение — элемент массива. Принимает значение и массив: литерал или поле-массив. В сервере оператор называется `$in`, а в `fn` — `isIn`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      active: fn.isIn(f.status, ["new", "paid"]),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, active: true },
+//   { total: 80, active: true },
+// ]
+```
+
+Массив может быть полем модели: тогда проверяется, что значение лежит в нём.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, cheap: fn.isIn(80, f.prices) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, cheap: false },
+//   { total: 80, cheap: true },
+// ]
+```
+
+Второй заказ содержит позицию 80, поэтому для него `cheap` равно `true`.
+
+## Выбор значения
+
+### fn.cond
+
+`fn.cond` возвращает одно из двух значений: `then`, если условие истинно, и `otherwise`, если нет. Принимает три аргумента: условие, значение «да» и значение «нет». Тип результата — объединение типов обеих ветвей.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      size: fn.cond(fn.gt(f.total, 100), "large", "small"),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, size: "large" },
+//   { total: 80, size: "small" },
+// ]
+```
+
+Это самая короткая запись выбора. Если вариантов больше двух, читаемее [`fn.switch`](#fnswitch).
+
+### fn.switch
+
+`fn.switch` выбирает значение по первому подошедшему условию. Принимает `branches` — список пар `{ case, then }` — и необязательный `default`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      size: fn.switch({
+        branches: [
+          { case: fn.gte(f.total, 100), then: "large" },
+          { case: fn.gte(f.total, 50), then: "medium" },
+        ],
+        default: "small",
+      }),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, size: "large" },
+//   { total: 80, size: "medium" },
+// ]
+```
+
+Первое условие, которое стало истинным, определяет результат, поэтому порядок ветвей — приоритет: 120 подходит и под «не меньше 100», и под «не меньше 50», но выбрана первая ветвь.
+
+Без `default` Typemo не добавляет `null` к типу результата, потому что сервер в этом случае не возвращает `null`, а падает. Это видно при выполнении:
+
+```text
+ServerError: $switch could not find a matching branch for an input, and no default was specified. (code 40066 Location40066)
+```
+
+Поэтому `default` стоит писать всегда, если ветви не покрывают все возможные значения.
+
+### fn.ifNull
+
+`fn.ifNull` возвращает первое значение, которое не `null` и не пропущено. Принимает значение и запасное значение того же типа; после них можно добавить ещё запасные.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, discount: fn.ifNull(f.discount, 0) })),
+).plain();
+console.log(rows);
+//          ^?
+// → [
+//   { discount: 10 },
+//   { discount: 0 },
+// ]
+```
+
+Тип результата — тип запасного значения (`number`), без `undefined`: пропуск и `null` заменены. Это нужный оператор для необязательных полей: он превращает «нет скидки» в `0`, с которым можно считать.
+
+### fn.literal
+
+`fn.literal` передаёт значение серверу как есть: его не читают как путь к полю или как оператор. Обычно он не нужен для строки со знаком доллара, потому что Typemo сам оборачивает такую строку в `$literal`. Это видно в результате:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      label: fn.concat("$", fn.toString_(f.total)),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, label: "$120" },
+//   { total: 80, label: "$80" },
+// ]
+```
+
+Здесь `"$"` — просто знак, а не путь `$…`. Если значение нужно зафиксировать явно, оберните его в `fn.literal`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, label: fn.literal("$5 off") })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, label: "$5 off" },
+//   { total: 80, label: "$5 off" },
+// ]
+```
+
+## Когда не подходит
+
+- Нужно отфильтровать документы, а не вычислить поле: используйте стадию [`match`](./stages.mdx#match) с обычным фильтром или предикатом-выражением, а не `fn.cond` в `project`.
+- Нужны арифметика и округление: смотрите [арифметические операторы](./expr-arithmetic.mdx).
+- Нужно сравнить строки без учёта регистра: используйте [`fn.strcasecmp`](./expr-string.mdx#fnstrcasecmp), а не `fn.cmp`.
+- Нужно проверить тип значения: для этого есть [`fn.typeOf`](./expr-conversion.mdx#fntypeof) и [`fn.isNumber`](./expr-conversion.mdx#fnisnumber).

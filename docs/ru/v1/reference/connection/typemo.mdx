@@ -1,0 +1,198 @@
+---
+title: Typemo
+description: "Глобальные настройки процесса: Typemo.plugin, Typemo.use, Typemo.instrument и константа VERSION"
+icon: Settings
+---
+
+Класс `Typemo` собирает настройки, которые действуют на весь процесс: глобальные плагины схем, глобальные расширения и глобальные подписчики на события. Глобального подключения к базе в нём нет: клиенты создаются явно через [`TypemoClient`](./typemo-client.mdx), а `Typemo` только регистрирует то, что должны увидеть все клиенты сразу.
+
+Каждая глобальная регистрация имеет пару на уровне клиента ([`client.use`](./typemo-client.mdx#clientuse), [`client.instrument`](./typemo-client.mdx#clientinstrument)) или подключения ([`connection.plugins`](./connection.mdx#connectionplugins)). Что выбрать и когда, рассказывает руководство [Несколько клиентов и расширения](../../connection/clients-and-extensions.mdx). Эта страница — справочник.
+
+Примеры используют одну модель счёта и расширение с ключом `label`. Ключ расширения нужно объявить для компилятора, поэтому в подготовке каждого блока есть `declare module`:
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+}
+```
+
+---
+
+## Typemo.plugin
+
+`Typemo.plugin` регистрирует глобальный плагин схем: он применяется ко всем схемам, скомпилированным после регистрации, у всех клиентов, раньше плагинов подключения и модели. Плагин — объект с именем и функцией `apply`, которая получает построитель схемы и может добавить поля, индексы, хуки, виртуальные поля и статические методы. Нужен для того, что должно быть у каждой модели приложения.
+
+```ts twoslash
+import { Typemo } from "@venloc/typemo";
+// ---cut---
+Typemo.plugin({
+  name: "log-compiled-models",
+  apply: (builder) => {
+    console.log("схема", builder.target.name);
+  },
+});
+```
+
+После этого при компиляции каждой модели, у любого клиента, плагин срабатывает один раз для схемы. Запуск на двух клиентах с моделью `Account` вывел строку `Account` два раза.
+
+<Params>
+<Param name="plugin" type="SchemaPlugin<O>" required>
+
+Объект `{ name, apply(builder, options), statics? }`. Имя обязательно и не пустое. Иначе `ConfigurationError: a plugin is an object { name, apply(builder, options) }`.
+
+</Param>
+<Param name="options" type="O">
+
+Настройки плагина. Обязательны, если плагин объявляет обязательные настройки, и тогда компилятор потребует второй аргумент.
+
+</Param>
+</Params>
+
+Возвращает `void`.
+
+### Регистрация до первой модели
+
+Плагин нужно зарегистрировать до компиляции первой модели **любого** клиента. Механизм строгий, потому что схемы, уже скомпилированные без плагина, изменить нельзя, а молча пропустить их значило бы получить приложение, где плагин работает у одних моделей и не работает у других. Текст ошибки получен запуском:
+
+```text
+ConfigurationError: plugin "late": the global plugins are fixed once a schema is compiled (Account was); register plugins before the first model
+```
+
+Поэтому глобальные плагины регистрируют в самом начале запуска приложения, до создания моделей. Подробнее о том, что может добавить плагин, — в справочнике [Плагины](../hooks/plugins.mdx) и в руководстве [Плагины](../../hooks/plugins.mdx).
+
+<FullType>
+
+```ts
+static plugin<O>(plugin: SchemaPlugin<O>, ...options: OptionsArgs<O>): void
+```
+
+</FullType>
+
+---
+
+## Typemo.use
+
+`Typemo.use` регистрирует расширение схемы для **каждого** клиента. Расширение вводит в `ext` у `@Prop` и `@Schema` новый ключ и проверяет каждое значение этого ключа при компиляции схемы. Так интеграции хранят свои настройки прямо в описании модели, не меняя ядро.
+
+Расширение состоит из двух частей. Первая — объявление типа ключа для компилятора: `declare module "@venloc/typemo"` дополняет `PropExtensions` или `SchemaExtensions`. Вторая — вызов `Typemo.use` с именем и проверкой значения.
+
+```ts twoslash
+import { Typemo } from "@venloc/typemo";
+declare module "@venloc/typemo" {
+  interface PropExtensions<V> {
+    label?: { readonly text: string };
+  }
+}
+// ---cut---
+Typemo.use({
+  name: "label",
+  validateProp: (value) => {
+    if (typeof value !== "object" || value === null || typeof (value as { text?: unknown }).text !== "string") {
+      throw new Error("label.text must be a string");
+    }
+  },
+});
+```
+
+Проверка получает значение как написано. Компилятор проверяет типизированный код, но JavaScript-вызывающий код и значения из конфигурации он не видит, поэтому параметр `value` имеет тип `unknown`, и проверка должна бросать ошибку сама. Ошибка становится `cause` у `ConfigurationError`, который видит пользователь модели.
+
+<Params>
+<Param name="extension" type="TypemoExtension" required>
+
+Объект `{ name, validateProp?, validateSchema? }`. `validateProp` проверяет значение на поле, `validateSchema` — на схеме; нужна хотя бы одна. Ключ используется только там, где есть соответствующая проверка. Имя не пустое и не начинается с `$`.
+
+</Param>
+</Params>
+
+Возвращает `void`. Ошибки — `ConfigurationError`:
+
+```text
+ConfigurationError: extension "label" is already registered
+```
+
+Это повторное имя: оно занято глобально или уже зарегистрировано на клиенте через [`client.use`](./typemo-client.mdx#clientuse).
+
+### Когда закрывается регистрация
+
+Плагины и расширения закрываются одинаково: первой **успешной** компиляцией схемы. Глобальный список закрывается компиляцией первой модели на любом клиенте, а список клиента и список подключения — первой моделью этого клиента или подключения. Компиляция, которая упала (например, из-за неизвестного ключа в `ext`), ничего не закрывает: запуск показал, что после такой ошибки `Typemo.use`, `Typemo.plugin` и `client.use` ещё принимают регистрацию, так что нужное расширение, которое назвала ошибка, можно зарегистрировать и повторить. После первой удачной компиляции на клиенте `A` глобальные регистрации уже закрыты, а второй клиент `B`, у которого своей модели ещё нет, по-прежнему может вызвать `B.use(...)`. Поэтому библиотека, которая создаёт свой клиент и модели при импорте, закрывает глобальные `Typemo.use` и `Typemo.plugin` для вашего приложения: регистрируйте глобальное раньше, чем подключаете такие библиотеки.
+
+Подробнее об устройстве расширений — в справочнике [Расширения](../extensions/extensions.mdx) и руководстве [Свои опции полей и схем](../../extensions/custom-options.mdx).
+
+<FullType>
+
+```ts
+static use(extension: TypemoExtension): void
+```
+
+</FullType>
+
+---
+
+## Typemo.instrument
+
+`Typemo.instrument` подписывает наблюдателя на операции **всех** клиентов процесса. Он нужен интеграциям (метрики, трассировка, журнал), которые должны видеть всё без привязки к конкретному клиенту. Пока подписчиков нет, наблюдаемость ничего не стоит.
+
+```ts twoslash
+import { Typemo } from "@venloc/typemo";
+// ---cut---
+const subscription = Typemo.instrument({
+  handle: (event) => {
+    if (event.type === "operation.end") {
+      console.log(`${event.connection}/${event.database}: ${event.operation}`);
+    }
+  },
+});
+subscription.unsubscribe();
+```
+
+Событие содержит имя клиента (`event.connection`, из опции `name`), базу и имя операции, поэтому один подписчик различает клиентов.
+
+<Params>
+<Param name="subscriber" type="InstrumentationSubscriber" required>
+
+Объект с функцией `handle` и необязательными настройками (`sensitive`, `driverCommands`, `poolEvents`, `steps`, `includeTenant`, `wrap`). Полное описание — в справочнике [События](../observability/events.mdx).
+
+</Param>
+</Params>
+
+<Returns type="Subscription">
+
+Объект с методом `unsubscribe()`; он же поддерживает `using`. Подписку на один клиент даёт [`client.instrument`](./typemo-client.mdx#clientinstrument).
+
+</Returns>
+
+Руководство: [События операций](../../observability/events.mdx).
+
+<FullType>
+
+```ts
+static instrument(subscriber: InstrumentationSubscriber): Subscription
+```
+
+</FullType>
+
+---
+
+## VERSION
+
+`VERSION` — строка версии пакета, экспортируется из `@venloc/typemo` как отдельная константа, а не как член класса `Typemo`. Значение сейчас `"0.0.0"`: пакет ещё не выпущен.
+
+```ts twoslash
+import { VERSION } from "@venloc/typemo";
+// ---cut---
+console.log(VERSION);
+// → "0.0.0"
+```
+
+---
+
+## Когда `Typemo` не подходит
+
+Если расширение, плагин или подписчик нужны одному клиенту, регистрируйте их на нём: [`client.use`](./typemo-client.mdx#clientuse), [`connection.plugins`](./connection.mdx#connectionplugins), [`client.instrument`](./typemo-client.mdx#clientinstrument). Так библиотека, которая создаёт свой клиент, не навязывает своё поведение приложению и наоборот.

@@ -1,0 +1,275 @@
+---
+title: Быстрый старт
+description: "Как установить Typemo, описать две модели и выполнить первые запросы к MongoDB: от пустой папки до работающего скрипта"
+icon: Rocket
+---
+
+Чтобы получить работающий результат, вам нужно пять шагов: установить пакеты, настроить `tsconfig.json`, описать модели классами, подключиться к базе и выполнить запросы. Ниже они собраны в один скрипт блога: пользователь пишет пост, пост сначала черновик, потом публикуется, и вы читаете его вместе с автором.
+
+Typemo хранит данные в **MongoDB**: это база, в которой записи лежат документами (объектами) в коллекциях, а не строками в таблицах. Схема данных в Typemo — это обычный TypeScript-класс с декораторами, и все типы результатов компилятор выводит из этих классов. Поэтому отдельных файлов схем и кодогенерации нет.
+
+## Что предполагается
+
+Работающий сервер MongoDB на `localhost:27017` (локальный `mongod` или любой другой, адрес меняется в одной строке) и установленный [Bun](https://bun.sh). Typemo пишется и проверяется на Bun, поэтому скрипт запускается командой `bun run`. Остальные варианты установки описаны в руководстве [Установка и настройка](./installation.mdx).
+
+<Steps>
+<Step>
+
+### Установите пакеты
+
+Создайте пустую папку с проектом и установите ядро, драйвер MongoDB и `bson` — пакет, который описывает типы данных MongoDB, например `ObjectId`. Драйвер и `bson` Typemo не приносит с собой: это его **peer-зависимости**, то есть пакеты, которые вы ставите сами, чтобы в приложении была одна копия каждого. Компилятор и типы для Bun нужны только при разработке.
+
+```package-install
+@venloc/typemo mongodb bson
+```
+
+```package-install
+-D typescript @types/bun
+```
+
+</Step>
+<Step>
+
+### Настройте `tsconfig.json`
+
+Схемы описываются декораторами. В ядре `@venloc/typemo` это **legacy-декораторы**, то есть режим TypeScript с флагом `experimentalDecorators`. Без него Bun применит декораторы по стандарту TC39, и Typemo остановит запуск. Остальные флаги задают рекомендуемую строгость компилятора и настройки для Bun.
+
+```json title="tsconfig.json"
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": true,
+    "experimentalDecorators": true,
+    "noEmit": true,
+    "types": ["bun"]
+  },
+  "include": ["src"]
+}
+```
+
+`import "reflect-metadata"` в приложении писать не нужно, а `emitDecoratorMetadata` включать не требуется: ядро хранит метаданные схемы само. Зачем нужен каждый флаг и как выбрать между legacy и TC39-декораторами — в руководстве [Установка и настройка](./installation.mdx).
+
+</Step>
+<Step>
+
+### Опишите модели
+
+**Модель** — это класс, который вы описываете один раз и получаете из него и проверки во время работы, и типы. [`@Schema`](../reference/schemas/schema.mdx#schema) говорит, в какой коллекции лежат документы класса, а [`@Prop`](../reference/schemas/prop.mdx#prop) описывает поле: первым аргументом идёт функция с типом значения, вторым — опции. Базовый класс [`Entity`](../reference/schemas/base-classes.mdx#entity) добавляет поле `_id` — идентификатор `ObjectId`, который MongoDB присваивает каждому документу.
+
+```ts twoslash title="src/models.ts"
+import { Entity, Prop, type Ref, Schema, Types } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true })
+  email!: string;
+}
+
+@Schema({ collection: "posts" })
+export class Post extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Boolean, { required: true })
+  published!: boolean;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+```
+
+Опция `required` делает поле обязательным, а `unique` не даёт завести двух пользователей с одним адресом. Поле `author` — **ссылка**: пост хранит только `_id` автора, а `ref` говорит, что это идентификатор из коллекции `User`. Тип [`Ref<User>`](../reference/schemas/field-markers.mdx#ref) сообщает компилятору, что в этом поле может лежать и идентификатор, и сам пользователь, если вы попросите заполнить ссылку.
+
+</Step>
+<Step>
+
+### Подключитесь и создайте документы
+
+[`TypemoClient.connect`](../reference/connection/typemo-client.mdx#typemoclientconnect) открывает соединение с сервером, а [`client.connection`](../reference/connection/typemo-client.mdx#clientconnection) выдаёт подключение к базе `blog`, которая названа в конце адреса. Из подключения вы получаете модели через [`connection.model`](../reference/connection/connection.mdx#connectionmodel).
+
+Typemo сам не создаёт индексы. Поэтому сразу после подключения вызывается [`connection.init`](../reference/connection/connection.mdx#connectioninit): он создаёт то, чего нет в базе, в частности уникальный индекс по `email`. Без него `unique` ничего бы не гарантировал.
+
+Затем [`create`](../reference/writes/writes.mdx#create) записывает документы. Обратите внимание, что в `author` можно передать `_id` только что созданного пользователя.
+
+```ts twoslash title="src/main.ts"
+// @filename: models.ts
+import { Entity, Prop, type Ref, Schema, Types } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true })
+  email!: string;
+}
+
+@Schema({ collection: "posts" })
+export class Post extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Boolean, { required: true })
+  published!: boolean;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+// @filename: main.ts
+// ---cut---
+import { TypemoClient } from "@venloc/typemo";
+import { Post, User } from "./models.ts";
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Users = client.connection.model(User);
+const Posts = client.connection.model(Post);
+await client.connection.init();
+
+const alice = await Users.create({ name: "Alice", email: "alice@example.com" });
+console.log(alice.name);
+// → "Alice"
+
+const post = await Posts.create({ title: "Hello", published: false, author: alice._id });
+console.log(post.title, post.published);
+// → "Hello" false
+```
+
+`create` возвращает **документ**: объект, который выглядит как экземпляр вашего класса, помнит, что в нём изменилось, и умеет сохранять себя. Как с ним работать, описано в руководстве [Документы](../documents/index.mdx).
+
+</Step>
+<Step>
+
+### Прочитайте и обновите данные
+
+[`find`](../reference/query/reading.mdx#modelfind) ищет документы по условию, а [`.plain()`](../reference/query/reading.mdx#plain) в конце запроса превращает результат в обычные объекты, готовые к отправке клиенту: `_id` становится строкой. Обновляет документы [`updateOne`](../reference/writes/writes.mdx#updateone): первым аргументом идёт фильтр, вторым — оператор MongoDB, здесь `$set` записывает новое значение поля.
+
+Чтобы вместо идентификатора автора получить самого автора, добавьте [`.populate`](../reference/populate/populate.mdx#populate). Ссылка может оказаться «висячей» (автора уже удалили), и тогда заполненное поле было бы `null`; опция `required: true` превращает такой случай в ошибку и убирает `null` из типа. Метод [`.orFail()`](../reference/query/reading.mdx#orfail) значит «если ничего не нашлось, брось ошибку», поэтому у результата нет `null`.
+
+```ts twoslash title="src/main.ts"
+// @filename: models.ts
+import { Entity, Prop, type Ref, Schema, Types } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => String, { required: true, unique: true })
+  email!: string;
+}
+
+@Schema({ collection: "posts" })
+export class Post extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Boolean, { required: true })
+  published!: boolean;
+
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true })
+  author!: Ref<User>;
+}
+// @filename: main.ts
+// ---cut---
+import { TypemoClient } from "@venloc/typemo";
+import { Post, User } from "./models.ts";
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Users = client.connection.model(User);
+const Posts = client.connection.model(Post);
+await client.connection.init();
+
+const alice = await Users.create({ name: "Alice", email: "alice@example.com" });
+const post = await Posts.create({ title: "Hello", published: false, author: alice._id });
+
+const drafts = await Posts.find({ published: false }).plain(); // [!code ++]
+console.log(drafts); // [!code ++]
+// → [{ _id: "…", title: "Hello", published: false, author: "…" }]
+
+const result = await Posts.updateOne({ _id: post._id }, { $set: { published: true } }); // [!code ++]
+console.log(result.modifiedCount); // [!code ++]
+// → 1
+
+const found = await Posts.findOne({ title: "Hello" }).populate({ path: "author", required: true }).orFail().plain(); // [!code ++]
+//    ^?
+console.log(found.author.name); // [!code ++]
+// → "Alice"
+
+await client.close(); // [!code ++]
+```
+
+Тип `found` выводится из моделей: у `found.author` есть `name`, потому что вы вызвали `.populate`. Без этого вызова в `author` лежала бы строка с идентификатором, а у строки нет поля `name`.
+
+Последняя строка закрывает клиент. Незакрытый клиент держит процесс запущенным, и скрипт не завершится.
+
+</Step>
+<Step>
+
+### Запустите скрипт
+
+Файл `src/main.ts` из предыдущего шага готов, запустите его:
+
+```bash
+bun run src/main.ts
+```
+
+Проверить типы отдельно можно командой `bunx tsc -p .`: Bun запускает TypeScript, но не проверяет его, а `tsc` проверяет. Так вы увидите ошибки компиляции, не запуская скрипт.
+
+</Step>
+</Steps>
+
+## Частые ошибки
+
+### Повторный запуск падает с `DuplicateKeyError`
+
+Скрипт создаёт пользователя с одним и тем же адресом, а индекс `unique`, который создал [`connection.init`](../reference/connection/connection.mdx#connectioninit), не пускает второго:
+
+```text
+DuplicateKeyError: duplicate key on email_1: { email: "alice@example.com" } (code 11000 DuplicateKey)
+```
+
+Так и должно быть: уникальность обеспечивает база. Чтобы перезапустить пример, удалите базу `blog` или поменяйте адрес. В своём коде такую ошибку [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicatekeyerror) перехватывают и превращают в ответ «адрес занят»: пример есть в руководстве [Первое приложение](./first-app.mdx#зарегистрировать-пользователя).
+
+### Запуск падает с `ConfigurationError` про legacy-декоратор
+
+В `tsconfig.json` нет `experimentalDecorators: true` (или файл лежит не в той папке, откуда вы запускаете Bun: он берёт `tsconfig.json` из текущей папки). Bun применяет декораторы по стандарту TC39, а ядро ждёт legacy-режима:
+
+```text
+ConfigurationError: @Prop from "@venloc/typemo" is a legacy decorator, but it was applied as a TC39 decorator (experimentalDecorators is off). Use "@venloc/typemo-decorators" in a TC39 project; the two packages cannot be mixed
+```
+
+Включите `experimentalDecorators` или, если вам нужны стандартные декораторы, перейдите на пакет из руководства [Использовать TC39-декораторы](../decorators-tc39/tc39.mdx).
+
+### `ConnectionError: no server available`
+
+Клиент не нашёл сервер по адресу: MongoDB не запущена или адрес неверный. Драйвер ждёт сервер до 30 секунд, поэтому ошибка приходит не сразу:
+
+```text
+ConnectionError: no server available: connect ECONNREFUSED ::1:27017, connect ECONNREFUSED 127.0.0.1:27017
+```
+
+Запустите сервер или исправьте адрес в [`TypemoClient.connect`](../reference/connection/typemo-client.mdx#typemoclientconnect). Как создавать клиент в настоящем приложении, рассказывает руководство [Подключиться к базе](../connection/connect.mdx).
+
+## Что дальше
+
+<Cards>
+<Card title="Установка и настройка" href="./installation.mdx">
+  Версии, peer-зависимости, каждый флаг `tsconfig` и выбор между legacy- и TC39-декораторами.
+</Card>
+<Card title="Первое приложение" href="./first-app.mdx">
+  Тот же блог целиком: пользователи, посты и комментарии, с сервисами и обработкой ошибок.
+</Card>
+<Card title="Описать модель" href="../schemas/define-model.mdx">
+  Как устроены `@Schema` и `@Prop` и откуда берётся тип документа.
+</Card>
+<Card title="Чтение данных" href="../queries/reading-data.mdx">
+  Документ, lean и plain: в каком виде получить данные и когда какой выбрать.
+</Card>
+</Cards>

@@ -1,0 +1,301 @@
+---
+title: История изменений
+description: "Как записывать, кто и что менял в счёте, показать историю одного документа и отправлять события о сохранении"
+icon: History
+---
+
+Чтобы ответить на вопрос «кто и когда изменил этот счёт», нужны две вещи: журнал, в который попадает каждая запись, и способ прочитать из него историю одного документа. Эта страница строит то и другое для банковских счетов: журнал ведёт политика [аудита](../policies/audit.mdx), актор (тот, кто действует) передаётся через контекст, а хук документа сообщает остальному приложению, что счёт сохранён.
+
+Журнал пишется в той же транзакции, что и сама запись: если журнал не записался, откатывается и изменение. Поэтому история не расходится с данными, но и стоит дороже обычной записи: каждая запись счёта — ещё одна запись в журнал.
+
+## Что предполагается
+
+Клиент подключён по руководству [Подключиться к базе](../connection/connect.mdx), база `bank`. MongoDB работает как реплика-сет: аудит пишет в транзакции, на одиночном `mongod` запись в аудируемую модель завершается `ConfigurationError`. Что записывает аудит и как маскирует секреты, описано в руководстве [Аудит](../policies/audit.mdx).
+
+## Быстрый путь
+
+Включите `audit: true` в схеме и оберните запись в [`PolicyContext.run`](../reference/policies/policy-context.mdx#policycontextrun) с актором. Запись счёта оставит строку журнала в коллекции `accounts_audit`:
+
+```ts twoslash
+import { ObjectId } from "mongodb";
+import { type AuditEntry, type Defaulted, Entity, PolicyContext, Post, Prop, Schema, TypemoClient } from "@venloc/typemo";
+declare const __publish__: (event: { type: string; title: string }) => void;
+@Schema({ collection: "accounts", audit: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => String, { sensitive: "mask" }) card?: string;
+  @Post("document.save")
+  announce(this: Account): void {
+    __publish__({ type: "account.saved", title: this.title });
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.db().model(Account);
+const asActor = <R>(userId: string, work: () => R): R => PolicyContext.run({ actor: userId }, work);
+// ---cut---
+const account = await asActor("user-1", () => Accounts.create({ title: "Main", card: "5500000000000004" }));
+
+const trail = client.unsafeDriver().db("bank").collection("accounts_audit");
+console.log(await trail.countDocuments({ actor: "user-1" }));
+// → 1
+```
+
+Остальная страница показывает, как прочитать историю одного счёта, объяснить её человеку и разослать события.
+
+## Описать модель
+
+У счёта название, баланс и номер карты. Карта помечена `sensitive: "mask"`: журнал запишет её как `?`, а не настоящий номер, поэтому доступ к истории не раскрывает секреты.
+
+```ts twoslash title="accounts/account.ts"
+import { type Defaulted, Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts", audit: true })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Number, { min: 0, default: 0 })
+  balance!: Defaulted<number>;
+
+  @Prop(() => String, { sensitive: "mask" })
+  card?: string;
+}
+```
+
+## Записывать от имени пользователя
+
+Журнал записывает актора из контекста политик: без него в строке нет `actor`, и непонятно, кто менял. Контекст открывает слой запроса один раз, как в рецепте [Многотенантное приложение](./multi-tenant.mdx). Здесь этот слой — функция `asActor`.
+
+```ts twoslash title="http/as-actor.ts"
+import { PolicyContext } from "@venloc/typemo";
+// ---cut---
+export const asActor = <R>(userId: string, work: () => R): R => PolicyContext.run({ actor: userId }, work);
+```
+
+Дальше все записи идут внутри неё. Обратите внимание: контекст берётся при **построении** операции, поэтому `asActor("u2", () => doc.$save())` работает, а строитель, созданный заранее вне `asActor`, актора не получит.
+
+## Прочитать историю одного счёта
+
+У журнала нет модели, и читать его нужно через драйвер: [`client.unsafeDriver()`](../reference/connection/typemo-client.mdx#clientunsafedriver). Строка журнала ([`AuditEntry`](../reference/policies/schema-options.mdx#auditentry)) хранит `filter` записи или вставленные `documents`. Поэтому записи одного счёта — это строки, где `filter._id` равен его `_id` (изменения и удаления), где `filter._id.$in` содержит его (запись сразу по нескольким счетам, см. раздел о `updateMany` ниже) или где `documents._id` равен ему (создание).
+
+```ts twoslash title="accounts/history.ts"
+import { ObjectId } from "mongodb";
+import { type AuditEntry, type Defaulted, Entity, PolicyContext, Post, Prop, Schema, TypemoClient } from "@venloc/typemo";
+declare const __publish__: (event: { type: string; title: string }) => void;
+@Schema({ collection: "accounts", audit: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => String, { sensitive: "mask" }) card?: string;
+  @Post("document.save")
+  announce(this: Account): void {
+    __publish__({ type: "account.saved", title: this.title });
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.db().model(Account);
+const asActor = <R>(userId: string, work: () => R): R => PolicyContext.run({ actor: userId }, work);
+// ---cut---
+export const historyOf = async (id: string) => {
+  const trail = client.unsafeDriver().db("bank").collection<AuditEntry>("accounts_audit");
+  const oid = new ObjectId(id);
+  return trail
+    .find({ $or: [{ "filter._id": oid }, { "filter._id.$in": oid }, { "documents._id": oid }] })
+    .sort({ _id: 1 })
+    .toArray();
+};
+```
+
+Сортировка по `_id` строки журнала даёт порядок записи. Пусть счёт `Main` создал `u1`, `u2` сохранил документ с новым балансом, а `u3` прибавил 5 оператором `$inc`. `historyOf` вернёт три строки с операциями `insertOne`, `updateOne`, `updateOne` и акторами `u1`, `u2`, `u3`. Запись через `$save` в журнале помечена `document: true`, а прямое обновление — `document: false`.
+
+## Объяснить историю человеку
+
+Пользователю нужна строка вроде «u3: увеличил balance», а не сырая строка журнала. Оператор и поле берутся из `update`: журнал хранит значения, уже приведённые к типам схемы, а секреты — замаскированными.
+
+```ts twoslash title="accounts/history.ts"
+import { type AuditEntry } from "@venloc/typemo";
+// ---cut---
+export const describeEntry = (entry: AuditEntry): { at: Date; actor: unknown; what: string } => {
+  const what = (() => {
+    if (entry.operation === "insertOne") return "created";
+    if (entry.operation === "deleteOne" || entry.operation === "deleteMany") return "deleted";
+    const update = entry.update;
+    if (update === undefined || Array.isArray(update)) return entry.operation;
+    return Object.entries(update)
+      .flatMap(([operator, fields]) =>
+        typeof fields === "object" && fields !== null ? Object.keys(fields).map((field) => `${operator} ${field}`) : [],
+      )
+      .join(", ");
+  })();
+  return { at: entry.at, actor: entry.actor, what };
+};
+```
+
+Для трёх записей выше получится `created`, `$set balance`, `$inc balance`. Значение карты здесь не появится ни в каком виде, кроме `?`.
+
+## Сообщать о сохранении событием
+
+Журнал отвечает на вопрос «что было», а событие — «что сейчас произошло»: уведомление клиенту, обновление кеша, письмо. Хук документа [`@Post`](../reference/hooks/pre-post.mdx#post) на событие `document.save` вызывается после записи документа. Отправка события — ваш код (`__publish__`).
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Post, Prop, Schema } from "@venloc/typemo";
+declare const __publish__: (event: { type: string; title: string }) => void;
+// ---cut---
+@Schema({ collection: "accounts", audit: true })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Post("document.save")
+  announce(this: Account): void {
+    __publish__({ type: "account.saved", title: this.title });
+  }
+}
+```
+
+Хук срабатывает на `create` и `$save`, то есть на пути через документ. `updateOne` и `updateMany` хуки документа не вызывают: изменение через них останется в журнале, но события не породит. Если событие нужно и для них, подписывайтесь на [подписку на изменения](./change-stream-jobs.mdx): она видит любую запись, откуда бы она ни пришла.
+
+## Как выбрать
+
+Спросите себя: **кому нужен ответ, человеку или коду?** Если «кто и что менял» нужен человеку, показывайте историю из журнала. Если коду нужно среагировать на изменение (обновить кеш, отправить письмо), используйте хук документа для путей через документ или [подписку на изменения](../change-streams/watch.mdx) для всех путей. Полную историю значений документа (каждая версия целиком) журнал не хранит: он хранит операции.
+
+## Когда это не нужно
+
+Если вам нужна только дата последнего изменения, хватит [`Timestamped`](../reference/schemas/base-classes.mdx#timestamped) с полями `createdAt` и `updatedAt`. Журнал дорог тем, что удваивает записи; включайте его на моделях, где вопрос «кто менял» действительно возникает: деньги, права, настройки.
+
+## Частые ошибки
+
+### В истории нет записей `updateMany`
+
+`updateMany` с фильтром по названию не хранит `_id` счетов: журнал записал условие, а не список задетых документов. `historyOf` по `_id` такую строку не найдёт, и в истории отдельного счёта не будет и самой записи. Прочитайте идентификаторы в транзакции и запишите по ним: тогда строка журнала назовёт `_id`, и `historyOf` её увидит.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { type Defaulted, Entity, PolicyContext, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", audit: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.db().model(Account);
+const asActor = <R>(userId: string, work: () => R): R => PolicyContext.run({ actor: userId }, work);
+// ---cut---
+export const setBalanceByTitle = (userId: string, title: string, balance: number) =>
+  asActor(userId, () =>
+    client.transaction(async () => {
+      const rows = await Accounts.find({ title }).select({ _id: 1 }).lean();
+      await Accounts.updateMany({ _id: { $in: rows.map((row) => row._id) } }, { $set: { balance } });
+    }),
+  );
+```
+
+Транзакция нужна, чтобы чтение идентификаторов и запись по ним опирались на одно состояние базы. Запуск показал, что строка журнала такой записи называет `filter: { _id: { $in: [...] } }` со всеми идентификаторами, а `historyOf` находит её по `filter._id.$in`. Подробнее о том, почему журнал хранит условие, — в руководстве [Аудит](../policies/audit.mdx#история-одного-документа).
+
+### В журнале нет актора
+
+Запись выполнена вне `asActor`. Строка журнала при этом всё равно есть, но с `actor: null`. Оборачивайте в `asActor` каждый обработчик, который что-то пишет.
+
+### Запись падает на одиночном `mongod`
+
+Аудит требует реплика-сет: запись и журнал идут в одной транзакции. Запустите MongoDB как реплика-сет, достаточно одного участника (см. [Аудит](../policies/audit.mdx#запись-падает-на-одиночном-mongod)).
+
+## Полный пример
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { ObjectId } from "mongodb";
+import {
+  type AuditEntry,
+  type Defaulted,
+  Entity,
+  PolicyContext,
+  Post,
+  Prop,
+  Schema,
+  TypemoClient,
+} from "@venloc/typemo";
+
+// your code: sends an event to the rest of the application
+declare const __publish__: (event: { type: string; title: string }) => void;
+
+// accounts/account.ts
+@Schema({ collection: "accounts", audit: true })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Number, { min: 0, default: 0 })
+  balance!: Defaulted<number>;
+
+  @Prop(() => String, { sensitive: "mask" })
+  card?: string;
+
+  @Post("document.save")
+  announce(this: Account): void {
+    __publish__({ type: "account.saved", title: this.title });
+  }
+}
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
+const Accounts = client.db().model(Account);
+
+// http/as-actor.ts: the actor of every write of a request
+export const asActor = <R>(userId: string, work: () => R): R => PolicyContext.run({ actor: userId }, work);
+
+// writes
+export const openAccount = (userId: string, title: string, card: string) =>
+  asActor(userId, () => Accounts.create({ title, card }));
+
+export const deposit = (userId: string, id: string, amount: number) =>
+  asActor(userId, () => Accounts.updateOne({ _id: id }, { $inc: { balance: amount } }).orFail());
+
+// history of one account, oldest first
+export const historyOf = async (id: string) => {
+  const trail = client.unsafeDriver().db("bank").collection<AuditEntry>("accounts_audit");
+  const oid = new ObjectId(id);
+  const entries = await trail
+    .find({ $or: [{ "filter._id": oid }, { "filter._id.$in": oid }, { "documents._id": oid }] })
+    .sort({ _id: 1 })
+    .toArray();
+  return entries.map(describeEntry);
+};
+
+// one line of the history for a person
+export const describeEntry = (entry: AuditEntry): { at: Date; actor: unknown; what: string } => {
+  const what = (() => {
+    if (entry.operation === "insertOne") return "created";
+    if (entry.operation === "deleteOne" || entry.operation === "deleteMany") return "deleted";
+    const update = entry.update;
+    if (update === undefined || Array.isArray(update)) return entry.operation;
+    return Object.entries(update)
+      .flatMap(([operator, fields]) =>
+        typeof fields === "object" && fields !== null ? Object.keys(fields).map((field) => `${operator} ${field}`) : [],
+      )
+      .join(", ");
+  })();
+  return { at: entry.at, actor: entry.actor, what };
+};
+```
+
+<Callout type="migration">
+
+В Mongoose историю обычно вели плагином (`mongoose-history` и подобные) с отдельной записью после основной: сбой между ними оставлял запись без истории. Здесь журнал пишется в той же транзакции, а секреты маскируются по опции поля `sensitive`.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Аудит" href="../policies/audit.mdx">
+  Что записывается, как маскируются секреты, что будет при сбое журнала.
+</Card>
+<Card title="Контекст политик" href="../policies/policy-context.mdx">
+  Как контекст с актором доходит до каждой операции.
+</Card>
+<Card title="Хуки документа" href="../hooks/document-hooks.mdx">
+  Все события документа и их порядок.
+</Card>
+<Card title="Фоновые задачи на изменениях" href="./change-stream-jobs.mdx">
+  Как реагировать на любую запись, включая `updateMany`.
+</Card>
+</Cards>

@@ -1,0 +1,194 @@
+---
+title: Описать и синхронизировать поисковые индексы
+description: "Как объявить индекс Atlas Search или Vector Search в схеме, посмотреть расхождение с сервером и применить его, и что происходит без Atlas Search"
+icon: SearchCode
+---
+
+Обычные индексы MongoDB ускоряют точные запросы и сортировку. Полнотекстовый поиск с ранжированием и поиск по векторам (по смыслу) работают на других индексах — **поисковых**: Atlas Search и Atlas Vector Search. Они хранятся отдельно от обычных индексов и работают только там, где включён Atlas Search: в MongoDB Atlas или в локальном развёртывании Atlas CLI (так говорит и сам сервер в тексте ошибки, см. ниже). Typemo позволяет описать такие индексы в схеме и синхронизировать их так же, как обычные.
+
+Как искать по такому индексу, описано в руководстве [Поиск в агрегациях](../aggregation/search.mdx). Эта страница — о том, как индекс описать и создать.
+
+**Важно.** Тестовый сервер, на котором проверялась эта документация, — обычный `mongod` без Atlas Search. Поэтому здесь запуском проверено только то, что происходит **без** Atlas Search: какие ошибки вы получите. Успешное создание, обновление и удаление поисковых индексов описано по коду и запуском не проверялось; на таких местах это сказано прямо.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель статьи с текстом.
+
+## Быстрый путь
+
+Объявите индекс декоратором [`@SearchIndex`](../reference/schemas/index-decorators.mdx#searchindex) и синхронизируйте: [`syncSearchIndexes`](../reference/collections/model-indexes.mdx#modelsyncsearchindexes) у модели или общим [`connection.syncAll`](../reference/connection/connection.mdx#connectionsyncall).
+
+```ts twoslash title="articles/article.ts"
+import { Entity, Prop, Schema, SearchIndex, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "articles" })
+@SearchIndex({ name: "articles_text", definition: { mappings: { dynamic: true } } })
+export class Article extends Entity {
+  @Prop(() => String, { required: true })
+  body!: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.connection.model(Article);
+// ---cut---
+const plan = await Articles.diffSearchIndexes();
+const result = await Articles.syncSearchIndexes();
+```
+
+На сервере с Atlas Search `plan.toCreate` содержит `"articles_text"`, а `syncSearchIndexes` создаёт индекс. Этот результат по коду, запуском не проверялся. Остальная страница разбирает задачи подробнее.
+
+## Описать поисковый индекс
+
+Ситуация: в коллекции нужен полнотекстовый поиск. Декоратор [`@SearchIndex`](../reference/schemas/index-decorators.mdx#searchindex) принимает имя индекса, тип и определение. Определение — тот же объект, который ожидает Atlas, Typemo его не разбирает и передаёт как есть.
+
+```ts twoslash title="articles/article.ts"
+import { Entity, Prop, Schema, SearchIndex } from "@venloc/typemo";
+
+@Schema({ collection: "articles" })
+@SearchIndex({ name: "articles_text", definition: { mappings: { dynamic: true } } })
+export class Article extends Entity {
+  @Prop(() => String, { required: true })
+  body!: string;
+}
+```
+
+Тип по умолчанию — `"search"` (полнотекстовый); для векторного поиска укажите `type: "vectorSearch"`. Декоратор только записывает описание в схему: индекс на сервере появится, когда вы вызовете синхронизацию. Класс может объявить несколько таких индексов с разными именами. Объявленные индексы видны в описании схемы без обращения к серверу: [`model.schema.describe().searchIndexes`](../reference/schemas/schema-info.mdx) возвращает их имена, типы и определения в порядке объявления, например `[{ name: "articles_text", definition: { mappings: { dynamic: true } } }]`.
+
+## Посмотреть расхождение
+
+Ситуация: вы изменили определение индекса и хотите знать, что изменится. [`diffSearchIndexes`](../reference/collections/model-indexes.mdx#modeldiffsearchindexes) сравнивает индексы схемы с индексами сервера **по имени**: отсутствующий попадает в `toCreate`, с другим типом или определением — в `toUpdate`, а индексы сервера, которых нет в схеме, — в `toDrop`.
+
+```ts twoslash
+import { Entity, Prop, Schema, SearchIndex, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "articles" })
+@SearchIndex({ name: "articles_text", definition: { mappings: { dynamic: true } } })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) body!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.connection.model(Article);
+// ---cut---
+const diff = await Articles.diffSearchIndexes();
+console.log(diff.toCreate, diff.toUpdate, diff.toDrop);
+// на сервере с Atlas Search: ["articles_text"] [] []
+```
+
+Комментарий с результатом описывает поведение по коду: на тестовом сервере метод бросает ошибку, о которой ниже.
+
+## Применить изменения
+
+Ситуация: план устраивает. [`syncSearchIndexes`](../reference/collections/model-indexes.mdx#modelsyncsearchindexes) удаляет лишние поисковые индексы, обновляет отличающиеся и создаёт недостающие. Он не останавливается на первой неудаче: собирает все и в конце бросает одну [`IndexSyncError`](../reference/errors/configuration-errors.mdx#indexsyncerror). Опция `dryRun: true` только показывает план.
+
+```ts twoslash title="scripts/sync-search.ts"
+import { Entity, Prop, Schema, SearchIndex, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "articles" })
+@SearchIndex({ name: "articles_text", definition: { mappings: { dynamic: true } } })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) body!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.connection.model(Article);
+// ---cut---
+const plan = await Articles.syncSearchIndexes({ dryRun: true });
+console.log(plan.dryRun, plan.toCreate);
+// на сервере с Atlas Search: true ["articles_text"]
+```
+
+Как и выше, результат описан по коду. Порядок шагов такой: сначала удаление, затем обновление, затем создание. Прямой вызов `syncSearchIndexes` не смотрит опцию схемы `autoIndex`, а в `init` и `syncAll` модель с `autoIndex: false` вместе с обычными индексами пропускает и поисковые.
+
+## Что происходит без Atlas Search
+
+Ситуация: приложение запущено на обычном `mongod`, например в разработке. Сервер отвечает на запрос списка поисковых индексов ошибкой, и Typemo **не превращает её в «индексов нет»**: иначе отсутствие поиска на сервере выглядело бы как «всё синхронизировано». Запуск на обычном `mongod` показал: [`diffSearchIndexes`](../reference/collections/model-indexes.mdx#modeldiffsearchindexes) и [`syncSearchIndexes`](../reference/collections/model-indexes.mdx#modelsyncsearchindexes) (в том числе с `dryRun: true`) бросают [`ServerError`](../reference/errors/server-errors.mdx#servererror) с кодом `31082` (`SearchNotEnabled`).
+
+```ts twoslash
+import { Entity, Prop, Schema, SearchIndex, ServerError, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "articles" })
+@SearchIndex({ name: "articles_text", definition: { mappings: { dynamic: true } } })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) body!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.connection.model(Article);
+// ---cut---
+try {
+  await Articles.diffSearchIndexes();
+} catch (error) {
+  if (error instanceof ServerError) console.log(error.code);
+  // → 31082
+}
+```
+
+В `message` — причина и код. Полный текст сервера, с подсказкой подключиться к Atlas и ссылкой на документацию MongoDB, лежит в `serverMessage`:
+
+```text
+ServerError: Using Atlas Search Database Commands and the $listSearchIndexes aggregation stage requires additional configuration. (code 31082 SearchNotEnabled)
+```
+
+То же происходит внутри общей синхронизации. [`connection.syncAll`](../reference/connection/connection.mdx#connectionsyncall) и [`connection.init`](../reference/connection/connection.mdx#connectioninit) выполняют все остальные шаги (например, создают саму коллекцию и обычные индексы), а в конце бросают [`SyncError`](../reference/errors/configuration-errors.mdx#syncerror): эта `ServerError` лежит в `error.errors` и в `errors` записи коллекции в `error.report`. Проверено запуском.
+
+Если вам нужна разработка без Atlas Search, не объявляйте `@SearchIndex` на моделях, которые запускаются на обычном `mongod`, или запускайте разработку на локальном развёртывании Atlas CLI.
+
+## Как выбрать
+
+Задайте себе один вопрос: **есть ли на всех серверах, где запускается приложение, Atlas Search?** Если да, объявляйте индексы в схеме и синхронизируйте их вместе со всем остальным через [`connection.syncAll`](../reference/connection/connection.mdx#connectionsyncall). Если только в продакшене, а разработчики работают на обычном `mongod`, держите поисковые модели отдельно и синхронизируйте их отдельным шагом деплоя через [`syncSearchIndexes`](../reference/collections/model-indexes.mdx#modelsyncsearchindexes).
+
+## Когда это не нужно
+
+Если вам нужен простой поиск по словам, достаточно обычного текстового индекса `text` в [`@Index`](../reference/schemas/index-decorators.mdx#index): он работает на любом сервере и синхронизируется вместе с остальными индексами, см. [Синхронизировать индексы](./index-sync.mdx). Поисковые индексы Atlas нужны для стадий `$search` и `$vectorSearch`.
+
+## Частые ошибки
+
+### `SearchNotEnabled` при запуске
+
+`ServerError` с кодом `31082` на обычном `mongod`. Сервер не поддерживает поисковые индексы. Подключитесь к Atlas или локальному развёртыванию Atlas CLI, либо не объявляйте `@SearchIndex` для этой среды.
+
+### `init` упал из-за поискового индекса
+
+Один сбой поискового индекса заставляет и [`connection.init`](../reference/connection/connection.mdx#connectioninit), и [`connection.syncAll`](../reference/connection/connection.mdx#connectionsyncall) бросить [`SyncError`](../reference/errors/configuration-errors.mdx#syncerror), хотя остальное уже создано. Причина — в `error.errors`, полный отчёт — в `error.report`. Если поиск есть не везде, не объявляйте `@SearchIndex` в моделях, которые запускаются без него.
+
+## Полный пример
+
+Файл описывает модель с поисковым индексом и шаг деплоя, который синхронизирует его и останавливается при сбое. Пример компилируется, но на обычном `mongod` завершится ошибкой `31082`, как описано выше.
+
+```ts twoslash title="scripts/deploy-search.ts"
+import { Entity, Prop, Schema, SearchIndex, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "articles" })
+@SearchIndex({ name: "articles_text", definition: { mappings: { dynamic: true } } })
+class Article extends Entity {
+  @Prop(() => String, { required: true })
+  body!: string;
+}
+
+const deploy = async (uri: string) => {
+  const client = await TypemoClient.connect(uri, { name: "deploy" });
+  try {
+    const Articles = client.connection.model(Article);
+
+    // план: что создастся, ничего не записывая
+    const plan = await Articles.syncSearchIndexes({ dryRun: true });
+    console.log("to create:", plan.toCreate);
+
+    // применение: создаёт, обновляет и удаляет; при сбое бросит IndexSyncError
+    await Articles.syncSearchIndexes();
+  } finally {
+    await client.close();
+  }
+};
+
+await deploy("mongodb://localhost:27017/app");
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Поиск в агрегациях" href="../aggregation/search.mdx">
+  Как искать по созданному индексу: `$search`, `$vectorSearch` и другие стадии.
+</Card>
+<Card title="Синхронизировать индексы" href="./index-sync.mdx">
+  Обычные индексы: создание, план, применение и разбор сбоев.
+</Card>
+<Card title="Справочник: индексы модели" href="../reference/collections/model-indexes.mdx">
+  `diffSearchIndexes`, `syncSearchIndexes` и типы результатов.
+</Card>
+</Cards>

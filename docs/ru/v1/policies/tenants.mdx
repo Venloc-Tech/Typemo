@@ -1,0 +1,315 @@
+---
+title: Разделить данные организаций
+description: "Как хранить данные разных организаций в одной коллекции так, чтобы запрос одной не мог увидеть или изменить данные другой"
+icon: Building2
+---
+
+Если ваш сервис обслуживает много организаций, а данные хранятся в общих коллекциях, каждая операция должна работать только с данными **одной** организации. В Typemo эту организацию называют **тенантом**, а правило включается в схеме двумя частями: опцией [`tenant`](../reference/policies/schema-options.mdx#опция-tenant) и декоратором [`@Tenant()`](../reference/schemas/field-markers.mdx#tenant) на поле тенанта. После этого модель сама добавляет условие по тенанту в каждый запрос и записывает тенанта в каждый новый документ. Обычная ошибка в коде без такой защиты — забытое условие `orgId` в одном из запросов, и клиент видит чужие заказы.
+
+Если вы впервые видите политики, сначала прочитайте [обзор](./overview.mdx). Здесь разобрана одна задача: разделить данные.
+
+## Что предполагается
+
+Клиент подключён по руководству [Подключиться к базе](../connection/connect.mdx). Примеры используют CRM: заказы принадлежат организациям `acme` и `globex`.
+
+## Быстрый путь
+
+Включите политику в схеме, пометьте поле тенанта декоратором [`@Tenant()`](../reference/schemas/field-markers.mdx#tenant) и типом [`TenantField`](../reference/schemas/field-markers.mdx#tenantfield) и открывайте область [`PolicyContext.run`](../reference/policies/policy-context.mdx#policycontextrun) там, где известна организация:
+
+```ts twoslash title="orders/order.ts"
+import { Entity, Prop, Schema, Tenant, type TenantField } from "@venloc/typemo";
+
+@Schema({ collection: "orders", tenant: true })
+export class Order extends Entity {
+  @Prop(() => String)
+  @Tenant()
+  tenantId!: TenantField<string>;
+
+  @Prop(() => String, { required: true })
+  number!: string;
+}
+```
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, PolicyContext, Tenant, type TenantField } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Orders = client.connection.model(Order);
+// ---cut---
+await PolicyContext.run({ tenant: "acme" }, () => Orders.create({ number: "A-1" }));
+
+const mine = await PolicyContext.run({ tenant: "acme" }, () => Orders.find().plain());
+console.log(mine[0]?.tenantId);
+// → "acme"
+```
+
+Остальная страница разбирает поведение на реальных задачах: описание поля, чтение, запись, тенант из запроса HTTP, работа по всем тенантам, агрегации, связанные данные и подписки.
+
+## Описать поле тенанта
+
+Поле тенанта объявляется тремя вещами сразу, и каждая отвечает за своё. [`@Prop`](../reference/schemas/prop.mdx) делает его полем схемы. Тип `TenantField<T>` говорит компилятору, что поле заполняет библиотека: поэтому `create` его не требует, а результаты чтения всегда его содержат. Декоратор `@Tenant()` сообщает то же самое **во время работы**: типы TypeScript при запуске исчезают, и без метки библиотека не знала бы, какое поле считать тенантом, а угадывать по имени не стала бы.
+
+Правила короткие. Опция `tenant: true` называет поле `tenantId`, а `tenant: { field: "orgId" }` — любое другое. Метка `@Tenant()` ставится ровно на это поле и только на него. Согласованность проверяется дважды. В типизированном коде её замечает компилятор: вот вторая метка на другом поле.
+
+```ts twoslash
+// @errors: 1238
+import { Entity, Prop, Schema, Tenant, type TenantField } from "@venloc/typemo";
+// ---cut---
+@Schema({ collection: "notes", tenant: true })
+class Note extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String) @Tenant() author!: TenantField<string>;
+}
+// компилятор: @Schema: "author" is TenantField<T>, but the tenant field is "tenantId"
+```
+
+Второе поле с `@Tenant()` — ошибка, потому что тенант в документе один. Так же не компилируется `@Tenant()` на поле, которое объявлено не `TenantField<T>`, и поле `TenantField<T>` в схеме без опции `tenant`. Во время работы те же правила проверяет сборка модели: она нужна для JavaScript и для кода, который обошёл типы приведением. Нарушение там — [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configurationerror) при вызове [`connection.model`](../reference/connection/connection.mdx#connectionmodel): модель не создаётся, ни одна операция не доходит до базы. Тексты этих ошибок перечислены ниже, в разделе [Ошибки сборки схемы](#ошибки-сборки-схемы).
+
+В пакете [`@venloc/typemo-decorators`](../decorators-tc39/index.mdx) для TC39-декораторов `@Tenant()` называется так же и работает так же.
+
+## Записать данные тенанта
+
+Вставка не требует, чтобы вы указывали тенанта: модель берёт его из контекста и записывает в документ. Поэтому тип `create` не содержит поля `tenantId`, а читаемый документ его содержит всегда.
+
+```ts twoslash title="orders/orders.service.ts"
+import { Entity, Prop, Schema, TypemoClient, PolicyContext, Tenant, type TenantField } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Orders = client.connection.model(Order);
+// ---cut---
+export const placeOrder = (tenant: string, number: string, total: number) =>
+  PolicyContext.run({ tenant }, () => Orders.create({ number, total }));
+
+const order = await placeOrder("acme", "A-1", 100);
+console.log(order.tenantId, order.number);
+// → "acme" "A-1"
+```
+
+Если вы всё же укажете чужого тенанта в документе, вставка откажет: документ принадлежал бы другой организации, чем операция. Запуск дал `StrictModeError: Order.create: the document is for another tenant (tenantId: globex) than the operation's (acme) [tenant]`. В тексте назван метод, который вы вызвали (`create`), а не внутренняя операция вставки.
+
+Если области нет, а тенант нужен только одной записи, передайте его в параметрах вызова: `Orders.create({ number: "A-1" }, { policy: { tenant: "acme" } })`. Такие же параметры принимают `insertOne`, `insertMany`, `bulkWrite` и `$save`. Значение приводится по типу поля тенанта, поэтому для `TenantField<ObjectId>` подойдёт и строка.
+
+## Читать данные тенанта
+
+В любом чтении — `find`, `findOne`, `countDocuments`, `distinct`, курсоре — к вашему фильтру добавляется условие по тенанту. Данные в коллекции: у `acme` два заказа, у `globex` один.
+
+```ts twoslash title="orders/orders.service.ts"
+import { Entity, Prop, Schema, TypemoClient, PolicyContext, Tenant, type TenantField } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Orders = client.connection.model(Order);
+// ---cut---
+export const listOrders = (tenant: string) =>
+  PolicyContext.run({ tenant }, () => Orders.find().sort({ number: 1 }).plain());
+
+const acme = await listOrders("acme");
+console.log(acme.map((order) => order.number));
+// → ["A-1", "A-2"]
+const globex = await PolicyContext.run({ tenant: "globex" }, () => Orders.countDocuments());
+// → 1
+```
+
+Ваше собственное условие по полю тенанта не заменяет условие политики: должны выполниться оба. Запрос `find({ tenantId: "globex" })` внутри области `acme` вернул `[]`, а не заказы `globex`. Так нельзя «выйти» из тенанта ни ошибкой, ни подменой.
+
+## Изменить и удалить данные тенанта
+
+Обновления, удаления и «найти и изменить» получают то же условие, поэтому `updateMany` или `deleteMany` в области `acme` не может задеть заказ `globex`. Само поле тенанта менять нельзя: перенос документа к другой организации был бы утечкой.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, PolicyContext, Tenant, type TenantField } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Orders = client.connection.model(Order);
+// ---cut---
+const removed = await PolicyContext.run({ tenant: "acme" }, () => Orders.deleteMany({ total: { $gt: 60 } }));
+console.log(removed.deletedCount);
+// → 1  (только заказ A-1 организации acme)
+
+await PolicyContext.run({ tenant: "acme" }, () =>
+  Orders.updateOne({ number: "A-2" }, { $set: { tenantId: "globex" } }),
+);
+// → StrictModeError: Order.updateOne: $set of the tenant field ("tenantId") would move the document to another tenant or lose it [tenant]
+```
+
+## Взять тенанта из запроса HTTP
+
+Тенанта обычно знает слой, принимающий запрос: он читает организацию из токена и открывает область один раз вокруг всей обработки. Сервисам внутри не нужно передавать тенанта параметром. Область сохраняется во всей цепочке асинхронных вызовов, поэтому `await` внутри неё безопасны.
+
+```ts twoslash title="http/handler.ts"
+import { Entity, Prop, Schema, TypemoClient, PolicyContext, Tenant, type TenantField } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Orders = client.connection.model(Order);
+// ---cut---
+declare const __readToken__: (token: string) => { readonly orgId: string; readonly userId: string };
+
+export const handleListOrders = async (token: string) => {
+  const { orgId, userId } = __readToken__(token);
+  return PolicyContext.run({ tenant: orgId, actor: userId }, async () => {
+    const orders = await Orders.find().plain();
+    return { status: 200, body: orders };
+  });
+};
+```
+
+Область берётся, когда операция **строится**, а не когда её ждут. Запрос, построенный внутри `run` и дождавшийся снаружи, остаётся запросом своего тенанта. А запрос, построенный вне области, тенанта не получит: он бросит `StrictModeError`, даже если его ждут внутри `run`. Так запрос, сохранённый в переменной модуля, не может «подцепить» тенанта чужого запроса. Подробности — в [Контексте политик](./policy-context.mdx).
+
+## Работать сразу по всем тенантам
+
+Фоновой задаче или админке иногда нужны все организации. Это разрешается только явно: `allTenants: true` в контексте или в `.policy()`. Значение по умолчанию не может быть «все»: забытый тенант должен быть ошибкой, а не выдачей всей коллекции.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, Tenant, type TenantField } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Orders = client.connection.model(Order);
+// ---cut---
+const all = await Orders.find().policy({ allTenants: true }).sort({ number: 1 }).plain();
+console.log(all.map((order) => `${order.tenantId}:${order.number}`));
+// → ["acme:A-1", "acme:A-2", "globex:G-1"]
+```
+
+Значения `tenant` и `allTenants: true` вместе запрещены: контекст не должен противоречить сам себе. Внутри области с тенантом вложенный `run({ allTenants: true })` снимает тенанта, и наоборот.
+
+Тенант обязан быть значением: пустая строка, строка из одних пробелов и `null` отвергаются сразу, при открытии области, а не при первой операции. Иначе ошибка в коде, достающем организацию из токена, выглядела бы как «тенанта нет» и молча превращалась бы в работу с документами без организации. Запуск показал: `PolicyContext.run: the tenant is empty (""); a tenant is a non-empty value, or allTenants: true for cross-tenant work [tenant]`. Пустой тенант в параметрах записи, `Orders.create(doc, { policy: { tenant: "" } })`, отвергается так же, и текст называет вызванный метод: `create.policy: the tenant is empty (""); …`.
+
+## Агрегации, связанные данные и подписки
+
+В агрегации условие тенанта ставится в начало конвейера. Стадии [`$lookup`](../reference/aggregation/stages.mdx#lookup), [`$unionWith`](../reference/aggregation/stages.mdx#unionwith) и [`$graphLookup`](../reference/aggregation/stages.mdx#graphlookup) присоединяют документы только того же тенанта, если класс, названный в стадии, тоже с политикой: чужая папка не подтянется, даже если ссылка на неё есть. Политику Typemo берёт из самого класса, поэтому модель присоединяемой коллекции на подключении создавать не нужно. Стадии [`$out`](../reference/aggregation/stages.mdx#out) и [`$merge`](../reference/aggregation/stages.mdx#merge) в коллекцию с тенантом запрещены, потому что они записали бы данные мимо политики. Запросы [`populate`](../populate/basics.mdx) — операции целевой модели, они ограничены так же и унаследуют контекст родительского запроса. Всё это проверено тестами ядра на настоящем сервере.
+
+Подписка ([`watch`](../reference/change-streams/watch.mdx)) модели с тенантом без `allTenants: true` запрещена: событие удаления не несёт документа, по которому его можно отфильтровать по тенанту. У `watch` нет своего `.policy()`, поэтому `allTenants: true` задаётся областью, и текст ошибки называет эту форму: `PolicyContext.run({ allTenants: true }, () => Orders.watch())`. Фильтруйте события сами. `estimatedDocumentCount` тоже запрещён (он читает метаданные и посчитал бы всех); используйте `countDocuments()`. Тексты обеих ошибок приведены в [Нарушениях политик](../reference/policies/violations.mdx#tenant).
+
+## Как выбрать
+
+Спросите себя: **могут ли документы двух организаций лежать в одной коллекции?** Если да, включайте `tenant`, и разделение станет свойством модели. Если организации должны быть изолированы физически (разные базы, разные требования к хранению), используйте отдельную базу для каждой через [`client.db(name)`](../reference/connection/typemo-client.mdx#clientdb): политика тогда не нужна. Комбинировать можно, но обычно хватает одного способа.
+
+## Когда это не нужно
+
+Если у вас одна организация, политика ничего не даёт и требует тенанта на каждой операции. Если разделение нужно по обычному полю, которое клиент вправе сам выбирать (например, по владельцу заметки, а не по организации), пишите его условием в фильтре: тенант — это то, что клиент выбирать **не должен**.
+
+## Частые ошибки
+
+### Операция без тенанта падает
+
+Сервис вызвал модель вне области. Текст (получен запуском): `StrictModeError: Order.find: Order is scoped by tenant ("tenantId") and the operation has no tenant; run it inside PolicyContext.run({ tenant }, …) or add .policy({ tenant }) to the query (cross-tenant work: .policy({ allTenants: true })) [tenant]`. Причина: тенант нигде не задан, а без него безопасного условия построить нельзя. Подсказка называет форму, которая есть у вашего вызова: у запроса это `.policy({ tenant })`, а у записи (`create`, `insertOne`, `insertMany`, `bulkWrite`, `$save`) — параметры вызова: `… or pass { policy: { tenant } } in the call's options (cross-tenant work: { policy: { allTenants: true } })`. Откройте [`PolicyContext.run`](../reference/policies/policy-context.mdx#policycontextrun) вокруг обработки или передайте значения в вызов.
+
+### Запрос, построенный заранее, падает без тенанта
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, PolicyContext, Tenant, type TenantField } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Orders = client.connection.model(Order);
+// ---cut---
+// неправильно: запрос построен вне области, ждём внутри
+const query = Orders.find();
+await PolicyContext.run({ tenant: "acme" }, async () => query.plain());
+// во время работы: StrictModeError … the operation has no tenant … [tenant]
+
+// правильно: строим внутри области
+await PolicyContext.run({ tenant: "acme" }, async () => Orders.find().plain());
+```
+
+Область берётся при построении, а не при ожидании, и это защищает вас от запроса, который «подцепил» бы тенанта не своего запроса.
+
+### Ошибки сборки схемы
+
+Схема с политикой тенанта не собирается, если поле и метка не согласованы. Компилятор ловит такие схемы раньше; эти тексты вы увидите там, где типов нет или они обойдены. Получены запуском `connection.model`:
+
+```text
+ConfigurationError: NoMark: the tenant field "tenantId" must be marked @Tenant() (declare it @Prop(...) @Tenant() tenantId!: TenantField<T>)
+ConfigurationError: NoOpt: @Tenant() on "tenantId", but the schema has no tenant policy — add tenant: true (or { field }) to @Schema
+ConfigurationError: Two: @Tenant() marks "tenantId", "other"; only the tenant field "tenantId" may be marked
+ConfigurationError: Wrong: the tenant field "orgId" must be marked @Tenant() (declare it @Prop(...) @Tenant() orgId!: TenantField<T>)
+ConfigurationError: NoField: tenant field "tenantId" is not a field of the class
+```
+
+Первая — опция есть, а метки нет. Вторая — метка есть, а опции нет. Третья — меток две. Четвёртая — опция называет `orgId`, а метка стоит на другом поле. Пятая — в классе нет поля, которое называет опция. Исправление всегда одно: опция и метка должны указывать на одно и то же поле.
+
+### Число вместо строки в тенанте
+
+Тенант приводится по типу поля. Для `TenantField<string>` число `5` даёт `CastError: Cast to string failed at path "tenantId" for 5 (number): expected a string [type]`. Передайте значение того типа, который объявлен в поле.
+
+## Полный пример
+
+```ts twoslash title="orders/orders.service.ts"
+import { Entity, Prop, Schema, TypemoClient, PolicyContext, Tenant, type TenantField } from "@venloc/typemo";
+
+@Schema({ collection: "orders", tenant: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Orders = client.connection.model(Order);
+
+// код читателя: организация из токена
+declare const __orgOf__: (token: string) => string;
+
+// запись: тенант проставляет модель
+export const placeOrder = (token: string, number: string, total: number) =>
+  PolicyContext.run({ tenant: __orgOf__(token) }, () => Orders.create({ number, total }));
+
+// чтение: только заказы своей организации
+export const listOrders = (token: string) =>
+  PolicyContext.run({ tenant: __orgOf__(token) }, () => Orders.find().sort({ number: 1 }).plain());
+
+// отчёт по всем организациям: явно
+export const countAllOrders = () => Orders.countDocuments().policy({ allTenants: true });
+```
+
+<Callout type="migration">
+
+В Mongoose мультитенантность делают плагином или `pre`-хуком `find`, и любой запрос, который хук не покрывает (`aggregate`, `lean`, `updateOne`), выдаёт чужие данные. В Typemo политика встроена в конвейер и покрывает каждый путь, включая агрегации и связанные данные. Тенант задаётся контекстом, а не глобальной переменной.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Контекст политик" href="./policy-context.mdx">
+  Как область `run` работает в асинхронном коде и как её вкладывать.
+</Card>
+<Card title="Аудит" href="./audit.mdx">
+  Как в журнал попадает тенант и актор каждой записи.
+</Card>
+<Card title="Справочник: опции политик" href="../reference/policies/schema-options.mdx">
+  Все настройки `tenant`, `softDelete` и `audit` с ошибками.
+</Card>
+<Card title="Подписка на изменения" href="../change-streams/watch.mdx">
+  Как подписаться на модель с тенантом через `allTenants`.
+</Card>
+</Cards>

@@ -1,0 +1,224 @@
+---
+title: Служебные агрегации
+description: "Как получить статистику коллекции и индексов, посмотреть выполняющиеся операции и сессии и выполнить агрегации уровня базы"
+icon: Activity
+---
+
+Агрегация умеет читать не только документы, но и служебные данные сервера: сколько документов в коллекции и сколько места она занимает, как часто используется каждый индекс, что выполняется прямо сейчас, какие сессии открыты. Эти стадии называются **служебными**, и у каждой своё место запуска. Стадии уровня коллекции ([`collStats`](../reference/aggregation/stages.mdx#collstats), [`indexStats`](../reference/aggregation/stages.mdx#indexstats), [`planCacheStats`](../reference/aggregation/stages.mdx#plancachestats)) запускаются через модель, как обычная агрегация. Стадии базы и сервера ([`currentOp`](../reference/aggregation/stages.mdx#currentop), [`queryStats`](../reference/aggregation/stages.mdx#querystats), [`listLocalSessions`](../reference/aggregation/stages.mdx#listlocalsessions) и другие) строятся в отдельных конвейерах [`Pipeline.database`](../reference/aggregation/pipeline.mdx#pipelinedatabase) и [`Pipeline.admin`](../reference/aggregation/pipeline.mdx#pipelineadmin), а стадия [`listSessions`](../reference/aggregation/stages.mdx#listsessions) — в [`Pipeline.sessions`](../reference/aggregation/pipeline.mdx#pipelinesessions). Эти планы выполняют [`client.aggregate`](../reference/connection/typemo-client.mdx#clientaggregate) и [`connection.aggregate`](../reference/connection/connection.mdx#connectionaggregate): подробно — в руководстве [Запросы уровня базы](./database-level.mdx).
+
+Типы не дают поставить стадию не туда: `currentOp` нет у конвейера коллекции, `collStats` нет у конвейера базы, а любая из этих стадий стоит только первой.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и запуск агрегации из руководства [Первая агрегация](first-aggregation.mdx). Служебные стадии обычно нужны администратору или скрипту мониторинга, поэтому у пользователя сервера должны быть права на чтение статистики. В коллекции `orders` два документа, а у модели один индекс по `status`.
+
+```ts twoslash title="orders/order.ts"
+import { Entity, Index, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true })
+  status!: string;
+}
+```
+
+## Быстрый путь
+
+Для коллекции — через модель, для сервера — план из `Pipeline.admin()` и `client.aggregate`:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, Pipeline } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+const stats = await Orders.aggregate((p) => p.collStats({ count: {} }));
+console.log(stats.map((row) => row.count));
+// → [2]
+
+const plan = Pipeline.admin().currentOp({ idleConnections: false }).limit(1).plan();
+const ops = await client.aggregate(plan);
+console.log(ops.length);
+// → 1
+```
+
+Дальше страница разбирает статистику коллекции, индексы, выполняющиеся операции и правила запуска.
+
+## Узнать размер и число документов коллекции
+
+`collStats` возвращает статистику коллекции; вы сами перечисляете разделы, которые нужны: `count` (число документов), `storageStats` (размер и хранилище, с необязательным `scale`), `latencyStats` (задержки) и `queryExecStats` (выполнение запросов). Лишние ключи отвергает компилятор, а тип строки содержит только запрошенные разделы.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, Pipeline } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+const query = Orders.aggregate((p) => p.collStats({ count: {} }));
+const rows = await query;
+//    ^?
+```
+
+Число документов (`count`) имеет тип `StatNumber`, то есть `number | bigint`: сервер пишет счётчик как int32, пока он мал, и как int64, когда он вырос, поэтому на большой коллекции значение придёт как `bigint`. Сравнивайте через `Number(row.count)` или проверяйте `typeof`. Стадия должна быть первой в конвейере: после неё можно ставить обычные стадии (`match`, `project`), чтобы выбрать нужное.
+
+## Посмотреть использование индексов
+
+[`indexStats`](../reference/aggregation/stages.mdx#indexstats) возвращает по строке на каждый индекс: имя, ключ, число использований с момента запуска сервера. По ней находят неиспользуемые индексы, которые замедляют записи.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, Pipeline } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+const query = Orders.aggregate((p) => p.indexStats().project({ name: 1, _id: 0 }).sort({ name: 1 }));
+const rows = await query;
+//    ^?
+// → [{ name: "_id_" }, { name: "status_1" }]
+```
+
+Помимо индекса по `status`, есть встроенный `_id_`: он создаётся всегда. [`planCacheStats`](../reference/aggregation/stages.mdx#plancachestats) показывает планы запросов, которые сервер запомнил для коллекции; на свежей коллекции их нет, и результат пуст.
+
+## Посмотреть, что выполняется сейчас
+
+`currentOp` перечисляет операции сервера: запросы, простаивающие соединения и курсоры. Это стадия сервера, поэтому конвейер начинается с [`Pipeline.admin`](../reference/aggregation/pipeline.mdx#pipelineadmin), а выполняет его [`client.aggregate`](../reference/connection/typemo-client.mdx#clientaggregate): запрос идёт в базу `admin`, результат типизирован, ошибки приходят как ошибки Typemo, а подписчики событий видят операцию.
+
+```ts twoslash title="ops/current-ops.ts"
+import { Entity, Index, Prop, Schema, TypemoClient, Pipeline } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+export const currentOps = async () => {
+  const plan = Pipeline.admin().currentOp({ idleConnections: false, allUsers: true }).limit(10).plan();
+  return client.aggregate(plan);
+};
+```
+
+Каждая строка описывает одну операцию (среди её полей `type`, `host`, `desc`, `active`). Параметры `allUsers`, `idleConnections`, `idleCursors`, `idleSessions`, `localOps` и `backtrace` включают соответствующие сведения.
+
+## Сессии, статистика запросов и каталог
+
+Остальные служебные стадии устроены так же. [`listLocalSessions`](../reference/aggregation/stages.mdx#listlocalsessions) показывает сессии текущего узла и строится в конвейере базы или администратора. [`listSessions`](../reference/aggregation/stages.mdx#listsessions) читает `config.system.sessions`, то, что сервер уже записал, и строится только в `Pipeline.sessions()`: на только что запущенном сервере она вернёт пустой список. [`queryStats`](../reference/aggregation/stages.mdx#querystats), [`querySettings`](../reference/aggregation/stages.mdx#querysettings) и [`listSampledQueries`](../reference/aggregation/stages.mdx#listsampledqueries) требуют базы `admin`, а [`listClusterCatalog`](../reference/aggregation/stages.mdx#listclustercatalog) — MongoDB 8.1 или новее. Для шардированных кластеров есть [`shardedDataDistribution`](../reference/aggregation/stages.mdx#shardeddatadistribution): на обычном сервере она отвечает `ServerError`, что запускается только на маршрутизаторе. Параметры и типы строк каждой стадии — в справочнике [Стадии](../reference/aggregation/stages.mdx). На тестовом сервере документации `queryStats`, `querySettings` и `listSampledQueries` вернули пустой список, а `listClusterCatalog` — по строке на каждую коллекцию базы.
+
+## Как выбрать
+
+Задайте вопрос: о чём вы спрашиваете сервер? О конкретной коллекции или её индексах — стадии уровня коллекции через модель. О состоянии сервера, сессиях, запросах — `Pipeline.admin()`, `Pipeline.database()` или `Pipeline.sessions()` и `client.aggregate`.
+
+## Когда это не нужно
+
+Если нужно только число документов, используйте [`countDocuments`](../reference/query/reading.mdx#modelcountdocuments). Статистику индексов, нужную для приложения, а не для администрирования, лучше держать в системе мониторинга: проверить, что запрос использует индекс, можно в тестах через [`explain`](../reference/aggregation/pipeline.mdx#explain).
+
+## Частые ошибки
+
+### План базы передан модели
+
+`Model.aggregate` принимает только план своей коллекции. План из `Pipeline.admin()` читает базу, поэтому модель отвергает его с `ConfigurationError`, а текст называет нужный метод:
+
+```text
+ConfigurationError: Order.aggregate: the plan reads a database, not this model's collection "orders"; run it with connection.aggregate(plan) or client.aggregate(plan)
+```
+
+Выполните такой план через `client.aggregate`, как выше.
+
+### Служебная стадия не первая
+
+Все служебные стадии стоят только в начале конвейера. Поставленная после другой стадии она не скомпилируется.
+
+```ts twoslash
+// @errors: 2684
+import { Entity, Index, Prop, Schema, TypemoClient, Pipeline } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+Orders.aggregate((p) => p.limit(1).indexStats());
+```
+
+## Полный пример
+
+```ts twoslash title="ops/monitoring.ts"
+import { Entity, Index, Prop, Schema, TypemoClient, Pipeline } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+// 1. Размер коллекции.
+export const ordersCount = async () => {
+  const [row] = await Orders.aggregate((p) => p.collStats({ count: {} }));
+  return Number(row?.count ?? 0);
+};
+
+// 2. Индексы коллекции.
+export const indexNames = () =>
+  Orders.aggregate((p) => p.indexStats().project({ name: 1, _id: 0 })).plain();
+
+// 3. Операции сервера.
+export const runningOps = () => {
+  const plan = Pipeline.admin().currentOp({ idleConnections: false }).limit(10).plan();
+  return client.aggregate(plan);
+};
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Запросы уровня базы" href="./database-level.mdx">
+  Как выполнить план базы, сервера и сессий: `client.aggregate`, события, транзакции.
+</Card>
+<Card title="Справочник: Pipeline и Model.aggregate" href="../reference/aggregation/pipeline.mdx#pipelineadmin">
+  `Pipeline.database`, `Pipeline.admin`, `Pipeline.sessions` и их планы.
+</Card>
+<Card title="Справочник: стадии" href="../reference/aggregation/stages.mdx#collstats">
+  Параметры и типы строк всех служебных стадий.
+</Card>
+<Card title="Индексы" href="../collections/index-sync.mdx">
+  Как описать индексы и синхронизировать их с базой.
+</Card>
+</Cards>

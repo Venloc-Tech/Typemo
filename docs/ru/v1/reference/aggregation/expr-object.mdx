@@ -1,0 +1,597 @@
+---
+title: "Выражения: объекты"
+description: "fn.mergeObjects, fn.getField, fn.setField, fn.unsetField, fn.objectToArray и fn.let: операторы для вложенных документов и переменных"
+icon: Braces
+---
+
+Эта страница описывает **выражения** — операторы, которые внутри конвейера считают новое значение из полей документа, — для вложенных документов (объектов) и переменных. Ими читают поле по имени, собирают документ из двух, добавляют и убирают поле, превращают документ в список пар и вводят временные переменные. Операторы лежат в объекте `fn` и вызываются в колбэке `(f) => …` стадий [`project`](./stages.mdx#project), [`addFields`](./stages.mdx#addfields) и других.
+
+Если вы только начинаете, прочитайте руководство [Выражения](../../aggregation/expressions.mdx). Эта страница — справочник по операторам этой группы.
+
+Все примеры используют одну модель заказа магазина с вложенным адресом доставки: город обязателен, индекс необязателен.
+
+```ts twoslash title="shop/order.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ nested: true })
+export class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+```
+
+В примерах стоят стадии `sort` по дате и `limit(2)`, чтобы остались два первых заказа, и `project`. Заказ Alice на 120 доставляется в Oslo с индексом 0150. Заказ Alice на 80 доставляется в Oslo без индекса. В коллекции ещё четыре заказа: Bob (один с адресом Rome, индекс 00100), Carol (один с адресом Turin). Строки получены методом [`.plain()`](./pipeline.mdx#plain).
+
+Поле `shipTo` необязательное, поэтому в выражениях его тип — документ или отсутствие. Операторы это учитывают: если документа нет, результат `null` или пропуск, и тип результата это показывает.
+
+## Слияние и чтение
+
+### fn.mergeObjects
+
+`fn.mergeObjects` склеивает документы слева направо: как `{ ...a, ...b }`, поле из правого документа заменяет одноимённое из левого. Принимает один документ или больше. `null` и пропущенный документ ничего не добавляют.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      card: fn.mergeObjects(f.shipTo, { country: "NO" }),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, card: { city: "Oslo", zip: "0150", country: "NO" } },
+//   { total: 80, card: { city: "Oslo", country: "NO" } },
+// ]
+```
+
+У первого заказа в результате город, индекс и добавленная страна. У второго индекса не было, поэтому его нет и в результате.
+
+Если правый документ содержит то же поле, оно заменяет левое. Здесь индекс 0150 первого заказа заменён на `"1"`, а у второго индекс появился:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      card: fn.mergeObjects(f.shipTo, { zip: "1" }),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, card: { city: "Oslo", zip: "1" } },
+//   { total: 80, card: { city: "Oslo", zip: "1" } },
+// ]
+```
+
+С одним аргументом оператор ещё и аккумулятор: в стадии [`group`](./stages.mdx#group) он склеивает документы группы. Заказы Alice имеют адрес Oslo, у Bob адрес только у одного заказа, поэтому остаётся он:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({ _id: f.customer, shipTo: fn.mergeObjects(f.shipTo) }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "Alice", shipTo: { city: "Oslo", zip: "0150" } },
+//   { _id: "Bob", shipTo: { city: "Rome", zip: "00100" } },
+//   { _id: "Carol", shipTo: { city: "Turin" } },
+// ]
+```
+
+Остальные аккумуляторы описаны на странице [Аккумуляторы](./accumulators.mdx).
+
+### fn.objectToArray
+
+`fn.objectToArray` превращает документ в массив пар `{ k, v }`: ключ и значение. Нужен, когда имена полей заранее неизвестны и по ним надо пройти.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, pairs: fn.objectToArray(f.shipTo) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, pairs: [{ k: "city", v: "Oslo" }, { k: "zip", v: "0150" }] },
+//   { total: 80, pairs: [{ k: "city", v: "Oslo" }] },
+// ]
+```
+
+Для `null` или пропущенного документа результат `null`.
+
+### fn.getField
+
+`fn.getField` читает поле документа по имени. Принимает `{ field, input }`, где `field` — строка-константа. Точки и знак `$` в имени считаются частью имени, а не путём. Поэтому оператор нужен для полей, чьё имя нельзя записать как путь. Если документа может не быть, тип результата включает `undefined`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      city: fn.getField({ field: "city", input: f.shipTo }),
+    })),
+).plain();
+console.log(rows);
+//          ^?
+// → [
+//   { total: 120, city: "Oslo" },
+//   { total: 80, city: "Oslo" },
+// ]
+```
+
+Для поля, которого в документе нет, результат — пропуск. У второго заказа индекса нет, и в строке нет ключа `zip`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      zip: fn.getField({ field: "zip", input: f.shipTo }),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, zip: "0150" },
+//   { total: 80 },
+// ]
+```
+
+## Изменение документа
+
+Операторы этой группы возвращают копию документа: конвейер только считает результат, в базе ничего не записывается.
+
+### fn.setField
+
+`fn.setField` возвращает копию документа с полем `field`, равным `value`. Принимает `{ field, input, value }`. Существующее поле заменяется, новое добавляется.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      card: fn.setField({ field: "zip", input: f.shipTo, value: "00000" }),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, card: { city: "Oslo", zip: "00000" } },
+//   { total: 80, card: { city: "Oslo", zip: "00000" } },
+// ]
+```
+
+### fn.unsetField
+
+`fn.unsetField` возвращает копию документа без поля `field`. Принимает `{ field, input }`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      card: fn.unsetField({ field: "zip", input: f.shipTo }),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, card: { city: "Oslo" } },
+//   { total: 80, card: { city: "Oslo" } },
+// ]
+```
+
+## Переменные
+
+### fn.let
+
+`fn.let` вводит переменные для одного выражения. Принимает `vars` — объект с выражениями — и колбэк `in`, который получает прокси переменных `v`: `v.tax`, `v.customer.name`. Значение выражения из `in` и есть результат.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  zip?: string;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Address)
+  shipTo?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      net: fn.let({
+        vars: { tax: fn.multiply(f.total, 0.2) },
+        in: (v) => fn.subtract(f.total, v.tax),
+      }),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, net: 96 },
+//   { total: 80, net: 64 },
+// ]
+```
+
+Здесь переменная `tax` — 20 процентов от `f.total`, и результат `120 − 24 = 96`. Переменную можно использовать в `in` несколько раз, не повторяя её вычисление в записи.
+
+Переменные видны только внутри `in`. Имя переменной в колбэке — обычное свойство, а не строка с `$$`: Typemo сам добавляет `$$` при отправке.
+
+## Когда не подходит
+
+- Нужно достать поле по обычному пути: пишите `f.shipTo.city`, без `fn.getField`. Оператор нужен только для имён с точками и знаком `$`.
+- Нужно изменить документ в базе, а не в результате запроса: используйте [обновления](../writes/writes.mdx).
+- Нужно выбрать поля вложенного документа целиком: стадия [`project`](./stages.mdx#project) с путём `"shipTo.city": 1`.

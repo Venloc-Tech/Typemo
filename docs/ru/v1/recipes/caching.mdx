@@ -1,0 +1,420 @@
+---
+title: Кеширование ответов
+description: "Как кешировать готовые ответы в plain-виде с масками и сбрасывать кеш по подписке на изменения, чтобы не отдавать устаревшее"
+icon: Zap
+---
+
+Кеш ускоряет чтение, но у него две опасности: положить в него то, чего там быть не должно (секретные поля), и отдать устаревшее после изменения. Эта страница строит кеш карточки клиента и закрывает обе. Кешируется не документ и не lean-строка, а готовый к отправке ответ в **plain-виде** с масками: в нём уже нет скрытых полей, значения приведены к JSON-типам, а почта и телефон замаскированы. Устаревшее сбрасывает подписка на изменения.
+
+Кешировать документ (`HydratedDoc`) не стоит: он привязан к модели и подключению, не сериализуется в JSON без потерь и содержит скрытые поля. Кешировать lean тоже: `ObjectId` и `bigint` в нём не превратятся в JSON без ваших усилий. Plain-вид создан для того, чтобы выходить за пределы процесса, а кеш как раз такой выход.
+
+## Что предполагается
+
+Клиент подключён по руководству [Подключиться к базе](../connection/connect.mdx), база `shop`. Сам кеш здесь — маленький класс в памяти процесса: в продакшене на его месте обычно стоит внешний кеш, но требования к нему те же (ключ, значение-строка, срок жизни, удаление). Сброс по подписке требует реплика-сета: см. руководство [Подписаться на изменения](../change-streams/watch.mdx).
+
+## Быстрый путь
+
+Читайте `.plain()`, маскируйте, кладите в кеш строкой JSON и отдавайте из кеша, пока запись жива:
+
+```ts twoslash
+import { type ChangeEvent, type Hidden, Entity, Mask, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => String, { nullable: true }) phone!: string | null;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+class TtlCache {
+  hits = 0;
+  misses = 0;
+  readonly #entries = new Map<string, { value: string; expiresAt: number }>();
+  constructor(readonly ttlMs: number) {}
+  get(key: string): string | undefined {
+    const entry = this.#entries.get(key);
+    if (entry === undefined || entry.expiresAt < Date.now()) {
+      this.#entries.delete(key);
+      this.misses += 1;
+      return undefined;
+    }
+    this.hits += 1;
+    return entry.value;
+  }
+  set(key: string, value: string): void {
+    this.#entries.set(key, { value, expiresAt: Date.now() + this.ttlMs });
+  }
+  delete(key: string): void {
+    this.#entries.delete(key);
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Customers = client.db().model(Customer);
+const cache = new TtlCache(60_000);
+// ---cut---
+const key = "6abd0000000000000000abcd";
+const cached = cache.get(key);
+const card =
+  cached !== undefined
+    ? JSON.parse(cached)
+    : await Customers.findById(key).plain().mask({ email: Mask.email(), phone: Mask.phone() });
+if (cached === undefined && card !== null) cache.set(key, JSON.stringify(card));
+```
+
+Остальная страница разбирает по шагам: что попадает в кеш, где ставить маску, как сбрасывать кеш и что делать с окном устаревания.
+
+## Описать модель
+
+У клиента есть скрытое поле `passwordHash`: оно никогда не должно оказаться ни в ответе, ни в кеше. Почта и телефон нужны, но показываются замаскированными.
+
+```ts twoslash title="customers/customer.ts"
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "customers" })
+export class Customer extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => String, { required: true })
+  email!: string;
+
+  @Prop(() => String, { nullable: true })
+  phone!: string | null;
+
+  @Prop(() => String, { hidden: true })
+  passwordHash?: Hidden<string>;
+}
+```
+
+## Кеш со сроком жизни
+
+Кеш хранит строки: значение приходит в JSON и уходит в JSON, поэтому внешний кеш подойдёт без переделок. Срок жизни — страховка: даже если сброс по подписке однажды не сработает, устаревшее не проживёт дольше срока. Счётчики `hits` и `misses` нужны, чтобы увидеть, работает ли кеш.
+
+```ts twoslash title="cache/ttl-cache.ts"
+export class TtlCache {
+  hits = 0;
+  misses = 0;
+  readonly #entries = new Map<string, { value: string; expiresAt: number }>();
+
+  constructor(readonly ttlMs: number) {}
+
+  get(key: string): string | undefined {
+    const entry = this.#entries.get(key);
+    if (entry === undefined || entry.expiresAt < Date.now()) {
+      this.#entries.delete(key);
+      this.misses += 1;
+      return undefined;
+    }
+    this.hits += 1;
+    return entry.value;
+  }
+
+  set(key: string, value: string): void {
+    this.#entries.set(key, { value, expiresAt: Date.now() + this.ttlMs });
+  }
+
+  delete(key: string): void {
+    this.#entries.delete(key);
+  }
+}
+```
+
+## Кешировать маскированный plain-вид
+
+Маска применяется [`.mask`](../reference/query/masks.mdx#mask) последним шагом, после [`.plain()`](../reference/query/reading.mdx#plain), поэтому в кеш попадает уже маскированное значение: даже если кто-то прочитает кеш напрямую, почты там нет. Скрытое поле `passwordHash` в plain-виде отсутствует само. Ключ — id в нижнем регистре: [`findById`](../reference/query/reading.mdx#modelfindbyid) принимает строку в любом регистре, и без нормализации один клиент получил бы две записи кеша.
+
+```ts twoslash title="customers/customers.service.ts"
+import { type ChangeEvent, type Hidden, Entity, Mask, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => String, { nullable: true }) phone!: string | null;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+class TtlCache {
+  hits = 0;
+  misses = 0;
+  readonly #entries = new Map<string, { value: string; expiresAt: number }>();
+  constructor(readonly ttlMs: number) {}
+  get(key: string): string | undefined {
+    const entry = this.#entries.get(key);
+    if (entry === undefined || entry.expiresAt < Date.now()) {
+      this.#entries.delete(key);
+      this.misses += 1;
+      return undefined;
+    }
+    this.hits += 1;
+    return entry.value;
+  }
+  set(key: string, value: string): void {
+    this.#entries.set(key, { value, expiresAt: Date.now() + this.ttlMs });
+  }
+  delete(key: string): void {
+    this.#entries.delete(key);
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Customers = client.db().model(Customer);
+const cache = new TtlCache(60_000);
+// ---cut---
+export const getCustomerCard = async (id: string) => {
+  const key = id.toLowerCase();
+  const cached = cache.get(key);
+  if (cached !== undefined) return JSON.parse(cached) as { _id: string; name: string; email: string; phone: string };
+
+  const card = await Customers.findById(id)
+    .orFail()
+    .plain()
+    .mask({ email: Mask.email(), phone: Mask.phone() });
+  cache.set(key, JSON.stringify(card));
+  return card;
+};
+```
+
+Карточка Alice с почтой `alice@gmail.com` и телефоном `+79161234567` лежит в кеше как `{"_id":"…","name":"Alice","email":"a***@gmail.com","phone":"+7********67"}`. Если телефона нет (`null`), маска даёт `"?"`, а не `null`: тип телефона в ответе — строка. Подробнее о масках — на странице [Маски ответа](../queries/response-masks.mdx).
+
+## Сбрасывать кеш при изменении
+
+Срок жизни устраняет устаревание не сразу. Чтобы изменение было видно немедленно, сбрасывайте запись по событию подписки: [`Model.watch`](../reference/change-streams/watch.mdx#modelwatch) присылает каждое изменение, откуда бы оно ни пришло, в том числе из другого процесса и через `updateMany`. Событие обновления, замены и удаления несёт `documentKey` с `_id` документа.
+
+```ts twoslash title="cache/invalidate.ts"
+import { type ChangeEvent, type Hidden, Entity, Mask, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => String, { nullable: true }) phone!: string | null;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+class TtlCache {
+  hits = 0;
+  misses = 0;
+  readonly #entries = new Map<string, { value: string; expiresAt: number }>();
+  constructor(readonly ttlMs: number) {}
+  get(key: string): string | undefined {
+    const entry = this.#entries.get(key);
+    if (entry === undefined || entry.expiresAt < Date.now()) {
+      this.#entries.delete(key);
+      this.misses += 1;
+      return undefined;
+    }
+    this.hits += 1;
+    return entry.value;
+  }
+  set(key: string, value: string): void {
+    this.#entries.set(key, { value, expiresAt: Date.now() + this.ttlMs });
+  }
+  delete(key: string): void {
+    this.#entries.delete(key);
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Customers = client.db().model(Customer);
+const cache = new TtlCache(60_000);
+// ---cut---
+export const invalidateOnChange = async (signal: AbortSignal): Promise<void> => {
+  const stream = await Customers.watch((pipeline) =>
+    pipeline.match({ operationType: { $in: ["update", "replace", "delete"] } }),
+  );
+  signal.addEventListener("abort", () => void stream.close());
+  const forget = (event: ChangeEvent<Customer>): void => {
+    if ("documentKey" in event) cache.delete(String(event.documentKey._id));
+  };
+  for await (const event of stream) forget(event);
+};
+```
+
+`await Customers.watch(...)` возвращается, когда поток уже открыт на сервере, поэтому изменение, случившееся до начала чтения, из потока не пропадёт. Как надёжно переживать перезапуск процесса, показано в рецепте [Фоновые задачи на изменениях](./change-stream-jobs.mdx). Запускайте `invalidateOnChange` при старте приложения и останавливайте сигналом.
+
+Между записью и приходом события есть **окно устаревания**: миллисекунды, в которые читатель ещё получит старую карточку. Если это неприемлемо (баланс счёта), не кешируйте такие данные или сбрасывайте запись сразу после своей же записи в том же процессе: `cache.delete(key)` в обработчике изменения. Подписка при этом остаётся для изменений из других процессов.
+
+## Проверить, что кеш работает и сбрасывается
+
+Первое чтение — промах, второе — попадание. После изменения клиента в базе третье чтение снова идёт в базу и возвращает свежее значение.
+
+```ts twoslash title="cache/cache.test.ts"
+import { type ChangeEvent, type Hidden, Entity, Mask, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => String, { nullable: true }) phone!: string | null;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+class TtlCache {
+  hits = 0;
+  misses = 0;
+  readonly #entries = new Map<string, { value: string; expiresAt: number }>();
+  constructor(readonly ttlMs: number) {}
+  get(key: string): string | undefined {
+    const entry = this.#entries.get(key);
+    if (entry === undefined || entry.expiresAt < Date.now()) {
+      this.#entries.delete(key);
+      this.misses += 1;
+      return undefined;
+    }
+    this.hits += 1;
+    return entry.value;
+  }
+  set(key: string, value: string): void {
+    this.#entries.set(key, { value, expiresAt: Date.now() + this.ttlMs });
+  }
+  delete(key: string): void {
+    this.#entries.delete(key);
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Customers = client.db().model(Customer);
+const cache = new TtlCache(60_000);
+const getCustomerCard = async (id: string) => ({ name: "" });
+const invalidateOnChange = async (signal: AbortSignal): Promise<void> => {};
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+// ---cut---
+const alice = await Customers.create({ name: "Alice", email: "alice@gmail.com", phone: null });
+const id = alice._id.toString();
+const stop = new AbortController();
+void invalidateOnChange(stop.signal);
+await sleep(1500);
+
+await getCustomerCard(id);
+await getCustomerCard(id);
+console.log(cache.hits, cache.misses);
+// → 1 1
+
+await Customers.updateOne({ _id: alice._id }, { $set: { name: "Alice B" } });
+await sleep(1500);
+console.log((await getCustomerCard(id)).name, cache.misses);
+// → "Alice B" 2
+stop.abort();
+```
+
+## Как выбрать
+
+Спросите себя: **что случится, если клиент увидит данные секундной давности?** Если ничего (карточка товара, профиль, справочник), кешируйте и сбрасывайте по подписке. Если случится ошибка (баланс, остаток на складе, права доступа), не кешируйте или сбрасывайте синхронно в месте записи. Срок жизни ставьте всегда: он ограничивает ущерб от пропущенного события.
+
+## Когда это не нужно
+
+Если запрос и так быстрый и редкий, кеш добавит слой, который придётся сбрасывать, и не даст выигрыша. Если ответ зависит от того, кто спрашивает (свои заказы, права), ключ должен включать пользователя, иначе один клиент получит ответ другого; часто проще не кешировать. Замеряйте: сначала посмотрите план запроса через [`.explain`](../reference/query/search-and-explain.mdx#explain), возможно, помогает индекс, а не кеш.
+
+## Частые ошибки
+
+### В кеше оказались секретные данные
+
+Вы положили в кеш документ или lean-строку без маски. Скрытые поля из документа не сериализуются, но `email` и `phone` лежат открыто, а lean содержит скрытые поля (см. [Скрытые и чувствительные поля](../schemas/hidden-and-sensitive.mdx)). Кешируйте только `.plain().mask(...)`, как в `getCustomerCard`.
+
+### Один и тот же клиент лежит в кеше дважды
+
+Ключом стал id из адреса, а клиент прислал его в верхнем регистре. Нормализуйте ключ (`toLowerCase`), как в примере: иначе сброс по подписке удалит одну запись, а вторая проживёт до конца срока.
+
+### Кеш сброшен, но читатель видит старое
+
+Событие подписки пришло позже запроса читателя: это окно устаревания. Сбрасывайте запись ещё и в обработчике вашей записи, а подписку оставьте для чужих процессов.
+
+## Полный пример
+
+```ts twoslash title="customers/customers.service.ts"
+import { type ChangeEvent, Entity, type Hidden, Mask, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+// customers/customer.ts
+@Schema({ collection: "customers" })
+export class Customer extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => String, { required: true })
+  email!: string;
+
+  @Prop(() => String, { nullable: true })
+  phone!: string | null;
+
+  @Prop(() => String, { hidden: true })
+  passwordHash?: Hidden<string>;
+}
+
+// cache/ttl-cache.ts: stands in for an external cache (string keys, string values, a lifetime)
+export class TtlCache {
+  hits = 0;
+  misses = 0;
+  readonly #entries = new Map<string, { value: string; expiresAt: number }>();
+
+  constructor(readonly ttlMs: number) {}
+
+  get(key: string): string | undefined {
+    const entry = this.#entries.get(key);
+    if (entry === undefined || entry.expiresAt < Date.now()) {
+      this.#entries.delete(key);
+      this.misses += 1;
+      return undefined;
+    }
+    this.hits += 1;
+    return entry.value;
+  }
+
+  set(key: string, value: string): void {
+    this.#entries.set(key, { value, expiresAt: Date.now() + this.ttlMs });
+  }
+
+  delete(key: string): void {
+    this.#entries.delete(key);
+  }
+}
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Customers = client.db().model(Customer);
+export const cache = new TtlCache(60_000);
+
+// the handler: the cache holds the masked plain view, never a document
+export const getCustomerCard = async (id: string) => {
+  const key = id.toLowerCase();
+  const cached = cache.get(key);
+  if (cached !== undefined) return JSON.parse(cached) as { _id: string; name: string; email: string; phone: string };
+
+  const card = await Customers.findById(id)
+    .orFail()
+    .plain()
+    .mask({ email: Mask.email(), phone: Mask.phone() });
+  cache.set(key, JSON.stringify(card));
+  return card;
+};
+
+// after your own write in this process: drop the entry at once
+export const renameCustomer = async (id: string, name: string) => {
+  await Customers.updateOne({ _id: id }, { $set: { name } }).orFail();
+  cache.delete(id.toLowerCase());
+};
+
+// changes from other processes: the change stream drops the entry
+export const invalidateOnChange = async (signal: AbortSignal): Promise<void> => {
+  const stream = await Customers.watch((pipeline) =>
+    pipeline.match({ operationType: { $in: ["update", "replace", "delete"] } }),
+  );
+  signal.addEventListener("abort", () => void stream.close());
+  const forget = (event: ChangeEvent<Customer>): void => {
+    if ("documentKey" in event) cache.delete(String(event.documentKey._id));
+  };
+  for await (const event of stream) forget(event);
+};
+```
+
+<Callout type="migration">
+
+В Mongoose кешируют обычно результат `.lean()`, и скрытые поля (`select: false`) приходится вычищать вручную перед записью в кеш. Здесь plain-вид уже без скрытых полей и в JSON-типах, а маска применяется частью запроса.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Маски ответа" href="../queries/response-masks.mdx">
+  Все готовые маски и свои функции для чувствительных значений.
+</Card>
+<Card title="Фоновые задачи на изменениях" href="./change-stream-jobs.mdx">
+  Как надёжно читать подписку и переживать перезапуск.
+</Card>
+<Card title="REST API для счетов" href="./rest-api.mdx">
+  Обработчики, у которых кеш стоит поверх.
+</Card>
+<Card title="Чтение данных" href="../queries/reading-data.mdx">
+  Чем plain отличается от lean и документа.
+</Card>
+</Cards>

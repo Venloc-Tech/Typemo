@@ -1,0 +1,487 @@
+---
+title: Ошибки сервера
+description: "ServerError, DuplicateKeyError, ServerValidationError, WriteConflictError, TimeoutError, BulkWriteError, ServerErrorCodes и ErrorLabels"
+icon: ServerCrash
+---
+
+Ошибки сервера приходят, когда отказала сама база: нарушен уникальный индекс, валидатор коллекции отверг документ, две записи задели один документ, закончилось время, часть пакетной записи не прошла. Библиотека превращает ошибку драйвера в свой класс по коду сервера, чтобы вы решали по классу и полям, а не по тексту, и при этом сохраняет оригинал в `cause` без изменений.
+
+Если вы только начинаете, сначала прочитайте руководство [Обработка ошибок](../../errors/handling.mdx). Эта страница — справочник. Дерево классов — в разделе [Иерархия ошибок](./hierarchy.mdx).
+
+Примеры используют модель счёта с уникальным названием: на ней проявляются и нарушение уникальности, и пакетная запись.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+}
+```
+
+Ошибки из групп соседних страниц: [ошибки данных](./data-errors.mdx), [ошибки запросов](./query-errors.mdx), [ошибки конфигурации и подключения](./configuration-errors.mdx).
+
+---
+
+## ServerError
+
+`ServerError` — общий класс отказа сервера: он бросается, когда для кода ошибки нет более точного класса. Три остальных класса на этой странице, [`DuplicateKeyError`](#duplicatekeyerror), [`ServerValidationError`](#servervalidationerror) и [`WriteConflictError`](#writeconflicterror), его потомки, поэтому проверка по `ServerError` ловит все четыре вместе.
+
+Класс копирует из ошибки драйвера код, имя кода и метки, а сама ошибка драйвера остаётся в `cause` целиком и неизменной. Копировать пришлось потому, что Mongoose разворачивал ошибку драйвера в свой объект и терял код.
+
+Сообщение у общего `ServerError` короткое: причина, которую назвал сервер, и код в скобках. Полный текст сервера часто содержит план запроса и значения из него: в журнал и в ответ клиенту такое попадать не должно. Поэтому полный текст лежит отдельно, в поле `serverMessage`, и в `cause`, а в `message` остаётся только то, что нужно, чтобы понять, что случилось.
+
+Пример: подсказка индекса (`hint`), которого нет. Сервер отвечает ошибкой с кодом 2:
+
+```ts twoslash
+import { Entity, Prop, Schema, ServerError, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+await Accounts.create({ title: "Main", owner: "alice" });
+// ---cut---
+try {
+  await Accounts.find().hint("nope_1");
+} catch (error) {
+  if (error instanceof ServerError) {
+    console.log(error.message);
+    // → hint provided does not correspond to an existing index (code 2 BadValue)
+    console.log(error.code, error.codeName);
+    // → 2 "BadValue"
+    console.log(error.serverMessage.startsWith("error enumerating plans for query"));
+    // → true
+    console.log((error.cause as Error).name);
+    // → "MongoServerError"
+  }
+}
+```
+
+### Поля
+
+<Params title="Поля ошибки">
+<Param name="code" type="number | undefined">
+
+Код ошибки сервера, если драйвер его сообщил. Названия известных кодов собраны в [`ServerErrorCodes`](#servererrorcodes).
+
+</Param>
+<Param name="codeName" type="string | undefined">
+
+Имя кода (`BadValue`, `WriteConflict`, `DuplicateKey`). Сервер присылает его не во всех ответах, например не в ошибках записи, поэтому недостающее имя берётся из таблицы [`ServerErrorCodes`](#servererrorcodes): запуск показал `DuplicateKey` у нарушения уникальности и `DocumentValidationFailure` у отказа валидатора, у пакетных ошибок тоже. Для кода, которого нет в таблице и который сервер прислал без имени, поле `undefined`; для решений надёжнее `code`.
+
+</Param>
+<Param name="errorLabels" type="readonly string[]">
+
+Метки ошибки (`TransientTransactionError`, `RetryableWriteError`). Массив заморожен. Смысл меток — в разделе [`ErrorLabels`](#errorlabels).
+
+</Param>
+<Param name="serverMessage" type="string">
+
+Полный текст, который прислал сервер, без сокращений. Он может содержать план запроса и значения документов, поэтому не отдавайте его клиенту. У классов-потомков (`DuplicateKeyError`, `ServerValidationError`, `WriteConflictError`) это текст сервера без приставки, которую библиотека добавляет к `message`.
+
+</Param>
+</Params>
+
+### hasErrorLabel
+
+Метод `hasErrorLabel(label)` возвращает `true`, если у ошибки есть метка. Он короче, чем `error.errorLabels.includes(...)`, и читается как вопрос:
+
+```ts twoslash
+import { ErrorLabels, ServerError } from "@venloc/typemo";
+declare const error: ServerError;
+// ---cut---
+const canRetryTransaction = error.hasErrorLabel(ErrorLabels.TransientTransactionError);
+```
+
+<FullType>
+
+```ts
+class ServerError extends TypemoError {
+  readonly code: number | undefined;
+  readonly codeName: string | undefined;
+  readonly errorLabels: readonly string[];
+  readonly serverMessage: string;
+  constructor(message: string, details: ServerErrorDetails);
+  hasErrorLabel(label: string): boolean;
+}
+```
+
+</FullType>
+
+### Когда не подходит
+
+Не ловите `ServerError` там, где вам нужен конкретный отказ: сначала проверьте частные классы, потом общий. Порядок проверок разобран в руководстве [Обработка ошибок](../../errors/handling.mdx).
+
+---
+
+## DuplicateKeyError
+
+`DuplicateKeyError` бросается, когда запись нарушила уникальный индекс (код сервера 11000). Это самая частая ошибка сервера в веб-приложении: два пользователя регистрируются с одной почтой, два запроса создают один и тот же счёт. Уникальность гарантирует индекс, а не проверка «есть ли уже такое» перед записью: проверка и запись не атомарны, между ними успеет вклиниться другой запрос. Поэтому правильная реакция — пытаться записать и ловить эту ошибку.
+
+```ts twoslash
+import { DuplicateKeyError, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+await client.connection.init();
+await Accounts.create({ title: "Main", owner: "alice" });
+// ---cut---
+try {
+  await Accounts.create({ title: "Main", owner: "bob" });
+} catch (error) {
+  if (error instanceof DuplicateKeyError) {
+    console.log(error.keyPattern, error.keyValue, error.index);
+    // → { title: 1 } { title: "Main" } "title_1"
+  }
+}
+```
+
+Уникальный индекс существует только после [`connection.init`](../connection/connection.mdx#connectioninit): без него дубликат запишется без ошибки. Сообщение короткое: индекс, значение ключа и код, `duplicate key on title_1: { title: "Main" } (code 11000 DuplicateKey)`. Служебные подробности сервера (имена базы и коллекции, идентификаторы сборки индекса, цепочка `:: caused by ::`) в него не попадают: они лежат в `serverMessage`.
+
+### Поля
+
+<Params title="Дополнительные поля">
+<Param name="keyPattern" type="Record<string, unknown> | undefined">
+
+Ключи нарушенного индекса (`{ title: 1 }`), если сервер их сообщил. С их помощью можно понять, какое из полей вызвало конфликт, не разбирая текст.
+
+</Param>
+<Param name="keyValue" type="Record<string, unknown> | undefined">
+
+Повторившиеся значения (`{ title: "Main" }`). Если поле помечено `sensitive`, значение заменено на `[hidden]` (или `?`, смотря какой режим выбран) и в этом поле, и в тексте сообщения, и в `serverMessage`, и в `cause`. В пакетной записи сервер значения не сообщает, поэтому `keyValue` там `undefined`, а в сообщении значения нет.
+
+</Param>
+<Param name="index" type="string | undefined">
+
+Имя индекса, отказавшего в записи. Библиотека берёт его из текста сервера (`index: title_1`); если разобрать не удалось, поле `undefined`, а в сообщении слов «on …» нет.
+
+</Param>
+</Params>
+
+Остальные поля, `code`, `codeName`, `errorLabels` и `serverMessage`, те же, что у [`ServerError`](#servererror) (у нарушения уникальности `codeName` равен `DuplicateKey`). Ответ клиенту: конфликт с существующими данными, то есть 409 вашего приложения; какое поле повторилось, вы видите в `keyPattern`.
+
+### В пакетной записи
+
+При `insertMany` и `bulkWrite` дубликат приходит не отдельной ошибкой, а как элемент [`BulkWriteError`](#bulkwriteerror): в `writeErrors[i].error` лежит `DuplicateKeyError` с теми же полями.
+
+### Когда не подходит
+
+Если вам нужно «создать или обновить», не ловите эту ошибку: используйте `upsert` в [`updateOne`](../writes/writes.mdx#updateone). Если вы хотите заранее проверить, свободно ли имя, помните: проверка не заменяет индекс, а только улучшает сообщение пользователю.
+
+---
+
+## ServerValidationError
+
+`ServerValidationError` бросается, когда валидатор коллекции (`$jsonSchema`) на стороне сервера отверг документ (код 121). Валидатор коллекции — это правила, которые хранит сама база; они действуют для всех, кто пишет в коллекцию, в том числе в обход Typemo. Ошибка приходит, когда документ прошёл проверку схемы в вашем коде, но не прошёл правила базы: например, схема допускает 500, а валидатор коллекции требует не больше 100.
+
+Пример: в коллекции `posts` валидатор ограничивает `score` сотней:
+
+```ts twoslash
+import { Entity, Prop, Schema, ServerValidationError, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) score!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Posts = client.connection.model(Post);
+// ---cut---
+try {
+  await Posts.create({ title: "z", score: 500 });
+} catch (error) {
+  if (error instanceof ServerValidationError) {
+    console.log(error.message);
+    // → the collection validator refused the document: Document failed validation
+    console.log(error.code);
+    // → 121
+  }
+}
+```
+
+### Поля
+
+<Params title="Дополнительные поля">
+<Param name="errInfo" type="Record<string, unknown> | undefined">
+
+Объяснение сервера: какое правило не выполнено и на каком поле (`errInfo.details`). В запуске оно содержало `operatorName: "$jsonSchema"`, список нарушенных правил, имя поля (`propertyName`), правило (`maximum`), рассмотренное значение (`consideredValue`) и идентификатор отвергнутого документа (`failingDocumentId`).
+
+</Param>
+</Params>
+
+Если в схеме поля есть `sensitive`, значения в `errInfo` маскируются так же, как и в других ошибках. Остальные поля — как у [`ServerError`](#servererror): `codeName` здесь `DocumentValidationFailure`, а `serverMessage` — `Document failed validation`.
+
+### Когда не подходит
+
+Валидатор коллекции нужен как последний рубеж для записей мимо библиотеки. Для проверки ввода клиента используйте схему модели: её [`ValidationError`](./data-errors.mdx#validationerror) перечисляет все проблемы сразу, а ошибка сервера называет их поодиночке.
+
+---
+
+## WriteConflictError
+
+`WriteConflictError` бросается, когда две записи (две транзакции или транзакция и одиночная запись) задели один документ, и сервер отказал одной из них (код 112). Это не поломка, а обычный способ сервера сохранить порядок: проигравшую запись можно выполнить заново.
+
+Внутри [`connection.transaction`](../transactions/transactions.mdx#transaction) вам почти не приходится с ней встречаться: сервер помечает такой отказ меткой `TransientTransactionError`, и драйвер повторяет функцию транзакции целиком. Ошибка доходит до вас, только если запись вне транзакции или повторы закончились. Поведение внутри транзакции (число попыток, что происходит с данными) разобрано в руководстве [Транзакции](../../transactions/transactions.mdx).
+
+Вне транзакции одиночные записи конфликтуют редко: сервер сам повторяет их внутри. В запуске ошибку удалось получить только искусственно, включив на сервере отказ команды `update` с кодом 112. Класс и поля при этом были такими:
+
+```text
+WriteConflictError: write conflict: Failing command via 'failCommand' failpoint
+code: 112, codeName: "WriteConflict", errorLabels: []
+```
+
+Сообщение всегда начинается с `write conflict: `, дальше идёт текст сервера. У класса нет собственных полей: `code`, `codeName` и `errorLabels` те же, что у [`ServerError`](#servererror), а `serverMessage` — текст сервера без приставки `write conflict: `.
+
+### Когда не подходит
+
+Не повторяйте запись при этой ошибке вручную внутри транзакции: повтор уже делает драйвер. Вне транзакции повторить одиночную запись безопасно только тогда, когда она идемпотентна (установка значения), но не тогда, когда она накапливает (`$inc`).
+
+---
+
+## TimeoutError
+
+`TimeoutError` бросается, когда закончилось время. Поле `kind` говорит где именно: `operation` (сработал `timeoutMS` операции или сервер сообщил `MaxTimeMSExpired`), `connection` (клиент не успел подключиться за `readyTimeoutMS`) или `transaction` (истёк `timeoutMS` транзакции, повторы включены). Во всех трёх случаях поле `timeoutMS` заполнено превышенным пределом.
+
+Срок операции. Здесь на сервере искусственно задержан ответ `find`, а операции отпущено 100 мс:
+
+```ts twoslash
+import { Entity, Prop, Schema, TimeoutError, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+try {
+  await Accounts.find().timeoutMS(100);
+} catch (error) {
+  if (error instanceof TimeoutError) {
+    console.log(error.kind);
+    // → "operation"
+    console.log(error.message);
+    // → operation timed out (timeoutMS): Timed out during socket read (100ms)
+    console.log(error.timeoutMS);
+    // → 100
+  }
+}
+```
+
+Клиент, который не подключился. У клиента, созданного через `new TypemoClient` без `connect`, операции ждут подключения не дольше `readyTimeoutMS`; после этого приходит ошибка вида `connection` с заполненным полем `timeoutMS`:
+
+```text
+TimeoutError: TypemoClient "default" is not connected after 100 ms: call connect() (operations issued before connect() wait for it)
+kind: "connection", timeoutMS: 100
+```
+
+Срок транзакции. Транзакция с `timeoutMS: 200`, внутри которой ответ `find` задержан на 400 мс, закончилась ошибкой другого вида:
+
+```text
+TimeoutError: transaction timed out after 200 ms (timeoutMS)
+kind: "transaction", timeoutMS: 200
+```
+
+Оригинал (`MongoOperationTimeoutError` драйвера) лежит в `cause`. Если ошибку с кодом 50 (`MaxTimeMSExpired`) прислал сам сервер, вид `operation`, а текст начинается с `the server stopped the operation (MaxTimeMSExpired):` (проверено искусственным отказом сервера).
+
+### Поля
+
+<Params title="Поля ошибки">
+<Param name="kind" type="TimeoutKind">
+
+Где закончилось время: `operation`, `connection` или `transaction`.
+
+</Param>
+<Param name="timeoutMS" type="number | undefined">
+
+Превышенный предел в миллисекундах. В запуске он был заполнен у всех трёх видов: 100 у `operation`, 100 у `connection`, 200 у `transaction`. `undefined` был у ошибки, которую сервер сообщил сам (код 50), когда у вызова не было своего `timeoutMS`.
+
+</Param>
+</Params>
+
+Оригинал, если он есть, лежит в `cause` (для срока операции это ошибка драйвера `MongoOperationTimeoutError`). Ответ клиенту: время вышло у вас, а не у пользователя, поэтому это 503 или 504 вашего приложения, а не 500.
+
+### Когда не подходит
+
+Не увеличивайте `timeoutMS` реакцией на эту ошибку, не поняв причину: чаще операция медленная из-за отсутствия индекса. Как это выяснить — в руководстве [Производительность запросов](../../queries/performance.mdx).
+
+---
+
+## BulkWriteError
+
+`BulkWriteError` бросается, когда часть пакетной записи (`insertMany`, `bulkWrite`) не прошла. Пакет не атомарен: пока одни записи прошли, другие могли отказать, и разобраться поможет только полный отчёт. Ошибка даёт его: список каждой неудавшейся записи с номером **в вашем вводе** (а не внутри пакета драйвера) и итог того, что записалось.
+
+Порядок влияет на результат. В пакете из четырёх документов, где второй и четвёртый нарушают уникальность, упорядоченная запись остановилась на втором, а неупорядоченная (`ordered: false`) записала первый и третий:
+
+```ts twoslash
+import { BulkWriteError, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+await client.connection.init();
+await Accounts.create({ title: "Main", owner: "alice" });
+// ---cut---
+const documents = [
+  { title: "N1", owner: "a" },
+  { title: "Main", owner: "b" },
+  { title: "N2", owner: "c" },
+  { title: "N1", owner: "d" },
+];
+
+try {
+  await Accounts.insertMany(documents, { ordered: false });
+} catch (error) {
+  if (error instanceof BulkWriteError) {
+    console.log(error.message);
+    // → Account.insertMany: 2 write(s) failed (first at index 1: duplicate key on title_1 (code 11000 DuplicateKey))
+    console.log(error.writeErrors.map((failure) => [failure.index, failure.code]));
+    // → [[1, 11000], [3, 11000]]
+    console.log(error.result.insertedCount, error.ordered);
+    // → 2 false
+  }
+}
+```
+
+Без `ordered: false` тот же вызов останавливается на первой ошибке: `writeErrors` содержит только индекс 1, `result.insertedCount` равен 1, а `ordered` равен `true`.
+
+### Поля
+
+<Params title="Поля ошибки">
+<Param name="writeErrors" type="readonly BulkWriteFailure[]">
+
+Каждая неудачная запись, отсортированная по индексу во вводе. У элемента: `index` (номер во вводе), `code` (код сервера: 11000, 121; для записи, отвергнутой до сервера из-за приведения или проверки схемы, `undefined`), `message` (текст сервера для отказа сервера, у остальных тот же, что у `error`) и `error` (разобранная ошибка: `DuplicateKeyError`, `ServerValidationError`, `CastError`, `ValidationError`).
+
+</Param>
+<Param name="result" type="BulkWriteSummary">
+
+Что изменили успешные записи: `insertedCount`, `matchedCount`, `modifiedCount`, `deletedCount`, `upsertedCount`, а также `insertedIds` и `upsertedIds` по номеру во вводе. В `insertedIds` попадают только записанные вставки: в примере выше это номера 0 и 2, номеров неудавшихся вставок (1 и 3) там нет.
+
+</Param>
+<Param name="ordered" type="boolean">
+
+Была ли запись упорядоченной. При `true` записи после первой неудачной не выполнялись.
+
+</Param>
+</Params>
+
+Текст самой ошибки называет неудачу с наименьшим индексом во вводе, а не ту, которую нашли первой: если проверку Typemo не прошёл документ 2, а сервер отказал документу 1, в тексте будет «first at index 1». Чтобы среди неудач найти повторы, достаточно проверить класс элемента: `failure.error instanceof DuplicateKeyError`. Ошибка приведения в упорядоченном `insertMany` бросается сразу как [`CastError`](./data-errors.mdx#casterror), до отправки пакета, а не собирается в `BulkWriteError`; ошибка проверки схемы в неупорядоченной записи собирается в пакет (индекс 1 в запуске).
+
+### Когда не подходит
+
+Если записи должны пройти вместе или не пройти вовсе, пакетная запись не подходит: она частична по природе. Используйте [транзакцию](../transactions/transactions.mdx#transaction).
+
+---
+
+## ServerErrorCodes
+
+`ServerErrorCodes` — замороженный объект с названиями кодов ошибок сервера, на которые реагирует Typemo. Драйвер не экспортирует констант почти для всех этих кодов (даже для 11000), поэтому они собраны здесь: `error.code === ServerErrorCodes.DuplicateKey` читается лучше, чем `error.code === 11000`.
+
+```ts twoslash
+import { ServerErrorCodes } from "@venloc/typemo";
+// ---cut---
+console.log(ServerErrorCodes.DuplicateKey, ServerErrorCodes.WriteConflict);
+// → 11000 112
+```
+
+Тип `ServerErrorCode` — объединение всех значений этой таблицы. Классы, которыми библиотека оборачивает коды: 11000 и 11001 дают `DuplicateKeyError`, 121 — `ServerValidationError`, 112 — `WriteConflictError`, 50 — `TimeoutError`, 18 — `ConnectionError` с видом `authentication`; остальные коды дают общий `ServerError`.
+
+<TypeTable
+  type={{
+    HostUnreachable: { description: "Код 6. Хост недоступен.", type: "6" },
+    HostNotFound: { description: "Код 7. Хост не найден.", type: "7" },
+    Unauthorized: { description: "Код 13. Нет прав на операцию.", type: "13" },
+    AuthenticationFailed: { description: "Код 18. Сервер отверг учётные данные. Даёт `ConnectionError` с видом `authentication`.", type: "18" },
+    IllegalOperation: { description: "Код 20. Недопустимая операция.", type: "20" },
+    NamespaceNotFound: { description: "Код 26. Коллекции или базы не существует.", type: "26" },
+    PathNotViable: { description: "Код 28. Путь нельзя применить к документу.", type: "28" },
+    ConflictingUpdateOperators: { description: "Код 40. Операторы обновления конфликтуют друг с другом.", type: "40" },
+    CursorNotFound: { description: "Код 43. Курсор на сервере не найден.", type: "43" },
+    NamespaceExists: { description: "Код 48. Коллекция уже существует.", type: "48" },
+    MaxTimeMSExpired: { description: "Код 50. Сервер остановил операцию по её пределу времени. Даёт `TimeoutError`.", type: "50" },
+    WriteConcernTimeout: { description: "Код 64. Не дождались подтверждения записи в срок.", type: "64" },
+    IndexOptionsConflict: { description: "Код 85. Индекс с такими ключами уже есть, но с другими опциями.", type: "85" },
+    IndexKeySpecsConflict: { description: "Код 86. Индекс с таким именем уже есть, но с другими ключами.", type: "86" },
+    NetworkTimeout: { description: "Код 89. Истекло время сетевой операции.", type: "89" },
+    ShutdownInProgress: { description: "Код 91. Сервер останавливается.", type: "91" },
+    WriteConflict: { description: "Код 112. Две записи задели один документ. Даёт `WriteConflictError`.", type: "112" },
+    ConflictingOperationInProgress: { description: "Код 117. В той же сессии уже идёт другая операция.", type: "117" },
+    DocumentValidationFailure: { description: "Код 121. Валидатор коллекции отверг документ. Даёт `ServerValidationError`.", type: "121" },
+    CappedPositionLost: { description: "Код 136. Позиция в ограниченной коллекции перезаписана.", type: "136" },
+    PrimarySteppedDown: { description: "Код 189. Первичный узел перестал быть первичным.", type: "189" },
+    IncompleteTransactionHistory: { description: "Код 217. История транзакции неполна.", type: "217" },
+    NoSuchTransaction: { description: "Код 251. Такой транзакции на сервере нет.", type: "251" },
+    TransactionCommitted: { description: "Код 256. Транзакция уже зафиксирована.", type: "256" },
+    TransactionTooLarge: { description: "Код 257. Транзакция слишком велика.", type: "257" },
+    ExceededTimeLimit: { description: "Код 262. Превышен предел времени операции.", type: "262" },
+    ChangeStreamFatalError: { description: "Код 280. Поток изменений завершился неустранимой ошибкой.", type: "280" },
+    ChangeStreamHistoryLost: { description: "Код 286. История потока изменений потеряна.", type: "286" },
+    NotWritablePrimary: { description: "Код 10107. Узел не первичный и писать в него нельзя.", type: "10107" },
+    DuplicateKey: { description: "Код 11000. Нарушен уникальный индекс. Даёт `DuplicateKeyError`.", type: "11000" },
+    InterruptedAtShutdown: { description: "Код 11600. Операция прервана остановкой сервера.", type: "11600" },
+    InterruptedDueToReplStateChange: { description: "Код 11602. Операция прервана сменой состояния реплика-сета.", type: "11602" },
+    SearchNotEnabled: { description: "Код 31082. На сервере нет Atlas Search: стадии `$search`, `$searchMeta`, `$vectorSearch` и команды поисковых индексов работают только в Atlas или в локальной среде Atlas. По этому коду приложение отличает «поиска нет» от других сбоев, см. [пример](#поиск-без-atlas).", type: "31082" },
+  }}
+/>
+
+Описания кодов даны по их названиям; точное поведение сервера в каждом случае здесь не проверялось, кроме кодов 11000, 121, 112, 50, 31082 и 2 (последний не входит в таблицу).
+
+### Поиск без Atlas
+
+Стадия `vectorSearch` на обычном сервере MongoDB завершается `ServerError` с кодом `SearchNotEnabled`. Приложение, которое в разработке работает без Atlas, ловит именно этот код и отвечает запасным поиском по словам, а остальные ошибки пробрасывает, чтобы сбой сети не выглядел как «поиска нет»:
+
+```ts twoslash title="articles/search.service.ts"
+import { ServerError, ServerErrorCodes } from "@venloc/typemo";
+const searchBySense = async (text: string): Promise<{ title: string }[]> => [];
+const searchByWords = async (text: string): Promise<{ title: string }[]> => [];
+// ---cut---
+export const search = async (text: string): Promise<{ title: string }[]> => {
+  try {
+    return await searchBySense(text);
+  } catch (error) {
+    if (error instanceof ServerError && error.code === ServerErrorCodes.SearchNotEnabled) return searchByWords(text);
+    throw error;
+  }
+};
+```
+
+Сообщение такой ошибки на тестовом сервере: `Using $search and $vectorSearch aggregation stages requires additional configuration. (code 31082 SearchNotEnabled)`. Целиком пример разобран в рецепте [Поиск по тексту и смыслу](../../recipes/search.mdx#вернуться-к-тексту-когда-смысла-нет).
+
+---
+
+## ErrorLabels
+
+`ErrorLabels` — замороженный объект с именами меток, которые сервер и драйвер прикрепляют к ошибкам. Метка не говорит, что случилось, а подсказывает, что можно сделать: повторить запись, повторить транзакцию, выяснить исход фиксации. Читать метки можно у [`ServerError`](#servererror), [`ConnectionError`](./configuration-errors.mdx#connectionerror) и [`DriverError`](./configuration-errors.mdx#drivererror) через `errorLabels` и `hasErrorLabel`.
+
+<TypeTable
+  type={{
+    RetryableWriteError: { description: "Запись можно повторить как есть: сбой временный.", type: '"RetryableWriteError"' },
+    TransientTransactionError: { description: "Транзакцию можно выполнить заново целиком. Внутри `transaction` это делает драйвер.", type: '"TransientTransactionError"' },
+    UnknownTransactionCommitResult: { description: "Исход фиксации неизвестен: она могла пройти или нет. Повторять фиксацию можно, повторять всю транзакцию без проверки нельзя.", type: '"UnknownTransactionCommitResult"' },
+    ResumableChangeStreamError: { description: "Поток изменений можно возобновить с последней позиции.", type: '"ResumableChangeStreamError"' },
+  }}
+/>
+
+Запуск показал метку `TransientTransactionError` на отказе, при котором функция транзакции выполнялась повторно: при двух искусственных отказах `update` функция получила `scope.attempt` равный 1, 2 и 3, и транзакция зафиксировалась.
+
+```ts twoslash
+import { ErrorLabels } from "@venloc/typemo";
+// ---cut---
+console.log(ErrorLabels.TransientTransactionError);
+// → "TransientTransactionError"
+```
+
+Описания меток (кроме `TransientTransactionError`) взяты из документации драйвера и в запуске не воспроизводились.

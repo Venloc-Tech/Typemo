@@ -1,0 +1,452 @@
+---
+title: Изменить и сохранить документ
+description: "Как поменять поля, массивы и вложенные объекты загруженного документа, увидеть, что изменилось, и сохранить только изменённое"
+icon: Save
+---
+
+Чтобы изменить документ, вы загружаете его, меняете поля обычным кодом и вызываете [`$save`](../reference/documents/document-api.mdx#save): Typemo сам находит, что изменилось, и отправляет в базу только это. Вам не нужно собирать обновление вручную и помнить, какие поля вы трогали.
+
+Это работает потому, что гидратированный документ следит за собой. **Гидратированный документ** — объект, который вы получаете из `find`, `create` и `Model.new`: экземпляр вашего класса, у которого массивы, Map и вложенные объекты заменены на типизированные коллекции с журналом изменений. Сравнивая журнал и исходные значения, [`$save`](../reference/documents/document-api.mdx#save) строит самое короткое обновление: `$set` для полей, `$push` для добавленных элементов массива, `$unset` для удалённых ключей Map.
+
+## Что предполагается
+
+Примеры используют заказ с покупателем, тегами, строками, адресом и Map сборов. Модель показана в [справочнике](../reference/documents/document-api.mdx), а подключение — в руководстве [Подключиться к базе](../connection/connect.mdx).
+
+```ts twoslash title="models/order.ts"
+import { Entity, type Hidden, Prop, Schema, Spec, Versioned } from "@venloc/typemo";
+
+@Schema({ nested: true })
+export class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+
+  @Prop(() => String)
+  street?: string;
+}
+
+@Schema()
+export class Line extends Entity {
+  @Prop(() => String, { required: true })
+  sku!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  qty!: number;
+}
+
+@Schema({ collection: "orders" })
+export class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => [Line])
+  lines!: Line[];
+
+  @Prop(() => Address)
+  address?: Address;
+
+  @Prop(() => Spec.map(Number))
+  fees?: Map<string, number>;
+
+  @Prop(() => String, { hidden: true })
+  note?: Hidden<string>;
+}
+```
+
+## Быстрый путь
+
+Три способа поменять документ, и все они попадают в один `$save`: присвоить скаляр, вызвать метод коллекции, задать путь через [`$set`](../reference/documents/document-api.mdx#set).
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: ["gift"], lines: [{ sku: "A1", qty: 2 }] });
+
+order.customer = "bob"; // присваивание
+order.tags.push("express"); // метод коллекции
+order.$set("lines.0.qty", 5); // путь
+await order.$save();
+
+console.log(order.$isModified());
+// → false
+```
+
+Остальная страница разбирает, что уходит в базу, как это увидеть и что делать, когда что-то идёт не так.
+
+## Изменить поля и сохранить
+
+Самая частая задача — поменять несколько полей загруженного документа. Присвойте новые значения и вызовите `$save`. Значение присваивается как есть, а приведение к типу поля и проверки выполняются при сохранении: если вы присвоите значение другого типа, узнаете об этом из [`CastError`](../reference/errors/data-errors.mdx#casterror) при `$save` (или `$validate`), а нарушение правила поля (`min`, `required`) — из [`ValidationError`](../reference/errors/data-errors.mdx#validationerror). Хотите ошибку сразу, используйте [`$set`](../reference/documents/document-api.mdx#set): он приводит значение при вызове и бросает `CastError` на нужной строке.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: ["gift"], lines: [] });
+console.log(order.__v);
+// → 0
+
+order.customer = "bob";
+await order.$save();
+console.log(order.customer, order.__v);
+// → "bob" 0
+```
+
+Версия `__v` не изменилась: изменение скалярного поля не считается изменением структуры, и Typemo не увеличивает версию. Когда версия меняется и зачем она нужна, объясняет руководство [Версии и параллельные изменения](./versions.mdx).
+
+## Изменить массив, Map или вложенный объект
+
+Массивы и Map изменяют **методами**: `push`, `pull`, `set`, `delete` и остальными. Вложенный объект изменяют присваиванием его полей. Индексы и `length` для записи закрыты типами, потому что запись по индексу не говорит, что вы хотели сделать, а метод говорит: полный перечень методов и операторов, в которые они превращаются, — в справочнике [Типизированные коллекции](../reference/documents/typed-collections.mdx).
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({
+  customer: "alice",
+  tags: ["gift"],
+  lines: [{ sku: "A1", qty: 2 }],
+  address: { city: "Oslo" },
+  fees: { delivery: 5 },
+});
+
+order.tags.push("express");
+order.lines[0]!.qty = 5;
+order.address!.city = "Rome";
+order.fees?.set("gift", 3);
+await order.$save();
+```
+
+Каждое изменение здесь превратилось в свою операцию, а не в перезапись документа: два клиента, изменившие разные теги одного заказа, не затрут друг друга. Что именно уйдёт в базу, показывает [`$getChanges`](../reference/documents/document-api.mdx#getchanges) — следующий раздел.
+
+## Посмотреть, что изменилось
+
+Чтобы узнать, что изменилось, не сохраняя, спросите документ. [`$isModified`](../reference/documents/document-api.mdx#ismodified) отвечает «да» или «нет» для документа целиком или для одного пути. [`$getChanges`](../reference/documents/document-api.mdx#getchanges) показывает само обновление: операторы, пути и значения в именах полей вашего класса.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({
+  customer: "alice",
+  tags: ["gift"],
+  lines: [{ sku: "A1", qty: 2 }],
+  fees: { delivery: 5 },
+});
+console.log(order.$isModified());
+// → false
+
+order.customer = "bob";
+order.tags.push("express");
+order.lines[0]!.qty = 5;
+order.fees?.set("gift", 3);
+console.log(order.$isModified("customer"), order.$isModified("address"));
+// → true false
+console.log(order.$getChanges());
+// → { $set: { customer: "bob", "lines.0.qty": 5, "fees.gift": 3 }, $push: { tags: { $each: ["express"] } } }
+```
+
+Typemo сравнивает значения, а не запоминает присваивания. Если вы поменяли `customer` и вернули прежнее значение, документ снова не считается изменённым, и `$save` ничего не отправит. Так же сравнивается `NaN`: число, которое другая программа записала в поле, считается равным самому себе, поэтому прочитанный документ с таким полем не «изменён» (`$isModified()` — `false`, `$getChanges()` — пустой объект), а `$save` не отправит это `NaN` обратно. `$getChanges` пригодится при отладке («почему сохранение такое большое?») и в тестах. Он ничего не бросает: если `$save` откажет (например, массив заменён присваиванием), причина лежит в ключе `$problems` результата: путь и текст той ошибки, которую бросило бы сохранение. Так вы видите будущий отказ заранее, вместе с остальным обновлением.
+
+## Сохранить ничего не изменённый документ
+
+Вызвать `$save` на документе без изменений безопасно: в базу не уходит ни одной команды, а метод завершается успешно, вернув тот же документ. Поэтому не нужно проверять `$isModified` перед каждым сохранением. Одно исключение связано не с базой: хуки `document.save` вызываются и для документа без изменений. Если хук должен работать только при правках, начните его с проверки: `if (!this.$isModified()) return;`.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: [], lines: [] });
+const same = await order.$save();
+console.log(Object.is(same, order), order.__v);
+// → true 0
+```
+
+## Сохранить в транзакции
+
+Если нужно, чтобы несколько записей применились вместе или не применились вовсе, оберните их в [`client.transaction`](../reference/connection/typemo-client.mdx#clienttransaction). `$save` внутри колбэка присоединяется к транзакции сам, передавать сессию не нужно. При откате изменения в базе исчезают.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: [], lines: [] });
+
+try {
+  await client.transaction(async () => {
+    const inside = await Orders.findById(order._id).orFail();
+    inside.customer = "bob";
+    await inside.$save();
+    throw new Error("payment failed");
+  });
+} catch {
+  // транзакция откатилась
+}
+
+const stored = await Orders.findById(order._id).orFail().plain();
+console.log(stored.customer);
+// → "alice"
+```
+
+Документ `inside` в памяти сохранил правку `"bob"`, хотя в базе её нет. Поэтому внутри транзакции документы читают заново (как здесь), а не берут загруженные раньше: колбэк может выполниться несколько раз, и правка ранее загруженного документа применилась бы повторно. Подробнее — в руководстве [Транзакции](../transactions/transactions.mdx).
+
+## Как выбрать
+
+Задайте себе один вопрос: **есть ли у вас загруженный документ, и нужно ли то, что вы меняете, ещё и в памяти?** Если документ уже загружен и вы работаете с его полями дальше (показываете, считаете, отдаёте), меняйте его и вызывайте [`$save`](../reference/documents/document-api.mdx#save). Если документ не загружен и вам нужно только изменить запись, используйте [`updateOne`](../reference/writes/writes.mdx#updateone): один запрос вместо чтения и записи. Если нужно атомарное изменение на стороне базы (счётчик, `$inc`), но документ уже у вас в руках, есть [`$updateOne`](../reference/documents/document-api.mdx#updateone), который не трогает копию в памяти.
+
+## Когда это не нужно
+
+Для массовых изменений (обновить все заказы покупателя) документы по одному не загружают: используйте [`updateMany`](../reference/writes/writes.mdx#updatemany). Для счётчиков, которые меняют многие клиенты одновременно, надёжнее оператор [`$inc`](../reference/writes/update-operators.mdx) в [`updateOne`](../reference/writes/writes.mdx#updateone), чем «прочитать, прибавить, сохранить»: между чтением и записью другой клиент успеет изменить значение.
+
+## Частые ошибки
+
+### Массив заменён присваиванием
+
+Присвоить массиву или Map новое значение через `=` нельзя:
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+const order = Orders.new({ customer: "alice", tags: ["gift"], lines: [] });
+// ---cut---
+// @errors: 2740
+order.tags = ["express"];
+```
+
+Если это обойти приведением типа, `$save` откажется писать: Typemo не знает, хотели вы заменить содержимое, дополнить его или вообще ошиблись. А [`$getChanges`](../reference/documents/document-api.mdx#getchanges) не бросит ошибку, а покажет тот же текст в `$problems`.
+
+```text
+DirectWriteError: "tags" was changed around its methods: the field was replaced by assignment; use $set("tags", value) or the container's methods
+```
+
+Исправление: для замены целиком используйте [`$set("tags", […])`](../reference/documents/document-api.mdx#set) или [`tags.replace([…])`](../reference/documents/typed-collections.mdx#strictarrayreplace), для добавления — [`tags.push`](../reference/documents/typed-collections.mdx#strictarraypush).
+
+### Неверное значение обнаружилось только при сохранении
+
+Обычное присваивание не приводит значение сразу. Если вы присвоили полю неподходящее значение в коде без проверки типов, ошибка появится только при [`$save`](../reference/documents/document-api.mdx#save) или [`$validate`](../reference/documents/document-api.mdx#validate), а не на строке присваивания, как у [`$set`](../reference/documents/document-api.mdx#set). Класс ошибки один на любой глубине: [`CastError`](../reference/errors/data-errors.mdx#casterror), причём до всякой валидации. Ограничения этого поля (`min`, `enum`) не проверяются, потому что проверять пока нечего, и в базу ничего не уходит.
+
+```text
+CastError: Cast to string failed at path "customer" for 5 (number): expected a string [type]
+CastError: Cast to number failed at path "lines.0.qty" for "abc" (string): expected a number [type]
+```
+
+Исправление: если значение приходит снаружи, присваивайте его через `$set` — ошибка появится сразу на нужной строке — или проверьте его заранее через [`Model.validate`](../reference/documents/model-document-methods.mdx#modelvalidate).
+
+### Сохранение не сработало после удаления
+
+Документ, удалённый через [`$deleteOne`](../reference/documents/document-api.mdx#deleteone), сохранить нельзя, а документ, удалённый другим клиентом, — тоже:
+
+```text
+QueryError: save: the document of Order was deleted
+DocumentNotFoundError: Order.save: the document is no longer in the collection (deleted since it was read, or out of the scope of the operation's policies); nothing was written
+```
+
+Первая ошибка — вы сами удалили документ в этой программе, вторая — записи в базе уже нет. Исправление: создайте документ заново через [`Model.new`](../reference/documents/model-document-methods.mdx#modelnew) или прочитайте актуальный.
+
+## Полный пример
+
+Функция сервиса, которая меняет покупателя заказа, добавляет тег и строку и сохраняет всё одним обращением к базе.
+
+```ts twoslash title="orders/orders.service.ts"
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+export const updateOrder = async (orderId: Order["_id"], customer: string) => {
+  const order = await Orders.findById(orderId).orFail();
+
+  order.customer = customer;
+  order.tags.addToSet("edited");
+  order.lines.push({ sku: "GIFT", qty: 1 });
+
+  if (!order.$isModified()) return order;
+  await order.$save();
+  return order.$toPlain();
+};
+```
+
+## Если вы пришли из Mongoose
+
+<Callout type="migration">
+
+В Mongoose изменение массива по индексу и вложенного значения нужно было сопровождать `doc.markModified(path)`, иначе `save()` могло ничего не записать. В Typemo индексы для записи закрыты типами, а методы коллекций отслеживаются сами, так что `$markModified` нужен только для значений, изменённых на месте (например, байты `Binary`). `doc.save()` называется `$save()`, а `doc.isModified()` — `$isModified()`.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Массивы и Map в документе" href="./typed-collections.mdx">
+  Какие методы коллекций дают какой оператор MongoDB и что запрещено.
+</Card>
+<Card title="Сериализация" href="./serialization.mdx">
+  Как отдать документ клиенту: `$toObject`, `$toPlain`, `$toJSON`.
+</Card>
+<Card title="Версии и параллельные изменения" href="./versions.mdx">
+  Что будет, если документ изменили после вашего чтения.
+</Card>
+<Card title="API документа" href="../reference/documents/document-api.mdx">
+  Все методы документа со всеми параметрами и ошибками.
+</Card>
+</Cards>

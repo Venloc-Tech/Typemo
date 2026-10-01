@@ -1,0 +1,376 @@
+---
+title: Многотенантное приложение
+description: "Как построить сервис заказов, в котором каждый запрос видит только данные своей организации, а отмены и изменения попадают в журнал"
+icon: Building2
+---
+
+Многотенантное приложение хранит данные многих организаций в общих коллекциях и гарантирует, что запрос одной организации не увидит и не изменит данные другой. Эта страница собирает такой сервис целиком: организация берётся из токена запроса, политики [тенанта](../policies/tenants.mdx), [мягкого удаления](../policies/soft-delete.mdx) и [аудита](../policies/audit.mdx) включаются в схеме, а тесты проверяют, что утечек нет.
+
+**Тенант** — это организация, чьи данные отделены от остальных. Главная идея рецепта: тенанта не передают параметром в каждую функцию и не пишут в каждое условие. Слой запроса открывает область один раз, а модель сама добавляет тенанта в каждую операцию. Забытое условие «`orgId = …`» перестаёт быть возможной ошибкой.
+
+## Что предполагается
+
+Клиент подключён по руководству [Подключиться к базе](../connection/connect.mdx), база `crm`, MongoDB работает как реплика-сет (аудит пишет в транзакции). Основы политики разобраны в руководстве [Разделить данные организаций](../policies/tenants.mdx): здесь мы строим на них законченное приложение.
+
+## Быстрый путь
+
+Модель помечается тремя политиками, а обработчик запроса открывает область [`PolicyContext.run`](../reference/policies/policy-context.mdx#policycontextrun) с тенантом и актором (тем, кто действует):
+
+```ts twoslash
+import { Entity, PolicyContext, Prop, Schema, SoftDelete, StrictModeError, Tenant, type TenantField, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true, softDelete: true, audit: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+  @Prop(() => Number, { required: true, min: 0 }) total!: number;
+  @Prop(() => Date, { nullable: true }) deletedAt?: Date | null;
+}
+class __Unauthorized__ extends Error {}
+declare const __verifyToken__: (token: string) => { readonly orgId: string; readonly userId: string } | null;
+const client = await TypemoClient.connect("mongodb://localhost:27017/crm");
+const Orders = client.db().model(Order);
+const handle = async <R>(token: string, work: () => Promise<R>): Promise<R> => work();
+// ---cut---
+const placeOrder = (orgId: string, userId: string) =>
+  PolicyContext.run({ tenant: orgId, actor: userId }, () => Orders.create({ number: "A-1", total: 10 }));
+
+const order = await placeOrder("acme", "user-1");
+console.log(order.tenantId);
+// → "acme"
+```
+
+Тенанта проставила модель: в `create` его нет. Остальная страница строит слой запроса, операции над заказами, отмену с восстановлением, отчёт по всем организациям и тесты.
+
+## Описать модель с политиками
+
+Поле тенанта объявляется типом [`TenantField`](../reference/schemas/field-markers.mdx#tenantfield) и помечается декоратором [`@Tenant()`](../reference/schemas/field-markers.mdx#tenant) рядом с `@Prop`. Опции [`tenant`](../reference/policies/schema-options.mdx#опция-tenant), [`softDelete`](../reference/policies/schema-options.mdx#опция-softdelete) и [`audit`](../reference/policies/schema-options.mdx#опция-audit) включают политики. Пометка обязательна: по ней схема знает, какое поле заполнять тенантом, и без неё схема с опцией `tenant` не собирается (текст ошибки — в разделе о частых ошибках). Поле `deletedAt` нужно для мягкого удаления: вместо удаления документа в него пишется дата.
+
+```ts twoslash title="orders/order.ts"
+import { Entity, Prop, Schema, Tenant, type TenantField } from "@venloc/typemo";
+
+@Schema({ collection: "orders", tenant: true, softDelete: true, audit: true })
+export class Order extends Entity {
+  @Prop(() => String)
+  @Tenant()
+  tenantId!: TenantField<string>;
+
+  @Prop(() => String, { required: true })
+  number!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  total!: number;
+
+  @Prop(() => Date, { nullable: true })
+  deletedAt?: Date | null;
+}
+```
+
+## Открыть область на каждый запрос
+
+Слой запроса проверяет токен и открывает область вокруг всей обработки. Проверка токена — ваш код (`__verifyToken__`): Typemo не знает, откуда приходит организация. Область сохраняется через все `await` внутри, поэтому сервисам передавать тенанта не нужно.
+
+```ts twoslash title="http/handle.ts"
+import { PolicyContext } from "@venloc/typemo";
+class __Unauthorized__ extends Error {}
+declare const __verifyToken__: (token: string) => { readonly orgId: string; readonly userId: string } | null;
+// ---cut---
+export const handle = async <R>(token: string, work: () => Promise<R>): Promise<R> => {
+  const identity = __verifyToken__(token);
+  if (identity === null || identity.orgId === "") throw new __Unauthorized__("invalid token");
+  return PolicyContext.run({ tenant: identity.orgId, actor: identity.userId }, work);
+};
+```
+
+Пустую организацию стоит отвергнуть самому, в слое запроса: тогда клиент получит понятный отказ в авторизации. Если пустая строка дойдёт до `PolicyContext.run`, оно откажет с `StrictModeError: PolicyContext.run: the tenant is empty (""); a tenant is a non-empty value, or allTenants: true for cross-tenant work [tenant]`, но это ошибка сервера, а не клиента. Токен должен подтверждать организацию: если брать её из заголовка, который клиент задаёт сам, любой пользователь выдаст себя за чужую организацию.
+
+## Записать и прочитать заказы организации
+
+Сервисные функции не знают о тенанте вообще: они просто вызывают модель.
+
+```ts twoslash title="orders/orders.service.ts"
+import { Entity, PolicyContext, Prop, Schema, SoftDelete, StrictModeError, Tenant, type TenantField, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true, softDelete: true, audit: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+  @Prop(() => Number, { required: true, min: 0 }) total!: number;
+  @Prop(() => Date, { nullable: true }) deletedAt?: Date | null;
+}
+class __Unauthorized__ extends Error {}
+declare const __verifyToken__: (token: string) => { readonly orgId: string; readonly userId: string } | null;
+const client = await TypemoClient.connect("mongodb://localhost:27017/crm");
+const Orders = client.db().model(Order);
+const handle = async <R>(token: string, work: () => Promise<R>): Promise<R> => work();
+// ---cut---
+export const placeOrder = (token: string, number: string, total: number) =>
+  handle(token, async () => (await Orders.create({ number, total })).$toPlain());
+
+export const listOrders = (token: string) =>
+  handle(token, async () => Orders.find().sort({ number: 1 }).plain());
+```
+
+Пусть `acme` создала заказ `A-1`, а `globex` — `B-1`. `listOrders` по токену `acme` вернёт только `A-1`, а поиск чужого заказа по `_id` даст `null`, изменение чужого — `matchedCount: 0`, удаление — `deletedCount: 0`. Чужие документы для организации просто не существуют. Модель не даёт и подложить чужого тенанта: `create` с `tenantId: "globex"` под тенантом `acme` бросает `StrictModeError`:
+
+```text
+StrictModeError: Order.create: the document is for another tenant (tenantId: globex) than the operation's (acme) [tenant]
+```
+
+## Отменить заказ и вернуть его
+
+При включённом `softDelete` [`deleteOne`](../reference/writes/writes.mdx#deleteone) не удаляет документ, а записывает в `deletedAt` дату, и обычные чтения удалённые заказы не видят. Вернуть заказ можно через [`SoftDelete.restore`](../reference/policies/soft-delete-and-untrusted.mdx#softdeleterestore). Посмотреть отменённые — опцией `onlyDeleted` строителя [`.policy`](../reference/policies/policy-context.mdx#policyvalues).
+
+```ts twoslash title="orders/orders.service.ts"
+import { Entity, PolicyContext, Prop, Schema, SoftDelete, StrictModeError, Tenant, type TenantField, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true, softDelete: true, audit: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+  @Prop(() => Number, { required: true, min: 0 }) total!: number;
+  @Prop(() => Date, { nullable: true }) deletedAt?: Date | null;
+}
+class __Unauthorized__ extends Error {}
+declare const __verifyToken__: (token: string) => { readonly orgId: string; readonly userId: string } | null;
+const client = await TypemoClient.connect("mongodb://localhost:27017/crm");
+const Orders = client.db().model(Order);
+const handle = async <R>(token: string, work: () => Promise<R>): Promise<R> => work();
+// ---cut---
+export const cancelOrder = (token: string, id: string) =>
+  handle(token, async () => {
+    await Orders.deleteOne({ _id: id }).orFail();
+  });
+
+export const restoreOrder = (token: string, id: string) =>
+  handle(token, async () => {
+    await SoftDelete.restore(Orders, { _id: id }).orFail();
+  });
+
+export const listCancelled = (token: string) =>
+  handle(token, async () => Orders.find().policy({ onlyDeleted: true }).plain());
+```
+
+После отмены `listOrders` возвращает пустой список, `listCancelled` — заказ `A-1`, а после восстановления заказ снова в списке. Обратите внимание: `restore` работает в той же области, поэтому организация не может вернуть отменённый заказ другой организации.
+
+## Читать журнал аудита
+
+Опция `audit` записывает каждую запись в коллекцию `orders_audit` в той же транзакции, что и сама запись, с тенантом и актором из области. Читателя журнала для модели нет, поэтому администратор читает его через драйвер: [`client.unsafeDriver()`](../reference/connection/typemo-client.mdx#clientunsafedriver) идёт мимо политик, и это осознанное решение только для админской задачи.
+
+```ts twoslash title="admin/audit.ts"
+import { Entity, PolicyContext, Prop, Schema, SoftDelete, StrictModeError, Tenant, type TenantField, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true, softDelete: true, audit: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+  @Prop(() => Number, { required: true, min: 0 }) total!: number;
+  @Prop(() => Date, { nullable: true }) deletedAt?: Date | null;
+}
+class __Unauthorized__ extends Error {}
+declare const __verifyToken__: (token: string) => { readonly orgId: string; readonly userId: string } | null;
+const client = await TypemoClient.connect("mongodb://localhost:27017/crm");
+const Orders = client.db().model(Order);
+const handle = async <R>(token: string, work: () => Promise<R>): Promise<R> => work();
+// ---cut---
+export const auditTrail = async () => {
+  const entries = await client.unsafeDriver().db("crm").collection("orders_audit").find().toArray();
+  return entries.map((entry) => [entry.operation, entry.tenant, entry.actor, entry.softDelete ?? false]);
+};
+// → [["insertOne", "acme", "user-1", false], ["insertOne", "globex", "user-9", false],
+//    ["deleteOne", "acme", "user-1", true], ["updateMany", "acme", "user-1", false]]
+```
+
+Журнал получен после двух созданий, отмены и восстановления. Отмена записана как `deleteOne` с пометкой `softDelete: true`, а восстановление — как `updateMany` со сбросом `deletedAt`: `SoftDelete.restore` всегда пишет через `updateMany`, поэтому строка восстановления хранит условие, а не `_id` задетого заказа (подробнее — в рецепте [История изменений](./change-history.mdx#в-истории-нет-записей-updatemany)). Подробнее о том, что попадает в журнал, — в описании [`AuditEntry`](../reference/policies/schema-options.mdx#auditentry).
+
+## Отчёт по всем организациям
+
+Внутренняя задача (сколько заказов в системе) должна видеть всех. Область без тенанта не годится: модель отвергнет операцию. Нужно явно сказать, что задача межтенантная, и это видно в коде при чтении:
+
+```ts twoslash title="admin/report.ts"
+import { Entity, PolicyContext, Prop, Schema, SoftDelete, StrictModeError, Tenant, type TenantField, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true, softDelete: true, audit: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+  @Prop(() => Number, { required: true, min: 0 }) total!: number;
+  @Prop(() => Date, { nullable: true }) deletedAt?: Date | null;
+}
+class __Unauthorized__ extends Error {}
+declare const __verifyToken__: (token: string) => { readonly orgId: string; readonly userId: string } | null;
+const client = await TypemoClient.connect("mongodb://localhost:27017/crm");
+const Orders = client.db().model(Order);
+const handle = async <R>(token: string, work: () => Promise<R>): Promise<R> => work();
+// ---cut---
+export const countAllOrders = () => Orders.countDocuments().policy({ allTenants: true });
+```
+
+`allTenants` — флаг, который никогда не включается сам, поэтому обычные обработчики его не получают. Не открывайте его в `handle`: для клиентских запросов он должен быть недоступен.
+
+## Проверить, что утечек нет
+
+Тест на утечку создаёт данные двух организаций и проверяет, что каждая операция одной не задевает вторую. Он идёт на настоящей базе: без неё политика не проверяется.
+
+```ts twoslash title="orders/orders.test.ts"
+import { Entity, PolicyContext, Prop, Schema, SoftDelete, StrictModeError, Tenant, type TenantField, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true, softDelete: true, audit: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+  @Prop(() => Number, { required: true, min: 0 }) total!: number;
+  @Prop(() => Date, { nullable: true }) deletedAt?: Date | null;
+}
+class __Unauthorized__ extends Error {}
+declare const __verifyToken__: (token: string) => { readonly orgId: string; readonly userId: string } | null;
+const client = await TypemoClient.connect("mongodb://localhost:27017/crm");
+const Orders = client.db().model(Order);
+const handle = async <R>(token: string, work: () => Promise<R>): Promise<R> => work();
+import { expect, test } from "bun:test";
+const listOrders = (token: string) => handle(token, async () => Orders.find().plain());
+// ---cut---
+test("an organization never sees another one's orders", async () => {
+  await PolicyContext.run({ tenant: "acme" }, () => Orders.create({ number: "A-1", total: 10 }));
+  const foreign = await PolicyContext.run({ tenant: "globex" }, () => Orders.create({ number: "B-1", total: 5 }));
+
+  const seen = await PolicyContext.run({ tenant: "acme" }, () => Orders.find().plain());
+  expect(seen.map((order) => order.number)).toEqual(["A-1"]);
+
+  const byId = await PolicyContext.run({ tenant: "acme" }, () => Orders.findById(foreign._id).plain());
+  expect(byId).toBeNull();
+
+  const changed = await PolicyContext.run({ tenant: "acme" }, () => Orders.updateOne({ _id: foreign._id }, { $set: { total: 0 } }));
+  expect(changed.matchedCount).toBe(0);
+
+  await expect(Orders.find()).rejects.toBeInstanceOf(StrictModeError);
+});
+```
+
+Последняя проверка ловит забытую область: запрос без тенанта не возвращает всё подряд, а падает с `StrictModeError`.
+
+## Как выбрать
+
+Задайте себе вопрос: **должна ли организация хоть раз видеть данные другой?** Если нет никогда — используйте политику `tenant`, как здесь. Если часть данных общая (справочники, тарифы), не помечайте их модель тенантом: модель без опции `tenant` доступна всем. Если организаций мало и они крупные, рассмотрите отдельную базу на организацию через [`useDb`](../reference/connection/connection.mdx#connectionusedb): изоляция сильнее, но каждая база — отдельные индексы и миграции.
+
+## Когда это не нужно
+
+Если пользователи одного приложения не образуют организаций, а каждый просто видит свои записи, хватит обычного фильтра `owner`. Политика тенанта нужна там, где ошибка в условии означает утечку данных между клиентами.
+
+## Частые ошибки
+
+### Операция падает с `StrictModeError`
+
+Вы вызвали модель вне области. Ошибка называет вызванный метод (`Order.find`, `Order.create`) и подсказывает форму вызова для этого случая:
+
+```text
+StrictModeError: Order.find: Order is scoped by tenant ("tenantId") and the operation has no tenant; run it inside PolicyContext.run({ tenant }, …) or add .policy({ tenant }) to the query (cross-tenant work: .policy({ allTenants: true })) [tenant]
+```
+
+Это защита, а не сбой: без тенанта операция увидела бы данные всех. Вызовите её внутри `handle`. Подробнее — в разделе [Частые ошибки](../policies/tenants.mdx#частые-ошибки) руководства о тенантах.
+
+### Схема не собирается: поле тенанта не помечено
+
+`client.db().model(Order)` бросает `ConfigurationError`, если в схеме есть опция `tenant`, а поле не помечено `@Tenant()`:
+
+```text
+ConfigurationError: Order: the tenant field "tenantId" must be marked @Tenant() (declare it @Prop(...) @Tenant() tenantId!: TenantField<T>)
+```
+
+Добавьте `@Tenant()` рядом с `@Prop` на поле типа `TenantField<T>`. Обратные нарушения (пометка без опции `tenant`, пометка на двух полях) описаны в [справочнике `@Tenant`](../reference/schemas/field-markers.mdx#tenant).
+
+### Организация берётся из заголовка запроса
+
+Если `handle` читает организацию из заголовка, который выставляет клиент, изоляции нет. Организацию должен подтверждать токен, подписанный вашим сервером.
+
+## Полный пример
+
+```ts twoslash title="orders/orders.service.ts"
+import {
+  Entity,
+  PolicyContext,
+  Prop,
+  Schema,
+  SoftDelete,
+  Tenant,
+  type TenantField,
+  TypemoClient,
+} from "@venloc/typemo";
+
+// your code: authentication
+export class __Unauthorized__ extends Error {}
+declare const __verifyToken__: (token: string) => { readonly orgId: string; readonly userId: string } | null;
+
+// orders/order.ts
+@Schema({ collection: "orders", tenant: true, softDelete: true, audit: true })
+export class Order extends Entity {
+  @Prop(() => String)
+  @Tenant()
+  tenantId!: TenantField<string>;
+
+  @Prop(() => String, { required: true })
+  number!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  total!: number;
+
+  @Prop(() => Date, { nullable: true })
+  deletedAt?: Date | null;
+}
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/crm");
+const Orders = client.db().model(Order);
+
+// http/handle.ts: one scope per request
+export const handle = async <R>(token: string, work: () => Promise<R>): Promise<R> => {
+  const identity = __verifyToken__(token);
+  if (identity === null || identity.orgId === "") throw new __Unauthorized__("invalid token");
+  return PolicyContext.run({ tenant: identity.orgId, actor: identity.userId }, work);
+};
+
+// orders/orders.service.ts: no tenant anywhere
+export const placeOrder = (token: string, number: string, total: number) =>
+  handle(token, async () => (await Orders.create({ number, total })).$toPlain());
+
+export const listOrders = (token: string) =>
+  handle(token, async () => Orders.find().sort({ number: 1 }).plain());
+
+export const cancelOrder = (token: string, id: string) =>
+  handle(token, async () => {
+    await Orders.deleteOne({ _id: id }).orFail();
+  });
+
+export const restoreOrder = (token: string, id: string) =>
+  handle(token, async () => {
+    await SoftDelete.restore(Orders, { _id: id }).orFail();
+  });
+
+export const listCancelled = (token: string) =>
+  handle(token, async () => Orders.find().policy({ onlyDeleted: true }).plain());
+
+// admin/report.ts: cross-tenant work is explicit
+export const countAllOrders = () => Orders.countDocuments().policy({ allTenants: true });
+
+// admin/audit.ts: the audit trail, read past the policies
+export const auditTrail = async () => {
+  const entries = await client.unsafeDriver().db("crm").collection("orders_audit").find().toArray();
+  return entries.map((entry) => [entry.operation, entry.tenant, entry.actor, entry.softDelete ?? false]);
+};
+```
+
+<Callout type="migration">
+
+В Mongoose изоляцию организаций строили плагином и `pre`-хуками на `find` и `update`, и любой путь мимо хуков (агрегация, `lean`, драйвер) мог выдать чужие данные. Здесь политика встроена в общий конвейер операций и не зависит от того, каким методом вы читаете.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Разделить данные организаций" href="../policies/tenants.mdx">
+  Все правила политики тенанта: агрегации, связанные данные, подписки.
+</Card>
+<Card title="Мягкое удаление" href="../policies/soft-delete.mdx">
+  Как работают `includeDeleted`, `onlyDeleted` и окончательное удаление.
+</Card>
+<Card title="Аудит" href="../policies/audit.mdx">
+  Что попадает в журнал, как маскируются секреты.
+</Card>
+<Card title="История изменений" href="./change-history.mdx">
+  Как показать пользователю, кто и что менял.
+</Card>
+</Cards>

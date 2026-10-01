@@ -1,0 +1,300 @@
+---
+title: Расширения
+description: "TypemoExtension, PropExtensions, SchemaExtensions, ExtensionName и описания места объявления: что принимают, как проверяют значения и какие ошибки бросают"
+icon: Blocks
+---
+
+**Расширение** добавляет в описание модели свой ключ внутри `ext` у `@Prop` и `@Schema` и проверяет его значения при компиляции схемы. Так библиотеки и ваш собственный код хранят настройки прямо у поля: подпись для интерфейса, правила экспорта, признаки для поиска. Расширение — только метаданные: оно ничего не делает во время операций и не обходит политики (арендатор, мягкое удаление, скрытые поля). Эта страница описывает всё, из чего расширение состоит.
+
+Если вы впервые добавляете свой ключ, сначала прочитайте руководство [Свои опции полей и схем](../../extensions/custom-options.mdx) и пример [Пример расширения](../../extensions/example.mdx). Регистрация на все клиенты описана в справочнике [`Typemo.use`](../connection/typemo.mdx#typemouse), на один клиент — [`client.use`](../connection/typemo-client.mdx#clientuse).
+
+Расширение состоит из трёх частей: объявления типа ключа для компилятора (`PropExtensions` или `SchemaExtensions`), регистрации проверки значения (`TypemoExtension`) и чтения из описания схемы ([`SchemaInfo`](../schemas/schema-info.mdx)). Примеры используют расширение `label`, которое хранит подпись поля для интерфейса.
+
+---
+
+## TypemoExtension
+
+`TypemoExtension<N>` — объект расширения: имя ключа и функции проверки. Он нужен, чтобы ошибочное значение обнаруживалось при компиляции схемы, а не тогда, когда интеграция его прочитала. Проверка получает значение как написано и **бросает ошибку**, если оно неверно.
+
+```ts twoslash
+import { type TypemoExtension } from "@venloc/typemo";
+declare module "@venloc/typemo" {
+  interface PropExtensions<V> {
+    label?: { readonly text: string; readonly format?: (value: V) => string };
+  }
+  interface SchemaExtensions {
+    label?: { readonly title: string };
+  }
+}
+// ---cut---
+export const label: TypemoExtension<"label"> = {
+  name: "label",
+  validateProp: (value) => {
+    if (typeof (value as { text?: unknown }).text !== "string") throw new TypeError("text must be a string");
+  },
+  validateSchema: (value) => {
+    if (typeof (value as { title?: unknown }).title !== "string") throw new TypeError("title must be a string");
+  },
+};
+```
+
+Значение приходит как `unknown`: компилятор проверяет вызовы на TypeScript, а значения из JavaScript-кода и конфигурации он не видит, поэтому проверка обязана защищаться сама. Проверка получает также описание места, где значение объявлено ([`ExtensionFieldInfo`](#extensionfieldinfo) или [`ExtensionSchemaInfo`](#extensionschemainfo)): по нему можно учесть вид поля или путь. Адрес поля в текст ошибки Typemo добавляет сам, поэтому в своём сообщении его повторять не нужно.
+
+<Params>
+<Param name="name" type="N extends ExtensionName" required>
+
+Имя расширения: ключ под `ext`. Оно должно быть ключом `PropExtensions` или `SchemaExtensions` (после объявления типа). Непустая строка, которая не начинается с `$`.
+
+</Param>
+<Param name="validateProp" type="(value: unknown, field: ExtensionFieldInfo) => void">
+
+Проверяет значение, использованное у поля. Бросает ошибку, если значение неверно. Ключ можно использовать в `ext` у `@Prop` только при наличии этой функции.
+
+</Param>
+<Param name="validateSchema" type="(value: unknown, schema: ExtensionSchemaInfo) => void">
+
+Проверяет значение, использованное у схемы. Бросает ошибку, если значение неверно. Ключ можно использовать в `ext` у `@Schema` только при наличии этой функции.
+
+</Param>
+</Params>
+
+Нужна хотя бы одна из двух функций: расширение без обеих бесполезно, и регистрация его отвергает.
+
+<FullType>
+
+```ts
+interface TypemoExtension<N extends ExtensionName = ExtensionName> {
+  readonly name: N;
+  readonly validateProp?: (value: unknown, field: ExtensionFieldInfo) => void;
+  readonly validateSchema?: (value: unknown, schema: ExtensionSchemaInfo) => void;
+}
+```
+
+</FullType>
+
+### Что делает Typemo со значением
+
+Перед проверкой значение копируется в замороженную копию: вход пользователя не меняется, а проверка и читатели не могут изменить сохранённое. Обычные объекты и массивы копируются глубоко, функции и значения BSON остаются как есть. Запуск: `Object.isFrozen` вернул `true` и для описания поля, и для значения расширения внутри него, а функция `format` осталась вызываемой.
+
+Ошибка, которую бросила проверка, становится `cause` у `ConfigurationError`, а адрес поля Typemo ставит перед её текстом (получено запуском для `ext: { label: { text: "" } }` и проверки, бросающей `TypeError("text must be a non-empty string")`):
+
+```text
+ConfigurationError: Bad.a: ext "label" is invalid: text must be a non-empty string
+```
+
+Ключ, использованный не там, где у расширения есть проверка, — `ConfigurationError` (получено запуском для расширения только с `validateProp`, использованного у схемы):
+
+```text
+ConfigurationError: Bad2: extension "label" has no schema options (used on a schema)
+```
+
+Ключ, который не зарегистрирован (запуск на клиенте без `client.use`):
+
+```text
+ConfigurationError: Account: ext "label" is not a registered extension; register it before the first model with client.use() (for the models of one client) or Typemo.use() (for every client)
+```
+
+Текст один и тот же и для клиента, и для глобальной регистрации: он называет оба способа, потому что ключ мог быть зарегистрирован любым из них. `ext`, который не является объектом, бросает `ConfigurationError` с текстом `Bad3.a: option "ext" is an object { [extension name]: options }`.
+
+### Ошибки регистрации
+
+Повтор имени, в том числе если оно уже занято глобально или на клиенте:
+
+```text
+ConfigurationError: extension "label" is already registered
+```
+
+Расширение без проверок:
+
+```text
+ConfigurationError: extension "x": needs validateProp, validateSchema or both
+```
+
+Имя, начинающееся с `$`, или пустое:
+
+```text
+ConfigurationError: an extension is an object { name, validateProp?, validateSchema? } with a name not starting with "$"
+```
+
+Регистрация после компиляции первой схемы клиента:
+
+```text
+ConfigurationError: extension "late": extensions are fixed once a schema is compiled (Account was); call client.use() before the first model
+```
+
+Реестр закрывает **первая успешная компиляция схемы**: расширение, зарегистрированное позже, не смогло бы проверить уже готовые схемы. Неудачная компиляция реестр не закрывает: запуск показал, что после `ConfigurationError` из-за незарегистрированного ключа `client.use` того же клиента ещё принимается, и достаточно зарегистрировать названное расширение и повторить `model`. Реестр клиента закрывается его первой моделью, реестр [`Typemo.use`](../connection/typemo.mdx#typemouse) — первой успешно собранной схемой на любом клиенте (в тексте при этом `call Typemo.use() before the first model`). Планы закрываются тем же правилом: плагины, зарегистрированные после первой успешной схемы, дают `ConfigurationError`. Подробнее — в руководстве [Несколько клиентов и расширения](../../connection/clients-and-extensions.mdx#регистрировать-до-первой-модели).
+
+### Когда `TypemoExtension` не подходит
+
+Если нужно повлиять на операции, расширение для этого не предназначено: у него нет доступа к операциям и политикам. Используйте [хуки](../../hooks/operation-hooks.mdx): `modify` проходит все политики. Если нужно наблюдать за операциями, подпишитесь на [события](../observability/events.mdx). Если нужно изменить схему по правилу для многих моделей, напишите [плагин](../hooks/plugins.mdx#schemaplugin).
+
+---
+
+## PropExtensions
+
+`PropExtensions<V>` — интерфейс опций расширений у поля, `ext` в `@Prop`. В ядре он пустой, и каждое расширение дописывает в него свой ключ через объявление модуля (`declaration merging`): так ключ становится допустимым у `@Prop`, а компилятор знает тип его значения. `V` — тип значения поля, поэтому опция может быть типизирована им: `format?: (value: V) => string`.
+
+```ts twoslash
+import { type Defaulted, Entity, Prop, Schema } from "@venloc/typemo";
+declare module "@venloc/typemo" {
+  interface PropExtensions<V> {
+    label?: { readonly text: string; readonly format?: (value: V) => string };
+  }
+}
+// ---cut---
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => Number, {
+    default: 0,
+    ext: { label: { text: "Баланс", format: (value) => value.toFixed(2) } },
+  })
+  balance!: Defaulted<number>;
+}
+```
+
+Здесь `value` в `format` — число: компилятор вывел его из типа поля.
+
+Параметр в каждом объявлении обязан называться `V`: это требование TypeScript к слиянию интерфейсов с параметрами типа. Ключи должны быть уникальными: одно расширение — один ключ.
+
+### Ошибки при компиляции
+
+Ключ, который не объявлен, компилятор не принимает:
+
+```ts twoslash
+import { Entity, Prop, Schema } from "@venloc/typemo";
+// ---cut---
+// @errors: 2322
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { ext: { nope: { text: "x" } } })
+  title?: string;
+}
+```
+
+Значение неверного типа тоже: если `label.text` объявлен строкой, число не подойдёт. Во время работы то же самое проверяет `validateProp`.
+
+<FullType>
+
+```ts
+interface PropExtensions<V = unknown> {}
+```
+
+</FullType>
+
+---
+
+## SchemaExtensions
+
+`SchemaExtensions` — то же для схемы: `ext` в `@Schema`. Ключи добавляются так же, объявлением модуля. Параметра типа у него нет.
+
+```ts twoslash
+import { Entity, Schema } from "@venloc/typemo";
+declare module "@venloc/typemo" {
+  interface SchemaExtensions {
+    label?: { readonly title: string };
+  }
+}
+// ---cut---
+@Schema({ collection: "accounts", ext: { label: { title: "Счета" } } })
+export class Account extends Entity {}
+```
+
+Дискриминатор использует опции схемы своего корня, и `ext` схемы корня относится и к нему.
+
+<FullType>
+
+```ts
+interface SchemaExtensions {}
+```
+
+</FullType>
+
+---
+
+## ExtensionName
+
+`ExtensionName` — имя расширения: ключ любого из двух интерфейсов, `PropExtensions` или `SchemaExtensions`. Пока ни одно расширение не объявлено, это `never`; после объявления `label` — `"label"`. Тип нужен для параметра `N` у [`TypemoExtension`](#typemoextension).
+
+<FullType>
+
+```ts
+type ExtensionName = (keyof PropExtensions | keyof SchemaExtensions) & string;
+```
+
+</FullType>
+
+---
+
+## ExtensionFieldInfo
+
+`ExtensionFieldInfo` — описание поля, у которого объявлен `ext`: то, что получает второй аргумент `validateProp`. По нему проверка может учесть вид поля или его путь и, например, разрешить ключ только скалярным полям. Адрес `Класс.поле` в сообщение об ошибке Typemo добавляет сам.
+
+<TypeTable
+  type={{
+    "where": { description: "`Класс.поле` для сообщений, например `Account.balance`.", type: "string" },
+    "path": { description: "Путь поля в схеме в кодовых именах (`name.first` для поля вложенного объекта).", type: "string" },
+    "dbPath": { description: "Путь поля в базе.", type: "string" },
+    "kind": { description: "Вид узла поля: `scalar`, `array`, `map`, `subdocument` и другие.", type: "string" },
+  }}
+/>
+
+<FullType>
+
+```ts
+interface ExtensionFieldInfo {
+  readonly where: string;
+  readonly path: string;
+  readonly dbPath: string;
+  readonly kind: string;
+}
+```
+
+</FullType>
+
+---
+
+## ExtensionSchemaInfo
+
+`ExtensionSchemaInfo` — описание схемы, у которой объявлен `ext`: второй аргумент `validateSchema`.
+
+<TypeTable
+  type={{
+    "name": { description: "Имя класса.", type: "string" },
+    "kind": { description: "Документ или вложенный объект.", type: "\"document\" | \"nested\"" },
+    "discriminator": { description: "Значение дискриминатора, если схема — дискриминатор (у него те же опции, что у корня), иначе `undefined`.", type: "string | undefined" },
+  }}
+/>
+
+<FullType>
+
+```ts
+interface ExtensionSchemaInfo {
+  readonly name: string;
+  readonly kind: "document" | "nested";
+  readonly discriminator: string | undefined;
+}
+```
+
+</FullType>
+
+---
+
+## Чтение значений
+
+Значения расширений читаются из описания схемы [`SchemaInfo`](../schemas/schema-info.mdx): `model.schema.ext` для схемы и `model.schema.extOf(path)` для поля. Тот же `SchemaInfo` лежит в поле `schema` событий операций и в [`OperationInfo`](../hooks/operation-context.mdx#operationinfo), поэтому интеграция может прочитать свои опции по событию. `extOf` принимает путь в любой позиционной форме (`lines.0.note`) и возвращает `undefined`, если такого пути нет; для поля без опций — пустой объект. Метод `describe()` включает `ext` у путей и схемы, но только в виде данных: функции в JSON пропадают.
+
+Запуск: `model.schema.ext` вернул `{ label: { title: "Счета" } }`, `extOf("title")` — `{ label: { text: "Название" } }`, `extOf("note")` для поля без опций — `{}`, `extOf("nope")` — `undefined`.
+
+## Что дальше
+
+<Cards>
+<Card title="Свои опции полей и схем" href="../../extensions/custom-options.mdx">
+  Как ввести свой ключ в `ext`, проверить его и прочитать из схемы.
+</Card>
+<Card title="Пример расширения" href="../../extensions/example.mdx">
+  Расширение от объявления типа до чтения в интерфейсе.
+</Card>
+<Card title="Typemo" href="../connection/typemo.mdx">
+  Глобальная регистрация расширений, плагинов и подписчиков.
+</Card>
+</Cards>

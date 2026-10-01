@@ -1,0 +1,240 @@
+---
+title: Доступ к драйверу
+description: "Как достать «сырой» MongoClient драйвера, когда это нужно и какие защиты Typemo при этом перестают действовать"
+icon: Unplug
+---
+
+Typemo не оборачивает весь драйвер MongoDB: команды администратора, GridFS и другие возможности драйвера остаются за пределами моделей. Для них у клиента есть выход к настоящему `MongoClient`: [`client.unsafeDriver`](../reference/connection/typemo-client.mdx#clientunsafedriver). Слово `unsafe` в названии — предупреждение: всё, что вы делаете через этот объект, идёт мимо защит Typemo. Эта страница объясняет, когда выход нужен, что именно вы при этом теряете и как обойтись без него.
+
+Если вы ещё не подключились к базе, сначала прочитайте руководство [Подключиться к базе](./connect.mdx).
+
+## Что предполагается
+
+Примеры используют подключённый клиент из файла `db/client.ts` и модель счёта из `accounts/account.ts`. Модель растёт по ходу страницы: сначала в ней два поля, затем появляются скрытый PIN и мягкое удаление.
+
+```ts twoslash title="db/client.ts"
+import { TypemoClient } from "@venloc/typemo";
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+```
+
+## Быстрый путь
+
+[`client.unsafeDriver`](../reference/connection/typemo-client.mdx#clientunsafedriver) возвращает драйверный `MongoClient`. Например, так можно отправить серверу команду проверки связи, которой у моделей нет:
+
+```ts twoslash
+import { TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+// ---cut---
+const pong = await client.unsafeDriver().db("admin").command({ ping: 1 });
+console.log(pong.ok);
+// → 1
+```
+
+Метод возвращает один и тот же объект при каждом вызове, поэтому хранить его в переменной не нужно. Остальная страница показывает, что вы теряете, и как понять, что выход к драйверу вам действительно нужен.
+
+## Отправить команду администратора
+
+Команды сервера — `ping`, `buildInfo`, управление пользователями и подобные — работают на уровне базы и не относятся ни к одной модели, поэтому модели их не выражают. Здесь драйвер — единственный путь, а потери минимальны: команда не читает и не пишет данные ваших моделей.
+
+```ts twoslash title="db/health.ts"
+import { TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+// ---cut---
+export const serverVersion = async (): Promise<string> => {
+  const info = await client.unsafeDriver().db("admin").command({ buildInfo: 1 });
+  return String(info.version);
+};
+```
+
+Драйвер использует то же подключение и тот же пул, что и модели: отдельного клиента для этого создавать не нужно.
+
+## Прочитать коллекцию мимо модели
+
+Иногда нужно посмотреть на данные так, как они лежат в базе: при отладке, миграции или разборе странного случая. Драйвер вернёт документ без слоя Typemo, а различия лучше увидеть на примере. Пусть в модели есть скрытое поле `pin`, которое Typemo не отдаёт наружу:
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => String, { hidden: true })
+  pin?: Hidden<string>;
+}
+```
+
+Через модель скрытое поле не попадает в результат `.plain()`, а через драйвер вы получите документ целиком. Запуск с записью `{ title: "Main", owner: "alice", pin: "1234" }` показал: у результата модели ключей `_id`, `title` и `owner`, а у документа из драйвера ещё и `pin` со значением `"1234"`. Идентификатор при этом тоже другой: `_id` из драйвера — объект `ObjectId`, а в результатах модели он строка.
+
+```ts twoslash title="accounts/inspect.ts"
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+// ---cut---
+const Accounts = client.connection.model(Account);
+const viaModel = await Accounts.findOne({ owner: "alice" }).plain();
+//    ^?
+const viaDriver = await client.unsafeDriver().db("app").collection("accounts").findOne({ owner: "alice" });
+//    ^?
+```
+
+Всё, что оберегает данные, поэтому не действует. Для скрытых полей, масок `sensitive` и аудита это значит, что секрет доступен любому коду, который получил `MongoClient`: не передавайте его в места, где нужны только данные моделей.
+
+## Что вы теряете
+
+Каждая защита Typemo работает внутри операции модели и с драйвером не связана. Запуск показал четыре последствия на одной коллекции.
+
+Мягкое удаление перестаёт действовать. Добавим модели опцию `softDelete` и поле `deletedAt`: после `deleteOne` через модель документ помечен удалённым, и модель его больше не видит. Драйвер видит запись по-прежнему:
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts", softDelete: true }) // [!code highlight]
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => String, { hidden: true })
+  pin?: Hidden<string>;
+
+  @Prop(() => Date, { nullable: true }) // [!code ++]
+  deletedAt?: Date | null; // [!code ++]
+}
+```
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", softDelete: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Date, { nullable: true }) deletedAt?: Date | null;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+const raw = client.unsafeDriver().db("app").collection("accounts");
+// ---cut---
+await Accounts.deleteOne({ title: "Main" });
+console.log(await Accounts.countDocuments(), await raw.countDocuments());
+// → 0 1
+```
+
+Проверки данных не действуют. Драйвер запишет документ с числом в поле `title`, и по умолчанию модель потом прочитает его как есть: чтение не сверяет каждый документ со схемой, потому что данные, записанные через модель, уже прошли проверку при записи, а сверка стоила бы времени на каждом чтении. Ошибку вы получили бы при записи через модель, но при записи мимо неё проверять некому. Чтобы такой документ не дошёл до кода под чужим типом, включите **строгое чтение**: вызов [`.validateReads()`](../reference/query/options.mdx#validatereads) в запросе или опция клиента [`validateReads`](../reference/connection/typemo-client.mdx#validatereads).
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+const raw = client.unsafeDriver().db("app").collection("accounts");
+// ---cut---
+await raw.insertOne({ title: 5, owner: "bob" });
+
+console.log(await Accounts.find({ owner: "bob" }).plain());
+// → [{ _id: "…", title: 5, owner: "bob" }]
+
+try {
+  await Accounts.find({ owner: "bob" }).validateReads().plain();
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to string failed at path "title" for 5 (number): the stored value does not match the schema of Account (a document read from the database, checked by validateReads) [type]
+```
+
+Первое чтение вернуло `title: 5`, хотя тип поля — `string`. Второе сверило документ со схемой и остановилось на поле `title` с ошибкой [`CastError`](../reference/errors/data-errors.mdx#casterror). Если в коллекцию пишут другие программы или скрипты через драйвер, включите `validateReads: "development"` в клиенте: в разработке и в тестах каждое чтение сверяется, а в продакшене (`NODE_ENV=production`) проверка не тратит время. Подробнее — в концепции [Строгость](../concepts/strictness.mdx#данные-которые-уже-лежат-в-базе).
+
+Транзакции не подхватывают запись драйвера. Операции моделей внутри [`client.transaction`](../reference/connection/typemo-client.mdx#clienttransaction) присоединяются к ней сами, а вызов драйвера внутри — нет: после отката транзакции запись `raw.insertOne` в ней осталась (запуск: `raw in tx survived rollback: 1`). Чтобы драйверная операция участвовала в транзакции, передайте ей сессию явно: `raw.insertOne(doc, { session: scope.session })`, где `scope` — аргумент функции транзакции. С такой записью после отката документа в коллекции нет: запуск показал `0`.
+
+События и аудит тоже пропускают такие вызовы: подписчики [`client.instrument`](../reference/connection/typemo-client.mdx#clientinstrument) операций драйвера не увидят, а модель с аудитом не запишет след.
+
+## Как выбрать: модель или драйвер
+
+Задайте себе один вопрос: **касается ли операция данных моих моделей?** Если да, используйте модель, даже если выражение кажется длиннее: политики, проверки, маски и события работают только там. Если операция относится к серверу или к возможности, которой у моделей нет (команды администратора, GridFS, слив статистики), используйте драйвер. Если вы сомневаетесь, посмотрите справочник моделей: многое, что кажется недоступным, уже есть, например агрегации ([`Pipeline`](../reference/aggregation/pipeline.mdx)) и потоки изменений ([`Model.watch`](../reference/change-streams/watch.mdx)).
+
+## Когда это не нужно
+
+Чтение и запись данных моделей ведите через модель. Мягкое удаление, скрытые поля и аудит сработают только там. Если нужен другой способ выражения запроса, посмотрите [операторы фильтра](../reference/query/filter-operators.mdx) и [конвейеры агрегации](../aggregation/first-aggregation.mdx): мимо модели идти не придётся.
+
+## Частые ошибки
+
+### Скрытое поле утекло в ответ
+
+Обработчик отдаёт клиенту документ, прочитанный через драйвер, и вместе с ним уходит скрытое поле. Причина — в том, что документ получен не через модель. Читайте через модель и отдавайте результат `.plain()`; про формы результата — в руководстве [Чтение данных](../queries/reading-data.mdx).
+
+### Удалённый документ снова «появился»
+
+Отчёт, написанный на драйвере, считает удалённые записи. Причина — мягкое удаление не применяется мимо модели. Читайте через модель либо добавьте в драйверный запрос условие по полю `deletedAt`.
+
+### Запись в транзакции не откатилась
+
+Откат не затронул драйверную запись. Причина — транзакция передаётся операциям моделей автоматически, а драйверу её нужно передать явно (`{ session: scope.session }`). Если можете, замените драйверную запись на операцию модели.
+
+## Полный пример
+
+Скрипт проверки окружения: команда через драйвер и подсчёт документов через модель, с закрытием клиента.
+
+```ts twoslash title="scripts/check-environment.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+}
+
+await using client = await TypemoClient.connect("mongodb://localhost:27017/app");
+
+// сервер: команда мимо моделей, через драйвер
+const info = await client.unsafeDriver().db("admin").command({ buildInfo: 1 });
+console.log("MongoDB", String(info.version));
+
+// данные: только через модель, чтобы действовали политики
+const total = await client.connection.model(Account).countDocuments();
+console.log("accounts:", total);
+```
+
+<Callout type="migration">
+
+В Mongoose драйвер достаётся через `mongoose.connection.getClient()` или `Model.collection`, и такие обращения так же обходят схемы, валидацию и хуки. В Typemo выход назван `unsafeDriver` и является методом, а не свойством: обход виден в месте вызова и при поиске по коду. Кроме того, у моделей Typemo нет прямого доступа к коллекции драйвера: `Model.collection` нет.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник: TypemoClient" href="../reference/connection/typemo-client.mdx#clientunsafedriver">
+  Точное описание `unsafeDriver` и остальных методов клиента.
+</Card>
+<Card title="Чтение данных" href="../queries/reading-data.mdx">
+  Как читать через модель и в каком виде отдавать данные, не обходя защиты.
+</Card>
+<Card title="Скрытые и чувствительные поля" href="../schemas/hidden-and-sensitive.mdx">
+  Как работают скрытые поля и маски, которые драйвер не применяет.
+</Card>
+<Card title="Строгость" href="../concepts/strictness.mdx#данные-которые-уже-лежат-в-базе">
+  Почему чтение по умолчанию не сверяет документы со схемой и как включить строгое чтение.
+</Card>
+<Card title="Транзакции" href="../transactions/transactions.mdx">
+  Как записи моделей присоединяются к транзакции и как передать сессию вручную.
+</Card>
+</Cards>

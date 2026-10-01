@@ -1,0 +1,313 @@
+---
+title: SyncAll
+description: "SyncAll.run, SyncAll.collections, SyncAllOptions и отчёты SyncReport, SyncCollectionReport и SyncViewReport"
+icon: RefreshCw
+---
+
+`SyncAll` приводит в соответствие со схемами моделей всю базу подключения за один вызов: для каждой коллекции — её параметры и индексы, для каждого представления — его определение. Обычно вы вызываете его не напрямую, а через [`connection.syncAll`](../connection/connection.mdx#connectionsyncall): это тот же самый код. На этой странице описан результат такого вызова — отчёт, — потому что именно отчёт вам приходится читать при деплое.
+
+Если вы впервые настраиваете базу при запуске, сначала прочитайте руководство [Синхронизация индексов](../../collections/index-sync.mdx). Эта страница — справочник.
+
+Главная особенность `SyncAll` в том, что он **не останавливается на первой ошибке**. Сбой одной модели (индекс не построился на грязных данных, коллекция объявлена иначе, чем в базе) не мешает остальным моделям: каждый шаг каждой модели выполняется, а в конце метод бросает одну ошибку [`SyncError`](../errors/configuration-errors.mdx#syncerror), в которой перечислены все сбои и лежит полный отчёт. Для шага деплоя это единственный удобный вариант: за один запуск вы видите всё, что не сошлось, а не по одной проблеме за раз, и деплой не пройдёт «успешно» с непостроенным индексом.
+
+Примеры используют две модели: счёт с уникальным названием и журнал проводок ограниченного размера.
+
+```ts twoslash title="accounts/models.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true, index: true })
+  owner!: string;
+}
+
+@Schema({ collection: "ledger", capped: { size: 65_536, max: 100 } })
+export class LedgerEntry extends Entity {
+  @Prop(() => String, { required: true })
+  note!: string;
+}
+```
+
+Результаты в комментариях получены на пустой базе, если рядом не сказано иное.
+
+---
+
+## SyncAll.run
+
+`SyncAll.run` синхронизирует все модели и представления подключения и возвращает отчёт. Он нужен, когда вам важны все итоги сразу: скрипт деплоя, проверка окружения в CI, служебная команда.
+
+Для каждой коллекции метод по очереди делает три шага: приводит параметры коллекции ([`ensureCollection`](./collection-manager.mdx#modelensurecollection)), приводит обычные индексы ([`syncIndexes`](./model-indexes.mdx#modelsyncindexes)) и, если схема объявляет поисковые индексы, приводит и их ([`syncSearchIndexes`](./model-indexes.mdx#modelsyncsearchindexes)). Затем для каждого представления вызывается [`TypedView.ensure`](./typed-view.mdx#typedviewensure). Сбой любого шага запоминается, остальные шаги выполняются.
+
+```ts twoslash
+import { Entity, Prop, Schema, SyncAll, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+}
+@Schema({ collection: "ledger", capped: { size: 65_536, max: 100 } })
+class LedgerEntry extends Entity {
+  @Prop(() => String, { required: true }) note!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+connection.model(Account);
+connection.model(LedgerEntry);
+// ---cut---
+const report = await SyncAll.run(connection);
+console.log(report.inSync, report.failed);
+// → false false
+console.log(report.collections.map((c) => [c.collection, c.options?.result, c.indexes?.toCreate]));
+// → [["accounts", "created", ["title_1", "owner_1"]], ["ledger", "created", []]]
+console.log(report.created);
+// → ["collection accounts", "index accounts.title_1", "index accounts.owner_1", "collection ledger"]
+```
+
+`inSync` здесь `false`, хотя ничего не сломалось: в базе было что создавать, и список `created` называет, что именно создано. Как только всё создано, повторный вызов возвращает `inSync: true` и пустой `created`.
+
+<Returns type="Promise<SyncReport>">
+
+Отчёт [`SyncReport`](#syncreport), если ни один шаг не упал. Если упал хотя бы один, метод бросает [`SyncError`](../errors/configuration-errors.mdx#syncerror), и тот же отчёт (с `failed: true`) лежит в его поле `report`.
+
+</Returns>
+
+<Params>
+<Param name="connection" type="Connection" required>
+
+Подключение, модели и представления которого синхронизируются. Учитываются только классы, зарегистрированные через [`connection.model`](../connection/connection.mdx#connectionmodel) (и представления через [`TypedView.define`](./typed-view.mdx#typedviewdefine)): класс, который вы не регистрировали, останется без внимания.
+
+</Param>
+<Param name="options" type="SyncAllOptions">
+
+Опции синхронизации: [`SyncAllOptions`](#syncalloptions).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static run(connection: Connection, options?: SyncAllOptions): Promise<SyncReport>
+```
+
+</FullType>
+
+Обычно вы вызываете `SyncAll.run` через [`connection.syncAll`](../connection/connection.mdx#connectionsyncall). Для запуска приложения есть другой метод, [`connection.init`](../connection/connection.mdx#connectioninit): он использует те же шаги, но только **создаёт** недостающее, ничего не удаляя и не меняя, а расхождение считает сбоем. Отчёт и ошибка у него те же.
+
+### Проверить, не записывая
+
+С `dryRun: true` метод сообщает, что изменилось бы, и ничего не записывает: ни коллекций, ни индексов, ни представлений. Так базу можно проверить перед деплоем, например в CI. Запуск на пустой базе показал, что после такого вызова в базе по-прежнему нет ни одной коллекции:
+
+```ts twoslash
+import { Entity, Prop, Schema, SyncAll, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+connection.model(Account);
+// ---cut---
+const plan = await SyncAll.run(connection, { dryRun: true });
+console.log(plan.inSync, plan.collections[0]?.indexes?.dryRun);
+// → false true
+console.log(plan.created);
+// → ["collection accounts", "index accounts.title_1", "index accounts.owner_1"]
+```
+
+Список `created` при `dryRun` — то, что было бы создано. Если во время проверки находится сбой, например коллекция устроена иначе, чем в схеме, метод и с `dryRun` бросает `SyncError`: деплой с таким расхождением всё равно не прошёл бы.
+
+### Сбой одной модели
+
+Допустим, в `accounts` два счёта с одним названием, а `ledger` уже существует как обычная коллекция без ограничения размера. Оба сбоя собраны в одной ошибке:
+
+```ts twoslash
+import { Entity, Prop, Schema, SyncAll, SyncError, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+}
+@Schema({ collection: "ledger", capped: { size: 65_536, max: 100 } })
+class LedgerEntry extends Entity {
+  @Prop(() => String, { required: true }) note!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+connection.model(Account);
+connection.model(LedgerEntry);
+const db = client.unsafeDriver().db("app");
+await db.createCollection("ledger");
+await db.collection("accounts").insertMany([
+  { title: "Main", owner: "alice" },
+  { title: "Main", owner: "bob" },
+]);
+// ---cut---
+try {
+  await SyncAll.run(connection);
+} catch (error) {
+  if (error instanceof SyncError) {
+    console.log(error.failures.map((f) => [f.kind, f.name, f.model, f.errors.map((e) => e.name)]));
+    // → [["collection", "accounts", "Account", ["IndexSyncError"]],
+    //    ["collection", "ledger", "LedgerEntry", ["CollectionOptionsError"]]]
+  }
+}
+```
+
+Обратите внимание: сбой индекса `accounts` не помешал остальным шагам. Параметры коллекции `accounts` сверены (`error.report.collections[0].options.result` равен `"unchanged"`), индекс `owner_1` построен, и только `title_1` не создался. У записи `ledger`, где не сошлись параметры коллекции, поле `options` пустое, а сообщение объясняет, что делать:
+
+```text
+collection "ledger": exists with options MongoDB cannot change (capped): drop the collection and create it again
+```
+
+### Какие модели пропускаются
+
+Схема с `autoCreate: false` не проходит шаг параметров коллекции, а схема с `autoIndex: false` не проходит шаги индексов; соответствующие поля отчёта в этом случае не заполняются. Эти две опции действуют только здесь и в [`connection.init`](../connection/connection.mdx#connectioninit): прямые вызовы `syncIndexes`, `createIndexes` и `ensureCollection` у модели их не смотрят. Схема с `autoCreate: false` без индексов пропускается целиком, даже если коллекции ещё нет; с индексами и параметрами «только при создании» отсутствующая коллекция — ошибка (подробности — на странице [`CollectionManager`](./collection-manager.mdx#схема-с-autocreate-false)). Модели-наследники ([дискриминаторы](../schemas/discriminator.mdx)) делят коллекцию с базовой моделью, поэтому коллекция синхронизируется один раз по схеме базовой модели, а индексы наследников в неё уже включены. Классы представлений (`TypedView`) в коллекции не попадают: они обрабатываются как представления.
+
+---
+
+## SyncAll.collections
+
+`SyncAll.collections` возвращает схемы корневых моделей подключения, по одной на каждую коллекцию: именно по этому списку `run` проходит шаги коллекций. Представления в списке нет, и наследники с общей коллекцией повторно не перечисляются. Метод нужен для проверок вроде «какие коллекции будет синхронизировать деплой».
+
+```ts twoslash
+import { Entity, Prop, Schema, SyncAll, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+}
+@Schema({ collection: "ledger", capped: { size: 65_536, max: 100 } })
+class LedgerEntry extends Entity {
+  @Prop(() => String, { required: true }) note!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+// ---cut---
+console.log(SyncAll.collections(connection).map((schema) => schema.collection));
+// → []
+
+connection.model(Account);
+connection.model(LedgerEntry);
+console.log(SyncAll.collections(connection).map((schema) => schema.collection));
+// → ["accounts", "ledger"]
+```
+
+<Returns type="readonly SchemaInfo[]">
+
+Описания схем корневых моделей: [`SchemaInfo`](../schemas/schema-info.mdx) с полями `collection` (имя коллекции) и `name` (имя класса). Пока ни одна модель не зарегистрирована, список пустой.
+
+</Returns>
+
+<Params>
+<Param name="connection" type="Connection" required>
+
+Подключение, чьи модели перечисляются.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static collections(connection: Connection): readonly SchemaInfo[]
+```
+
+</FullType>
+
+---
+
+## SyncAllOptions
+
+Опции [`SyncAll.run`](#syncallrun) и [`connection.syncAll`](../connection/connection.mdx#connectionsyncall).
+
+<TypeTable
+  type={{
+    dryRun: { type: "boolean", default: "false", description: "Только сообщить, что изменилось бы; ничего не записывать. Действует на коллекции, индексы, поисковые индексы и представления." },
+    update: { type: "boolean", default: "false", description: "Применить командой `collMod` то, что сервер умеет менять на месте: параметры коллекции и определение представления. Без неё такое различие становится сбоем (ошибка [`CollectionOptionsError`](../errors/configuration-errors.mdx#collectionoptionserror) в отчёте и в `SyncError`). На индексы не влияет: их `syncAll` всегда приводит в соответствие." },
+  }}
+/>
+
+Опция `update` защищает работающую коллекцию: параметры не должны меняться случайно. Пример: если в схеме появился валидатор, а коллекция создана без него, без `update: true` метод бросит `SyncError` с `CollectionOptionsError`, а с ним валидатор применится.
+
+---
+
+## SyncReport
+
+Итог [`SyncAll.run`](#syncallrun) и [`connection.syncAll`](../connection/connection.mdx#connectionsyncall). Объект и все его списки заморожены: их нельзя менять.
+
+<TypeTable
+  type={{
+    collections: { type: "readonly SyncCollectionReport[]", required: true, description: "По одной записи на каждую синхронизированную коллекцию, в порядке регистрации моделей." },
+    views: { type: "readonly SyncViewReport[]", required: true, description: "По одной записи на каждое представление подключения, в порядке определения." },
+    inSync: { type: "boolean", required: true, description: "`true`, если ничего не упало и база совпадает со схемами. Для `syncAll` это значит, что ничего не отличалось: если метод что-то создал или изменил, `inSync` равен `false` (различие было, даже если его удалось устранить), и повторный вызов покажет `true`. Для [`connection.init`](../connection/connection.mdx#connectioninit) `inSync` равен `true` и после того, как он создал недостающее: `init` только создаёт, и после успеха база совпадает со схемами. `dryRun`, который находит что делать, никогда не в `inSync`." },
+    created: { type: "readonly string[]", required: true, description: "Что создано или, при `dryRun`, было бы создано, по порядку: `\"collection users\"`, `\"index users.email_1\"`, `\"search index users.default\"`, `\"view active_users\"`. Пусто, если ничего не недоставало." },
+    failed: { type: "boolean", required: true, description: "`true`, если хотя бы один шаг не удался. Возвращённый отчёт всегда `false`: при сбое метод бросает [`SyncError`](../errors/configuration-errors.mdx#syncerror), а `true` бывает только в его поле `report`." },
+  }}
+/>
+
+`inSync` и `failed` — разные вещи. `failed: false, inSync: false` означает «изменения были, и все они применены» (или, при `dryRun`, «изменения нужны»). `failed: true` означает, что часть работы не сделана: такой отчёт вы получите только из `SyncError.report` и найдёте причины в `errors` его записей.
+
+### SyncCollectionReport
+
+Итог по одной коллекции.
+
+<TypeTable
+  type={{
+    collection: { type: "string", required: true, description: "Имя коллекции." },
+    model: { type: "string", required: true, description: "Имя класса корневой модели коллекции." },
+    options: { type: "EnsureCollectionReport", description: "Что сделано с параметрами коллекции: [`EnsureCollectionReport`](./collection-manager.mdx#ensurecollectionreport). Пусто, если схема объявляет `autoCreate: false` или шаг не удался." },
+    indexes: { type: "IndexSyncResult", description: "Что сделано с обычными индексами: [`IndexSyncResult`](./model-indexes.mdx#indexsyncresult). Пусто, если схема объявляет `autoIndex: false` или шаг не удался." },
+    searchIndexes: { type: "SearchIndexSyncResult", description: "Что сделано с поисковыми индексами: [`SearchIndexSyncResult`](./model-indexes.mdx#searchindexsyncresult). Пусто, если схема не объявляет поисковых индексов или шаг не удался." },
+    errors: { type: "readonly TypemoError[]", required: true, description: "Все сбои этой коллекции (остальные шаги при этом выполнялись); любой сбой заставляет вызов бросить `SyncError`. Это ошибки Typemo: [`IndexSyncError`](../errors/configuration-errors.mdx#indexsyncerror), [`CollectionOptionsError`](../errors/configuration-errors.mdx#collectionoptionserror), [`ServerError`](../errors/server-errors.mdx#servererror) и другие." },
+  }}
+/>
+
+### SyncViewReport
+
+Итог по одному представлению.
+
+<TypeTable
+  type={{
+    view: { type: "string", required: true, description: "Имя представления." },
+    result: { type: "EnsureCollectionReport", description: "Что сделано с представлением: [`EnsureCollectionReport`](./collection-manager.mdx#ensurecollectionreport). Пусто, если шаг не удался." },
+    errors: { type: "readonly TypemoError[]", required: true, description: "Все сбои этого представления." },
+  }}
+/>
+
+### Как читать сбой
+
+Чтобы вывести все сбои одним списком и остановить деплой, перехватите `SyncError`: все исходные ошибки лежат в его `errors`, а полный отчёт — в `report`.
+
+```ts twoslash
+import { Entity, Prop, Schema, SyncError, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+connection.model(Account);
+// ---cut---
+try {
+  await connection.syncAll();
+} catch (error) {
+  if (error instanceof SyncError) {
+    for (const failure of error.failures) console.error(failure.name, failure.errors.map((e) => e.message));
+    throw new Error(`database sync failed: ${error.errors.length} problem(s)`, { cause: error });
+  }
+  throw error;
+}
+```
+
+---
+
+## Когда не подходит
+
+Если нужно только создать недостающее, ничего не удаляя и не меняя, вызовите [`connection.init`](../connection/connection.mdx#connectioninit): расхождение он считает сбоем и бросает [`SyncError`](../errors/configuration-errors.mdx#syncerror), как и `syncAll`. Если нужна синхронизация одной модели, вызывайте [`syncIndexes`](./model-indexes.mdx#modelsyncindexes) и [`ensureCollection`](./collection-manager.mdx#modelensurecollection) у неё самой. Проверить состояние без записи можно и без `SyncAll`: [`diffIndexes`](./model-indexes.mdx#modeldiffindexes) показывает расхождение индексов одной модели.
+
+Руководство с реальными задачами — [Синхронизация индексов](../../collections/index-sync.mdx).

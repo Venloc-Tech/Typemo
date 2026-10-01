@@ -1,0 +1,391 @@
+---
+title: Сортировка и страницы
+description: "Как задать порядок документов, взять первые записи, вывести список по страницам и посчитать общее число"
+icon: ArrowDownUp
+---
+
+Список, который видит пользователь, почти всегда нужно упорядочить и разбить на страницы. Порядок задаёт [`.sort`](../reference/query/reading.mdx#sort), размер страницы — [`.limit`](../reference/query/reading.mdx#limit), сколько записей пропустить — [`.skip`](../reference/query/reading.mdx#skip), а общее число записей для «страница 2 из 5» считает [`countDocuments`](../reference/query/reading.mdx#modelcountdocuments).
+
+Если вы впервые работаете с MongoDB, запомните два правила. Без сортировки база возвращает документы в любом порядке, и этот порядок может меняться от запроса к запросу. А если у нескольких документов совпало значение, по которому вы сортируете, их порядок между собой тоже не определён, пока вы не добавите ещё один ключ.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель поста с названием и числом просмотров:
+
+```ts twoslash title="posts/post.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "posts" })
+export class Post extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true })
+  views!: number;
+}
+```
+
+В коллекции семь постов, созданных в алфавитном порядке. Просмотры: `A` — 50, `B` и `C` — по 40, `D` — 30, `E` — 20, `F` и `G` — по 10. Результаты в комментариях `// →` — названия постов в порядке ответа.
+
+## Быстрый путь
+
+Отсортировать по убыванию просмотров, взять три поста и посчитать все:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Posts = client.db().model(Post);
+// ---cut---
+const top = await Posts.find().sort({ views: -1, _id: 1 }).limit(3).plain();
+console.log(top.map((post) => post.title));
+// → ["A", "B", "C"]
+
+console.log(await Posts.countDocuments());
+// → 7
+```
+
+Остальная страница разбирает каждый шаг на реальных задачах. Если список длинный или пользователь листает его бесконечно, вместо `.skip` вам понадобится [пагинация по ключу](./keyset-pagination.mdx).
+
+## Отсортировать список
+
+Сортировка — это объект «поле → направление»: `1` по возрастанию, `-1` по убыванию. Ключей может быть несколько, и их порядок важен: второй ключ работает только внутри одинаковых значений первого.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Posts = client.db().model(Post);
+// ---cut---
+const byTitle = await Posts.find().sort({ title: -1 }).limit(3).plain();
+console.log(byTitle.map((post) => post.title));
+// → ["G", "F", "E"]
+
+const byViews = await Posts.find().sort({ views: -1, title: 1 }).plain();
+console.log(byViews.map((post) => post.title));
+// → ["A", "B", "C", "D", "E", "F", "G"]
+```
+
+Направление можно записать и словом: `"asc"`, `"desc"`, `"ascending"`, `"descending"`. Если порядок ключей должен быть очевиден при чтении кода, используйте список пар: `.sort([["views", "desc"], ["title", "asc"]])`. Разницы в результате нет.
+
+Несколько вызовов `.sort` добавляют ключи в конец, а не заменяют предыдущие. Один и тот же ключ дважды не допускается: и в одном вызове, и в разных Typemo бросает [`QueryError`](../reference/errors/query-errors.mdx#queryerror) с текстом `sort: "views" is sorted twice`. Так второй вызов не может незаметно оказаться бесполезным.
+
+Сортировка есть и у [`findOne`](../reference/query/reading.mdx#modelfindone): она решает, какой из подходящих документов считается первым.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Posts = client.db().model(Post);
+// ---cut---
+const best = await Posts.findOne().sort({ views: -1, _id: 1 }).plain().orFail();
+console.log(best.title);
+// → "A"
+```
+
+## Сделать порядок стабильным
+
+Посты `B` и `C` набрали по 40 просмотров. Если отсортировать только по просмотрам, MongoDB вправе вернуть их в любом порядке, и он может отличаться от запроса к запросу. Для списка на одной странице это не страшно, но для постраничного вывода это ошибка: пост, попавший в конец страницы 1, может снова оказаться в начале страницы 2.
+
+Поэтому последним ключом всегда добавляйте поле, значения которого различаются у всех документов. Проще всего `_id`: он уникален, и порядок становится полным.
+
+```ts twoslash title="posts/posts.service.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Posts = client.db().model(Post);
+// ---cut---
+export const topPosts = () =>
+  Posts.find()
+    .sort({ views: -1, _id: 1 })
+    .limit(3)
+    .plain();
+```
+
+Направление у `_id` может быть любым, лишь бы оно не менялось между запросами.
+
+## Взять первые записи
+
+[`.limit`](../reference/query/reading.mdx#limit) ограничивает число документов в ответе. Используйте его всегда, когда список показывается пользователю: коллекция, в которой сегодня десять записей, через год может вырасти до миллиона, и запрос без ограничения положит приложение.
+
+В MongoDB `limit(0)` означает «без ограничения», а отрицательное число включает особый режим. Оба правила неочевидны: ноль легко получить из пустого параметра запроса и неожиданно выгрузить всю коллекцию. Поэтому Typemo принимает только целые положительные числа и бросает `QueryError` сразу при вызове:
+
+```text
+QueryError: limit must be a positive integer, got 0 (number)
+```
+
+Значение печатается вместе с типом, поэтому строка из параметра URL сразу видна: `limit("3")` бросает `limit must be a positive integer, got "3" (string)`. Переведите такое значение в число сами, прежде чем передать его в `.limit`.
+
+Если ограничение не нужно, просто не вызывайте `.limit`. Метод есть только у [`find`](../reference/query/reading.mdx#modelfind): для `findOne` он не компилируется, а в коде без типов даёт `QueryError`: `limit applies to find() only, not findOne()`.
+
+## Вывести страницу
+
+Страница номер `page` при размере `perPage` — это пропуск всех предыдущих страниц и ограничение до одной. Для этого есть [`.skip`](../reference/query/reading.mdx#skip):
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Posts = client.db().model(Post);
+// ---cut---
+const page = 2;
+const perPage = 3;
+
+const items = await Posts.find()
+  .sort({ views: -1, _id: 1 })
+  .skip((page - 1) * perPage)
+  .limit(perPage)
+  .plain();
+console.log(items.map((post) => post.title));
+// → ["D", "E", "F"]
+```
+
+Страница 3 состоит из одного поста `G`, а страница за концом списка — пустой массив, не ошибка:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Posts = client.db().model(Post);
+// ---cut---
+const last = await Posts.find().sort({ views: -1, _id: 1 }).skip(6).limit(3).plain();
+console.log(last.map((post) => post.title));
+// → ["G"]
+
+const beyond = await Posts.find().sort({ views: -1, _id: 1 }).skip(60).limit(3).plain();
+console.log(beyond.length);
+// → 0
+```
+
+`.skip` принимает целое число, не меньше нуля; отрицательное или дробное — `QueryError` с текстом `skip must be a non-negative integer, got -1 (number)`. Причина та же, что у `.limit`: число в запросе часто приходит извне, и молчаливое приведение скрыло бы ошибку.
+
+## Посчитать общее число
+
+Чтобы показать «страница 2 из 3», нужно знать общее число записей. Его считает [`countDocuments`](../reference/query/reading.mdx#modelcountdocuments): он принимает тот же фильтр, что и `find`, и возвращает число документов, которые под него подходят.
+
+```ts twoslash title="posts/posts.service.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Posts = client.db().model(Post);
+// ---cut---
+export const listPosts = async (page: number, perPage: number) => {
+  const [items, total] = await Promise.all([
+    Posts.find()
+      .sort({ views: -1, _id: 1 })
+      .skip((page - 1) * perPage)
+      .limit(perPage)
+      .plain(),
+    Posts.countDocuments(),
+  ]);
+  return { items, total, pages: Math.ceil(total / perPage) };
+};
+
+const result = await listPosts(2, 3);
+console.log(result.items.map((post) => post.title), result.total, result.pages);
+// → ["D", "E", "F"] 7 3
+```
+
+Страница и число — два отдельных запроса, поэтому их удобно выполнить одновременно, как выше. Между ними данные могут измениться, и число не будет точным снимком той же выборки: для списка на экране это допустимо. Если нужно число документов по фильтру, передайте его в оба запроса:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Posts = client.db().model(Post);
+// ---cut---
+const popular = { views: { $gte: 30 } };
+
+const total = await Posts.countDocuments(popular);
+console.log(total);
+// → 4
+```
+
+Для приблизительного числа документов во всей коллекции есть [`estimatedDocumentCount`](../reference/query/reading.mdx#modelestimateddocumentcount): он берёт число из метаданных и работает быстро, но фильтр не принимает.
+
+## Принять номер страницы из URL
+
+Номер страницы и размер приходят из адреса строками, и им нельзя верить. `page=0` даст отрицательный `skip`, `perPage=0` даст `limit(0)`, а `perPage=100000` заставит базу отдать всё. Typemo не пропустит неверные числа, но лучше проверить ввод раньше и подставить безопасные значения:
+
+```ts twoslash title="posts/posts.service.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Posts = client.db().model(Post);
+// ---cut---
+const MAX_PER_PAGE = 50;
+
+export const listPostsFromQuery = (pageParam: string | undefined, perPageParam: string | undefined) => {
+  const page = Math.max(1, Number.parseInt(pageParam ?? "1", 10) || 1);
+  const perPage = Math.min(MAX_PER_PAGE, Math.max(1, Number.parseInt(perPageParam ?? "20", 10) || 20));
+
+  return Posts.find()
+    .sort({ views: -1, _id: 1 })
+    .skip((page - 1) * perPage)
+    .limit(perPage)
+    .plain();
+};
+```
+
+Верхний предел размера страницы нужен потому, что пользователь не должен решать, сколько документов загрузит ваш сервер.
+
+## Как выбрать
+
+Задайте себе один вопрос: **нужно ли пользователю перейти на произвольную страницу?** Если да, например в таблице администратора с номерами страниц, используйте `.skip` и `.limit` с `countDocuments`. Если пользователь только листает вперёд, как в ленте, используйте [пагинацию по ключу](./keyset-pagination.mdx): она стоит одинаково на любой глубине и не повторяет записи, когда список меняется.
+
+## Когда это не нужно
+
+Чтобы пропустить `n` документов, MongoDB всё равно их прочитывает, а потом отбрасывает. На первых страницах это незаметно, но на тысячной странице с двадцатью записями база прочитает двадцать тысяч документов ради двадцати. Кроме того, если между запросами страниц кто-то добавил запись, документы сдвинутся, и пользователь увидит одну запись дважды или пропустит другую. Для длинных списков и бесконечной прокрутки используйте [`Model.keysetPage`](../reference/query/keyset.mdx#modelkeysetpage).
+
+Если нужно выгрузить все документы, а не показать страницу, не листайте их через `.skip`: используйте [курсор](./large-results.mdx).
+
+## Частые ошибки
+
+### `limit(0)` не выгружает всё
+
+Вы взяли размер страницы из параметра запроса, и он оказался нулём. В MongoDB это означало бы «без ограничения», в Typemo это ошибка:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Posts = client.db().model(Post);
+// ---cut---
+Posts.find().limit(0); // [!code error]
+// QueryError: limit must be a positive integer, got 0 (number)
+```
+
+Проверьте и ограничьте размер страницы до вызова, как в разделе [Принять номер страницы из URL](#принять-номер-страницы-из-url).
+
+### Запись показалась на двух страницах
+
+Вы сортировали только по `views`, а у постов `B` и `C` значения совпали. Порядок таких документов между собой не определён, и они могли поменяться местами между запросами страниц. Добавьте последним ключом `_id`, как в разделе [Сделать порядок стабильным](#сделать-порядок-стабильным).
+
+### Сортировка по опечатке в поле
+
+Компилятор не пропускает несуществующее поле в сортировке. Во время работы Typemo бросает `StrictModeError`:
+
+```ts twoslash
+// @errors: 2353
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Posts = client.db().model(Post);
+// ---cut---
+Posts.find().sort({ nope: 1 });
+```
+
+```text
+StrictModeError: sort: "nope" is not a field of Post [unknown-path]
+```
+
+Иначе сортировка по несуществующему полю молча оставила бы документы в произвольном порядке.
+
+### `.skip` у `findOne` не компилируется
+
+`.skip` и `.limit` есть только у `find`: у `findOne` результат один, и пропускать нечего. Если вам нужен «второй по счёту», вызовите `find().skip(1).limit(1)`.
+
+## Полный пример
+
+Сервис постов: страница с общим числом и подстановкой безопасных значений из параметров URL.
+
+```ts twoslash title="posts/posts.service.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
+const Posts = client.db().model(Post);
+// ---cut---
+const MAX_PER_PAGE = 50;
+
+// список постов страницами, с общим числом
+export const listPosts = async (pageParam: string | undefined, perPageParam: string | undefined) => {
+  const page = Math.max(1, Number.parseInt(pageParam ?? "1", 10) || 1);
+  const perPage = Math.min(MAX_PER_PAGE, Math.max(1, Number.parseInt(perPageParam ?? "20", 10) || 20));
+
+  const [items, total] = await Promise.all([
+    // порядок полный: последним ключом идёт _id
+    Posts.find()
+      .sort({ views: -1, _id: 1 })
+      .skip((page - 1) * perPage)
+      .limit(perPage)
+      .plain(),
+    Posts.countDocuments(),
+  ]);
+
+  return { items, total, page, pages: Math.ceil(total / perPage) };
+};
+
+// самый популярный пост
+export const topPost = () => Posts.findOne().sort({ views: -1, _id: 1 }).plain().orFail();
+```
+
+<Callout type="migration">
+
+В Mongoose `limit(0)` означал «без ограничения», а `skip` и `limit` принимали любое число, в том числе строку или дробь, и приводили его молча. В Typemo `limit` принимает только целое положительное число, а `skip` — целое не меньше нуля, всё остальное `QueryError`. Повторный ключ сортировки тоже ошибка, а несколько вызовов `.sort` складываются. Строковая запись `sort("-views title")` в Typemo не поддерживается: сортировка — объект или список пар.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Пагинация по ключу" href="./keyset-pagination.mdx">
+  Как листать длинные списки без `.skip`: токен следующей страницы и бесконечная прокрутка.
+</Card>
+<Card title="Справочник: чтение" href="../reference/query/reading.mdx">
+  `.sort`, `.limit`, `.skip` и подсчёт документов с точными типами и ошибками.
+</Card>
+<Card title="Большие выборки" href="./large-results.mdx">
+  Как выгрузить тысячи документов курсором, не загружая их в память.
+</Card>
+<Card title="Производительность запросов" href="./performance.mdx">
+  Как понять, использует ли запрос индекс.
+</Card>
+</Cards>

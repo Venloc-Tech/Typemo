@@ -1,0 +1,1785 @@
+---
+title: Запись
+description: "Все методы записи модели: создание, обновление, замена, удаление, пакетная запись, их опции, результаты и ошибки"
+icon: Pencil
+---
+
+На этой странице собраны все методы модели, которые создают, изменяют, заменяют и удаляют документы, а также опции записи и виды результатов. Здесь описано, что принимает каждый метод, что он возвращает и в каких случаях бросает ошибку.
+
+Если вы только начинаете, сначала прочитайте руководство [Создать документы](../../writes/create.mdx) или [Обновить документы](../../writes/update.mdx). Эта страница — справочник: к ней возвращаются, когда нужно уточнить деталь.
+
+Все методы записи проходят одну и ту же проверку, прежде чем что-то уйдёт в базу: значения приводятся к типам схемы, неизвестные поля отвергаются, валидаторы поля выполняются, политики модели (тенант, мягкое удаление, обязательный фильтр) применяются. Поэтому запись в Typemo не «доверяет» вводу так, как это делает драйвер MongoDB: неверное значение останавливается ещё до сети.
+
+Все примеры используют одну модель счёта. В ней есть обязательные поля, уникальное поле, поле с ограничением и значением по умолчанию, массив и необязательное поле: так на каждом методе видно, как он с ними обращается.
+
+```ts twoslash title="accounts/account.ts"
+import { type Defaulted, Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { min: 0, default: 0 })
+  balance!: Defaulted<number>;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => String)
+  note?: string;
+}
+```
+
+Индекс `unique` по `title` нужно создать в базе заранее (`connection.init()`), иначе повторное значение не будет ошибкой. Поле `balance` (`Defaulted`) при создании можно не передавать. Массив `tags` без `required` и без `default` тоже можно не передавать: новый документ получит пустой массив `[]`. Идентификаторы в результатах сокращены до `"…"`: база выдаёт их заново при каждом запуске. Примеры страницы выполняются по порядку на одной пустой коллекции: счета, которые создали ранние примеры (`Main`, `Salary`, `Savings`, `Second`, `Cash`, `Card` и другие), нужны поздним.
+
+Методы записи бывают двух видов. Одни возвращают **строитель записи** — объект, к которому цепочкой добавляют `.orFail()`, `.session()` и другие опции, и который уходит в базу только на `await` (это `updateOne`, `updateMany`, `replaceOne`, `deleteOne`, `deleteMany`). Другие, `findOneAnd*` и `findByIdAnd*`, возвращают строитель запроса, как в [чтении](../query/reading.mdx). Остальные (`create`, `insertOne`, `insertMany`, `bulkWrite`, `bulkSave`) — обычные асинхронные методы: опции им передают вторым аргументом.
+
+Любая ошибка записи называет метод, который вы вызвали: `Account.create`, а не `insertOne` или `bulkWrite`, в которые он превращается внутри; ошибка `$save` удалённого документа называет `Account.save`. По тексту сразу видно, какая строка вашего кода её вызвала.
+
+---
+
+## create
+
+`create` создаёт один документ или список документов и возвращает их **гидратированными**: объектами класса модели с заполненными значениями по умолчанию и `_id`. Это основной способ создать запись, потому что он проходит тот же путь, что и [`$save`](../documents/document-api.mdx#save): проверку значений, валидаторы, хуки сохранения и служебные поля.
+
+Метод понимает два вида входа. Один объект даёт один документ, а список — несколько документов **одной упорядоченной записью**: они уходят в базу одним запросом и в том порядке, в котором вы их передали. Параллельно они не создаются: иначе при ошибке нельзя было бы сказать, какие документы уже записаны.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const account = await Accounts.create({ title: "Main", owner: "alice" });
+console.log(account.title, account.balance);
+// → "Main" 0
+```
+
+<Returns type="Promise<HydratedDoc<Account>> | Promise<HydratedDoc<Account>[]>">
+
+Для одного объекта — гидратированный документ, для списка — массив документов в порядке входа. Значения по умолчанию (`balance: 0`) и `_id` уже заполнены. Документ помечен как сохранённый: [`$isNew()`](../documents/document-api.mdx#isnew) возвращает `false`.
+
+</Returns>
+
+<Params>
+<Param name="doc" type="CreateInput<T> | readonly CreateInput<T>[]" required>
+
+Данные документа или список таких данных. Поля с `Defaulted`, необязательные поля, массивы без `required` и `TenantField` можно не передавать, остальные обязательны. `undefined` значением не бывает: поле либо есть, либо отсутствует. Значения приводятся к типам схемы сразу, при создании документа: `ObjectId` можно передать строкой, `bigint` — десятичной строкой. Значение, которое не приводится, — `CastError`; ограничения поля (`min`, `required`) проверяются следом, одним `ValidationError` на все поля.
+
+</Param>
+<Param name="options" type="WriteOptions">
+
+Сессия, тайм-аут, комментарий, уровень подтверждения записи и контекст политик. Полный перечень — в разделе [WriteOptions](#writeoptions).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+create(doc: CreateInput<T>, options?: WriteOptions): Promise<HydratedDoc<T>>;
+create(docs: readonly CreateInput<T>[], options?: WriteOptions): Promise<HydratedDoc<T>[]>;
+```
+
+</FullType>
+
+### Список документов
+
+Список записывается одним упорядоченным запросом. Если документ с ошибкой валидации стоит в списке, не записывается **ничего**: валидация идёт до отправки.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const created = await Accounts.create([
+  { title: "Salary", owner: "alice" },
+  { title: "Savings", owner: "alice", balance: 500 },
+]);
+console.log(created.map((account) => account.title));
+// → ["Salary", "Savings"]
+```
+
+Если же документ проходит валидацию, но база его отвергает, например из-за дубликата уникального ключа, документы до него уже записаны, а последующие — нет. Это `BulkWriteError` (см. ниже).
+
+### Ошибки
+
+Документ с неверным значением останавливает [`ValidationError`](../errors/data-errors.mdx#validationerror), ещё до обращения к базе:
+
+```text
+ValidationError: Validation failed: "balance": must be at least 0 [min]
+ValidationError: Validation failed: "title": the field is required [required]
+```
+
+Неизвестное поле или значение не того типа — [`CastError`](../errors/data-errors.mdx#casterror):
+
+```text
+CastError: Cast to Account failed at path "zzz" for 1 (number): not a field of Account [unknown-key]
+CastError: Cast to string failed at path "title" for 5 (number): expected a string [type]
+```
+
+Дубликат уникального значения для одного документа — [`DuplicateKeyError`](../errors/server-errors.mdx#duplicatekeyerror), а в списке — [`BulkWriteError`](../errors/server-errors.mdx#bulkwriteerror), в котором `writeErrors[0].error` — тот же `DuplicateKeyError`:
+
+```text
+DuplicateKeyError: duplicate key on title_1: { title: "Main" } (code 11000 DuplicateKey)
+BulkWriteError: Account.create: 1 write(s) failed (first at index 1: duplicate key on title_1 (code 11000 DuplicateKey))
+```
+
+Обратите внимание: в тексте `BulkWriteError` стоит `Account.create`, то есть метод, который вызвали вы. Внутри список записывается тем же механизмом, что и [`bulkSave`](#bulksave), но ошибка этого не выдаёт. Пустой список допустим: он ничего не записывает и возвращает пустой массив.
+
+### Когда не подходит
+
+Если вам не нужны хуки сохранения и объект документа, а нужна быстрая вставка данных, используйте [`insertOne`](#insertone) или [`insertMany`](#insertmany). Если документы уже созданы через [`Model.new`](../documents/model-document-methods.mdx#modelnew) и изменены, сохраняйте их через [`bulkSave`](#bulksave). Руководство по теме — [Создать документы](../../writes/create.mdx).
+
+---
+
+## insertOne
+
+`insertOne` вставляет один документ и возвращает его гидратированным. Он делает ту же запись, что [`create`](#create) с одним документом: значения приводятся и проверяются, выполняются хуки документа `document.validate` и `document.save`, а изменение, которое сделал `@Pre`, попадает в базу. Различие только во входе: `create` принимает и список документов, а `insertOne` — ровно один объект, и список или не-объект он отвергает.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const account = await Accounts.insertOne({ _id: "6abcfa53381ada4ddb42f67b", title: "Second", owner: "alice", balance: 5 });
+console.log(account.title, account.balance);
+// → "Second" 5
+```
+
+<Returns type="Promise<HydratedDoc<Account>>">
+
+Вставленный документ со значениями по умолчанию и `_id`. Если вы передали `_id` строкой, он приведён к типу поля: для `ObjectId` строка из 24 шестнадцатеричных символов превращается в `ObjectId`.
+
+</Returns>
+
+<Params>
+<Param name="doc" type="CreateInput<T>" required>
+
+Данные документа. Правила те же, что у [`create`](#create).
+
+</Param>
+<Param name="options" type="WriteOptions">
+
+Сессия, тайм-аут, комментарий, уровень подтверждения записи и контекст политик. См. [WriteOptions](#writeoptions).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+insertOne(doc: CreateInput<T>, options?: WriteOptions): Promise<HydratedDoc<T>>
+```
+
+</FullType>
+
+### Ошибки
+
+Дубликат уникального значения — [`DuplicateKeyError`](../errors/server-errors.mdx#duplicatekeyerror), неверное значение — [`ValidationError`](../errors/data-errors.mdx#validationerror) или [`CastError`](../errors/data-errors.mdx#casterror) (тексты те же, что у [`create`](#create)). Если `doc` не объект, метод бросает [`QueryError`](../errors/query-errors.mdx#queryerror).
+
+### Когда не подходит
+
+Если нужен список документов, берите [`create`](#create) со списком или [`insertMany`](#insertmany): второй отправляет один запрос и умеет неупорядоченный режим. Хуки документа у `insertOne` те же, что у `create`: отказываться от него ради хуков не нужно.
+
+---
+
+## insertMany
+
+`insertMany` вставляет список документов одним запросом и возвращает их гидратированными. Это способ загрузить много данных: импорт, начальное заполнение, пакет событий.
+
+Главный выбор у метода — упорядоченность. По умолчанию вставка **упорядоченная**: на первой ошибке метод останавливается, и документы после неё не вставляются. Опция `ordered: false` меняет поведение: вставляются все документы, которые проходят проверку, а ошибки собираются и сообщаются в конце.
+
+Перед отправкой каждый документ проходит тот же путь, что при [`create`](#create): приведение значений, проверка и хуки документа `document.validate` и `document.save`, по одному документу за другим. Сам запрос окружает событие `model.insertMany`: его хуки выполняются и для пустого списка.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const inserted = await Accounts.insertMany([
+  { title: "Cash", owner: "bob" },
+  { title: "Card", owner: "bob" },
+]);
+console.log(inserted.length);
+// → 2
+```
+
+<Returns type="Promise<HydratedDoc<Account>[]>">
+
+Массив вставленных документов в порядке входа. Пустой список допустим: запрос в базу не уходит, результат — пустой массив.
+
+</Returns>
+
+<Params>
+<Param name="docs" type="readonly CreateInput<T>[]" required>
+
+Список документов. Не список или элемент, который не объект, — [`QueryError`](../errors/query-errors.mdx#queryerror) с сообщением `insertMany: a list of documents`.
+
+</Param>
+<Param name="options.ordered" type="boolean" default="true">
+
+`true` — остановиться на первой ошибке, `false` — вставить всё, что можно. Остальные поля — [WriteOptions](#writeoptions).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+insertMany(docs: readonly CreateInput<T>[], options?: InsertManyOptions): Promise<HydratedDoc<T>[]>
+
+interface InsertManyOptions extends WriteOptions {
+  readonly ordered?: boolean;
+}
+```
+
+</FullType>
+
+### Упорядоченная и неупорядоченная вставка
+
+Допустим, второй документ списка нарушает уникальность. В упорядоченной вставке первый документ записан, третий — нет:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+try {
+  await Accounts.insertMany([
+    { title: "I1", owner: "c" },
+    { title: "Main", owner: "c" }, // такой title уже есть
+    { title: "I3", owner: "c" },
+  ]);
+} catch (error) {
+  if (error instanceof BulkWriteError) {
+    console.log(error.ordered, error.writeErrors.map((failure) => failure.index));
+    // → true [1]
+    console.log(error.result.insertedCount);
+    // → 1
+  }
+}
+```
+
+В неупорядоченной вставке ошибки собираются все, а остальные документы записаны. Документ, который не прошёл проверку в Typemo (`balance: -5`), и документ, который отверг сервер (дубликат), попадают в один и тот же список `writeErrors`:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+try {
+  await Accounts.insertMany(
+    [
+      { title: "U1", owner: "d" },
+      { title: "Main", owner: "d" }, // дубликат: отвергнет сервер
+      { title: "U3", owner: "d", balance: -5 }, // отвергнет Typemo до отправки
+      { title: "U4", owner: "d" },
+    ],
+    { ordered: false },
+  );
+} catch (error) {
+  if (error instanceof BulkWriteError) {
+    console.log(error.writeErrors.map((failure) => [failure.index, failure.error.name]));
+    // → [[1, "DuplicateKeyError"], [2, "ValidationError"]]
+    console.log(error.result.insertedCount);
+    // → 2
+  }
+}
+```
+
+### Ошибки
+
+Что придёт, зависит от режима. В **упорядоченном** режиме документ, который не проходит проверку Typemo, останавливает всю вставку до отправки: вы получаете [`ValidationError`](../errors/data-errors.mdx#validationerror) (или [`CastError`](../errors/data-errors.mdx#casterror)), а в коллекции не появляется ни одного документа списка. Отказ сервера, например дубликат, приходит как [`BulkWriteError`](../errors/server-errors.mdx#bulkwriteerror): документы до него записаны.
+
+В **неупорядоченном** режиме любой сбой списка — `BulkWriteError`, и проверку Typemo, и отказ сервера он собирает в один список. У него есть `writeErrors` (индекс во входном списке, код сервера, классифицированная ошибка), `result` (сколько записано и какие `_id`: упавшие вставки в `insertedIds` не входят) и `ordered`.
+
+```text
+ValidationError: Validation failed: "balance": must be at least 0 [min]
+BulkWriteError: Account.insertMany: 1 write(s) failed (first at index 1: duplicate key on title_1 (code 11000 DuplicateKey))
+BulkWriteError: Account.insertMany: 1 write(s) failed (first at index 1: Validation failed: "balance": must be at least 0 [min])
+```
+
+Первая строка — упорядоченная вставка с неверным документом, вторая — упорядоченная с дубликатом, третья — неупорядоченная с неверным документом. Если в одном неупорядоченном списке есть и неверный документ, и дубликат, проверку Typemo документ проходит или нет до отправки, а отказ сервера приходит после. Текст всё равно называет неудачу с наименьшим индексом во вводе: «first at index» совпадает с первым элементом `writeErrors`, который отсортирован по индексу.
+
+### Когда не подходит
+
+Если список нужно записать строго по порядку и неупорядоченный режим не нужен, достаточно [`create`](#create) со списком: он тоже запускает хуки документа и записывает документы упорядоченно. Если в одной записи нужно смешать вставки, изменения и удаления, используйте [`bulkWrite`](#bulkwrite).
+
+---
+
+## updateOne
+
+`updateOne` применяет обновление к **первому** документу, который подошёл под фильтр. Он нужен, когда вы знаете, что меняете одну запись: пополнить счёт, поменять заметку, добавить тег.
+
+Обновление — это объект операторов MongoDB (`$set`, `$inc`, `$push` и другие), а не новый документ. Оператор говорит базе, **что сделать** с полем: `$inc` прибавит число, а не запишет его, поэтому параллельные пополнения не затирают друг друга. Второй вид обновления — конвейер, `(p) => p.set(…)`, см. [Обновление через конвейер](./pipeline-updates.mdx).
+
+Метод возвращает **строитель записи**: он ничего не отправляет, пока вы не напишете `await`.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const result = await Accounts.updateOne({ title: "Main" }, { $inc: { balance: 10 }, $push: { tags: "vip" } });
+console.log(result.matchedCount, result.modifiedCount);
+// → 1 1
+```
+
+<Returns type="WriteBuilder<UpdateResult<ObjectId>>">
+
+Строитель записи. После `await` вы получаете [`UpdateResult`](#updateresult): сколько документов подошло и сколько изменилось. Если ничего не подошло, метод **не бросает ошибку**: `matchedCount` равен `0`. Если пустое совпадение для вас ошибка, добавьте [`.orFail()`](#orfail). Класс строителя, [`WriteBuilder`](#writebuilder), экспортируется из пакета: он нужен, если вы пишете функцию, которая принимает или возвращает такую запись.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+Условия поиска, как в [`find`](../query/reading.mdx#modelfind). Фильтр должен быть непустым: «первый подошедший документ» при пустом фильтре — произвольный документ коллекции. Пустой литерал `{}` компилятор не принимает, а пустой объект, собранный во время работы, отвергает `StrictModeError` с причиной `empty-filter`; чтобы изменить произвольный документ намеренно, передайте `Filters.all()`. `_id` можно передать строкой.
+
+</Param>
+<Param name="update" type="Update<T> | UpdatePipelineFor<T>" required>
+
+Объект операторов или функция-конвейер. Пустое обновление (`{}`, оператор без полей) — ошибка: тихо «ничего не менять» слишком легко получить из пустого объекта. Все операторы и их операнды — на странице [Операторы обновления](./update-operators.mdx).
+
+</Param>
+<Param name="options.upsert" type="boolean" default="false">
+
+Если ничего не подошло, вставить новый документ. См. [upsert](#upsert).
+
+</Param>
+<Param name="options.arrayFilters" type="ArrayFilters<T, U>">
+
+Условия для элементов массивов в путях `$[id]`. См. [arrayFilters](#arrayfilters). С конвейером не допускается.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+updateOne<F extends Filter<T, true>, const U extends Update<T, true>>(
+  filter: F & NoInfer<WriteFilterCheck<T, F, "one">>,
+  update: U & NoInfer<UpdateCheck<T, U>>,
+  options?: NoInfer<UpdateOptions<T, U>>,
+): WriteBuilder<UpdateResult<IdOf<T>>>;
+updateOne<F extends Filter<T, true>>(
+  filter: F & NoInfer<WriteFilterCheck<T, F, "one">>,
+  pipeline: UpdatePipelineFor<T>,
+  options?: PipelineUpdateOptions,
+): WriteBuilder<UpdateResult<IdOf<T>>>;
+```
+
+</FullType>
+
+### Ничего не подошло
+
+Если под фильтр не попал ни один документ, результат содержит нули, а ошибки нет. С `.orFail()` то же обращается в ошибку:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const none = await Accounts.updateOne({ title: "Nope" }, { $set: { note: "x" } });
+console.log(none.matchedCount);
+// → 0
+
+try {
+  await Accounts.updateOne({ title: "Nope" }, { $set: { note: "x" } }).orFail();
+} catch (error) {
+  console.log(error instanceof DocumentNotFoundError);
+  // → true
+}
+```
+
+```text
+DocumentNotFoundError: Account.updateOne: no document matched the filter (orFail)
+```
+
+### Обновление проверяется до отправки
+
+Typemo проверяет обновление дважды. Компилятор знает поля модели и то, к каким полям применим оператор: `$inc` на строке не скомпилируется. А во время работы Typemo приводит значения к типам схемы и запускает валидаторы полей, которые обновление записывает. Поэтому значение, которое нарушает `min`, останавливается ещё до базы:
+
+```text
+ValidationError: Validation failed: "balance": must be at least 0 [min]
+CastError: Cast to number failed at path "$set.balance" for "abc" (string): expected a number [type]
+StrictModeError: $set: "nope" is not a field of Account [unknown-path]
+```
+
+Особый случай — `$inc` и `$mul` на поле с `min`/`max`. Итог зависит от значения в базе, поэтому проверить его заранее нельзя. Typemo добавляет в фильтр условие на стороне сервера: результат вне диапазона просто не записывается, и вы получаете `ValidationError`:
+
+```text
+ValidationError: Validation failed: "balance": $inc -1000 on 10 gives -990, below the minimum 0; nothing was written [min]
+```
+
+Подробности и исключения — в руководстве [Операторы обновления](../../writes/update-operators.mdx#границы-min-и-max).
+
+### Одно выполнение на строитель
+
+Запись выполняется **один раз** для каждого объекта строителя. Второй `await` того же объекта — ошибка, потому что он повторил бы запись, а это почти всегда случайность:
+
+```text
+QueryError: updateOne: this operation was already executed; build a new one, or run it again deliberately with exec({ force: true }) (a write runs once per builder)
+```
+
+Если повторить нужно намеренно, вызовите [`.exec({ force: true })`](#exec).
+
+### Когда не подходит
+
+Чтобы изменить много документов, используйте [`updateMany`](#updatemany). Чтобы получить документ обратно, [`findOneAndUpdate`](#findoneandupdate). Чтобы заменить документ целиком, [`replaceOne`](#replaceone). Руководство: [Обновить документы](../../writes/update.mdx).
+
+---
+
+## updateMany
+
+`updateMany` применяет обновление ко **всем** документам, которые подошли под фильтр. Он нужен для массовых изменений: закрыть все счета клиента, проставить флаг всем записям старше даты.
+
+Как и [`updateOne`](#updateone), он **требует непустой фильтр**. Причина в том, что фильтр часто собирается из данных: одна опечатка, и пустой объект изменил бы всю коллекцию. Если изменить нужно действительно всё, напишите это явно: `Filters.all()`.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const result = await Accounts.updateMany({ owner: "alice" }, { $set: { note: "checked" } });
+console.log(result.matchedCount, result.modifiedCount);
+// → 4 4
+```
+
+<Returns type="WriteBuilder<UpdateResult<ObjectId>>">
+
+Строитель записи, как у [`updateOne`](#updateone). После `await` — [`UpdateResult`](#updateresult) для всех документов вместе.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+Непустой фильтр. `{}` — ошибка `empty-filter`.
+
+</Param>
+<Param name="update" type="Update<T> | UpdatePipelineFor<T>" required>
+
+Объект операторов или конвейер, как в [`updateOne`](#updateone).
+
+</Param>
+<Param name="options.upsert" type="boolean" default="false">
+
+Если ничего не подошло, вставить один документ. См. [upsert](#upsert).
+
+</Param>
+<Param name="options.arrayFilters" type="ArrayFilters<T, U>">
+
+Условия для `$[id]`. См. [arrayFilters](#arrayfilters).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+updateMany<F extends Filter<T, true>, const U extends Update<T, true>>(
+  filter: F & NoInfer<WriteFilterCheck<T, F, "many">>,
+  update: U & NoInfer<UpdateCheck<T, U>>,
+  options?: NoInfer<UpdateOptions<T, U>>,
+): WriteBuilder<UpdateResult<IdOf<T>>>;
+updateMany<F extends Filter<T, true>>(
+  filter: F & NoInfer<WriteFilterCheck<T, F, "many">>,
+  pipeline: UpdatePipelineFor<T>,
+  options?: PipelineUpdateOptions,
+): WriteBuilder<UpdateResult<IdOf<T>>>;
+```
+
+</FullType>
+
+### Пустой фильтр
+
+MongoDB приняла бы `{}` и изменила все документы. Typemo отказывается дважды. Пустой литерал `{}` не компилируется: [`WriteFilterCheck`](#writefiltercheck) превращает его в ошибку типа с подсказкой про `Filters.all()`. А пустой объект, который получился во время работы (из условий, которые не пришли), отвергается до отправки:
+
+```text
+StrictModeError: updateMany with an empty filter would affect every document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]
+```
+
+Чтобы изменить всё намеренно, передайте `Filters.all()`. Это настоящий фильтр `{ _id: { $exists: true } }`, который подходит любому документу, поэтому в журнале команд видно, что вы этого хотели. Тип модели указывать не нужно: вызов компилируется и без него, а `Filters.all<Account>()` даёт фильтр, объявленный для модели.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const all = await Accounts.updateMany(Filters.all(), { $set: { note: "audited" } });
+console.log(all.matchedCount);
+// → 9
+```
+
+Подробнее о том, почему так, — в руководстве [Пустые фильтры в записи](../../writes/empty-filters.mdx).
+
+### Граница `$inc` для нескольких документов
+
+Если `$inc` нарушает `min` хотя бы у одного из документов, не записывается **ничего**: Typemo находит такие документы до записи и бросает `ValidationError`. Частичное изменение, о котором никто не просил, было бы хуже ошибки.
+
+```text
+ValidationError: Validation failed: "balance": $inc -100 on 12 gives -88, below the minimum 0; nothing was written [min]
+```
+
+### Когда не подходит
+
+Один документ изменяет [`updateOne`](#updateone). Если операции разные (вставки, изменения, удаления), объедините их в [`bulkWrite`](#bulkwrite). Руководство: [Обновить документы](../../writes/update.mdx).
+
+---
+
+## replaceOne
+
+`replaceOne` заменяет **первый** подошедший документ целиком: всё, что было в документе, кроме `_id` и служебных полей, исчезает, а вместо него записывается новое содержимое. Он нужен, когда новое состояние документа полностью известно и вам не нужно перечислять изменения оператором за оператором: импорт из внешней системы, «сохранить целиком» из формы.
+
+В замене нет операторов: вы пишете обычные поля документа. Замена не содержит `_id` и служебных полей `createdAt`, `updatedAt`, `__v`: ядро оставляет `createdAt` и `__v`, а `updatedAt` обновляет само.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const result = await Accounts.replaceOne(
+  { title: "Main" },
+  { title: "Main", owner: "carol", balance: 10 },
+);
+console.log(result.modifiedCount);
+// → 1
+```
+
+<Returns type="WriteBuilder<UpdateResult<ObjectId>>">
+
+Строитель записи, после `await` — [`UpdateResult`](#updateresult). Без `upsert` и без совпадения метод не бросает ошибку: `matchedCount` равен `0`.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+Непустой фильтр, как у [`updateOne`](#updateone): пустой выбрал бы произвольный документ. `{}` не компилируется и во время работы даёт `StrictModeError` с причиной `empty-filter`.
+
+</Param>
+<Param name="replacement" type="Replacement<T>" required>
+
+Новый документ: все обязательные поля модели. Поля с `immutable` несут сохранённые значения, а необязательное поле с `immutable`, которого в документе нет, не передаётся. Без `_id` и служебных полей. Ключ, начинающийся с `$`, — ошибка.
+
+</Param>
+<Param name="options.upsert" type="boolean" default="false">
+
+Вставить замену, если ничего не подошло. `_id` у нового документа берётся из фильтра, если он там есть, иначе создаётся.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+replaceOne<F extends Filter<T, true>>(
+  filter: F & NoInfer<WriteFilterCheck<T, F, "one">>,
+  replacement: Replacement<T>,
+  options?: ReplaceOptions,
+): WriteBuilder<UpdateResult<IdOf<T>>>
+
+interface ReplaceOptions {
+  readonly upsert?: boolean;
+}
+```
+
+</FullType>
+
+### Что заменяется, а что остаётся
+
+Поля, которых нет в замене, **удаляются** из документа: это отличие замены от обновления. Если вы забыли необязательное поле, оно пропадёт, и ни компилятор, ни база этого не заметят.
+
+Служебные поля модели с [`Timestamped`](../schemas/base-classes.mdx) ядро сохраняет: `createdAt` и `__v` остаются, `updatedAt` получает текущее время. Если вы всё же передадите служебное поле, замена откажется:
+
+```text
+StrictModeError: a replacement of Account carries the service field "createdAt": the core keeps createdAt/__v and bumps updatedAt itself; leave it out [immutable]
+```
+
+Поле с `immutable` замена не может ни изменить, ни потерять, ни добавить. Сохранённый документ знает только сервер, поэтому Typemo добавляет к фильтру условие: каждое такое поле в замене равно сохранённому, а поля, которого нет в замене, нет и в документе. Сервер проверяет условие в той же операции, и замена с расхождением не записывается. Если замена ничего не нашла, Typemo один раз читает документ по вашему фильтру, чтобы отличить отсутствие документа от расхождения, и называет поле:
+
+```text
+StrictModeError: a replacement of Account changes the immutable field "region"; the document was not replaced. Carry the stored value [immutable]
+```
+
+Если поле есть в документе, но не передано, текст говорит `without the immutable field "region" would drop it from the stored document`, а если поле передано, но в документе его нет, — `sets the immutable field "region", which the stored document does not have`. Необязательное поле, которого нет ни в замене, ни в документе, замене не мешает. С `upsert: true` сервер не принимает такое условие в фильтре, поэтому Typemo проверяет документ чтением до записи; вне транзакции документ, записанный между чтением и заменой, уже не сравнивается. Внутри транзакции чтение идёт в той же сессии. Подробно, с примерами, — в руководстве [Заменить документ](../../writes/replace.mdx#замена-расходится-с-полем-immutable).
+
+### Ошибки
+
+Оператор в замене отвергается до отправки, как и не-объект:
+
+```text
+QueryError: replacement: "$set" — a replacement has no operators
+```
+
+`_id` в замене запрещён **любой**, даже равный `_id` найденного документа: замена оставляет сохранённый `_id`, а документ нужно выбирать по `_id` в фильтре. Компилятор такое поле не принимает, а если типы обойдены, замена отвергается до отправки:
+
+```text
+StrictModeError: a replacement of Account carries "_id": a replacement keeps the stored _id and cannot change it; leave "_id" out and select the document by _id in the filter [immutable]
+```
+
+Те же ошибки бросают [`findOneAndReplace`](#findoneandreplace) и операция `replaceOne` внутри [`bulkWrite`](#bulkwrite).
+
+### Когда не подходит
+
+Если меняются отдельные поля, используйте [`updateOne`](#updateone): он не затирает остальное и безопасен при параллельных изменениях. Чтобы получить документ обратно, [`findOneAndReplace`](#findoneandreplace). Руководство: [Заменить документ](../../writes/replace.mdx).
+
+---
+
+## findOneAndUpdate
+
+`findOneAndUpdate` меняет один документ и **возвращает его**. Он нужен, когда после изменения вы работаете с документом: пополнить счёт и показать новый баланс, взять задачу из очереди и сразу начать её обработку. Изменение и чтение происходят одной атомарной командой, поэтому между ними никто не успеет вклиниться.
+
+По умолчанию возвращается документ **после** изменения. В драйвере MongoDB и в Mongoose по умолчанию возвращается документ до изменения; здесь это сделано наоборот, потому что почти всегда нужен результат. Чтобы получить состояние до, передайте `returnDocument: "before"`.
+
+Метод возвращает строитель запроса, как [`find`](../query/reading.mdx#modelfind): к нему добавляют [`.select`](../query/reading.mdx#select), [`.lean`](../query/reading.mdx#lean), [`.plain`](../query/reading.mdx#plain), [`.orFail`](../query/reading.mdx#orfail) и остальные методы.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const account = await Accounts.findOneAndUpdate({ title: "Main" }, { $inc: { balance: 1 } });
+console.log(account?.balance);
+// → 11
+```
+
+<Returns type="QueryBuilder">
+
+Строитель запроса. После `await` вы получаете гидратированный документ или `null`, если ничего не подошло. С [`.orFail()`](../query/reading.mdx#orfail) `null` заменяется ошибкой `DocumentNotFoundError`, а в типе пропадает `null`. С `upsert: true` и `returnDocument: "after"` (по умолчанию) документ есть всегда, поэтому `null` из типа убирается сразу.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+Непустой фильтр: метод выбирает документ для изменения, и пустой фильтр выбрал бы произвольный. `{}` — `StrictModeError` с причиной `empty-filter`, но только во время работы: компилятор пустой литерал здесь пропускает. «Любой документ» пишется `Filters.all()`.
+
+</Param>
+<Param name="update" type="Update<T> | UpdatePipelineFor<T>" required>
+
+Объект операторов или конвейер.
+
+</Param>
+<Param name="options.returnDocument" type={'"before" | "after"'} default={'"after"'}>
+
+Какую версию документа вернуть. См. [returnDocument](#returndocument).
+
+</Param>
+<Param name="options.upsert" type="boolean" default="false">
+
+Вставить документ, если ничего не подошло. См. [upsert](#upsert).
+
+</Param>
+<Param name="options.arrayFilters" type="ArrayFilters<T, U>">
+
+Условия для `$[id]`. С конвейером не допускается.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+findOneAndUpdate<
+  F extends Filter<T, true>,
+  const U extends Update<T, true>,
+  const O extends FindOneAndUpdateOptions<T, U> = Record<never, never>,
+>(
+  filter: F & NoInfer<WriteFilterCheck<T, F, "one">>,
+  update: U & NoInfer<UpdateCheck<T, U>>,
+  options?: O & NoInfer<FindOneAndUpdateOptions<T, U>>,
+): QueryBuilder<T, "findOneAndUpdate", undefined, never, false, UpsertFound<O>, NoNarrowing, never>
+```
+
+</FullType>
+
+### Документ до изменения
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const before = await Accounts.findOneAndUpdate(
+  { title: "Main" },
+  { $inc: { balance: 1 } },
+  { returnDocument: "before" },
+).plain();
+console.log(before?.balance);
+// → 11
+```
+
+### Только нужные поля
+
+Проекция применяется к возвращаемому документу, а не к обновлению:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const owner = await Accounts.findOneAndUpdate({ title: "Main" }, { $set: { owner: "dave" } })
+  .select({ owner: 1 })
+  .plain();
+console.log(owner);
+// → { _id: "…", owner: "dave" }
+```
+
+### Сырой результат
+
+Чтобы узнать, обновился существующий документ или вставился новый, добавьте `.includeResultMetadata()`. Результат — [`ModifyResult`](#modifyresult): сам документ лежит в `value`, а подробности — в `lastErrorObject`.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const raw = await Accounts.findOneAndUpdate(
+  { title: "Fresh" },
+  { $set: { owner: "erin" }, $setOnInsert: { balance: 100 } },
+  { upsert: true },
+).includeResultMetadata();
+console.log(raw.ok, raw.lastErrorObject?.updatedExisting);
+// → 1 false
+```
+
+### Ошибки
+
+Пустой фильтр:
+
+```text
+StrictModeError: findOneAndUpdate with an empty filter would change or remove an arbitrary document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]
+```
+
+С `.orFail()` и без совпадения:
+
+```text
+DocumentNotFoundError: Account.findOneAndUpdate: no document matched the filter (orFail)
+```
+
+Остальные ошибки обновления те же, что у [`updateOne`](#updateone).
+
+### Когда не подходит
+
+Если возвращать документ не нужно, [`updateOne`](#updateone) дешевле. Если документ известен по `_id`, есть [`findByIdAndUpdate`](#findbyidandupdate). Руководство: [Обновить документы](../../writes/update.mdx).
+
+---
+
+## findByIdAndUpdate
+
+`findByIdAndUpdate(id, update, options)` — это `findOneAndUpdate({ _id: id }, update, options)`. Он нужен, когда `_id` пришёл извне, например из адреса запроса: не нужно строить фильтр самому.
+
+`id` можно передать в естественном виде (`ObjectId`) или строкой: 24 шестнадцатеричных символа для `ObjectId`, каноническая строка для `UUID`. Нельзя передать `null` и `undefined`.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const account = await Accounts.findByIdAndUpdate("6abcfa53381ada4ddb42f67b", { $set: { note: "by id" } });
+console.log(account?.note);
+// → "by id"
+```
+
+<Returns type="QueryBuilder">
+
+Строитель запроса, как у [`findOneAndUpdate`](#findoneandupdate): документ после изменения (по умолчанию) или `null`.
+
+</Returns>
+
+<Params>
+<Param name="id" type="IdInputOf<T>" required>
+
+`_id` документа или его строковая форма. Строка неверного формата — `CastError`.
+
+</Param>
+<Param name="update" type="Update<T>" required>
+
+Объект операторов. Конвейер здесь не принимается: для него используйте [`findOneAndUpdate`](#findoneandupdate) с фильтром `{ _id }`.
+
+</Param>
+<Param name="options" type="FindOneAndUpdateOptions<T, U>">
+
+`upsert`, `returnDocument`, `arrayFilters`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+findByIdAndUpdate<
+  const U extends Update<T, true>,
+  const O extends FindOneAndUpdateOptions<T, U> = Record<never, never>,
+>(
+  id: IdInputOf<T>,
+  update: U & NoInfer<UpdateCheck<T, U>>,
+  options?: O & NoInfer<FindOneAndUpdateOptions<T, U>>,
+): QueryBuilder<T, "findOneAndUpdate", undefined, never, false, UpsertFound<O>, NoNarrowing, never>
+```
+
+</FullType>
+
+### Ошибки
+
+```text
+CastError: Cast to ObjectId failed at path "_id" for "zzz" (string): not a 24-character hex string [format]
+QueryError: findByIdAndUpdate: an id is required
+```
+
+### Когда не подходит
+
+Если документ ищется по другому полю, берите [`findOneAndUpdate`](#findoneandupdate). Чтобы не получать документ, [`updateOne`](#updateone) с `{ _id: id }`. Руководство: [Обновить документы](../../writes/update.mdx).
+
+---
+
+## findOneAndReplace
+
+`findOneAndReplace` заменяет один документ целиком и возвращает его. Он относится к [`replaceOne`](#replaceone) так же, как [`findOneAndUpdate`](#findoneandupdate) к [`updateOne`](#updateone): та же замена, но с получением документа. По умолчанию возвращается документ **после** замены.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const account = await Accounts.findOneAndReplace(
+  { title: "Main" },
+  { title: "Main", owner: "frank" },
+).plain();
+console.log(account?.owner);
+// → "frank"
+```
+
+<Returns type="QueryBuilder">
+
+Строитель запроса: документ (после замены по умолчанию) или `null`. С `upsert: true` и `"after"` документ есть всегда.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+Непустой фильтр, как у [`findOneAndUpdate`](#findoneandupdate).
+
+</Param>
+<Param name="replacement" type="Replacement<T>" required>
+
+Новый документ, правила те же, что у [`replaceOne`](#replaceone).
+
+</Param>
+<Param name="options.upsert" type="boolean" default="false">
+
+Вставить замену, если ничего не подошло.
+
+</Param>
+<Param name="options.returnDocument" type={'"before" | "after"'} default={'"after"'}>
+
+Какую версию вернуть.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+findOneAndReplace<F extends Filter<T, true>, const O extends FindOneAndReplaceOptions = Record<never, never>>(
+  filter: F & NoInfer<WriteFilterCheck<T, F, "one">>,
+  replacement: Replacement<T>,
+  options?: O,
+): QueryBuilder<T, "findOneAndReplace", undefined, never, false, UpsertFound<O>, NoNarrowing, never>
+
+interface FindOneAndReplaceOptions extends ReplaceOptions {
+  readonly returnDocument?: "before" | "after";
+}
+```
+
+</FullType>
+
+### Ошибки
+
+Пустой фильтр — `StrictModeError` с причиной `empty-filter`, оператор или служебное поле в замене — те же ошибки, что у [`replaceOne`](#replaceone).
+
+### Когда не подходит
+
+Если меняются отдельные поля, берите [`findOneAndUpdate`](#findoneandupdate). Если документ возвращать не нужно, [`replaceOne`](#replaceone). Руководство: [Заменить документ](../../writes/replace.mdx).
+
+---
+
+## deleteOne
+
+`deleteOne` удаляет **первый** документ, который подошёл под фильтр. Он нужен, когда запись известна и её нужно убрать: закрыть счёт, отозвать токен.
+
+Если у модели включено мягкое удаление (`softDelete`), документ не стирается: ему проставляется отметка, и он пропадает из выборок. Чтобы удалить физически, передайте `.policy({ hardDelete: true })`.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const result = await Accounts.deleteOne({ title: "U1" });
+console.log(result.deletedCount);
+// → 1
+```
+
+<Returns type="WriteBuilder<DeleteResult>">
+
+Строитель записи. После `await` — [`DeleteResult`](#deleteresult). Если ничего не подошло, `deletedCount` равен `0`, ошибки нет. С [`.orFail()`](#orfail) пустое совпадение — `DocumentNotFoundError`.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+Непустой фильтр: пустой выбрал бы произвольный документ. Пустой литерал `{}` не компилируется, пустой объект во время работы — `StrictModeError` с причиной `empty-filter`. Чтобы удалить произвольный документ намеренно, `Filters.all()`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+deleteOne<F extends Filter<T, true>>(filter: F & NoInfer<WriteFilterCheck<T, F, "one">>): WriteBuilder<DeleteResult>
+```
+
+</FullType>
+
+### Пустой фильтр
+
+```text
+StrictModeError: deleteOne with an empty filter would change or remove an arbitrary document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]
+```
+
+Текст зависит от формы метода: у форм `One` он называет «an arbitrary document», потому что удалился бы один документ, но какой именно, не гарантирует база; у `deleteMany` — «every document». Правило то же: фильтр должен сказать, что вы имеете в виду.
+
+### Ничего не удалено
+
+```text
+DocumentNotFoundError: Account.deleteOne: no document matched the filter (orFail)
+```
+
+### Когда не подходит
+
+Много документов удаляет [`deleteMany`](#deletemany), документ вместе с получением — [`findOneAndDelete`](#findoneanddelete). Мягкое удаление описано в [политиках](../../policies/soft-delete.mdx). Руководство: [Удалить документы](../../writes/delete.mdx).
+
+---
+
+## deleteMany
+
+`deleteMany` удаляет **все** документы, которые подошли под фильтр. Как и [`updateMany`](#updatemany), он требует непустой фильтр: пустой объект, полученный из опечатки, стёр бы коллекцию.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const result = await Accounts.deleteMany({ owner: "bob" });
+console.log(result.deletedCount);
+// → 2
+```
+
+<Returns type="WriteBuilder<DeleteResult>">
+
+Строитель записи. После `await` — [`DeleteResult`](#deleteresult) со числом удалённых документов.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+Непустой фильтр. Пустой литерал `{}` компилятор не принимает; чтобы удалить всё намеренно, `Filters.all()`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+deleteMany<F extends Filter<T, true>>(filter: F & NoInfer<WriteFilterCheck<T, F, "many">>): WriteBuilder<DeleteResult>
+```
+
+</FullType>
+
+### Пустой фильтр
+
+```text
+StrictModeError: deleteMany with an empty filter would affect every document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]
+```
+
+Удалить всё намеренно:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.deleteMany(Filters.all());
+```
+
+### Когда не подходит
+
+Один документ удаляет [`deleteOne`](#deleteone). Руководства: [Удалить документы](../../writes/delete.mdx) и [Пустые фильтры в записи](../../writes/empty-filters.mdx).
+
+---
+
+## findOneAndDelete
+
+`findOneAndDelete` удаляет один документ и **возвращает его** таким, каким он был до удаления. Он нужен, когда удалённые данные ещё пригодятся: показать «запись удалена», положить копию в архив, взять задачу из очереди с одновременным её удалением.
+
+Фильтр обязателен и непуст: метод выбирает документ для удаления.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const removed = await Accounts.findOneAndDelete({ title: "Second" }).plain();
+console.log(removed?.title);
+// → "Second"
+```
+
+<Returns type="QueryBuilder">
+
+Строитель запроса. После `await` — документ, который удалён, или `null`, если ничего не подошло. С [`.orFail()`](../query/reading.mdx#orfail) `null` заменяется `DocumentNotFoundError`.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+Непустой фильтр. Пустой — `StrictModeError` с причиной `empty-filter`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+findOneAndDelete<F extends Filter<T, true>>(
+  filter: F & NoInfer<WriteFilterCheck<T, F, "one">>,
+): QueryBuilder<T, "findOneAndDelete", undefined, never, false, false, NoNarrowing, never>
+```
+
+</FullType>
+
+### Когда не подходит
+
+Если документ возвращать не нужно, [`deleteOne`](#deleteone). Если известен `_id`, [`findByIdAndDelete`](#findbyidanddelete). Руководство: [Удалить документы](../../writes/delete.mdx).
+
+---
+
+## findByIdAndDelete
+
+`findByIdAndDelete(id)` — это `findOneAndDelete({ _id: id })`. `id` принимает те же виды, что у [`findByIdAndUpdate`](#findbyidandupdate): естественный тип `_id` или его строковую форму.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const removed = await Accounts.findByIdAndDelete("6abcfa53381ada4ddb42f67b").plain();
+console.log(removed);
+// → null
+```
+
+<Returns type="QueryBuilder">
+
+Строитель запроса: удалённый документ или `null`, если документа с таким `_id` нет.
+
+</Returns>
+
+<Params>
+<Param name="id" type="IdInputOf<T>" required>
+
+`_id` или его строка. `null` и `undefined` — `QueryError: findByIdAndDelete: an id is required`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+findByIdAndDelete(
+  id: IdInputOf<T>,
+): QueryBuilder<T, "findOneAndDelete", undefined, never, false, false, NoNarrowing, never>
+```
+
+</FullType>
+
+### Когда не подходит
+
+Если документ ищется по другому полю, [`findOneAndDelete`](#findoneanddelete). Руководство: [Удалить документы](../../writes/delete.mdx).
+
+---
+
+## bulkWrite
+
+`bulkWrite` отправляет в базу **несколько разных операций одним запросом**: вставки, изменения, замены и удаления вперемешку. Он нужен, когда нужно уложить много записей в один обмен с сервером: синхронизация с внешним источником, пакетная обработка.
+
+Каждая операция — объект с **одним** ключом-именем: `insertOne`, `updateOne`, `updateMany`, `replaceOne`, `deleteOne` или `deleteMany`. Операции типизированы моделью, а вход не меняется: Typemo копирует его перед отправкой.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const result = await Accounts.bulkWrite([
+  { insertOne: { document: { title: "Bulk", owner: "gina" } } },
+  { updateOne: { filter: { title: "Main" }, update: { $set: { note: "bulk" } } } },
+  { deleteOne: { filter: { title: "Old" } } },
+]);
+console.log(result.insertedCount, result.matchedCount, result.deletedCount);
+// → 1 1 0
+```
+
+<Returns type="Promise<BulkWriteResult<ObjectId>>">
+
+[`BulkWriteResult`](#bulkwriteresult): числа вставленных, найденных, изменённых, удалённых и вставленных через `upsert` документов и словари `insertedIds` и `upsertedIds`, где ключ — индекс операции во входном списке. Пустой список допустим: запрос не уходит, результат — нули.
+
+</Returns>
+
+<Params>
+<Param name="operations" type="readonly BulkWriteOperation<T>[]" required>
+
+Операции. В каждой ровно один ключ из шести имён. Формы:
+
+`insertOne: { document }`, `updateOne` и `updateMany`: `{ filter, update, upsert?, arrayFilters?, hint? }`, `replaceOne`: `{ filter, replacement, upsert?, hint? }`, `deleteOne` и `deleteMany`: `{ filter, hint? }`. Фильтры и обновления проверяются так же, как в отдельных методах, в том числе пустой фильтр: он отвергается у `updateOne`, `updateMany`, `replaceOne`, `deleteOne` и `deleteMany`. Замена с `_id` отвергается так же, как у `replaceOne`, а `upsert` проверяет обязательные поля вставляемого документа. Поля с `immutable` в `replaceOne` сверяются с сохранённым документом чтением до отправки пакета: результат пакета не говорит, какая операция что нашла. Обновление `updateOne`/`updateMany` — объект операторов или обновление конвейером (функция `(p) => p.set(…)`), как у отдельных методов; и типы, и работа во время выполнения принимают оба вида. Массив стадий отвергается: `update: an update pipeline is built with the pipeline builder …`.
+
+</Param>
+<Param name="options.ordered" type="boolean" default="true">
+
+`true` — остановиться на первой ошибке, `false` — выполнить все возможные операции. Остальные поля — [WriteOptions](#writeoptions).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+bulkWrite(
+  operations: readonly BulkWriteOperation<T>[],
+  options?: BulkWriteOptions,
+): Promise<BulkWriteResultOf<T>>
+
+interface BulkWriteOptions extends WriteOptions {
+  readonly ordered?: boolean;
+}
+```
+
+</FullType>
+
+### Упорядоченная запись и ошибки
+
+При ошибке сервера метод бросает [`BulkWriteError`](../errors/server-errors.mdx#bulkwriteerror): `writeErrors` называет индекс и причину каждой неудачи, `result` — что уже записано, `ordered` — режим. В `result.insertedIds` входят только вставки, которые действительно записаны: упавшие и не выполненные после них в упорядоченном режиме там нет. В упорядоченном режиме операции после первой ошибки не выполняются, но всё до неё **остаётся записанным**: откатить помогает только транзакция. Операцию, которую отвергла проверка Typemo (неверное значение, пустой фильтр), режим пакета трактует по-разному. В упорядоченном режиме она останавливает весь пакет до отправки: вы получаете саму ошибку проверки (`ValidationError`, `CastError`, `StrictModeError`), и ничего не записано. В неупорядоченном режиме неверное значение вставки или обновления (`ValidationError`, `CastError`) попадает в `writeErrors` вместе с отказами сервера, а остальные операции выполняются. Нарушение политики, например пустой фильтр, останавливает пакет и в этом режиме: вы получаете `StrictModeError`, ничего не записано. Исключение — расхождение `replaceOne` с полем `immutable`: оно зависит от сохранённого документа, как отказ сервера, поэтому в неупорядоченном режиме попадает в `writeErrors` (`StrictModeError` с причиной `immutable`), а остальные операции записываются. Так же в неупорядоченном режиме обрабатывается исключение, брошенное `@Pre` хуком одной операции: оно попадает в `writeErrors` по её индексу (`TypemoError` с исходным исключением в `cause`), остальные операции записываются; в упорядоченном режиме пакет останавливается, и приходит исключение хука.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.create({ title: "B1", owner: "o" });
+
+try {
+  await Accounts.bulkWrite([
+    { insertOne: { document: { title: "B2", owner: "o" } } },
+    { insertOne: { document: { title: "B1", owner: "o" } } }, // B1 уже есть
+    { insertOne: { document: { title: "B3", owner: "o" } } },
+  ]);
+} catch (error) {
+  if (error instanceof BulkWriteError) {
+    console.log(error.writeErrors.map((failure) => [failure.index, failure.code]));
+    // → [[1, 11000]]
+    console.log(error.result.insertedCount);
+    // → 1
+  }
+}
+```
+
+### Когда операция неверна
+
+Неверно составленную операцию Typemo отвергает по индексу, до отправки:
+
+```text
+QueryError: bulkWrite[0]: one of insertOne, updateOne, updateMany, replaceOne, deleteOne, deleteMany (got insertOne, deleteOne)
+QueryError: bulkWrite[0]: one of insertOne, updateOne, updateMany, replaceOne, deleteOne, deleteMany (got foo)
+StrictModeError: deleteMany with an empty filter would affect every document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]
+```
+
+### Хуки операций пакета
+
+Каждая операция пакета запускает хуки своего отдельного аналога: `insertOne` — хуки документа `document.validate` и `document.save` (изменение, которое сделал `@Pre`, попадает в базу), `updateOne`, `updateMany`, `replaceOne`, `deleteOne` и `deleteMany` — хуки `query.updateOne`, `query.updateMany` и так далее. У хука операции пакета `this.bulkIndex` равен позиции операции в списке, а `@Post` получает [`BulkOperationResult`](#bulkoperationresult): по одной операции сервер называет только идентификатор документа, вставленного через `upsert`, поэтому счётчики там `null`. `upsert` не запускает хуков документа: документа до ответа сервера нет.
+
+Порядок такой. Сначала `@Pre` хуки документов вставок вместе с проверкой, затем `@Pre` хуки операций по порядку списка, затем `@Pre` хуки `model.bulkWrite`, затем запрос. После запроса `@Post` хука `model.bulkWrite`, затем `@Post` хуки операций и документов вставок по порядку списка. Если пакет не удался, операции, которые сервер применил (при упорядоченной записи — все до первой ошибки, при неупорядоченной — все без ошибки записи), заканчиваются `@Post`, остальные — `@PostError`. Подробности, примеры и ошибки — в руководстве [Пакетная запись](../../writes/bulk.mdx#хуки-операций-внутри-bulkwrite), а сами типы — на странице [Контекст операции](../hooks/operation-context.mdx#bulkoperationresult).
+
+### Ограничение: `$inc` на поле с границами
+
+`$inc` и `$mul` на поле с `min` или `max` в `bulkWrite` **не принимаются**: результат каждой операции не сообщает, сколько документов она нашла, а без этого нельзя отличить сработавшую защиту от отсутствующего документа. Используйте `updateOne` или `updateMany`.
+
+```text
+ValidationError: Validation failed: "balance": $inc on a field with min/max cannot be guarded in bulkWrite (no per-operation match count tells a failed guard from a missing document); use updateOne/updateMany [min]
+```
+
+### Когда не подходит
+
+Если операции однотипны, проще [`insertMany`](#insertmany), [`updateMany`](#updatemany), [`deleteMany`](#deletemany). Для документов, которые вы уже загрузили и изменили в памяти, есть [`bulkSave`](#bulksave). Руководство: [Пакетная запись](../../writes/bulk.mdx).
+
+---
+
+## bulkSave
+
+`bulkSave` сохраняет **документы**, загруженные или созданные в памяти, одной упорядоченной записью. Каждый документ проходит ту же подготовку, что и [`$save`](../documents/document-api.mdx#save): хуки, валидаторы (в том числе асинхронные), версия. Новые документы вставляются, изменённые обновляются, а неизменённые пропускаются.
+
+Метод нужен, когда вы изменили в памяти много документов и хотите сохранить их одним обменом с сервером вместо цикла с `$save`.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const existing = await Accounts.findOne({ title: "Main" }).orFail();
+existing.owner = "hank";
+const fresh = Accounts.new({ title: "BulkSaved", owner: "hank" });
+const result = await Accounts.bulkSave([existing, fresh]);
+console.log(result?.insertedCount, result?.modifiedCount);
+// → 1 1
+```
+
+<Returns type="Promise<BulkWriteResult<ObjectId> | undefined>">
+
+[`BulkWriteResult`](#bulkwriteresult) или `undefined`, если писать было нечего: пустой список или все документы не менялись. В этом случае запрос в базу не уходит.
+
+</Returns>
+
+<Params>
+<Param name="documents" type="readonly SavableDocument[]" required>
+
+Документы модели. Не список — `QueryError: bulkSave: a list of documents`.
+
+</Param>
+<Param name="options" type="SaveOptions">
+
+Сессия, тайм-аут, контекст политик и `dropUnknownFields`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+bulkSave(
+  documents: readonly SavableDocument[],
+  options?: SaveOptions,
+): Promise<BulkWriteResultOf<T> | undefined>
+```
+
+</FullType>
+
+### Ошибки
+
+Документ, который не проходит валидацию, останавливает всю запись до отправки: ни один документ списка не записан. Ошибки записи на стороне сервера — `BulkWriteError`.
+
+### Когда не подходит
+
+Если документы не загружены, а данные пришли извне, используйте [`insertMany`](#insertmany) или [`bulkWrite`](#bulkwrite). Руководство: [Пакетная запись](../../writes/bulk.mdx).
+
+---
+
+## Строитель записи
+
+Методы [`updateOne`](#updateone), [`updateMany`](#updatemany), [`replaceOne`](#replaceone), [`deleteOne`](#deleteone) и [`deleteMany`](#deletemany) возвращают **строитель записи**. Он неизменяемый: каждый метод возвращает новый объект, а сам запрос уходит в базу на `await`. Класс называется [`WriteBuilder`](#writebuilder), его методы описаны ниже.
+
+### WriteBuilder
+
+`WriteBuilder<R>` — класс строителя записи, где `R` — результат, который вы получите после `await`: [`UpdateResult`](#updateresult) или [`DeleteResult`](#deleteresult). Он экспортируется из пакета, чтобы его можно было назвать в типах: функция, которая собирает запись, но не запускает её, возвращает `WriteBuilder<UpdateResult<ObjectId>>`, а вызывающий код сам решает, добавить ли `.orFail()` или `.session(…)`. Свои методы у него два, [`.orFail`](#orfail) и [`.writeConcern`](#writeconcern); остальное он наследует от общих опций запроса: `.session`, `.policy`, `.hint`, `.collation`, `.comment`, `.timeoutMS` и `.exec`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, WriteBuilder, type UpdateResult } from "@venloc/typemo";
+import type { ObjectId } from "mongodb";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const annotate = (title: string): WriteBuilder<UpdateResult<ObjectId>> =>
+  Accounts.updateOne({ title }, { $set: { note: "checked" } });
+
+await annotate("Main").orFail();
+```
+
+### .orFail
+
+`.orFail()` делает «ничего не подошло» ошибкой [`DocumentNotFoundError`](../errors/query-errors.mdx#documentnotfounderror). Тип результата не меняется: результаты записи никогда не `null`. Вставка через `upsert` считается совпадением.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.deleteOne({ title: "Main" }).orFail();
+```
+
+### .writeConcern
+
+`.writeConcern({ w, journal })` задаёт уровень подтверждения записи для этой операции. Внутри транзакции действует уровень транзакции, и другой уровень у отдельной операции — ошибка.
+
+### .session, .policy, .hint, .collation, .comment, .timeoutMS
+
+Общие опции неизменяемого запроса. `.session(session)` выполняет запись в сессии (`null` выводит из внешней транзакции), `.policy(values)` задаёт контекст политик (тенант, мягкое удаление), `.hint(index)` подсказывает индекс, `.collation(options)` задаёт правила сравнения строк, `.comment(text)` — комментарий для профилировщика, `.timeoutMS(ms)` — тайм-аут операции. Их подробное описание — в справочнике [Опции запроса](../query/options.mdx).
+
+### .exec
+
+`.exec()` запускает запись, как `await`. `.exec({ force: true })` запускает её повторно и намеренно: без `force` второй запуск того же объекта — ошибка.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const query = Accounts.updateOne({ title: "Main" }, { $inc: { balance: 1 } });
+await query;
+await query.exec({ force: true });
+```
+
+---
+
+## Опции записи
+
+Опции бывают двух видов: перечислены в объекте вторым или третьим аргументом метода или добавляются цепочкой на строителе.
+
+### upsert
+
+`upsert: true` вставляет новый документ, если фильтр ничего не нашёл. Новый документ строится из равенств в фильтре, оператора `$set` и оператора `$setOnInsert` (он срабатывает **только** при вставке и единственный принимает поля с `Immutable`). Значения по умолчанию, служебные поля и версия заполняются.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const result = await Accounts.updateOne(
+  { title: "Fresh" },
+  { $set: { owner: "ivan" }, $setOnInsert: { balance: 100 } },
+  { upsert: true },
+);
+console.log(result.upsertedCount, result.upsertedId !== null);
+// → 1 true
+```
+
+Проверки `required` при обычном обновлении касаются только тех полей, которые обновление записывает: остальные лежат в базе и уже проверены. Но `upsert` может вставить новый документ, и тогда непроверенным остался бы весь документ. Поэтому Typemo до отправки собирает документ, который вставился бы, и требует в нём каждое обязательное поле: из равенств в фильтре, из `$set`, из `$setOnInsert` или из любого другого оператора, который пишет этот путь. Результат проверки не зависит от того, вставит ли сервер документ на самом деле: она действует на каждый `upsert`. Недостающее поле — `ValidationError` до обращения к базе:
+
+```text
+ValidationError: Validation failed: "owner": upsert would create a document without the required field "owner"; give it in the filter (an equality), in $set or in $setOnInsert [required]
+```
+
+Те же правила у `upsert` конвейером и у операции `updateOne` с `upsert: true` внутри [`bulkWrite`](#bulkwrite).
+
+`upsert` не работает с `$inc` и `$mul` на полях с `min` или `max`: если условие защиты не выполнится, сервер вставил бы новый документ.
+
+```text
+ValidationError: Validation failed: "balance": $inc on a field with min/max cannot be guarded with upsert (a failed guard would insert a new document) [min]
+```
+
+### returnDocument
+
+`returnDocument: "after"` (по умолчанию) возвращает документ после изменения, `"before"` — до. Опция есть у [`findOneAndUpdate`](#findoneandupdate), [`findByIdAndUpdate`](#findbyidandupdate) и [`findOneAndReplace`](#findoneandreplace). Если документа до изменения не было (вставка при `upsert`), `"before"` вернёт `null`.
+
+### arrayFilters
+
+`arrayFilters` — список условий для элементов массива в путях с `$[id]`. Каждому идентификатору в обновлении нужен свой фильтр, и каждый фильтр должен использоваться: сервер отвергает лишнее и недостающее, и Typemo сообщает об этом раньше:
+
+```text
+QueryError: arrayFilters: no filter for the identifier "l" of the update
+QueryError: arrayFilters: the filter for "l" is not used by the update (the server refuses it)
+QueryError: arrayFilters: not allowed with an update pipeline
+```
+
+Подробности — в руководстве [Операторы обновления](../../writes/update-operators.mdx#arrayfilters-и-позиционные-пути).
+
+### ordered
+
+`ordered` есть у [`insertMany`](#insertmany) и [`bulkWrite`](#bulkwrite): `true` (по умолчанию) — остановиться на первой ошибке, `false` — сделать всё, что можно.
+
+### WriteOptions
+
+Методы без строителя — [`create`](#create), [`insertOne`](#insertone), [`insertMany`](#insertmany), [`bulkWrite`](#bulkwrite) — принимают объект `WriteOptions`.
+
+<TypeTable
+  type={{
+    session: { description: "Явная сессия транзакции; `null` — выполнить вне внешней транзакции; без поля — текущая внешняя транзакция. См. [Сессии](../../transactions/sessions.mdx).", type: "ClientSession | null" },
+    timeoutMS: { description: "Тайм-аут операции на стороне клиента.", type: "number" },
+    comment: { description: "Комментарий для профилировщика и журналов.", type: "string" },
+    writeConcern: { description: "Уровень подтверждения записи. Внутри транзакции действует уровень транзакции, другой — ошибка.", type: "{ w?: W; journal?: boolean }" },
+    policy: { description: "Контекст политик этой записи (тенант, актёр, мягкое удаление) поверх текущего.", type: "PolicyValues" },
+  }}
+/>
+
+Опции `timestamps` у записи нет: `createdAt` и `updatedAt` ведёт базовый класс [`Timestamped`](../schemas/base-classes.mdx), и он обновляет `updatedAt` при каждой записи сам.
+
+---
+
+## Результаты
+
+### UpdateResult
+
+Результат `updateOne`, `updateMany` и `replaceOne`. `acknowledged` — подтвердил ли сервер запись, `matchedCount` — сколько документов подошло, `modifiedCount` — сколько изменилось (если обновление ничего не поменяло, оно меньше `matchedCount`), `upsertedCount` — сколько вставлено через `upsert`, `upsertedId` — `_id` вставленного документа того же типа, что `_id` модели, или `null`.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const result = await Accounts.updateOne({ title: "Main" }, { $set: { note: "n" } });
+console.log(result);
+// → { acknowledged: true, matchedCount: 1, modifiedCount: 1, upsertedCount: 0, upsertedId: null }
+```
+
+### DeleteResult
+
+Результат `deleteOne` и `deleteMany`: `acknowledged` и `deletedCount`. При мягком удалении `deletedCount` считает документы, которым проставлена отметка.
+
+### ModifyResult
+
+Сырой результат `findOneAnd*` с [`.includeResultMetadata()`](#findoneandupdate): `value` (документ или `null`), `lastErrorObject` (`n`, `updatedExisting`, `upserted`), `ok`, а на реплика-сетах ещё `operationTime` и `$clusterTime`.
+
+### BulkWriteResult
+
+Результат `bulkWrite` и `bulkSave`: `insertedCount`, `matchedCount`, `modifiedCount`, `deletedCount`, `upsertedCount`, а также `insertedIds` и `upsertedIds`. Ключ словаря — индекс операции во входном списке, значение — `_id`.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const result = await Accounts.bulkWrite([{ insertOne: { document: { title: "Ids", owner: "j" } } }]);
+console.log(Object.keys(result.insertedIds));
+// → ["0"]
+```
+
+### BulkOperationResult
+
+Результат, который получает хук `@Post` одной операции внутри `bulkWrite`. По одной операции пакета сервер сообщает только `_id` документа, вставленного через `upsert`, поэтому `matchedCount`, `modifiedCount` и `deletedCount` в нём равны `null`, а `upsertedCount` и `upsertedId` известны. Итоги всего пакета — в [`BulkWriteResult`](#bulkwriteresult). Поля и примеры — на странице [Контекст операции](../hooks/operation-context.mdx#bulkoperationresult).
+
+---
+
+## WriteFilterCheck
+
+`WriteFilterCheck<T, F, Form>` — тип, который стоит за аргументом `filter` у [`updateOne`](#updateone), [`updateMany`](#updatemany), [`replaceOne`](#replaceone), [`deleteOne`](#deleteone), [`deleteMany`](#deletemany), [`findOneAndUpdate`](#findoneandupdate), [`findOneAndReplace`](#findoneandreplace) и [`findOneAndDelete`](#findoneanddelete). Третий параметр `Form` — форма метода (`WriteForm`): `"one"` у методов, которые затрагивают один документ, `"many"` у `updateMany` и `deleteMany`. Он делает то же, что проверка фильтра у чтения (неизвестное поле или условие не того типа — ошибка компиляции), и добавляет правило записи: пустой объектный литерал `{}` не принимается. Причина в том, что пустой фильтр в этих методах означает «любой документ», а случайно пустой фильтр не должен менять или удалять произвольную запись. Вам этот тип нужен, если вы пишете обёртку над методом записи и хотите передать то же ограничение дальше.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+// @errors: 2345
+await Accounts.deleteOne({});
+```
+
+Компилятор отвечает ошибкой про свойство `"filter error"` с текстом `an empty filter would change or remove an arbitrary document; pass a filter, or Filters.all() to mean every document on purpose`. У `updateMany` и `deleteMany` текст другой, как и у ошибки во время работы: `an empty filter would affect every document; …`. Правило действует только на литерал: фильтр, объявленный как `Filter<Account>`, и `Record<string, unknown>` компилируются, и для них остаётся проверка во время работы (`StrictModeError` с причиной `empty-filter`).
+
+<FullType>
+
+```ts
+type WriteForm = "one" | "many";
+type WriteFilterCheck<T, F, Form extends WriteForm> = FilterCheck<T, F> &
+  ("$and" extends keyof F
+    ? unknown
+    : [keyof F] extends [never]
+      ? {
+          readonly "filter error": `an empty filter would ${Form extends "one"
+            ? "change or remove an arbitrary document"
+            : "affect every document"}; pass a filter, or Filters.all() to mean every document on purpose`;
+        }
+      : unknown);
+```
+
+</FullType>
+
+---
+
+## Остальные методы
+
+Методы записи, которых нет на этой странице, живут на других страницах справочника.
+
+- Операторы обновления (`$set`, `$inc`, `$push` и другие): [Операторы обновления](./update-operators.mdx).
+- Обновление через конвейер: [Обновление через конвейер](./pipeline-updates.mdx).
+- Типы входа (`CreateInput`, `UpdateInput`, `Update`, `Replacement`, `WriteValue`): [Типы ввода](./input-types.mdx).
+- Методы документа `$save`, `$deleteOne`, `$updateOne` и `Model.new`: справочник [API документа](../documents/document-api.mdx).
+- Мягкое удаление и `SoftDelete.restore`: [`SoftDelete` и `Untrusted`](../policies/soft-delete-and-untrusted.mdx).

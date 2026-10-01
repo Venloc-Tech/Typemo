@@ -1,0 +1,422 @@
+---
+title: Полнотекстовый и векторный поиск
+description: "Как искать статьи по словам с оценкой релевантности и что нужно для поиска по смыслу: текстовые и поисковые индексы, $text, $search и $vectorSearch"
+icon: TextSearch
+---
+
+Чтобы найти документы по словам, а не по точному значению, используйте **полнотекстовый поиск**: условие [`$text`](../reference/query/filter-operators.mdx#text) ищет слова в полях, для которых создан текстовый индекс, учитывает формы слов («query» найдёт «queries») и умеет считать оценку релевантности. Для поиска по смыслу — «похожие по значению», даже если слова не совпадают, — есть **векторный поиск**: он сравнивает числовые векторы (эмбеддинги) текстов и доступен только в MongoDB Atlas и локальной среде Atlas.
+
+Если вы впервые работаете с индексами MongoDB: индекс — это структура, которую база строит заранее, чтобы искать быстро. Для `$text` нужен особый вид, **текстовый индекс**: без него запрос завершится ошибкой, а не медленным поиском.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель статьи из файла `articles/article.ts`. В коллекции три статьи: «Typed queries» (в тексте «queries in mongodb», 5 просмотров), «Mongo tips» (в тексте слова «typed» три раза и «queries», 50 просмотров) и «Cooking» (текст «pasta», 500 просмотров). Индексы созданы [`init()`](../reference/connection/connection.mdx#connectioninit): модель сама индексы в базе не создаёт, их создаёт [синхронизация](../collections/index-sync.mdx).
+
+```ts twoslash title="articles/article.ts"
+import { Entity, Index, Prop, Schema } from "@venloc/typemo";
+
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+export class Article extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => Number, { required: true })
+  views!: number;
+}
+```
+
+## Быстрый путь
+
+Найдите статьи со словами и получите оценку релевантности каждой. Текстовый индекс по `title` и `body` описан декоратором [`@Index`](../reference/schemas/index-decorators.mdx), а [`.textScore`](../reference/query/search-and-explain.mdx#textscore) добавляет к строкам поле `score`:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(Article);
+// ---cut---
+const found = await Articles.find({ $text: { $search: "typed queries" } }).textScore().sort({ title: 1 }).plain();
+console.log(found.map((article) => [article.title, article.score]));
+// → [["Mongo tips", 2.15625], ["Typed queries", 2.25]]
+```
+
+Оценка зависит от данных и версии сервера, поэтому сравнивайте значения между собой, а не с числами из документации. Остальная страница разбирает поиск по шагам.
+
+## Найти документы по словам
+
+Допустим, на странице поиска пользователь вводит слова, а вам нужны статьи, в которых они встречаются. [`$text`](../reference/query/filter-operators.mdx#text) принимает строку `$search` и ищет **любое** из слов: строка `"typed pasta"` находит и статьи про типы, и статью про пасту. Слова сравниваются по основе, поэтому «query» находит «queries».
+
+```ts twoslash title="articles/search.service.ts"
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(Article);
+// ---cut---
+export const search = async (words: string) => {
+  const articles = await Articles.find({ $text: { $search: words } }).sort({ title: 1 }).plain();
+  return articles.map((article) => article.title);
+};
+
+console.log(await search("typed pasta"));
+// → ["Cooking", "Mongo tips", "Typed queries"]
+console.log(await search("query"));
+// → ["Mongo tips", "Typed queries"]
+```
+
+Поиск можно сочетать с обычными условиями: они применяются вместе. Так вы ищете только среди статей, набравших не меньше десяти просмотров:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(Article);
+// ---cut---
+const popular = await Articles.find({ $text: { $search: "queries" }, views: { $gte: 10 } }).plain();
+console.log(popular.map((article) => article.title));
+// → ["Mongo tips"]
+```
+
+### Исключить слово и найти фразу
+
+Строка поиска понимает две особые записи. Слово с минусом исключает документы, где оно есть, а фраза в двойных кавычках ищется целиком.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(Article);
+// ---cut---
+const withoutTyped = await Articles.find({ $text: { $search: "pasta -typed" } }).plain();
+const phrase = await Articles.find({ $text: { $search: '"typed queries"' } }).sort({ title: 1 }).plain();
+console.log(withoutTyped.map((a) => a.title), phrase.map((a) => a.title));
+// → ["Cooking"] ["Mongo tips", "Typed queries"]
+```
+
+Если поиск должен учитывать регистр, добавьте `$caseSensitive: true` (тогда `"TYPED"` не найдёт слово «typed»), а язык для основ слов задаёт `$language`. Неизвестный язык отклоняет сервер: `ServerError: unsupported language: "xx" for text index version 3 (code 2 BadValue)`.
+
+## Отсортировать по релевантности
+
+Сам `$text` не говорит, какая статья подошла лучше. [`.textScore`](../reference/query/search-and-explain.mdx#textscore) добавляет к каждой строке число — оценку, и база упорядочивает строки по нему. Поле называется `score`, а другое имя можно передать первым аргументом. Оно появляется и в строке, и в её типе: без вызова `.textScore` его нет. Даже когда вы выбираете поля через `.select`, поле оценки добавляется само.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(Article);
+// ---cut---
+const found = await Articles.find({ $text: { $search: "typed queries" } })
+  .textScore("relevance")
+  .select({ title: 1 })
+  .plain();
+console.log(found[0]?.relevance);
+//                     ^?
+```
+
+Чтобы лучшие статьи шли первыми, передайте опцию `{ sort: true }`. Typemo отправляет сортировку `{ score: { $meta: "textScore" } }`, и база упорядочивает строки по убыванию оценки сама:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(Article);
+// ---cut---
+const best = await Articles.find({ $text: { $search: "typed queries" } }).textScore("score", { sort: true }).plain();
+console.log(best.map((article) => [article.title, article.score]));
+// → [["Typed queries", 2.25], ["Mongo tips", 2.15625]]
+```
+
+Сортировка выполняется на сервере, поэтому [`.limit`](../reference/query/reading.mdx#limit) после неё отсекает худшие строки, а не произвольные: `.textScore("score", { sort: true }).limit(1)` возвращает одну статью «Typed queries», у которой оценка выше. Без сортировки по оценке порядок строк не определён, и лимит взял бы любую из двух.
+
+Поле оценки — известное имя и для [`.sort`](../reference/query/reading.mdx#sort): `.sort({ score: -1 })` значит то же, что `{ sort: true }`, но ставит оценку на своё место среди ключей сортировки. Так статьи с равной оценкой можно дополнительно упорядочить по другому полю:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(Article);
+// ---cut---
+const ranked = await Articles.find({ $text: { $search: "typed queries" } })
+  .textScore()
+  .sort({ score: -1, views: 1 })
+  .select({ title: 1 })
+  .plain();
+console.log(ranked.map((article) => article.title));
+// → ["Typed queries", "Mongo tips"]
+```
+
+Оценку можно сортировать только по убыванию: база ранжирует совпадения от лучшего, и обратного порядка у неё нет. Поэтому `.sort({ score: 1 })` не компилируется, а без типов это `QueryError`, о нём — в [частых ошибках](#оценка-по-возрастанию). Опция `{ sort: true }` добавляет оценку после ключей, которые вы уже передали в `.sort`: `.sort({ views: -1 }).textScore("score", { sort: true })` сначала упорядочивает по просмотрам.
+
+## Настроить текстовый индекс
+
+Текстовый индекс описывается в модели. В коллекции может быть **только один** текстовый индекс, но он может охватывать несколько полей. Есть два способа. Декоратор [`@Index`](../reference/schemas/index-decorators.mdx) с видом `"text"` для каждого поля, как выше, и опция `text: true` у самого поля: поля с этой опцией объединяются в один индекс.
+
+```ts twoslash title="articles/article.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "notes" })
+export class Note extends Entity {
+  @Prop(() => String, { required: true, text: true })
+  title!: string;
+
+  @Prop(() => String, { required: true, text: true })
+  body!: string;
+}
+```
+
+Оба поля попадут в индекс `title_text_body_text`. Повторный [`init()`](../reference/connection/connection.mdx#connectioninit) на такой модели проходит спокойно: индекс уже есть, `inSync` равен `true`, а список `created` пуст. Два разных `@Index` с текстовыми ключами — ошибка: `ConfigurationError: Two: a collection has at most one text index; "text: true" fields are merged into one, so remove the extra @Index text (found title_text, body_text)`.
+
+Когда одно поле важнее другого, задайте **веса** (`weights`) в опциях `@Index`: слова из поля с большим весом сильнее влияют на оценку. Ниже заголовок весит в десять раз больше текста. В коллекции две статьи: с заголовком «typed» (текст «other words») и с заголовком «other» (текст «typed typed typed»). Искомое слово «typed» в заголовке даёт оценку 10, а три вхождения в тексте — 1,75:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" }, { weights: { title: 10, body: 1 }, name: "article_text" })
+@Schema({ collection: "weighted_articles" })
+class WeightedArticle extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(WeightedArticle);
+// ---cut---
+const found = await Articles.find({ $text: { $search: "typed" } }).textScore().sort({ title: 1 }).plain();
+console.log(found.map((article) => [article.title, article.score]));
+// → [["other", 1.75], ["typed", 10]]
+```
+
+## Поиск по смыслу и Atlas Search
+
+Текстовый индекс ищет по словам и формам слов. Он не найдёт «автомобиль» по запросу «машина». Для этого есть две возможности MongoDB Atlas: **Atlas Search** (стадия `$search`: нечёткий поиск, подсветка, фасеты) и **векторный поиск** (стадия `$vectorSearch`: ближайшие по смыслу документы среди векторов). Они работают только в Atlas или в локальной среде Atlas, а не на обычном сервере MongoDB, и строятся не в запросе `find`, а в [агрегации](../aggregation/search.mdx).
+
+Индексы для них называются **поисковыми** и описываются декоратором [`@SearchIndex`](../reference/schemas/index-decorators.mdx). Декоратор только записывает описание в модель; создаёт индекс синхронизация, [`Model.syncSearchIndexes`](../reference/collections/model-indexes.mdx#modelsyncsearchindexes). Вектор хранится в поле с типом `Vector`, описанном через `Spec.vector` с типом чисел и размерностью.
+
+```ts twoslash title="articles/document.ts"
+import { Entity, Prop, Schema, SearchIndex, Spec, type Vector } from "@venloc/typemo";
+
+@SearchIndex({
+  name: "embedding_index",
+  type: "vectorSearch",
+  definition: {
+    fields: [{ type: "vector", path: "embedding", numDimensions: 3, similarity: "cosine" }],
+  },
+})
+@Schema({ collection: "documents" })
+export class Document extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 }))
+  embedding?: Vector;
+}
+```
+
+Сам запрос — стадия `vectorSearch` в конвейере агрегации: вы называете индекс, поле с векторами, вектор запроса (его строит модель эмбеддингов, ваш код) и число результатов.
+
+```ts twoslash title="articles/similar.service.ts"
+import { Entity, Prop, Schema, SearchIndex, Spec, TypemoClient, type Vector } from "@venloc/typemo";
+@SearchIndex({
+  name: "embedding_index",
+  type: "vectorSearch",
+  definition: { fields: [{ type: "vector", path: "embedding", numDimensions: 3, similarity: "cosine" }] },
+})
+@Schema({ collection: "documents" })
+class Document extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) embedding?: Vector;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Documents = client.db().model(Document);
+// ---cut---
+export const similar = (queryVector: number[]) =>
+  Documents.aggregate((p) =>
+    p.vectorSearch({ index: "embedding_index", path: "embedding", queryVector, limit: 5, numCandidates: 50 }),
+  ).plain();
+```
+
+<Callout type="warning">
+
+Векторный поиск и `$search` в этой документации **не выполнялись**: тестовый сервер не Atlas. На обычном сервере они завершаются `ServerError` с текстом `Using $search and $vectorSearch aggregation stages requires additional configuration. (code 31082 SearchNotEnabled)`; полный текст сервера, с советом подключиться к Atlas, лежит в поле `serverMessage`. То же для [`Model.syncSearchIndexes`](../reference/collections/model-indexes.mdx#modelsyncsearchindexes): `Using Atlas Search Database Commands and the $listSearchIndexes aggregation stage requires additional configuration. (code 31082 SearchNotEnabled)`. Код выше проверен компилятором, но его поведение на Atlas описано по коду продукта. Все параметры стадий смотрите в справочнике [Стадии](../reference/aggregation/stages.mdx).
+
+</Callout>
+
+## Как выбрать
+
+Задайте себе один вопрос: **совпадают ли слова?** Если пользователь ищет те же слова, что в тексте, и вам достаточно основ слов и оценки релевантности, берите `$text`: он работает на любом сервере MongoDB и не требует ничего, кроме текстового индекса. Если нужен нечёткий поиск, подсветка совпадений или фасеты, используйте Atlas Search (`$search`). Если нужно искать по смыслу, а не по словам, используйте векторный поиск. Последние два доступны только в Atlas.
+
+## Когда это не нужно
+
+Для поиска точного значения (артикул, email) не нужен ни один из видов: обычный фильтр по полю с обычным индексом быстрее и надёжнее. Для префиксов и подстрок текстовый индекс не подходит: он ищет целые слова, а «pas» не найдёт «pasta». Для фильтров вроде «начинается с» используйте `$regex` и индекс, см. руководство [Фильтры](./filters.mdx).
+
+## Частые ошибки
+
+### `text index required for $text query`
+
+Вы искали через `$text` по коллекции, в которой нет текстового индекса. Запрос завершается `ServerError` с текстом `text index required for $text query (code 27 IndexNotFound)`: без индекса поиск не выполняется, а не работает медленно. Причина обычно одна из двух: индекс не описан в модели или описан, но не создан: индексы нужно создать при развёртывании: [`init()`](../reference/connection/connection.mdx#connectioninit) создаёт недостающие, а [`Model.syncIndexes`](../reference/collections/model-indexes.mdx#modelsyncindexes) приводит индексы модели к описанию.
+
+### `query requires text score metadata`
+
+Вы вызвали `.textScore()`, а в фильтре нет `$text`. Оценку считает текстовый поиск, и без него считать нечего: `ServerError: query requires text score metadata, but it is not available (code 40218 Location40218)`. Компилятор этого не проверяет. Уберите `.textScore()` или добавьте `$text`.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(Article);
+// ---cut---
+// неправильно: оценка без текстового поиска
+await Articles.find({ views: { $gt: 10 } }).textScore().plain();
+
+// правильно: оценка вместе с $text
+await Articles.find({ $text: { $search: "typed" } }).textScore().plain();
+```
+
+### Оценка по возрастанию
+
+Вы хотели показать сначала худшие совпадения и написали `.sort({ score: 1 })`. Компилятор такую сортировку не пропускает: у поля оценки направление только `-1`. Если сортировка собрана без типов, запрос не строится и бросает `QueryError: sort: "score" is the text score, which sorts from the best match only: use -1 (or textScore("score", { sort: true }))`. Причина в базе: она ранжирует совпадения от лучшего к худшему, и порядка «по возрастанию оценки» у `$meta: "textScore"` нет. Сортируйте по убыванию, а нужный обратный порядок получите, перевернув массив в коде.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(Article);
+// ---cut---
+// @errors: 2322
+// неправильно: оценка сортируется только по убыванию
+Articles.find({ $text: { $search: "typed" } }).textScore().sort({ score: 1 });
+
+// правильно: лучшие первыми
+Articles.find({ $text: { $search: "typed" } }).textScore().sort({ score: -1 });
+```
+
+## Полный пример
+
+Один файл собирает всё: поиск по словам с оценкой и сортировкой по ней на сервере и исключение слова. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="articles/search.service.ts"
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => Number, { required: true })
+  views!: number;
+}
+
+// код читателя: разбор строки поиска из запроса HTTP
+declare const __cleanQuery__: (raw: string) => string;
+
+export const createSearch = (client: TypemoClient) => {
+  const Articles = client.db().model(Article);
+
+  // поиск по словам: лучшие первыми, сортирует база, лимит отсекает худшие
+  const search = async (raw: string, minViews = 0) => {
+    const found = await Articles.find({ $text: { $search: __cleanQuery__(raw) }, views: { $gte: minViews } })
+      .textScore("score", { sort: true })
+      .limit(50)
+      .plain();
+    return found.map((article) => ({ title: article.title, score: article.score }));
+  };
+
+  // поиск без слова: минус перед словом исключает документы с ним
+  const searchWithout = (word: string, without: string) =>
+    Articles.find({ $text: { $search: `${word} -${without}` } }).plain();
+
+  return { search, searchWithout };
+};
+```
+
+<Callout type="migration">
+
+В Mongoose `.sort({ score: { $meta: "textScore" } })` и проекция `$meta` записывались вручную и могли расходиться с типом. В Typemo оценку добавляет [`.textScore`](../reference/query/search-and-explain.mdx#textscore), и она сразу попадает в тип строки. Сортировку `$meta` пишет сам Typemo: опция `{ sort: true }` или обычный `.sort({ score: -1 })`.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник: Поиск и план запроса" href="../reference/query/search-and-explain.mdx">
+  `.textScore` и `.explain` с точными типами и ошибками.
+</Card>
+<Card title="Поиск в агрегациях" href="../aggregation/search.mdx">
+  `$search`, `$searchMeta`, `$vectorSearch` и слияние результатов нескольких поисков.
+</Card>
+<Card title="Индексы" href="../schemas/indexes.mdx">
+  Как описать текстовые, составные и поисковые индексы в модели.
+</Card>
+<Card title="Поисковые индексы" href="../collections/search-indexes.mdx">
+  Как создать и сравнить поисковые индексы Atlas с описанием в модели.
+</Card>
+</Cards>

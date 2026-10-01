@@ -1,0 +1,208 @@
+---
+title: JSON Schema и Standard Schema
+description: "Как использовать схему модели для проверки на стороне сервера и во внешних библиотеках форм и валидации"
+icon: FileCheck
+---
+
+Схема модели описывает данные один раз, а использовать её можно в двух других форматах. **JSON Schema** — формат, которым MongoDB проверяет документы на стороне сервера: из схемы строится валидатор коллекции, и сервер отвергает неверные документы, даже если их пишет другая программа. **Standard Schema** — общий интерфейс проверки значений, который понимают формы, роутеры API и другие библиотеки: каждая модель сама является таким валидатором, так что проверять вход можно, не зная о Typemo. И наоборот, запрос может проверить свои результаты чужой схемой.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель пользователя из файла `users/user.ts`: имя с проверками и роль из двух значений.
+
+## Быстрый путь
+
+Валидатор на сервере — опция `validator: true`, проверка входа — свойство `~standard` модели:
+
+```ts twoslash title="users/signup.ts"
+import { Entity, type Defaulted, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users", validator: true })
+class User extends Entity {
+  @Prop(() => String, { required: true, trim: true, lowercase: true, minLength: 3 })
+  name!: string;
+  @Prop(() => String, { enum: ["user", "admin"] as const, default: "user" })
+  role!: Defaulted<"user" | "admin">;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+await client.db().init(); // коллекция создаётся с серверным валидатором
+
+const result = await Users["~standard"].validate({ name: " Zed " });
+console.log(result);
+// → { value: { _id: "…", name: "zed", role: "user" } }
+```
+
+Остальная страница разбирает оба направления.
+
+## Проверять на сервере
+
+Опция [`validator`](../reference/schemas/schema.mdx#validator) строит из схемы `$jsonSchema` и передаёт серверу при создании коллекции. Валидатор — второй рубеж: проверки Typemo остаются, а сервер защищает данные от чужих программ и от ошибок в обход Typemo. Посмотреть, что сервер получил, можно через драйвер (для этого нужен [`client.unsafeDriver`](../reference/connection/typemo-client.mdx#clientunsafedriver)):
+
+```ts twoslash title="users/inspect-validator.ts"
+import { Entity, type Defaulted, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users", validator: true })
+class User extends Entity {
+  @Prop(() => String, { required: true, trim: true, lowercase: true, minLength: 3 })
+  name!: string;
+  @Prop(() => String, { enum: ["user", "admin"] as const, default: "user" })
+  role!: Defaulted<"user" | "admin">;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+await client.db().init();
+const [info] = await client.unsafeDriver().db("app").listCollections({ name: "users" }, { nameOnly: false }).toArray();
+console.log(JSON.stringify(info?.options?.validator));
+// → {"$jsonSchema":{"bsonType":"object","properties":{"_id":{"bsonType":"objectId"},"name":{"bsonType":"string","minLength":3},"role":{"bsonType":"string","enum":["user","admin"]}},"required":["_id","name"],"additionalProperties":false}}
+```
+
+Правила построения видны в результате. Тип поля превращается в `bsonType`, `required` собирается из обязательных полей и `_id`, `enum` и границы длины переносятся как есть. Строгость абсолютная: `additionalProperties: false` на каждом уровне, поэтому лишнее поле сервер отвергнет. Сервер не может выразить собственные функции `validate`, границы дат и правила ключей Map: их проверяет только Typemo. Уровень и действие настраиваются опциями [`validationLevel`](../reference/schemas/schema.mdx#validationlevel) и [`validationAction`](../reference/schemas/schema.mdx#validationaction); подробнее — в руководстве [Особые коллекции](./special-collections.mdx#валидатор-на-сервере).
+
+Тот же документ можно получить и в коде, не создавая коллекции: [`JsonSchemaGenerator.generate`](../reference/schemas/json-and-standard-schema.mdx#jsonschemageneratorgenerate) принимает модель (или её `schema`) и возвращает `$jsonSchema`, а [`JsonSchemaGenerator.validator`](../reference/schemas/json-and-standard-schema.mdx#jsonschemageneratorvalidator) — то, что уходит серверу целиком: валидатор, уровень и действие.
+
+```ts twoslash title="users/inspect-validator.ts"
+import { Entity, type Defaulted, JsonSchemaGenerator, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users", validator: true })
+class User extends Entity {
+  @Prop(() => String, { required: true, trim: true, lowercase: true, minLength: 3 })
+  name!: string;
+  @Prop(() => String, { enum: ["user", "admin"] as const, default: "user" })
+  role!: Defaulted<"user" | "admin">;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+console.log(JsonSchemaGenerator.generate(Users).required);
+// → ["_id", "name"]
+const { validationLevel, validationAction } = JsonSchemaGenerator.validator(Users);
+console.log(validationLevel, validationAction);
+// → strict error
+```
+
+## Проверить вход через Standard Schema модели
+
+У модели есть свойство `~standard`: вход — то, что принимает `create`, выход — приведённые данные. Проверка приводит типы, обрезает и переводит в нижний регистр по опциям поля, подставляет значения по умолчанию, запускает `required` и все `validate`, и возвращает либо значение, либо список проблем с путями.
+
+```ts twoslash title="users/signup.ts"
+import { Entity, type Defaulted, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users", validator: true })
+class User extends Entity {
+  @Prop(() => String, { required: true, trim: true, lowercase: true, minLength: 3 })
+  name!: string;
+  @Prop(() => String, { enum: ["user", "admin"] as const, default: "user" })
+  role!: Defaulted<"user" | "admin">;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+const good = await Users["~standard"].validate({ name: " Zed " });
+// → { value: { _id: "…", name: "zed", role: "user" } }
+
+const bad = await Users["~standard"].validate({ name: "a" });
+console.log(bad);
+// → { issues: [{ message: "must be at least 3 characters long", path: ["name"] }] }
+```
+
+Значение `_id` ядро придумывает при проверке, а служебные поля (метки времени, версия) проверка не требует. Значение вне `enum` даёт проблему `must be one of "user", "admin"` с путём `["role"]`, лишнее поле — `not a field of User` с путём `["extra"]`, а не объект вообще — `Cast to User failed for 5 (number): expected an object [type]` с пустым путём. Проверка не пишет в базу, поэтому подходит для форм: библиотека, которая умеет читать Standard Schema, получает готовые тексты проблем.
+
+Свойство `~standard` — часть общего интерфейса: `version` равен `1`, `vendor` — `"typemo"`. Проверить, что перед вами именно такой валидатор, умеет [`StandardSchema.isSchema`](../reference/schemas/json-and-standard-schema.mdx#standardschemaisschema). Тот же валидатор возвращает [`StandardSchema.of`](../reference/schemas/json-and-standard-schema.mdx#standardschemaof): он принимает модель или её `schema`, и `StandardSchema.of(Users)` ведёт себя как `Users["~standard"]`.
+
+## Проверить результат запроса чужой схемой
+
+Другое направление — [`.parse`](../reference/query/contracts.mdx#parse) у запросов проверяет каждую строку результата любым валидатором Standard Schema (zod, valibot, arktype или своим), не подключая их к ядру. Запрос должен быть в lean- или plain-виде. Проблемы всех строк собираются в одну [`ValidationError`](../reference/errors/data-errors.mdx#validationerror). Ниже валидатор написан вручную, чтобы пример не зависел от сторонних пакетов:
+
+```ts twoslash title="users/report.ts"
+import { Entity, type Defaulted, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users", validator: true })
+class User extends Entity {
+  @Prop(() => String, { required: true, trim: true, lowercase: true, minLength: 3 })
+  name!: string;
+  @Prop(() => String, { enum: ["user", "admin"] as const, default: "user" })
+  role!: Defaulted<"user" | "admin">;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+const nameRow = {
+  "~standard": {
+    version: 1 as const,
+    vendor: "app",
+    validate: (value: unknown) => {
+      const row = value as { name?: unknown };
+      if (typeof row.name !== "string") return { issues: [{ message: "name must be a string", path: ["name"] }] };
+      return { value: { name: row.name } };
+    },
+    types: undefined as unknown as { input: unknown; output: { name: string } },
+  },
+};
+
+await Users.create({ name: "zed" });
+const rows = await Users.find().lean().parse(nameRow);
+console.log(rows);
+// → [{ name: "zed" }]
+```
+
+Подробно контракты результата описаны в руководстве [Контракты результата](../queries/contracts.mdx).
+
+## Как выбрать
+
+Задайте себе один вопрос: **кто может записать в коллекцию, кроме вашего приложения?** Если только оно, серверный валидатор избыточен: проверки Typemo достаточно. Если ещё скрипты, другие сервисы или ручные правки, включите `validator`. Standard Schema нужен, когда проверка должна произойти на границе приложения, в форме или обработчике, до обращения к модели. `.parse` нужен, когда данные приходят из базы, а вы хотите проверить их форму, например после миграции.
+
+## Когда это не нужно
+
+Не включайте `validator`, если схема часто меняется: сервер начнёт отвергать документы, пока вы не обновите коллекцию. Не заменяйте проверками сервера проверки Typemo: сервер не знает ваших функций `validate`. Не вызывайте `~standard.validate` ради записи: `create` проверяет данные сам.
+
+## Частые ошибки
+
+### Генератору передали класс, а не модель
+
+`JsonSchemaGenerator.generate(User)` с самим классом `User` не подходит: нужна модель, полученная от подключения, или её `schema`. Класс отвергает компилятор, а в коде без типов приходит `ConfigurationError`: `JsonSchemaGenerator.generate: a model (connection.model(Entity)) or its schema (model.schema) is expected, got function`. Передайте `client.db().model(User)` или `Users.schema`.
+
+### Сервер отверг запись, которую принял Typemo
+
+Сервер отвечает ошибкой `Document failed validation`, если документ записан в обход Typemo, например через драйвер. Это и есть смысл валидатора. Если так отвергается запись самого приложения, схема на сервере устарела относительно класса: обновите параметры коллекции по руководству [Создание коллекций](../collections/create.mdx#изменить-параметры-существующей-коллекции).
+
+## Полный пример
+
+```ts twoslash title="users/signup.ts"
+import { Entity, type Defaulted, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "users", validator: true })
+class User extends Entity {
+  @Prop(() => String, { required: true, trim: true, lowercase: true, minLength: 3 })
+  name!: string;
+  @Prop(() => String, { enum: ["user", "admin"] as const, default: "user" })
+  role!: Defaulted<"user" | "admin">;
+}
+
+// код читателя: ошибка на границе приложения
+class __BadRequest__ extends Error {}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+
+// старт: коллекция создаётся вместе с серверным валидатором
+await client.db().init();
+
+// обработчик формы: проверяем вход и отдаём тексты проблем
+export const signUp = async (input: unknown) => {
+  const result = await Users["~standard"].validate(input);
+  if (result.issues !== undefined) throw new __BadRequest__(result.issues.map((issue) => issue.message).join("; "));
+  return Users.create({ name: (result.value as { name: string }).name });
+};
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник: JsonSchemaGenerator и StandardSchema" href="../reference/schemas/json-and-standard-schema.mdx">
+  Все методы, типы и точные правила построения `$jsonSchema`.
+</Card>
+<Card title="Контракты результата" href="../queries/contracts.mdx">
+  Как проверять и описывать форму результата запроса.
+</Card>
+<Card title="Особые коллекции" href="./special-collections.mdx">
+  Уровень и действие серверного валидатора и другие свойства коллекции.
+</Card>
+</Cards>

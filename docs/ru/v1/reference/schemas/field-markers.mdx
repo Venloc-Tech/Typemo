@@ -1,0 +1,399 @@
+---
+title: Маркерные типы полей
+description: "Hidden, Immutable, Defaulted, Ref, Computed, VirtualRef, TenantField, @Tenant, Discriminators, Vector и другие типы, которыми объявляются поля модели"
+icon: Tags
+---
+
+Тип поля в TypeScript не говорит, что поле скрытое, неизменяемое или ссылка на другую модель: это свойства схемы, а не значения. Чтобы компилятор знал о них, Typemo использует **маркерные типы**: обёртки вида `Hidden<string>`, которые для TypeScript остаются строкой, но несут метку, по которой выводятся типы результатов и проверяются опции декоратора. Эта страница описывает каждый маркерный тип и типы полей, которыми объявляются векторы, int64-строки и коллекции документа.
+
+Маркер идёт **в паре с опцией** [`@Prop`](./prop.mdx#prop): `Hidden<T>` с `hidden: true`, `Defaulted<T>` с `default`, `Immutable<T>` с `immutable: true`. У маркера `TenantField<T>` парой служит декоратор [`@Tenant()`](#tenant), а у `Discriminators<…>` — опция схемы [`discriminators`](./schema.mdx#опция-discriminators). Если пара нарушена, компилятор говорит об этом сообщением с именем поля: примеры — в разделах ниже. Метки — необязательные члены с ключами-символами, поэтому они не появляются в подсказках автодополнения, и любое значение `T` присваивается в `T & Маркер`. `null` и `undefined` маркером не помечаются: `Defaulted<string | null>` — это `(string & DefaultedMarker) | null`.
+
+Руководства с примерами: [Скрытые и чувствительные поля](../../schemas/hidden-and-sensitive.mdx), [Неизменяемые поля](../../schemas/immutable.mdx), [Ссылки на другие модели](../../schemas/references.mdx), [Виртуальные поля](../../schemas/virtuals.mdx).
+
+---
+
+## Defaulted
+
+`Defaulted<T>` говорит, что при отсутствии значения подставляется значение по умолчанию. Пара — опция [`default`](./prop.mdx#default). Для поля с этим типом `create` не требует значения, а прочитанное значение всегда есть.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Member extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+  @Prop(() => String, { enum: ["user", "admin"] as const, default: "user" }) // [!code highlight]
+  role!: Defaulted<"user" | "admin">;
+}
+const Members = client.db().model(Member);
+const member = await Members.create({ name: "Ann" });
+console.log(member.role);
+// → user
+```
+
+Служебные поля базовых классов ([`_id`, `createdAt`, `updatedAt`, `__v`](./base-classes.mdx)) тоже объявлены как `Defaulted`. Исключение — `_id` у [`EntityWithId`](./base-classes.mdx#entitywithid) без `default`: он обязателен.
+
+---
+
+## Immutable
+
+`Immutable<T>` говорит, что значение нельзя менять после создания документа. Пара — опция [`immutable`](./prop.mdx#immutable). Компилятор не пустит такое поле в `$set` обновления.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Account extends Entity {
+  @Prop(() => String, { immutable: true })
+  country?: Immutable<string>;
+}
+const Accounts = client.db().model(Account);
+const account = await Accounts.create({ country: "PL" });
+const country = account.country;
+//    ^?
+```
+
+Подсказка редактора показывает обычный `string | undefined`: метки скрыты, но компилятор их помнит, поэтому значение можно передать туда, где ждут `string`, а в `$set` обновления такое поле не попадёт. Если забыть `immutable: true`, компилятор ответит: `@Prop "country": the field is Immutable<T>, add immutable: true`.
+
+---
+
+## Hidden
+
+`Hidden<T>` говорит, что поле не возвращается запросами, пока вы не выберете его явно. Пара — опция [`hidden`](./prop.mdx#hidden). Метка убирает поле из типа результата по умолчанию, поэтому обращение к `passwordHash` в обычном результате не скомпилируется.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { hidden: true }) // [!code highlight]
+  passwordHash?: Hidden<string>;
+}
+const Users = client.db().model(User);
+const rows = await Users.find({ name: "gina" }).plain();
+const row = rows[0];
+// @errors: 2339
+row?.passwordHash;
+```
+
+---
+
+## Computed
+
+`Computed<T>` — тип, который возвращает геттер класса без сеттера: вычисляемое значение, не хранящееся в базе. Декоратор не нужен: геттер сам по себе — виртуальное поле. Метка нужна типам, чтобы отличить вычисляемое значение от данных: оно не попадает в фильтры и запись и не входит в `$toPlain()`, пока вы не попросите `{ virtuals: true }`.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Person extends Entity {
+  @Prop(() => String) first?: string;
+  @Prop(() => String) last?: string;
+  get fullName(): Computed<string> { // [!code highlight]
+    return `${this.first ?? ""} ${this.last ?? ""}`.trim() as Computed<string>;
+  }
+}
+const People = client.db().model(Person);
+const person = await People.create({ first: "Ann", last: "Lee" });
+console.log(person.fullName);
+// → Ann Lee
+console.log(person.$toPlain({ virtuals: true }).fullName);
+// → Ann Lee
+```
+
+В базу значение не записывается, а `lean()` его не содержит: документ хранит только `_id`, `first` и `last`. Значение получают приведением `as Computed<string>`: компилятор не превращает обычную строку в маркерный тип сам.
+
+---
+
+## VirtualValue
+
+`VirtualValue<T>` — тип пары «геттер и сеттер» класса: вычисляемое значение, которому можно присвоить значение. Сеттер разбирает присвоенное на настоящие поля.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Person extends Entity {
+  @Prop(() => String) first?: string;
+  @Prop(() => String) last?: string;
+  get handle(): VirtualValue<string> { // [!code highlight]
+    return `${this.first}.${this.last}`.toLowerCase() as VirtualValue<string>;
+  }
+  set handle(value: VirtualValue<string>) { // [!code highlight]
+    const [first = "", last = ""] = (value as string).split(".");
+    this.first = first;
+    this.last = last;
+  }
+}
+const People = client.db().model(Person);
+const person = await People.create({ first: "Ann", last: "Lee" });
+console.log(person.handle);
+// → ann.lee
+person.handle = "bob.ray" as VirtualValue<string>;
+console.log(person.first, person.last);
+// → bob ray
+```
+
+Как и `Computed`, значение не хранится: в базе лежат только настоящие поля `first` и `last`.
+
+---
+
+## Ref
+
+`Ref<M, Id>` — идентификатор документа модели `M`, который можно подтянуть запросом `populate`. Второй параметр — тип `_id` целевой модели, по умолчанию `ObjectId`. Пара — опции [`ref`](./prop.mdx#ref), [`refPath`](./prop.mdx#refpath), [`refModel`](./prop.mdx#refmodel). Массив ссылок — `Ref<M>[]`, карта — `Map<string, Ref<M>>`.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Author extends Entity {
+  @Prop(() => String) name?: string;
+}
+@Schema()
+class Post extends Entity {
+  @Prop(() => Types.ObjectId, { ref: () => Author }) // [!code highlight]
+  author?: Ref<Author>;
+}
+const Posts = client.db().model(Post);
+const post = await Posts.findOne({}).orFail();
+const author = post.author;
+//    ^?
+```
+
+Вместо идентификатора в такое поле можно передать сам документ модели: гидратированный, `lean` или экземпляр класса. В базу уходит его `_id`, и это верно для `create`, обновлений, фильтров, массивов ссылок и значений `Map`. Строка с `_id` тоже принимается и приводится к типу идентификатора.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, Types, type Ref } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+@Schema()
+class Author extends Entity {
+  @Prop(() => String)
+  name?: string;
+}
+@Schema()
+class Post extends Entity {
+  @Prop(() => Types.ObjectId, { ref: () => Author })
+  author?: Ref<Author>;
+}
+const Authors = client.db().model(Author);
+const Posts = client.db().model(Post);
+// ---cut---
+const ann = await Authors.create({ name: "Ann" });
+const post = await Posts.create({ author: ann }); // [!code highlight]
+console.log(post.author?.toHexString() === ann._id.toHexString());
+// → true
+```
+
+Если присвоить документ полю загруженного документа напрямую (`post.author = other`), поле до сохранения хранит присвоенный документ, и `$getChanges()` показывает объект. Метод `post.$set("author", other)` кладёт в поле идентификатор, и `$getChanges()` показывает его. В обоих случаях `$save()` записывает `_id`. Документ `lean` присвоить полю напрямую нельзя по типам, через `$set` можно.
+
+Идентификатор без `Ref<M>` в типе поля и `ref` в опциях не согласуются: `@Prop "author": the field is Ref<Model>, add ref: () => Model` и `"ref" is set, but the field type is not Ref<Model>`.
+
+---
+
+## VirtualRef
+
+`VirtualRef<M, JustOne, Count>` — тип поля, которое подтягивает документы по обратной связи и ничего не хранит. `M` — модель, `JustOne` — один документ вместо массива, `Count` — число документов вместо документов. Флаги должны совпадать с опциями [`@Virtual`](./virtual.mdx#virtual): `justOne` и `count`. Объявляется без `@Prop`: `@Prop` на таком поле — ошибка (`a VirtualRef field is declared with @Virtual, not @Prop`).
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Post extends Entity {
+  @Prop(() => Types.ObjectId, { required: true }) author!: Types.ObjectId;
+}
+@Schema()
+class Author extends Entity {
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) // [!code highlight]
+  posts!: VirtualRef<Post>;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author", count: true }) // [!code highlight]
+  postCount!: VirtualRef<Post, false, true>;
+}
+```
+
+---
+
+## TenantField
+
+`TenantField<T>` помечает поле, которое несёт [политику](./schema.mdx#tenant) мультитенантности: ядро само записывает в него владельца, поэтому `create` не требует значения, а чтение всегда его содержит. Тип ставится в паре с декоратором [`@Tenant()`](#tenant) и опцией схемы `tenant`, и `@Schema` проверяет, что тип стоит ровно на поле, названном в этой опции.
+
+```ts twoslash
+import { Entity, Prop, Schema, Tenant, TypemoClient, type TenantField } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+// @errors: 1238
+@Schema({ tenant: true })
+class Doc extends Entity {
+  @Prop(() => String)
+  tenantId!: string;
+}
+```
+
+Поле объявлено обычным `string`, и компилятор требует тип `TenantField<T>`. Внутри сообщения: `@Schema: declare the tenant field as tenantId!: TenantField<T> — the core fills it, create() does not require it, reads always have it`. Тип без опции `tenant` тоже ошибка: `@Schema: "tenantId" is TenantField<T>, but the schema has no tenant option — add tenant: { field: "tenantId" } or use a plain type`. Тип на другом поле, чем названо в опции: `@Schema: "owner" is TenantField<T>, but the tenant field is "tenantId"`.
+
+---
+
+## @Tenant
+
+`@Tenant()` помечает поле тенанта в классе: декоратор ставится рядом с [`@Prop`](./prop.mdx#prop) на поле типа [`TenantField<T>`](#tenantfield). Тип видит компилятор, а декоратор видит время работы: по нему схема находит поле, в которое ядро записывает тенанта. Вместе с опцией [`tenant`](./schema.mdx#tenant) это обязательная пара: схема с `tenant` и полем без `@Tenant()` не собирается.
+
+```ts twoslash
+import { Entity, Prop, Schema, Tenant, TypemoClient, type TenantField } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ tenant: true })
+class Note extends Entity {
+  @Prop(() => String) @Tenant() // [!code highlight]
+  tenantId!: TenantField<string>;
+
+  @Prop(() => String, { required: true })
+  title!: string;
+}
+const Notes = client.db().model(Note);
+const note = await Notes.create({ title: "Plan" }, { policy: { tenant: "acme" } });
+console.log(note.tenantId);
+// → acme
+```
+
+<Returns type="PropertyDecorator">
+
+Декоратор свойства без аргументов: `@Tenant()`. Он записывает метку в описание класса и ничего не возвращает.
+
+</Returns>
+
+Принимает ничего.
+
+<FullType>
+
+```ts
+const Tenant: () => <T extends object, K extends string>(
+  target: T & TenantCheck<T, K>,
+  key: K,
+  descriptor?: unknown,
+) => void
+```
+
+</FullType>
+
+### Ошибки
+
+Тип поля проверяется при компиляции: `@Tenant()` на поле, которое не объявлено `TenantField<T>`, отклоняется.
+
+```ts twoslash
+import { Entity, Prop, Schema, Tenant, type TenantField } from "@venloc/typemo";
+// ---cut---
+@Schema({ tenant: true })
+class Note extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  // @errors: 1240
+  @Prop(() => String) @Tenant() title!: string;
+}
+```
+
+Сообщение компилятора: `@Tenant "title": declare the field as TenantField<T>`. Остальные нарушения находит сборка схемы, и все они `ConfigurationError`: `Note: the tenant field "tenantId" must be marked @Tenant() (declare it @Prop(...) @Tenant() tenantId!: TenantField<T>)` (поле без декоратора), `Note: @Tenant() on "tenantId", but the schema has no tenant policy — add tenant: true (or { field }) to @Schema` (декоратор без опции), `Note: @Tenant() marks "tenantId", "owner"; only the tenant field "tenantId" may be marked` (декоратор на двух полях или не на том поле). Декоратор на статическом члене, методе или аксессоре, а также повторный на одном поле — тоже `ConfigurationError`. В TC39-пакете `@Tenant()` работает так же, но смешивать декораторы двух видов нельзя.
+
+---
+
+## Discriminators
+
+`Discriminators<C>` — тип ключа дискриминатора в классе **базы**, которая перечисляет наследников опцией [`discriminators`](./schema.mdx#опция-discriminators): `declare readonly __t?: Discriminators<Card | Transfer>`. Ядро пишет ключ само, менять его нельзя, а параметр `C` — объединение классов наследников. По нему типы чтения через модель базы строят объединение «база без ключа или любой наследник». У самих наследников ключ объявляется типом [`DiscriminatorValue`](#discriminatorvalue). Подробнее, с примерами и ошибками, — на странице [`@Discriminator`](./discriminator.mdx#discriminators).
+
+---
+
+## DiscriminatorValue
+
+`DiscriminatorValue<"circle">` — тип ключа дискриминатора в классе-наследнике: `declare readonly __t: DiscriminatorValue<"circle">`. Это `Defaulted<Immutable<"circle">>`: ядро пишет ключ само, менять его нельзя, а lean и plain-виды несут литерал. Объявление обязательно у каждого класса с [`@Discriminator`](./discriminator.mdx#discriminator), и декоратор проверяет, что литерал совпадает со значением.
+
+---
+
+## Unbranded
+
+`Unbranded<T>` убирает метки полей (`Defaulted`, `Immutable`, `Hidden`, `Computed`, `VirtualValue`, `TenantField`, `Discriminators`) из типа, поштучно по членам объединения. `Ref` остаётся: ссылка входит в смысл значения. Тип нужен тем, кто пишет свои обёртки над типами Typemo. В примере ниже присваивание в `string | null` компилируется: метка `Hidden` снята, а `null` остался.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+declare const value: Unbranded<Hidden<string> | null>;
+const clean: string | null = value; // [!code highlight]
+```
+
+---
+
+## Vector
+
+`Vector` — тип поля-вектора: во время работы это `Binary` подтипа 9, а тип несёт метку, потому что plain-форма и JSON-форма вектора — `number[]`, а не байты. Пара — построитель [`Spec.vector`](./types-and-spec.mdx#specvector). Без метки поле-вектор нельзя отличить от обычного `Binary`: `Spec.vector(...)` требует типа `Vector` (`Spec.vector(...) needs the field type Vector`), а поле типа `Vector` требует `Spec.vector` (`a Vector field needs Spec.vector({ dtype, dimensions })`).
+
+---
+
+## Int64String
+
+`Int64String` — десятичная строка int64, то есть plain- и JSON-форма поля `bigint`. Это шаблонный тип `` `${bigint}` ``: дробную запись, запись с плюсом или ведущим нулём TypeScript отклоняет уже при компиляции, а `CastError` во время работы строже: пробелы, экспонента и префиксы тоже запрещены. Строка принимается вместо `bigint` при записи, в фильтрах и в `$inc`, `$mul`, `$min`, `$max`. `number` в поле `bigint` принимается только как безопасное целое, иначе `CastError` с подсказкой `5n` или `"5"`.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+const ok: Int64String = "9223372036854775807";
+// @errors: 2322
+const bad: Int64String = "1.5";
+```
+
+---
+
+## Типы коллекций документа
+
+Гидратированный документ хранит массивы, карты и поддокументы в собственных строго типизированных коллекциях. Эти типы вы видите в подсказках, когда обращаетесь к полю загруженного документа; методы и запрещённые операции описаны в справочнике [Типизированные коллекции](../documents/typed-collections.mdx).
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Line {
+  @Prop(() => String) sku?: string;
+}
+@Schema()
+class Order extends Entity {
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) scores?: Map<string, number>;
+}
+const Orders = client.db().model(Order);
+const order = await Orders.findOne({}).orFail();
+const tags = order.tags;
+//    ^?
+const lines = order.lines;
+//    ^?
+```
+
+- `StrictArray<T>` — массив значений. Читается как обычный, пишется только методами (`push`, `set`, `pull` и другие).
+- `SubdocumentArray<T>` — массив поддокументов; кроме методов `StrictArray` есть `create`, `id` и `pull` по идентификатору.
+- `TypedMap<V>` — карта `Map<string, V>` с проверкой ключей и значений; пишется методами `set`, `delete`, `clear`.
+- `Subdocument<T>` — поддокумент или вложенный объект: его поля и методы с приставкой `$`.
+
+## Когда не подходит
+
+Маркеры не нужны в запросах и в результатах: Typemo снимает их сам, и в `plain()`, `lean()` и `$toObject()` поле `Hidden<string>` — просто `string`. Пользоваться `Unbranded` в обычном коде приложения незачем. Для значения, которое вы хотите вычислять, нужен геттер с `Computed`, а не поле с `@Prop`.
+
+## Что дальше
+
+<Cards>
+<Card title="@Prop" href="./prop.mdx">
+  Опции, которые идут в паре с маркерами: `hidden`, `immutable`, `default`, `ref`.
+</Card>
+<Card title="@Virtual" href="./virtual.mdx">
+  Как объявить связь, которую описывает `VirtualRef`.
+</Card>
+<Card title="Скрытые и чувствительные поля" href="../../schemas/hidden-and-sensitive.mdx">
+  `Hidden` и `sensitive` на реальных задачах.
+</Card>
+</Cards>

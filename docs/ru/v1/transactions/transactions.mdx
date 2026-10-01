@@ -1,0 +1,377 @@
+---
+title: Транзакции
+description: "Как записать несколько документов так, чтобы они применились вместе или не применились совсем, и что делать при повторах"
+icon: ArrowLeftRight
+---
+
+Чтобы несколько записей применились вместе или не применились вовсе, выполните их в одном вызове [`client.transaction`](../reference/transactions/transactions.mdx#transaction). Это нужно там, где половина изменения хуже, чем никакого: перевод денег со счёта на счёт, заказ и его позиции, счёт и запись о нём в журнале. Без транзакции сбой между двумя записями оставил бы деньги списанными, но не зачисленными.
+
+**Транзакция** — это группа операций, которую база показывает другим читателям только целиком, после фиксации, а при ошибке откатывает всю. В Typemo вам не нужно передавать сессию в каждую операцию: все операции внутри функции транзакции присоединяются к ней сами. Сложность в другом: при временных сбоях сервера функция выполняется заново, и код внутри неё должен это выдерживать. Этому посвящена значительная часть страницы.
+
+Транзакции требуют реплика-сета (или шардированного кластера): на одиночном `mongod` `transaction` бросает [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configurationerror) раньше, чем выполнится функция. Заранее это можно проверить через [`client.supportsTransactions`](../reference/connection/typemo-client.mdx#clientsupportstransactions), а для разработки достаточно реплика-сета из одного узла. Подробнее — в руководстве [Подключиться к базе](../connection/connect.mdx).
+
+## Что предполагается
+
+Примеры используют подключённый клиент из файла `db/client.ts` и модель счёта из `accounts/account.ts`. В базе два счёта: `Main` с балансом 100 и `Savings` с балансом 50.
+
+```ts twoslash title="db/client.ts"
+import { TypemoClient } from "@venloc/typemo";
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+```
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  balance!: number;
+}
+```
+
+## Быстрый путь
+
+Передайте функцию в [`client.transaction`](../reference/transactions/transactions.mdx#transaction). Всё, что она сделала с базой, применяется вместе. Что она вернула, то вернёт и `transaction`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const count = await client.transaction(async () => {
+  await Accounts.updateOne({ title: "Main" }, { $inc: { balance: -30 } });
+  await Accounts.updateOne({ title: "Savings" }, { $inc: { balance: 30 } });
+  return Accounts.countDocuments();
+});
+// → 2
+```
+
+Если функция бросит ошибку, обе записи откатятся, а ошибка дойдёт до вас без изменений. То же можно вызвать через подключение: [`connection.transaction`](../reference/connection/connection.mdx#connectiontransaction) передаёт вызов своему клиенту. Остальная страница разбирает реальные задачи и ловушки.
+
+## Перевести деньги между счетами
+
+Перевод читает баланс, проверяет остаток и меняет два документа. Проверка внутри транзакции нужна, чтобы решение «денег хватает» и списание были частью одного целого. Если денег не хватает, бросается ваша ошибка, и транзакция откатывается вместе со всем, что было сделано до этого места.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+export const transfer = (from: string, to: string, amount: number) =>
+  client.connection.transaction(async () => {
+    const source = await Accounts.findOne({ title: from }).orFail();
+    if (source.balance < amount) throw new Error("insufficient funds");
+    await Accounts.updateOne({ title: from }, { $inc: { balance: -amount } });
+    await Accounts.updateOne({ title: to }, { $inc: { balance: amount } });
+    return source.balance - amount;
+  });
+
+console.log(await transfer("Main", "Savings", 30));
+// → 70
+```
+
+Обратите внимание: баланс меняется атомарной записью `$inc`, а не «прочитал, вычел, записал». Так функция дает верный результат при любом числе повторов: `$inc` не зависит от того, что осталось в памяти от прошлой попытки.
+
+Запуск: после перевода 30 балансы стали 70 и 80. Попытка перевести 500 бросила `insufficient funds`, и балансы остались `[70, 80]`: списание и зачисление откатились бы, даже если бы первая запись уже прошла.
+
+## Откат при ошибке
+
+Любая ошибка внутри функции откатывает транзакцию: ваша, ошибка проверки схемы, нарушение уникальности. Откат касается и того, что функция успела сделать раньше. В примере первая запись списывает 1 у счёта `Main`, а вторая пытается создать счёт с занятым названием:
+
+```ts twoslash
+import { DuplicateKeyError, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+await client.connection.init();
+// ---cut---
+try {
+  await client.transaction(async () => {
+    await Accounts.updateOne({ title: "Main" }, { $inc: { balance: -1 } });
+    await Accounts.create({ title: "Main", balance: 1 });
+  });
+} catch (error) {
+  if (error instanceof DuplicateKeyError) console.log("rolled back");
+  // → "rolled back"
+}
+```
+
+Списание отменено: баланс `Main` остался прежним (в запуске 70 до и после). Ошибка приходит как есть, поэтому обработчик ловит её по классу так же, как вне транзакции: подробности — в руководстве [Обработка ошибок](../errors/handling.mdx). Ошибку вашей собственной функции библиотека не оборачивает: то, что вы бросили, вы и поймаете (в запуске `caught === thrown` было `true`).
+
+## Выполнять операции по очереди
+
+Внутри транзакции операции нужно выполнять по одной, каждую с `await`. Сервер не умеет выполнять параллельные операции в одной транзакции и на такую попытку отвечает ошибкой; драйвер документирует это как неопределённое поведение. Поэтому библиотека отказывает сама, не дожидаясь сервера: [`StrictModeError`](../reference/errors/data-errors.mdx#strictmodeerror) с причиной `concurrent-session`.
+
+Типичный случай — `Promise.all` по списку: разумно выглядит, но в транзакции запрещено. Ошибка называет обе операции: ту, что вы пытались запустить, и ту, что ещё не закончилась. Обход в цикле работает:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+await client.transaction(async () => {
+  for (const title of ["Main", "Savings"]) {
+    await Accounts.updateOne({ title }, { $inc: { balance: 1 } });
+  }
+});
+```
+
+В запуске цикл изменил оба счёта, а `Promise.all` из двух чтений внутри транзакции завершился ошибкой:
+
+```text
+StrictModeError: Account.find: the session is in use by Account.countDocuments, which has not finished; operations on one session must run one after another — await each one; only reads may overlap, and only outside a transaction (MongoDB does not support concurrent operations on a session) [concurrent-session]
+```
+
+Правило действует для операций с общей сессией, то есть для всех операций внутри транзакции. Последовательный код ему не мешает: в запуске обход курсора с записью после каждого документа работал.
+
+## Функция может выполниться несколько раз
+
+Сервер помечает некоторые отказы меткой «временная ошибка транзакции»: например, две транзакции изменяли один документ, и вторая проиграла. В этом случае драйвер выполняет функцию **с самого начала**. Для вас это значит одно правило: всё, что не является записью в базу, внутри функции делать нельзя. Письмо, платёж во внешнем сервисе, запись в файл выполнятся по разу на каждую попытку, а откатить их транзакция не умеет.
+
+Здесь письмо отправляется внутри функции, а первая попытка терпит временный сбой на записи. Письмо ушло дважды:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+declare const __sendEmail__: (text: string) => void;
+// ---cut---
+// неправильно: письмо уходит на каждой попытке
+await client.transaction(async () => {
+  __sendEmail__("transfer started");
+  await Accounts.updateOne({ title: "Main" }, { $inc: { balance: 1 } });
+});
+// при одном временном сбое письмо отправлено дважды
+
+// правильно: письмо после фиксации
+await client.transaction(async () => {
+  await Accounts.updateOne({ title: "Main" }, { $inc: { balance: 1 } });
+});
+__sendEmail__("transfer done");
+```
+
+В запуске список отправленных писем при неправильном варианте был `["email", "email"]`, а при правильном содержал одну запись, после фиксации. Если письмо нужно гарантированно, запишите его в коллекцию «исходящих» в той же транзакции и отправляйте из отдельного процесса.
+
+Номер попытки виден в аргументе функции: [`scope.attempt`](../reference/transactions/transactions.mdx#transactionscope) равен 1 при первом запуске, 2 при первом повторе и далее. Он нужен в основном для журнала и тестов, а не для логики.
+
+### Документы, загруженные снаружи
+
+Второе следствие повторов касается документов. Если вы загрузили документ **до** транзакции и меняете его внутри, повтор применит изменение поверх уже изменённых значений. В запуске функция вычитала 10 из баланса 100, получила временный сбой на сохранении, при повторе увидела 90, вычла ещё 10 и сохранила 80 вместо 90. Библиотека возвращает документу признак «изменён» между попытками, но отменить ваши присваивания не может.
+
+Читайте документы внутри функции, а числа меняйте атомарными операциями (`$inc`), как в переводе выше. Тогда любое число повторов даёт один результат.
+
+## Ограничить общий срок
+
+По умолчанию транзакция ждёт, пока драйвер не перестанет повторять. Чтобы ограничить это время, передайте [`timeoutMS`](../reference/transactions/transactions.mdx#transactionoptions): срок для всей транзакции, повторы включены.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const total = await client.transaction(async () => Accounts.countDocuments(), {
+  readConcern: "snapshot",
+  writeConcern: { w: "majority" },
+  timeoutMS: 5_000,
+});
+```
+
+Настройки транзакции задаются здесь, а не у отдельных операций: [`readConcern`](../reference/transactions/transactions.mdx#transactionoptions) означает, какие данные читает транзакция, `writeConcern` — сколько узлов подтверждают фиксацию. Операция внутри транзакции со своим `readConcern`, `writeConcern`, `readPreference` (кроме `primary`) или `timeoutMS` получит `StrictModeError` с причиной `transaction-option`: сервер не позволил бы переопределить настройки транзакции, а драйвер молча отбросил бы их.
+
+Когда срок вышел, приходит [`TimeoutError`](../reference/errors/server-errors.mdx#timeouterror). В запуске транзакция с `timeoutMS: 200`, где запрос блокировался на 400 мс, завершилась ошибкой `kind: "transaction"` с `timeoutMS: 200` и текстом `transaction timed out after 200 ms (timeoutMS)`. Срок одной операции (`timeoutMS` запроса) даёт другой вид, `"operation"`: по `kind` видно, чей срок вышел.
+
+## Как выбрать
+
+Задайте себе один вопрос: **есть ли у меня две записи, из которых половина хуже, чем ничего?** Если запись одна, транзакция не нужна: запись в один документ атомарна сама. Если записей несколько и они связаны, нужна транзакция. Если связанных записей несколько, но частичный результат допустим (пакетная загрузка, где пропущенные строки просто перезагрузят), достаточно `insertMany` или `bulkWrite`.
+
+Между `transaction` и ручной сессией выбирайте по управлению: `transaction` сама создаёт и закрывает сессию, повторяет функцию и откатывает состояние документов. Ручная сессия нужна только когда вам нужно управлять фиксацией самим: см. [Сессии вручную](./sessions.mdx).
+
+## Когда это не нужно
+
+Транзакция не нужна для одной записи, для чтения и для записей, которые не связаны между собой. Она добавляет накладные расходы и ограничения (операции по очереди, запрет на настройки отдельных операций) и держит ресурсы сервера, пока идёт. Не оборачивайте в транзакцию длинные операции с внешними сервисами: ждать ответа сервиса внутри транзакции значит держать её открытой и повышать вероятность конфликта.
+
+Атомарный счётчик или флаг решается одним `updateOne` с `$inc` или `$set`. Уникальность гарантирует индекс, а не транзакция: см. [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicatekeyerror).
+
+## Частые ошибки
+
+### Запись драйвера осталась после отката
+
+Вы вызвали драйвер напрямую внутри транзакции, транзакция откатилась, а запись осталась. Вызовы драйвера в транзакцию сами не присоединяются: присоединяются только операции моделей. Передайте сессию явно из аргумента функции:
+
+```ts twoslash
+import { TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const raw = client.unsafeDriver().db("app").collection("accounts");
+// ---cut---
+await client.transaction(async (scope) => {
+  await raw.insertOne({ title: "Raw", balance: 1 }, { session: scope.session }); // [!code highlight]
+});
+```
+
+С `session: scope.session` запись откатывается вместе с транзакцией: в запуске после ошибки в функции документа в коллекции не было (`0`). Без этого аргумента он остался бы. Подробнее о выходе к драйверу — в руководстве [Доступ к драйверу](../connection/driver-access.mdx).
+
+### Транзакция внутри транзакции
+
+Вызов `transaction` из функции другой транзакции того же клиента бросает `ConfigurationError`:
+
+```text
+ConfigurationError: transaction(): transactions do not nest (already inside a transaction of this client)
+```
+
+У MongoDB вложенных транзакций нет, поэтому вложенный вызов был бы либо молчаливым присоединением, либо отдельной транзакцией с другим исходом. Библиотека не выбирает за вас. Вынесите общую часть в функцию, которая не вызывает `transaction` сама и работает внутри уже открытой.
+
+### Модель другого клиента внутри транзакции
+
+Транзакция принадлежит одному клиенту. Модель другого клиента присоединиться к ней не может, и вместо тихой записи вне транзакции вы получаете `ConfigurationError` с советом передать `session(null)`, чтобы осознанно выйти из транзакции:
+
+```text
+ConfigurationError: Account.countDocuments: called inside a transaction of another client; its model cannot join that transaction — pass session(null) (or { session: null }) to run it outside explicitly
+```
+
+В запуске вызов с `session(null)` прошёл и вернул результат вне транзакции.
+
+### Баланс оказался 80 вместо 90 после повтора
+
+Вы загрузили документ до транзакции, изменили его арифметикой внутри и сохранили, а после временного сбоя в базе оказалось вдвое большее изменение. Причина в том, что при повторе функция видит тот же объект в памяти: значение из первой попытки (90) остаётся в нём, и второй проход вычитает ещё 10. В запуске с одним временным сбоем при фиксации функция выполнилась дважды и сохранила 80:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const outside = await Accounts.findOne({ title: "Main" }).orFail();
+
+// неправильно: объект загружен снаружи, при повторе вычитание применится дважды
+await client.transaction(async () => {
+  outside.balance = outside.balance - 10;
+  await outside.$save();
+});
+
+// правильно: документ читается внутри, каждая попытка начинает с значения из базы
+await client.transaction(async () => {
+  const inside = await Accounts.findOne({ title: "Main" }).orFail();
+  inside.balance = inside.balance - 10;
+  await inside.$save();
+});
+```
+
+Второй вариант в том же запуске сохранил 90: обе попытки прочитали из базы 100. Ещё надёжнее атомарная запись `updateOne` с `$inc`, как в переводе выше: она вообще не зависит от того, что лежит в памяти. Присвоение фиксированного значения (`doc.status = "closed"`) при повторе безвредно: оно одинаково в каждой попытке.
+
+### Транзакция не запускается на одиночном сервере
+
+На одиночном `mongod` транзакций нет, и `client.transaction` сразу бросает [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configurationerror): функция не вызывается, ничего не записывается. Текст называет причину и выход (запуск на `mongod` без реплика-сета, `client.supportsTransactions` был `false`):
+
+```text
+ConfigurationError: TypemoClient "default": transaction(): transactions need a replica set or a sharded cluster; this server is a standalone mongod. Run MongoDB as a replica set (a single-member one is enough).
+```
+
+Для разработки хватит реплика-сета из одного узла. Проверку `client.supportsTransactions` всё равно удобно сделать при запуске приложения, чтобы остановить его с понятным сообщением, а не при первом переводе денег.
+
+## Полный пример
+
+Один файл собирает всё вместе: перевод между счетами, отправка письма после фиксации и ответ клиенту. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { DocumentNotFoundError, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  balance!: number;
+}
+
+declare const __sendEmail__: (text: string) => void;
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+
+// перевод: чтение, проверка и две атомарные записи в одной транзакции
+export const transfer = async (from: string, to: string, amount: number): Promise<number> => {
+  const left = await client.transaction(async () => {
+    const source = await Accounts.findOne({ title: from }).orFail();
+    if (source.balance < amount) throw new Error("insufficient funds");
+    await Accounts.updateOne({ title: from }, { $inc: { balance: -amount } });
+    await Accounts.updateOne({ title: to }, { $inc: { balance: amount } });
+    return source.balance - amount;
+  });
+
+  // побочные эффекты только после фиксации
+  __sendEmail__(`transferred ${amount} from ${from} to ${to}`);
+  return left;
+};
+
+// граница приложения: счёт не найден и недостаток средств превращаются в ответы
+export const transferRequest = async (from: string, to: string, amount: number) => {
+  try {
+    return { status: 200, left: await transfer(from, to, amount) };
+  } catch (error) {
+    if (error instanceof DocumentNotFoundError) return { status: 404 };
+    if (error instanceof Error && error.message === "insufficient funds") return { status: 409 };
+    throw error;
+  }
+};
+```
+
+<Callout type="migration">
+
+В Mongoose сессию нужно было передавать в каждую операцию (`{ session }`) и легко было забыть её в одном вызове: та операция молча выполнялась вне транзакции. В Typemo операции моделей внутри `transaction` присоединяются к ней сами, включая `populate`, курсоры, агрегации и пакетные записи. Повторы при временных сбоях делает драйвер, а документы, сохранённые в неудавшейся попытке, получают обратно признак «изменён» (в Mongoose это была известная ловушка: повторный `save` посылал не ту запись).
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Сессии вручную" href="./sessions.mdx">
+  Как запустить и зафиксировать транзакцию самому и передать сессию операциям.
+</Card>
+<Card title="Справочник транзакций" href="../reference/transactions/transactions.mdx">
+  Все аргументы `transaction`, настройки, `TransactionScope` и точные типы.
+</Card>
+<Card title="Обработка ошибок" href="../errors/handling.mdx">
+  Как ловить `DuplicateKeyError`, `TimeoutError` и другие ошибки внутри и снаружи транзакции.
+</Card>
+<Card title="Подключиться к базе" href="../connection/connect.mdx">
+  Реплика-сет для транзакций и проверка `supportsTransactions` при запуске.
+</Card>
+</Cards>

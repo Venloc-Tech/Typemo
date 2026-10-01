@@ -1,0 +1,1432 @@
+---
+title: Аккумуляторы
+description: "fn.sum, fn.avg, fn.min, fn.first, fn.push, fn.top и другие операторы, которые сводят много документов в одно значение"
+icon: Sigma
+---
+
+**Аккумулятор** — оператор, который читает значение из каждого документа группы и сводит их в одно: сумму, среднее, список, первое значение. Аккумуляторы стоят в значениях стадии [`group`](./stages.mdx#group), в `output` стадий `bucket` и [`bucketAuto`](./stages.mdx#bucketauto) и в `output` стадии [`setWindowFields`](./stages.mdx#setwindowfields). Все они собраны в объекте `fn` и вызываются внутри колбэка `(f) => …`, где `f` — прокси полей модели. Компилятор знает поля и их типы, поэтому опечатку в `f.totl` он остановит сразу.
+
+Если вы только начинаете, прочитайте руководство [Группировка и отчёты](../../aggregation/grouping.mdx): оно объясняет, как `_id` группы и аккумуляторы складываются в отчёт. Эта страница — справочник: к ней возвращаются, чтобы уточнить, что вернёт конкретный аккумулятор и когда он даёт `null`.
+
+Все примеры используют одну модель заказа магазина. В ней есть число, необязательное число, массив чисел и дата.
+
+```ts twoslash title="shop/order.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+```
+
+В коллекции шесть заказов. Результаты в комментариях `// →` получены на них.
+
+- Alice: оплачен на 120 (скидка 10, позиции 20 и 100, 5 января); оплачен на 80 (без скидки, позиция 80, 12 января).
+- Bob: новый на 45 (скидка 5, позиции 30 и 15, 19 января); оплачен на 200 (без скидки, позиции 50, 50 и 100, 2 февраля).
+- Carol: отменён на 60 (без скидки, позиция 60, 9 февраля); оплачен на 95 (скидка 15, позиции 45 и 50, 16 февраля).
+
+Во всех блоках стадия `group` строит `_id` из поля `customer` или `status`, а сразу после неё стоит `sort` по `_id`, чтобы порядок строк в примерах не менялся. Строку результата каждого блока получает [`.plain()`](./pipeline.mdx#plain): числа остаются числами, даты становятся строками.
+
+## Как работают аккумуляторы
+
+Один и тот же оператор может стоять в разных местах, и тип узла у него разный. Это проверяет компилятор, а не сервер.
+
+Оператор, который умеет работать и как выражение, и как аккумулятор (`fn.sum`, `fn.avg`, `fn.min`, `fn.max`, `fn.first`, `fn.last`, `fn.stdDevPop`, `fn.stdDevSamp`, `fn.median`, `fn.percentile`, `fn.firstN`, `fn.lastN`, `fn.minN`, `fn.maxN`), принимает один аргумент. В группе он собирает значение по документам. В стадии `project` или `addFields` тот же вызов работает с массивом внутри одного документа:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, linesSum: fn.sum(f.prices) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, linesSum: 120 },
+//   { total: 80, linesSum: 80 },
+// ]
+```
+
+Здесь `fn.sum(f.prices)` сложил позиции внутри каждого заказа: 20 и 100 дали 120. У этих операторов есть и форма с двумя и более аргументами, но она всегда выражение, а не аккумулятор:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      net: fn.sum(f.total, fn.ifNull(f.discount, 0)),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, net: 130 },
+//   { total: 80, net: 80 },
+// ]
+```
+
+Операторы `fn.push`, `fn.addToSet`, `fn.count`, `fn.top`, `fn.bottom`, `fn.topN` и `fn.bottomN` работают только как аккумуляторы: у сервера нет выражения с таким именем. Поэтому они разрешены только в `group`, в `output` стадий `bucket` и `bucketAuto` и в `setWindowFields`, а в `project` и `addFields` компилятор их не пропустит:
+
+```ts twoslash
+// @errors: 2769
+import { Entity, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] }) status!: "new" | "paid" | "cancelled";
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => [Number]) prices!: number[];
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+await Orders.aggregate((p) => p.project((f) => ({ _id: 0, all: fn.push(f.total) })));
+```
+
+Ошибка читается по имени в `PathError`: `field "all": an accumulator or window function is not an expression here`. Сервер ответил бы на то же `ServerError: Unknown expression $push`, но Typemo останавливает вызов раньше.
+
+Как аккумуляторы обращаются с отсутствующим полем и `null`, показывает один запрос. В статусе `cancelled` единственный заказ Carol не имеет поля `discount`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({
+      _id: f.status,
+      total: fn.sum(f.discount),
+      average: fn.avg(f.discount),
+      first: fn.first(f.discount),
+      largest: fn.max(f.discount),
+    }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "cancelled", total: 0, average: null, first: null, largest: null },
+//   { _id: "new", total: 5, average: 5, first: 5, largest: 5 },
+//   { _id: "paid", total: 25, average: 12.5, first: 10, largest: 15 },
+// ]
+```
+
+`fn.sum` даёт `0` там, где складывать нечего, поэтому он никогда не возвращает `null`. `fn.avg`, `fn.first` и `fn.max` в таком случае возвращают `null`: среднего нет, значения нет. В статусе `paid` из четырёх заказов скидка есть у двух, и среднее посчитано только по ним: `(10 + 15) / 2 = 12.5`.
+
+## Сумма и среднее
+
+### fn.sum
+
+`fn.sum` складывает числа. Принимает число или массив чисел, возвращает сумму. Отсутствующие и нечисловые значения он считает нулём.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p.group((f) => ({ _id: f.customer, revenue: fn.sum(f.total) })).sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "Alice", revenue: 200 },
+//   { _id: "Bob", revenue: 245 },
+//   { _id: "Carol", revenue: 155 },
+// ]
+```
+
+Тип результата — самый широкий числовой тип входов. Для `number` это `number`; для `bigint` вместе с возможным `null` — `bigint | number`, потому что сумма пропущенного значения — обычный ноль. Форму с несколькими аргументами и сумму массива в выражении вы видели выше.
+
+### fn.avg
+
+`fn.avg` считает среднее. Возвращает `number | null`: если усреднять нечего, результат `null`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p.group((f) => ({ _id: f.customer, average: fn.avg(f.total) })).sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "Alice", average: 100 },
+//   { _id: "Bob", average: 122.5 },
+//   { _id: "Carol", average: 77.5 },
+// ]
+```
+
+### fn.stdDevPop
+
+`fn.stdDevPop` считает стандартное отклонение по всей совокупности документов группы. Для одного значения оно равно нулю.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({ _id: f.status, spread: fn.stdDevPop(f.total) }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "cancelled", spread: 0 },
+//   { _id: "new", spread: 0 },
+//   { _id: "paid", spread: 46.283771453934044 },
+// ]
+```
+
+В статусе `paid` четыре заказа (120, 80, 200, 95), отклонение около 46,28. В `cancelled` и `new` по одному заказу, поэтому 0.
+
+### fn.stdDevSamp
+
+`fn.stdDevSamp` считает стандартное отклонение выборки. Для одного значения оно не определено, и оператор возвращает `null`. Тип результата — `number | null`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({ _id: f.status, spread: fn.stdDevSamp(f.total) }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "cancelled", spread: null },
+//   { _id: "new", spread: null },
+//   { _id: "paid", spread: 53.44389581607987 },
+// ]
+```
+
+Выбирайте между двумя операторами по вопросу «эти документы — вся совокупность или выборка из неё?». Отчёт по всем заказам месяца — `fn.stdDevPop`. Оценка по части заказов — `fn.stdDevSamp`.
+
+### fn.median
+
+`fn.median` считает приблизительную медиану. Принимает объект с полем `input`. Поле `method` допускает единственное значение `"approximate"`, и Typemo отправляет его сам.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({ _id: f.status, median: fn.median({ input: f.total }) }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "cancelled", median: 60 },
+//   { _id: "new", median: 45 },
+//   { _id: "paid", median: 95 },
+// ]
+```
+
+Медиана вычисляется приблизительным алгоритмом, поэтому на больших данных она может отличаться от точной. Для одного документа она равна его значению.
+
+### fn.percentile
+
+`fn.percentile` считает приблизительные процентили. Принимает `input` и массив долей `p`, возвращает массив: по одному значению на каждую долю.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({
+      _id: f.status,
+      q: fn.percentile({ input: f.total, p: [0.25, 0.9] }),
+    }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "cancelled", q: [60, 60] },
+//   { _id: "new", q: [45, 45] },
+//   { _id: "paid", q: [80, 200] },
+// ]
+```
+
+Доля — число от 0 до 1. Если доля записана литералом вне отрезка, компилятор откажет:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+// @errors: 2322
+fn.percentile({ input: 1, p: [1.5] });
+```
+
+Число, которое компилятору неизвестно (например, из переменной типа `number`), он проверить не может и пропустит. Тогда границу проверит сервер.
+
+## Минимум и максимум
+
+### fn.min
+
+`fn.min` возвращает наименьшее значение. Принимает значение любого типа, не только число, и возвращает `null`, если значений нет.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p.group((f) => ({ _id: f.customer, smallest: fn.min(f.total) })).sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "Alice", smallest: 80 },
+//   { _id: "Bob", smallest: 45 },
+//   { _id: "Carol", smallest: 60 },
+// ]
+```
+
+С датами он работает так же: вы получаете самую раннюю дату.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({ _id: f.customer, firstOrder: fn.min(f.placedAt) }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "Alice", firstOrder: "2026-01-05T00:00:00.000Z" },
+//   { _id: "Bob", firstOrder: "2026-01-19T00:00:00.000Z" },
+//   { _id: "Carol", firstOrder: "2026-02-09T00:00:00.000Z" },
+// ]
+```
+
+### fn.max
+
+`fn.max` возвращает наибольшее значение. Как и `fn.min`, принимает один аргумент (аккумулятор или массив) либо два и больше, которые сравниваются между собой:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p.group((f) => ({ _id: f.customer, largest: fn.max(f.total) })).sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "Alice", largest: 120 },
+//   { _id: "Bob", largest: 200 },
+//   { _id: "Carol", largest: 95 },
+// ]
+```
+
+Форма из нескольких аргументов даёт способ ограничить значение снизу:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, capped: fn.max(f.total, 100) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, capped: 120 },
+//   { total: 80, capped: 100 },
+// ]
+```
+
+### fn.minN
+
+`fn.minN` собирает `n` наименьших значений по возрастанию. Принимает `{ input, n }`. Если документов меньше `n`, в массиве будет столько значений, сколько есть.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({ _id: f.status, two: fn.minN({ input: f.total, n: 2 }) }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "cancelled", two: [60] },
+//   { _id: "new", two: [45] },
+//   { _id: "paid", two: [80, 95] },
+// ]
+```
+
+### fn.maxN
+
+`fn.maxN` собирает `n` наибольших значений по убыванию.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({ _id: f.status, two: fn.maxN({ input: f.total, n: 2 }) }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "cancelled", two: [60] },
+//   { _id: "new", two: [45] },
+//   { _id: "paid", two: [200, 120] },
+// ]
+```
+
+Значения `null` и отсутствующие поля он пропускает: у Alice две скидки-кандидата, но одна из них не задана, поэтому в массиве одно число.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({
+      _id: f.customer,
+      discounts: fn.minN({ input: f.discount, n: 2 }),
+    }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "Alice", discounts: [10] },
+//   { _id: "Bob", discounts: [5] },
+//   { _id: "Carol", discounts: [15] },
+// ]
+```
+
+## Первое и последнее
+
+Аккумуляторы этой группы зависят от порядка документов, поэтому перед `group` ставится [`sort`](./stages.mdx#sort). Без него «первый» означает «первый, кто попался серверу», и результат может меняться от запуска к запуску.
+
+### fn.first
+
+`fn.first` возвращает значение первого документа группы. Если поля нет, результат `null`, а не отсутствие ключа: тип результата включает `null`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .group((f) => ({ _id: f.customer, firstTotal: fn.first(f.total) }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "Alice", firstTotal: 120 },
+//   { _id: "Bob", firstTotal: 45 },
+//   { _id: "Carol", firstTotal: 60 },
+// ]
+```
+
+### fn.last
+
+`fn.last` возвращает значение последнего документа группы.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .group((f) => ({ _id: f.customer, lastTotal: fn.last(f.total) }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "Alice", lastTotal: 80 },
+//   { _id: "Bob", lastTotal: 200 },
+//   { _id: "Carol", lastTotal: 95 },
+// ]
+```
+
+### fn.firstN
+
+`fn.firstN` собирает первые `n` значений группы в порядке документов. Принимает `{ input, n }`. 
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .group((f) => ({ _id: f.status, two: fn.firstN({ input: f.total, n: 2 }) }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "cancelled", two: [60] },
+//   { _id: "new", two: [45] },
+//   { _id: "paid", two: [120, 80] },
+// ]
+```
+
+Пропущенное поле попадает в массив как `null`, в отличие от `fn.minN`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .group((f) => ({
+      _id: f.customer,
+      discounts: fn.firstN({ input: f.discount, n: 2 }),
+    }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "Alice", discounts: [10, null] },
+//   { _id: "Bob", discounts: [5, null] },
+//   { _id: "Carol", discounts: [null, 15] },
+// ]
+```
+
+### fn.lastN
+
+`fn.lastN` собирает последние `n` значений группы.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .group((f) => ({ _id: f.status, two: fn.lastN({ input: f.total, n: 2 }) }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "cancelled", two: [60] },
+//   { _id: "new", two: [45] },
+//   { _id: "paid", two: [200, 95] },
+// ]
+```
+
+### fn.top
+
+`fn.top` возвращает поле `output` документа, который идёт первым по `sortBy`. Порядок задают пары `[поле, направление]`, где поле — ссылка `f.поле`, а направление — `1`, `-1` или слово `"asc"`, `"desc"`, `"ascending"`, `"descending"` в нижнем регистре. Сервер получает всегда `1` или `-1`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({
+      _id: f.customer,
+      biggest: fn.top({ output: f.total, sortBy: [[f.total, -1]] }),
+    }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "Alice", biggest: 120 },
+//   { _id: "Bob", biggest: 200 },
+//   { _id: "Carol", biggest: 95 },
+// ]
+```
+
+Направление можно записать словом:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({
+      _id: f.customer,
+      biggest: fn.top({ output: f.total, sortBy: [[f.total, "desc"]] }),
+    }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "Alice", biggest: 120 },
+//   { _id: "Bob", biggest: 200 },
+//   { _id: "Carol", biggest: 95 },
+// ]
+```
+
+Ссылка на поле обязательна. Вычисленное выражение (`fn.add(f.total, 1)`) или переменная не подойдут: компилятор откажет, а если такое значение всё же дойдёт до построения стадии, Typemo бросит `ConfigurationError`:
+
+```text
+ConfigurationError: sortBy takes field references (f.field), got {"$add":["$total",1]}
+```
+
+Порядок пар — приоритет сортировки.
+
+### fn.bottom
+
+`fn.bottom` возвращает `output` документа, который идёт последним по `sortBy`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({
+      _id: f.customer,
+      smallest: fn.bottom({ output: f.total, sortBy: [[f.total, -1]] }),
+    }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "Alice", smallest: 80 },
+//   { _id: "Bob", smallest: 45 },
+//   { _id: "Carol", smallest: 60 },
+// ]
+```
+
+Как видно, `fn.bottom` с сортировкой по убыванию даёт наименьшее значение, то есть то же, что `fn.top` по возрастанию.
+
+### fn.topN
+
+`fn.topN` возвращает массив `output` первых `n` документов по `sortBy`. Принимает `{ output, sortBy, n }`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({
+      _id: f.status,
+      best: fn.topN({ output: f.total, sortBy: [[f.total, -1]], n: 2 }),
+    }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "cancelled", best: [60] },
+//   { _id: "new", best: [45] },
+//   { _id: "paid", best: [200, 120] },
+// ]
+```
+
+### fn.bottomN
+
+`fn.bottomN` возвращает массив `output` последних `n` документов по `sortBy`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({
+      _id: f.status,
+      worst: fn.bottomN({ output: f.total, sortBy: [[f.total, -1]], n: 2 }),
+    }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "cancelled", worst: [60] },
+//   { _id: "new", worst: [45] },
+//   { _id: "paid", worst: [95, 80] },
+// ]
+```
+
+Заказы отсортированы по сумме по убыванию, поэтому «последние два» — самые маленькие: у `paid` это 95 и 80.
+
+## Сбор значений
+
+### fn.push
+
+`fn.push` собирает значение из каждого документа в массив. Отсутствующие поля пропускаются, `null` остаётся. Порядок в массиве совпадает с порядком документов на входе.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p.group((f) => ({ _id: f.status, totals: fn.push(f.total) })).sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "cancelled", totals: [60] },
+//   { _id: "new", totals: [45] },
+//   { _id: "paid", totals: [120, 80, 200, 95] },
+// ]
+```
+
+### fn.addToSet
+
+`fn.addToSet` собирает различные значения. Порядок в массиве не определён: не полагайтесь на него.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({ _id: f.customer, statuses: fn.addToSet(f.status) }))
+    .sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "Alice", statuses: ["paid"] },
+//   { _id: "Bob", statuses: ["new", "paid"] },
+//   { _id: "Carol", statuses: ["cancelled", "paid"] },
+// ]
+```
+
+### fn.count
+
+`fn.count` считает документы группы. Принимает ничего и возвращает `number`. Он работает и как аккумулятор `group`, и в окне.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p.group((f) => ({ _id: f.status, orders: fn.count() })).sort({ _id: 1 }),
+).plain();
+console.log(rows);
+// → [
+//   { _id: "cancelled", orders: 1 },
+//   { _id: "new", orders: 1 },
+//   { _id: "paid", orders: 4 },
+// ]
+```
+
+Не путайте его со стадией [`count`](./stages.mdx#count): стадия заменяет весь результат одной строкой, а аккумулятор считает документы каждой группы.
+
+## Код на JavaScript
+
+### fn.accumulator
+
+`fn.accumulator` соответствует оператору сервера `$accumulator`, который выполняет собственный аккумулятор на JavaScript. Typemo серверный JavaScript не поддерживает: такой код выполняется с правами базы, его нельзя проверить по схеме, а внедрённый в него ввод становится исполняемым кодом. Поэтому любой вызов `fn.accumulator` — ошибка компиляции, и её текст сразу говорит, чем заменить оператор:
+
+```text
+fn.accumulator: server-side JavaScript ($accumulator) is not supported: it runs with the rights of the database and cannot be checked against the schema; use the $group accumulators instead (fn.sum, fn.avg, fn.push, fn.addToSet, fn.top, fn.firstN, fn.mergeObjects, ...)
+```
+
+Код на JavaScript, который вызывает оператор без проверки типов, получает отказ до отправки запроса. Typemo проверяет конвейер и отказывает всем операторам, которые запускают JavaScript на сервере:
+
+```text
+StrictModeError: "$accumulator" runs JavaScript on the server and is not supported (at "pipeline.0"): JavaScript code in a query runs with the rights of the database, cannot be checked against the schema, and turns injected input into executed code (Mongoose CVE-2025-23061, $where in populate); write the condition with query or aggregation operators ($expr) instead [sanitize]
+```
+
+Собрать нужное значение почти всегда можно готовыми аккумуляторами этой страницы: `fn.sum`, `fn.avg`, `fn.top` и `fn.firstN`, а сложную обработку — через `fn.push` и код приложения.
+
+### fn.function
+
+`fn.function` соответствует оператору сервера `$function`: выражению на JavaScript. Как и `fn.accumulator`, любой вызов — ошибка компиляции, а текст называет замену:
+
+```text
+fn.function: server-side JavaScript ($function) is not supported: it runs with the rights of the database and cannot be checked against the schema; use the $expr operators instead (fn.cond, fn.switch, fn.map, fn.filter, fn.reduce, fn.let, ...)
+```
+
+Вызов без проверки типов отклоняется до отправки с той же ошибкой `StrictModeError`, где вместо имени оператора стоит `"$function"`. Ветвления пишутся через [`fn.cond` и `fn.switch`](./expr-logic.mdx), обработка массивов — через [`fn.map`, `fn.filter` и `fn.reduce`](./expr-array.mdx), а для строк и чисел есть операторы из страниц про [строки](./expr-string.mdx) и [арифметику](./expr-arithmetic.mdx).
+
+## Когда не подходит
+
+- Нужно не свести, а сохранить документы группы: добавьте в группу `fn.push(f.total)` или используйте `fn.top` и `fn.topN`. 
+- Нужна сумма или среднее внутри одного документа, по массиву: используйте `fn.sum(f.prices)` в [`project`](./stages.mdx#project) или [`addFields`](./stages.mdx#addfields) без `group`.
+- Нужно нарастающее значение по порядку (нарастающий итог, скользящее среднее): подойдут [`withWindow`](./window-operators.mdx#withwindow) и оконные операторы, а не `group`.
+- Нужен подсчёт по значению поля: короче стадия [`sortByCount`](./stages.mdx#sortbycount).

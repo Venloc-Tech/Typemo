@@ -1,0 +1,248 @@
+---
+title: "Опции политик в схеме"
+description: "Опции tenant, softDelete и audit в @Schema: поля класса, значения по умолчанию, ошибки описания и запись аудита"
+icon: ShieldCheck
+---
+
+Три политики данных включаются в схеме модели одноимёнными опциями [`@Schema`](../schemas/schema.mdx): `tenant`, `softDelete` и `audit`. По умолчанию все три выключены. Каждая принимает `true` (все настройки по умолчанию) или объект с настройками, а после включения действует на **все** операции модели, и отключить её в отдельном запросе нельзя. Значения, которые политика берёт из окружения (какой тенант, кто действует), передаёт [контекст политик](./policy-context.mdx). Если вы впервые встречаете политики, начните с [обзора](../../policies/overview.mdx); эта страница — справочник.
+
+Примеры страницы строятся на банке: у счёта есть владелец-организация, счёт нельзя стереть без следа, а каждая запись должна оставлять пометку в журнале.
+
+<TypeTable
+  type={{
+    tenant: { description: "Политика тенанта: каждая операция работает с данными одного тенанта.", type: "true | TenantSchemaOptions" },
+    softDelete: { description: "Мягкое удаление: удаление помечает документ, чтение скрывает помеченные.", type: "true | SoftDeleteSchemaOptions" },
+    audit: { description: "Аудит: каждая запись оставляет строку в журнале; нужен реплика-сет.", type: "true | AuditSchemaOptions" },
+  }}
+/>
+
+## Опция tenant
+
+Опция `tenant` объявляет, что документы модели принадлежат разным **тенантам** — независимым владельцам данных (организациям, клиентам сервиса), которые лежат в одной коллекции и не должны видеть друг друга. Политика добавляет условие по полю тенанта в фильтр каждой операции, проставляет тенанта новым документам и запрещает переносить документ к другому тенанту. Одна забытая проверка `where orgId = …` в обычном коде выдала бы данные чужой организации; здесь забыть нельзя, потому что условие ставит не автор запроса.
+
+Поле тенанта описывается в классе тремя вещами: обычным [`@Prop`](../schemas/prop.mdx), декоратором [`@Tenant()`](../schemas/field-markers.mdx#tenant) и типом [`TenantField`](../schemas/field-markers.mdx#tenantfield). Ядро заполняет поле само, поэтому `create` его не требует, а результаты чтения всегда его содержат. Тип сообщает об этом компилятору, а декоратор — библиотеке во время работы: типы TypeScript при запуске исчезают, и без метки она не знала бы, какое поле считать тенантом.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema, Tenant, type TenantField } from "@venloc/typemo";
+
+@Schema({ collection: "accounts", tenant: true })
+export class Account extends Entity {
+  @Prop(() => String)
+  @Tenant()
+  tenantId!: TenantField<string>;
+
+  @Prop(() => String, { required: true })
+  title!: string;
+}
+```
+
+Второй пример показывает объект настроек: поле называется `orgId`, а тип тенанта — `ObjectId`. Значение из контекста приводится по типу поля, поэтому строка из адреса запроса подойдёт.
+
+```ts twoslash title="accounts/org-account.ts"
+import { Entity, Prop, Schema, Types, Tenant, type TenantField } from "@venloc/typemo";
+
+@Schema({ collection: "org_accounts", tenant: { field: "orgId" } })
+export class OrgAccount extends Entity {
+  @Prop(() => Types.ObjectId)
+  @Tenant()
+  orgId!: TenantField<Types.ObjectId>;
+
+  @Prop(() => String, { required: true })
+  title!: string;
+}
+```
+
+Политика охватывает каждый путь. Фильтры чтения, записи и «найти и изменить» получают условие тенанта (если вы сами фильтруете по полю тенанта, ваше условие остаётся, и должны выполняться оба, поэтому чужого тенанта так не получить). Вставки и замены записывают тенанта, если поля нет, а чужое значение — ошибка. Обновление не может менять поле тенанта (запись собственного значения допустима). В агрегации условие ставится в начало, а [`$lookup`](../aggregation/stages.mdx#lookup), [`$unionWith`](../aggregation/stages.mdx#unionwith) и [`$graphLookup`](../aggregation/stages.mdx#graphlookup) присоединяют только документы того же тенанта, если класс, названный в стадии, тоже с политикой (модель этого класса на подключении для этого не нужна). [`$out`](../aggregation/stages.mdx#out) и [`$merge`](../aggregation/stages.mdx#merge) в коллекцию с тенантом запрещены: они записали бы данные мимо политики. Запросы [`populate`](../populate/populate.mdx) — это операции целевой модели, они ограничиваются так же. Без тенанта операция не уходит на сервер: бросается [`StrictModeError`](./violations.mdx#tenant) с причиной `tenant`.
+
+<Params title="Настройки">
+<Param name="field" type="string" default='"tenantId"'>
+
+Имя поля тенанта в классе. Поле должно быть объявлено в классе: иначе `client.connection.model(Class)` бросает `ConfigurationError: NoField: tenant field "tenantId" is not a field of the class`. Тип `TenantField` и декоратор `@Tenant()` должны стоять ровно на этом поле: на другом поле или на двух полях сразу они дают ошибку сборки схемы, а `@Tenant()` на поле не типа `TenantField<T>` не компилируется (см. [`TenantField`](../schemas/field-markers.mdx#tenantfield) и [`@Tenant`](../schemas/field-markers.mdx#tenant)).
+
+</Param>
+</Params>
+
+Согласованность опции и метки проверяется при сборке модели. Каждое нарушение — [`ConfigurationError`](../errors/configuration-errors.mdx#configurationerror) (тексты получены запуском):
+
+```text
+ConfigurationError: NoMark: the tenant field "tenantId" must be marked @Tenant() (declare it @Prop(...) @Tenant() tenantId!: TenantField<T>)
+ConfigurationError: NoOpt: @Tenant() on "tenantId", but the schema has no tenant policy — add tenant: true (or { field }) to @Schema
+ConfigurationError: Two: @Tenant() marks "tenantId", "other"; only the tenant field "tenantId" may be marked
+```
+
+Первая ошибка — опция есть, а метки нет; вторая — метка есть, а опции нет; третья — меток две. Все варианты разобраны в руководстве [Разделить данные организаций](../../policies/tenants.mdx#ошибки-сборки-схемы). В пакете `@venloc/typemo-decorators` тот же декоратор работает так же.
+
+Три операции ведут себя особо. `estimatedDocumentCount` читает метаданные коллекции и не может ограничить подсчёт тенантом, поэтому вместо тихого подсчёта всех тенантов бросается ошибка со ссылкой на `countDocuments()`. Подписка на изменения ([`watch`](../change-streams/watch.mdx)) модели с тенантом запрещена без `allTenants: true`: событие удаления не содержит документа, по которому его можно было бы отфильтровать. Подписаться на всех тенантов можно, а фильтровать события придётся самому. Наконец, `.policy({ tenant })` для модели без политики принимается и ничего не меняет, чтобы один и тот же код работал с разными моделями.
+
+<FullType>
+
+```ts
+interface TenantSchemaOptions {
+  readonly field?: string;
+}
+// SchemaOptions.tenant
+readonly tenant?: true | TenantSchemaOptions;
+```
+
+</FullType>
+
+## Опция softDelete
+
+Опция `softDelete` включает **мягкое удаление**: удаление не стирает документ, а записывает в поле метку времени, и все остальные операции модели перестают видеть помеченные документы. Так удалённый счёт можно восстановить, а история остаётся. Поле в классе — `Date` с `null`: `null` означает «жив».
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts", softDelete: true })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Date, { nullable: true })
+  deletedAt?: Date | null;
+}
+```
+
+Операции `deleteOne`, `deleteMany`, `findOneAndDelete`, удаления в `bulkWrite` и `$deleteOne` документа превращаются в обновление метки. Результат остаётся результатом удаления: `deletedCount` равен числу помеченных документов, а `findOneAndDelete` возвращает документ таким, каким он был. Уже удалённый документ повторно не удаляется, его метка не меняется. Все остальные операции получают условие `deletedAt: null` (метка `null` или отсутствует); ваше условие по полю метки сохраняется, и нужно, чтобы выполнились оба, поэтому `find({ deletedAt: { $ne: null } })` без контекста ничего не найдёт. Чтобы увидеть удалённые, используйте `includeDeleted` или `onlyDeleted` в [контексте политик](./policy-context.mdx#policyvalues). Вставка записывает `deletedAt: null`, если поля нет. Присоединённые документы ([`$lookup`](../aggregation/stages.mdx#lookup), [`$unionWith`](../aggregation/stages.mdx#unionwith), [`$graphLookup`](../aggregation/stages.mdx#graphlookup), `populate`) удалёнными никогда не бывают: политику стадия берёт из класса, который в ней назван, даже если его модель на подключении не создана.
+
+<Params title="Настройки">
+<Param name="field" type="string" default='"deletedAt"'>
+
+Имя поля метки. Поле обязано быть `Date` с `null`, иначе модель не создаётся: `ConfigurationError: S1: softDelete field "deletedAt" must be a nullable Date field (Date | null)`. Ту же ошибку вызывает и отсутствие поля в классе.
+
+</Param>
+</Params>
+
+`estimatedDocumentCount` считает и удалённые документы (это метаданные коллекции), поэтому без `includeDeleted: true` бросается [`StrictModeError`](./violations.mdx#soft-delete) с причиной `soft-delete`.
+
+Мягкое удаление и уникальные индексы дружат плохо: удалённый документ продолжает занимать значение. Поэтому при создании модели Typemo подсказывает про каждый уникальный индекс, у которого нет частичного условия по метке, как сделать его частичным по живым документам: `partialFilterExpression: { deletedAt: { $type: "null" } }`. Условие именно `$type: "null"`, потому что частичный индекс не умеет выражать «поле отсутствует», а вставка всегда записывает `null`.
+
+Стереть документы навсегда или вернуть их позволяют [`SoftDelete.purge`](./soft-delete-and-untrusted.mdx#softdeletepurge) и [`SoftDelete.restore`](./soft-delete-and-untrusted.mdx#softdeleterestore).
+
+<FullType>
+
+```ts
+interface SoftDeleteSchemaOptions {
+  readonly field?: string;
+}
+// SchemaOptions.softDelete
+readonly softDelete?: true | SoftDeleteSchemaOptions;
+```
+
+</FullType>
+
+## Опция audit
+
+Опция `audit` включает **аудит**: каждая запись в модель оставляет строку в отдельной коллекции журнала. Из строки видно, что и когда записано, чей это был тенант и кто действовал (`actor` из [контекста политик](./policy-context.mdx#policyvalues)). Читать журнал нужно для расследований («кто изменил лимит счёта»), для отчётности и для восстановления картины по цепочке изменений.
+
+```ts twoslash title="transfers/transfer.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "transfers", audit: true })
+export class Transfer extends Entity {
+  @Prop(() => String, { required: true })
+  from!: string;
+
+  @Prop(() => Number, { required: true })
+  amount!: number;
+
+  @Prop(() => String, { sensitive: "mask" })
+  card?: string;
+}
+```
+
+Журнал пишется в той же транзакции, что и сама запись, сразу после неё. Строка называет то, что назвала операция: запись по фильтру без `_id` оставляет фильтр, а не идентификаторы затронутых документов. Чтобы получить историю документа, читайте идентификаторы в транзакции и пишите по `_id: { $in }`: рецепт разобран в руководстве [Вести журнал изменений](../../policies/audit.mdx#история-одного-документа). Поэтому запись и её строка фиксируются вместе или не фиксируются вообще: если строка не записалась, операция завершается ошибкой [`AuditError`](../errors/configuration-errors.mdx#auditerror), а запись откатывается. Ради этого запись в модель с аудитом вне транзакции сама открывает собственную транзакцию. Для этого нужен **реплика-сет** или шардированный кластер; на одиночном `mongod` запись бросает `ConfigurationError` с просьбой запустить реплика-сет (одноузлового достаточно). Чтения в журнал не попадают.
+
+Секреты в журнале маскируются по опции поля [`sensitive`](../schemas/prop.mdx#sensitive), у самой опции `audit` для этого настроек нет: значение заменяется на `?` (`"mask"`) или `[hidden]` (`"hide"`) в фильтре, обновлении и документах, а собственная функция `{ mask: (value) => … }` оставляет то, что она вернёт (например, последние четыре цифры). Функция вызывается только со значением объявленного типа поля; операнд другого типа, например `{ $exists: true }` в фильтре по этому полю, попадает в журнал как `?` без вызова. Скрытое поле (`Hidden`) без пометки в журнале тоже маскируется.
+
+<Params title="Настройки">
+<Param name="collection" type="string" default="<collection>_audit">
+
+Имя коллекции журнала. По умолчанию к имени коллекции модели добавляется `_audit`: для `transfers` это `transfers_audit`.
+
+</Param>
+</Params>
+
+У журнала нет модели: Typemo только пишет в него. Читать строки можно через драйвер: [`client.unsafeDriver()`](../connection/typemo-client.mdx#clientunsafedriver). Вот запись в модели `Transfer` от имени `user-7` и строка, которая осталась в журнале (получено запуском):
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, PolicyContext } from "@venloc/typemo";
+@Schema({ collection: "transfers", audit: true })
+class Transfer extends Entity {
+  @Prop(() => String, { required: true }) from!: string;
+  @Prop(() => Number, { required: true }) amount!: number;
+  @Prop(() => String, { sensitive: "mask" }) card?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Transfers = client.connection.model(Transfer);
+// ---cut---
+await PolicyContext.run({ actor: "user-7" }, () =>
+  Transfers.updateOne({ from: "A" }, { $set: { amount: 90, card: "5500000000000004" } }),
+);
+
+const trail = client.unsafeDriver().db("app").collection("transfers_audit");
+const entry = await trail.findOne({ operation: "updateOne" });
+console.log(entry);
+// → { model: "Transfer", collection: "transfers", operation: "updateOne", document: false,
+//     actor: "user-7", outcome: "ok", filter: { from: "A" },
+//     update: { $set: { amount: 90, card: "?" } },
+//     result: { matchedCount: 1, modifiedCount: 1, upsertedCount: 0, upsertedId: null }, … }
+```
+
+## AuditEntry
+
+`AuditEntry` описывает строку журнала. Поля `filter`, `update`, `replacement`, `documents` и `operations` хранят значения после приведения типов, под именами полей класса, с замаскированными секретами. Мягкое удаление записывается как удаление, с признаком `softDelete: true`.
+
+<TypeTable
+  type={{
+    at: { description: "Когда сделана запись.", type: "Date" },
+    model: { description: "Имя модели (класса).", type: "string" },
+    collection: { description: "Коллекция модели.", type: "string" },
+    operation: { description: "Операция: `insertOne`, `updateMany`, `deleteMany`, `bulkWrite` и т. д. Запись документа через `$save` — `insertOne` или `updateOne`.", type: "string" },
+    document: { description: "`true`, если запись сделана через документ (`$save`, `$deleteOne`, `create`, `bulkSave`).", type: "boolean" },
+    actor: { description: "`actor` из контекста политик, если он был.", type: "unknown", required: false },
+    tenant: { description: "`tenant` из контекста политик, если он был.", type: "unknown", required: false },
+    filter: { description: "Фильтр записи (с маскировкой).", type: "PlanDocument", required: false },
+    update: { description: "Обновление (с маскировкой).", type: "PlanDocument | readonly PlanDocument[]", required: false },
+    replacement: { description: "Документ замены (с маскировкой).", type: "PlanDocument", required: false },
+    documents: { description: "Вставленные документы (только записанные).", type: "readonly PlanDocument[]", required: false },
+    operations: { description: "Для `bulkWrite`: отправленные операции (с маскировкой).", type: "readonly PlanDocument[]", required: false },
+    result: { description: "Счётчики сервера: `insertedCount`, `matchedCount`, `modifiedCount`, `deletedCount`; для «найти и изменить» — `found` и `_id`.", type: "Readonly<Record<string, unknown>>" },
+    outcome: { description: "`\"ok\"` или `\"partial\"`: неупорядоченная пакетная вставка или `bulkWrite` упали, записав часть.", type: '"ok" | "partial"' },
+    softDelete: { description: "`true`, если это мягкое удаление.", type: "true", required: false },
+  }}
+/>
+
+Тип нужен, чтобы описать результат чтения журнала. Строка, прочитанная драйвером, дополнительно имеет `_id`.
+
+<FullType>
+
+```ts
+interface AuditEntry {
+  readonly at: Date;
+  readonly model: string;
+  readonly collection: string;
+  readonly operation: string;
+  readonly document: boolean;
+  readonly actor?: unknown;
+  readonly tenant?: unknown;
+  readonly filter?: PlanDocument;
+  readonly update?: PlanDocument | readonly PlanDocument[];
+  readonly replacement?: PlanDocument;
+  readonly documents?: readonly PlanDocument[];
+  readonly operations?: readonly PlanDocument[];
+  readonly result: Readonly<Record<string, unknown>>;
+  readonly outcome: "ok" | "partial";
+  readonly softDelete?: true;
+}
+```
+
+</FullType>
+
+### Что не попадает в журнал
+
+Чтения, агрегации со стадиями `$out` и `$merge` (о них сообщается отдельно) и записи, которые отменил хук до отправки (записывать было нечего). Неупорядоченная пакетная запись, упавшая внутри транзакции, не оставляет ни записи, ни строки: сервер откатывает всю транзакцию. Строка `partial` появляется, только если часть документов отвергнута до отправки на сервер (приведением типов или проверкой), а остальные записаны.
+
+## Когда не подходит
+
+Политики не заменяют права доступа: они делят данные и оставляют следы, но не решают, кому разрешена операция. Если вам нужно разрешать и запрещать по ролям, проверяйте права до вызова модели. Для аудита каждого чтения журнал не подходит: читать в него не пишется, для этого используйте журнал доступа сервера. Если реплика-сета нет, аудит включить нельзя: вместо него можно вести историю изменений собственным [хуком](../../hooks/operation-hooks.mdx) записи. Руководства: [Мультитенантность](../../policies/tenants.mdx), [Мягкое удаление](../../policies/soft-delete.mdx), [Аудит](../../policies/audit.mdx).

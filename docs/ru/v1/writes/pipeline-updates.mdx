@@ -1,0 +1,396 @@
+---
+title: Обновление через конвейер
+description: "Как обновить поле значением, вычисленным из других полей того же документа, и чем конвейер отличается от операторов"
+icon: Workflow
+---
+
+Операторы обновления записывают значения, которые известны заранее: `$set` кладёт «bob», `$inc` прибавляет 5. Но иногда новое значение нужно вычислить **из других полей того же документа**: собрать заметку из владельца и названия, удвоить баланс, поставить метку в зависимости от суммы. Для этого обновление записывают **конвейером**: вместо объекта операторов передают функцию, которая описывает, как получить новое значение из полей документа. База выполняет её на месте одной атомарной командой, поэтому документ не нужно читать и записывать обратно.
+
+Если значение известно заранее, конвейер не нужен: [операторы](./update-operators.mdx) проще и подходят `$inc`, `$push` и другим. Что именно Typemo проверяет в конвейере и чего проверить не может, разобрано в разделах про проверки и ограничения ниже.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель счёта. В коллекции один счёт: `Main`, владелец `alice`, баланс 10, прозвище `al`. Каждый пример выполняется на этих данных заново.
+
+```ts twoslash title="accounts/account.ts"
+import { type Defaulted, Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { min: 0, default: 0 })
+  balance!: Defaulted<number>;
+
+  @Prop(() => String)
+  note?: string;
+
+  @Prop(() => String)
+  nickname?: string;
+}
+```
+
+## Быстрый путь
+
+Вместо объекта операторов передайте функцию. Она получает **строитель конвейера** `p`, а `p.set(…)` описывает новые значения через прокси полей `f` и функции `fn`:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Date) lastLogin?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, (p) => p.set((f) => ({ balance: fn.add(f.balance, 5) })));
+// → balance: 15
+```
+
+Остальная страница разбирает вычисляемые значения, несколько стадий, условия и ограничения конвейера.
+
+## Записать значение, вычисленное из других полей
+
+Ситуация: в заметку нужно записать «владелец/название». Значение зависит от двух других полей, поэтому оператором `$set` его не записать. Запишите его стадией `set`: обращение `f.owner` означает «значение поля `owner` в документе на момент обновления».
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Date) lastLogin?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+export const fillNote = async (title: string) => {
+  await Accounts.updateOne({ title }, (p) => p.set((f) => ({ note: fn.concat(f.owner, "/", f.title) })));
+};
+```
+
+Результат — `note: "alice/Main"`. Что произошло. Функция `fn.concat` — строковая операция базы, а прокси `f` подставил в неё ссылки на поля. Typemo превратил всё это в стадию `{ $set: { note: { $concat: ["$owner", "/", "$title"] } } }` и отправил на сервер: значение считается там, поэтому оно всегда основано на **актуальных** данных документа, даже если между чтением и записью что-то изменилось.
+
+Функции `fn` — общий набор выражений, они описаны в разделе [агрегации](../aggregation/expressions.mdx). Здесь достаточно знать: `fn.add`, `fn.multiply`, `fn.concat` считают, `fn.cond` выбирает значение по условию, `fn.now()` даёт время сервера.
+
+## Условное значение
+
+Ситуация: поставить метку «rich» или «poor» в зависимости от баланса. Условие проверяет сервер на значении из документа:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Date) lastLogin?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne(
+  { title: "Main" },
+  (p) => p.set((f) => ({ note: fn.cond(fn.gt(f.balance, 5), "rich", "poor") })),
+);
+// → note: "rich"
+```
+
+С операторами так не получится: `$set` не умеет «если баланс больше 5, записать одно, иначе другое». Без конвейера пришлось бы прочитать документ, решить в коде и записать, а между чтением и записью документ мог измениться.
+
+## Несколько стадий
+
+Конвейер — цепочка стадий, и каждая видит результат предыдущей. Так можно разбить вычисление на шаги: вторая стадия ниже дописывает восклицательный знак к тому, что записала первая.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Date) lastLogin?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, (p) =>
+  p
+    .set((f) => ({ note: fn.concat(f.owner, "/", f.title) }))
+    .set((f) => ({ note: fn.concat(f.note, "!") })),
+);
+// → note: "alice/Main!"
+```
+
+Что произошло. Первая стадия записала `alice/Main`, вторая прочитала это значение и добавила знак. Порядок стадий важен, как порядок действий в формуле. Одно ограничение: если поле с границами (`min`, `max`) считается в нескольких стадиях, где позднее читает результат раннего, Typemo не сможет проверить границу и откажет; подробнее в разделе про проверки.
+
+## Удалить поле
+
+Стадия [`unset`](../reference/writes/pipeline-updates.mdx#unset) убирает поле или список полей, обычно вместе с другими стадиями:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Date) lastLogin?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, (p) => p.unset("nickname"));
+// → поле nickname удалено, owner остаётся "alice"
+```
+
+## Много документов и получение документа
+
+Конвейер принимают те же методы, что и операторы: [`updateOne`](../reference/writes/writes.mdx#updateone), [`updateMany`](../reference/writes/writes.mdx#updatemany) и [`findOneAndUpdate`](../reference/writes/writes.mdx#findoneandupdate). Правила фильтра остаются прежними: у `updateMany` он обязателен и не пуст.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Date) lastLogin?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const result = await Accounts.updateMany({ owner: "alice" }, (p) =>
+  p.set((f) => ({ balance: fn.multiply(f.balance, 2) })),
+);
+console.log(result.matchedCount);
+// → 1
+
+const before = await Accounts.findOneAndUpdate(
+  { title: "Main" },
+  (p) => p.set((f) => ({ balance: fn.add(f.balance, 1) })),
+  { returnDocument: "before" },
+).plain();
+console.log(before?.balance);
+// → 20
+```
+
+Второй вызов видит баланс, удвоенный первым (10 стало 20), и возвращает состояние **до** своего изменения.
+
+## Что проверяет конвейер
+
+Конвейер записывает то, что вычислит сервер, поэтому Typemo не может привести значение к типу так же прямо, как у оператора. Но он не оставляет конвейер без проверок. Значения разбираются по трём случаям.
+
+**Константа** в стадии `set` — обычное значение: Typemo приводит её к типу поля и проверяет границы ещё до отправки, как у `$set`. Неверный тип — `CastError`, нарушенная граница — `ValidationError`:
+
+```text
+CastError: Cast to number failed at path "$set.balance" for "abc" (string): expected a number [type]
+ValidationError: Validation failed: "balance": must be at least 0 [min]
+```
+
+**Удаление обязательного поля** (`unset` или замена документа без него) — `ValidationError` до отправки:
+
+```text
+ValidationError: Validation failed: "owner": update.0.$unset: the field is required; the pipeline would remove it [required]
+```
+
+**Вычисляемое значение** поля с ограничениями (`min`, `max`, `enum`, `minLength`, `maxLength`, `match`, `required`) проверяет сама база. Typemo добавляет к фильтру условие с тем же выражением и теми же ограничениями, поэтому неверный результат не записывается, и это происходит атомарно, одной командой. Если условие отказало, одно дополнительное чтение отличает «документ не найден» от «значение не подошло» и называет вычисленное значение. Граница `min: 0` у `balance` защищена так:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Date) lastLogin?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+try {
+  await Accounts.updateOne({ title: "Main" }, (p) => p.set((f) => ({ balance: fn.add(f.balance, -50) })));
+} catch (error) {
+  console.log(error instanceof ValidationError);
+  // → true
+}
+```
+
+```text
+ValidationError: Validation failed: "balance": the update pipeline computes -40; the value must be at least 0; nothing was written [min]
+```
+
+Баланс в базе остался прежним (10), а ошибка называет вычисленное значение (-40). Так же работают [`findOneAndUpdate`](../reference/writes/writes.mdx#findoneandupdate) и `updateMany`: у `updateMany` документы, которым условие отказало бы, находятся до записи, и тогда не записывается **ничего**.
+
+## Что конвейер не может проверить
+
+Условие базы считает выражение над хранимым документом. Поэтому оно точно, только пока выражение читает поля, которые ни одна предыдущая стадия не меняла. Всё остальное Typemo отвергает до отправки, а не записывает непроверенным:
+
+```text
+ValidationError: Validation failed: "balance": update.1.$set: the computed value of "balance" cannot be checked against its constraints: it reads "balance", which an earlier stage of the pipeline changes; compute both in one stage [min]
+ValidationError: Validation failed: "balance": the computed value of "balance" cannot be checked against its constraints with upsert (a failed guard would insert a new document) [min]
+```
+
+Первая ошибка — значение, которое читает поле, изменённое ранней стадией, или `$$ROOT` после изменения; решение — посчитать всё в одной стадии. Вторая — вычисляемое значение поля с границами вместе с `upsert` (так же, как `$inc` с границей в обновлении с `upsert`). Тем же правилом отвергаются вычисляемое значение после стадии, которая переписывает документ целиком, поле с границами за массивом или `Map`, целый документ, вычисленный выражением, и такой конвейер в `bulkWrite`.
+
+Не проверяется то, чего выражение сервера выразить не может: ваши функции `validate`, ограничения элементов **внутри** вычисленного массива, `Map` или вложенного документа и тип вычисленного значения у поля без ограничений. Для такого поля единственная защита — типы: компилятор знает поля модели и типы выражений, поэтому опечатку в имени поля или выражение неверного типа он остановит. Если результат нужно уложить в границы, а выражение читает поле после изменения, используйте `$inc`: он защищает `min` и `max` на стороне сервера.
+
+Есть и жёсткие правила. `arrayFilters` с конвейером не допускаются, потому что в конвейере нет позиционных путей:
+
+```text
+QueryError: arrayFilters: not allowed with an update pipeline
+```
+
+Массив стадий вместо функции тоже не принимается, потому что стадии нужно строить строителем, чтобы они проверялись типами:
+
+```text
+QueryError: update: an update pipeline is built with the pipeline builder: updateOne(filter, (p) => p.set({ … })), not passed as an array
+```
+
+Функция без стадий — тоже ошибка запроса:
+
+```text
+QueryError: an update pipeline needs at least one stage
+```
+
+`upsert` с конвейером проверяет обязательные поля вставляемого документа так же, как с операторами: недостающее поле — `ValidationError` до отправки.
+
+## Заменить документ целиком стадией
+
+Стадии `project`, `replaceWith` и `replaceRoot` переписывают документ целиком. На модели с неизменяемыми полями (`immutable`, а также служебное `createdAt` у `Timestamped`) такая стадия могла бы потерять или изменить поле, которое менять нельзя. Поэтому Typemo пропускает её только тогда, когда новый корень переносит **каждое** неизменяемое поле как есть. Допустимы формы `createdAt: "$createdAt"` (через прокси полей `owner: f.owner`), `$$ROOT` целиком, `$mergeObjects` с `$$ROOT` и объектом из других полей, а у `project` — включающая форма с этими полями или исключающая, которая их не трогает. Ключи объекта в `replaceWith` вы пишете именами полей модели: Typemo переводит их в имена в базе, если у поля задан `dbName`.
+
+Допустим, у модели есть неизменяемое поле `owner` и служебное `createdAt`. Замена, которая несёт их с собой, проходит, а остальные поля заменяются:
+
+```ts twoslash
+import { Entity, fn, type Immutable, Prop, Schema, Timestamped, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "stamped" })
+class Stamped extends Timestamped(Entity) {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true, immutable: true }) owner!: Immutable<string>;
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Stampeds = client.db().model(Stamped);
+// ---cut---
+await Stampeds.updateOne({ title: "first" }, (p) =>
+  p.replaceWith((f) => ({ title: fn.literal("second"), owner: f.owner, createdAt: f.createdAt })),
+);
+// → документ: title "second", прежние owner и createdAt, поля note больше нет
+```
+
+Если новый корень не переносит неизменяемое поле или переносит его из другого поля, обновление отвергается до отправки, а в тексте названы потерянные поля:
+
+```text
+StrictModeError: update.0.$replaceWith: $replaceWith rewrites the whole document and would change or drop the immutable fields createdAt, owner; carry each unchanged (createdAt: "$createdAt") or use $set/$unset of the other fields [immutable]
+```
+
+Модель с полями под другим именем в базе (`dbName`) не допускает `$$ROOT` и `$$CURRENT` в такой стадии: `ConfigurationError: Stamped: $$ROOT/$$CURRENT of a model with dbName fields would give stored names to the rows; list the fields instead`. Перечисляйте поля явно.
+
+## Как выбрать
+
+Задайте себе один вопрос: **зависит ли новое значение от других полей документа?** Если нет, берите операторы: `$set` для значения, `$inc` для числа. Они проще, а `$inc` защищает границы без особых условий. Если да, и вам нужно вычислить значение на месте, берите конвейер. Если значение зависит только от **того же** числового поля («прибавить», «умножить»), тоже берите оператор: `$inc` и `$mul` атомарны и защищены, и конвейер не даст ничего сверх.
+
+## Когда это не нужно
+
+Если вы вычисляете значение в коде приложения из данных, которые у вас уже есть, запишите его оператором `$set`: константа проходит все проверки ещё до отправки. Если нужно вычислить значение и вернуть его, не меняя документ, используйте [агрегацию](../aggregation/first-aggregation.mdx): конвейер обновления меняет документы.
+
+## Частые ошибки
+
+### Граница поля не проверена
+
+Симптом: `ValidationError: … cannot be checked against its constraints: it reads "balance", which an earlier stage of the pipeline changes`. Причина: вторая стадия читает поле с границами, которое изменила первая, и база не может проверить границу по хранимому документу. Правильно: посчитайте поле в одной стадии (`fn.multiply(fn.add(f.balance, 1), 2)`) или проведите промежуточный результат через поле без границ.
+
+### Массив стадий
+
+Неправильно: `Accounts.updateOne(filter, [{ $set: { owner: "q" } }])`. Typemo отвергает массив: `update: an update pipeline is built with the pipeline builder …`. Правильно: функция `(p) => p.set(…)`.
+
+### Замена корня теряет неизменяемое поле
+
+Неправильно: `p.replaceWith(…)` на модели с `Timestamped`, где новый документ не несёт `createdAt`. Typemo останавливает обновление и называет потерянные поля:
+
+```text
+StrictModeError: update.0.$replaceWith: $replaceWith rewrites the whole document and would change or drop the immutable fields createdAt, owner; carry each unchanged (createdAt: "$createdAt") or use $set/$unset of the other fields [immutable]
+```
+
+Правильно: перенесите каждое неизменяемое поле как есть (`createdAt: f.createdAt`) или перечислите изменения через `p.set(…)` и `p.unset(…)`.
+
+## Полный пример
+
+Файл собирает описанное: вычисляемая заметка, метка по балансу и удвоение всех балансов владельца.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Date) lastLogin?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+// Записать заметку «владелец/название»
+export const fillNote = async (title: string) => {
+  await Accounts.updateOne({ title }, (p) => p.set((f) => ({ note: fn.concat(f.owner, "/", f.title) })));
+};
+
+// Поставить метку по балансу
+export const labelAccount = async (title: string) => {
+  await Accounts.updateOne(
+    { title },
+    (p) => p.set((f) => ({ note: fn.cond(fn.gt(f.balance, 5), "rich", "poor") })),
+  );
+};
+
+// Удвоить балансы владельца
+export const doubleBalances = async (owner: string) => {
+  return Accounts.updateMany({ owner }, (p) => p.set((f) => ({ balance: fn.multiply(f.balance, 2) })));
+};
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Обновление через конвейер: справочник" href="../reference/writes/pipeline-updates.mdx">
+  Все стадии, допустимые в обновлении, с типами и ограничениями.
+</Card>
+<Card title="Операторы обновления" href="./update-operators.mdx">
+  Когда значение известно заранее: `$set`, `$inc`, `$push` и другие.
+</Card>
+<Card title="Обновить документы" href="./update.mdx">
+  Как применить обновление к одному или многим документам.
+</Card>
+</Cards>

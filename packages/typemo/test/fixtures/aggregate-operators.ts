@@ -1,0 +1,230 @@
+/*
+ * The operator matrix: every family of `fn.*` in a `$project` over the order
+ * fixtures (rows with a value, with `null` and with the field missing). The runtime test proves that the
+ * server accepts every operator; the shape test compares the rows with the computed types (including
+ * null propagation, since the three orders cover value / `null` / missing).
+ */
+import { fn, Pipeline, Vars } from "../../src/index.ts";
+import { Customer, Order } from "./aggregate-entities.ts";
+
+/* A fixed UUID string the conversion operators work on. */
+const UUID_TEXT = "10b1dd36-b2b2-46f5-ba90-9058d4a499bf";
+
+/** One static `$project` (or `$group`) pipeline per operator family. */
+export class AggregateOperators {
+  static readonly arithmetic = Pipeline.from(Order).project((f) => ({
+    abs: fn.abs(fn.subtract(0, f.total)),
+    ceil: fn.ceil(f.discount),
+    floor: fn.floor(f.total),
+    sqrt: fn.sqrt(f.total),
+    exp: fn.exp(1),
+    ln: fn.ln(f.total),
+    log10: fn.log10(f.total),
+    sin: fn.sin(0.5),
+    cos: fn.cos(0.5),
+    tan: fn.tan(0.5),
+    asin: fn.asin(0.5),
+    acos: fn.acos(0.5),
+    atan: fn.atan(0.5),
+    asinh: fn.asinh(0.5),
+    acosh: fn.acosh(2),
+    atanh: fn.atanh(0.5),
+    sinh: fn.sinh(0.5),
+    cosh: fn.cosh(0.5),
+    tanh: fn.tanh(0.5),
+    d2r: fn.degreesToRadians(f.total),
+    r2d: fn.radiansToDegrees(1),
+    sigmoid: fn.sigmoid(f.discount),
+    sigmoidOr: fn.ifNull(fn.sigmoid(f.discount), -1),
+    add: fn.add(f.total, 1, 2),
+    addDate: fn.add(f.placedAt, 1000),
+    sub: fn.subtract(f.total, 1),
+    subDates: fn.subtract(f.placedAt, f.placedAt),
+    subMs: fn.subtract(f.placedAt, 1000),
+    mul: fn.multiply(f.total, 2),
+    div: fn.divide(f.total, 4),
+    mod: fn.mod(f.total, 7),
+    pow: fn.pow(f.total, 2),
+    log: fn.log(f.total, 2),
+    atan2: fn.atan2(1, f.total),
+    round: fn.round(f.discount, 1),
+    trunc: fn.trunc(f.total),
+    bigAdd: fn.add(f.points, 1n),
+    decAdd: fn.add(f.exact, 1),
+  }));
+
+  static readonly conversion = Pipeline.from(Order).project((f) => ({
+    str: fn.toString_(f.total),
+    bool: fn.toBool(f.total),
+    int: fn.toInt(f.total),
+    long: fn.toLong(f.total),
+    double: fn.toDouble(f.total),
+    decimal: fn.toDecimal(f.total),
+    date: fn.toDate(f._id),
+    oid: fn.toObjectId("650000000000000000000001"),
+    uuid: fn.toUUID(UUID_TEXT),
+    arr: fn.toArray("[1, 2]"),
+    obj: fn.toObject('{"a": 1}'),
+    convert: fn.convert({ input: f.total, to: "string" }),
+    convertLong: fn.convert({ input: f.total, to: "long" }),
+    convertFail: fn.convert({ input: "x", to: "int", onError: -1 }),
+    convertNull: fn.convert({ input: f.notes, to: "bool", onNull: false }),
+    convertUuid: fn.convert({ input: UUID_TEXT, to: { type: "binData", subtype: 4 }, format: "uuid" }),
+    isNumber: fn.isNumber(f.total),
+    isArray: fn.isArray(f.items),
+    type: fn.typeOf(f.discount),
+    subtype: fn.subtype(fn.toUUID(UUID_TEXT)),
+    hash: fn.hash({ input: f.status, algorithm: "sha256" }),
+    hex: fn.hexHash({ input: f.status, algorithm: "md5" }),
+    newId: fn.createObjectId(),
+    hashed: fn.toHashedIndexKey(f.status),
+    binarySize: fn.binarySize(f.status),
+    bsonSize: fn.bsonSize(f),
+    ejson: fn.serializeEJSON({ input: f.total }),
+    fromEjson: fn.deserializeEJSON({ input: fn.literal({ $numberLong: "5" }) }),
+  }));
+
+  static readonly strings = Pipeline.from(Order).project((f) => ({
+    upper: fn.toUpper(f.status),
+    lower: fn.toLower(f.notes),
+    lenCP: fn.strLenCP(f.status),
+    lenBytes: fn.strLenBytes(f.status),
+    concat: fn.concat(f.status, "-", f.notes),
+    split: fn.split(f.status, "a"),
+    casecmp: fn.strcasecmp(f.status, "PAID"),
+    substrCP: fn.substrCP(f.status, 0, 2),
+    substrBytes: fn.substrBytes(f.notes, 0, 2),
+    substr: fn.substr(f.status, 1, 2),
+    indexBytes: fn.indexOfBytes(f.status, "a"),
+    indexCP: fn.indexOfCP(f.notes, "5"),
+    trim: fn.trim({ input: f.notes }),
+    ltrim: fn.ltrim({ input: f.status, chars: "p" }),
+    rtrim: fn.rtrim({ input: f.status, chars: "d" }),
+    replaceOne: fn.replaceOne({ input: f.status, find: "a", replacement: "A" }),
+    replaceAll: fn.replaceAll({ input: f.notes, find: "$", replacement: "€" }),
+    regexFind: fn.regexFind({ input: f.status, regex: /a(i)?/ }),
+    regexFindAll: fn.regexFindAll({ input: f.notes, regex: "o" }),
+    regexMatch: fn.regexMatch({ input: f.status, regex: /^p/, options: "i" }),
+  }));
+
+  static readonly logic = Pipeline.from(Order).project((f) => ({
+    and: fn.and(true, fn.gt(f.total, 1)),
+    or: fn.or(fn.eq(f.status, "open"), fn.lt(f.total, 20)),
+    not: fn.not(fn.eq(f.status, "paid")),
+    cmp: fn.cmp(f.total, 20),
+    eq: fn.eq(f.discount, null),
+    ne: fn.ne(f.status, "paid"),
+    gte: fn.gte(f.placedAt, new Date("2024-02-01T00:00:00Z")),
+    lte: fn.lte(f.total, 25),
+    in: fn.isIn(f.status, ["paid", "open"]),
+    cond: fn.cond(fn.gt(f.total, 20), "big", 0),
+    switch: fn.switch({
+      branches: [
+        // biome-ignore lint/suspicious/noThenProperty: `then` is the key of a MongoDB $switch branch
+        { case: fn.gt(f.total, 25), then: "large" },
+        // biome-ignore lint/suspicious/noThenProperty: `then` is the key of a MongoDB $switch branch
+        { case: fn.gt(f.total, 15), then: "medium" },
+      ],
+      default: "small",
+    }),
+    ifNull: fn.ifNull(f.notes, "none"),
+    literal: fn.literal("$not a path"),
+  }));
+
+  static readonly arrays = Pipeline.from(Order).project((f) => ({
+    size: fn.size(f.items),
+    reversed: fn.reverseArray(f.items),
+    concat: fn.concatArrays(f.items, f.items),
+    union: fn.setUnion(["a"], ["b", "a"]),
+    intersection: fn.setIntersection(["a", "b"], ["b"]),
+    difference: fn.setDifference(["a", "b"], ["b"]),
+    subset: fn.setIsSubset(["a"], ["a", "b"]),
+    equals: fn.setEquals(["a"], ["a"]),
+    indexOf: fn.indexOfArray(["x", "y"], "y"),
+    range: fn.range(0, 5, 2),
+    zip: fn.zip({ inputs: [fn.map({ input: f.items, in: (i) => i.sku }), [1, 2]] }),
+    slice: fn.slice(f.items, 1),
+    allTrue: fn.allElementsTrue([true, fn.gt(f.total, 1)]),
+    anyTrue: fn.anyElementTrue([false]),
+    elemAt: fn.arrayElemAt(f.items, 0),
+    toObject: fn.arrayToObject([["a", 1]]),
+    sorted: fn.sortArray({ input: f.items, sortBy: { price: -1 } }),
+    sortedScalars: fn.sortArray({ input: [3, 1, 2], sortBy: 1 }),
+    skus: fn.map({ input: f.items, in: (i) => i.sku }),
+    expensive: fn.filter({ input: f.items, cond: (i) => fn.gt(i.price, 6) }),
+    sum: fn.reduce({ input: f.items, initialValue: 0, in: (acc, i) => fn.add(acc, i.price) }),
+    products: fn.map({
+      input: f.items,
+      in: (i) => fn.map({ input: f.items, in: (j) => fn.multiply(i.price, j.price) }),
+    }),
+    first: fn.first(f.items),
+    last: fn.last(f.items),
+    firstN: fn.firstN({ input: f.items, n: 1 }),
+    maxN: fn.maxN({ input: [3, 1, 2], n: 2 }),
+    sumOf: fn.sum([1, 2, 3]),
+    avgOf: fn.avg([1, 2]),
+    minOf: fn.min([3, 1]),
+    maxOf: fn.max(1, 5, 3),
+    sdOf: fn.stdDevPop([1, 3]),
+    medianOf: fn.median({ input: [1, 2, 3] }),
+  }));
+
+  static readonly objects = Pipeline.from(Customer).project((f) => ({
+    merged: fn.mergeObjects(f.address, { extra: 1 }),
+    pairs: fn.objectToArray(f.address),
+    city: fn.getField({ field: "city", input: f.address }),
+    dollar: fn.getField({ field: "$odd", input: fn.literal({ $odd: 1 }) }),
+    set: fn.setField({ field: "zip", input: f.address, value: "none" }),
+    unset: fn.unsetField({ field: "zip", input: f.address }),
+    doubled: fn.let({ vars: { n: fn.strLenCP(f.name) }, in: (v) => fn.multiply(v.n, 2) }),
+  }));
+
+  static readonly dates = Pipeline.from(Order).project((f) => ({
+    year: fn.year(f.placedAt),
+    month: fn.month(f.placedAt),
+    day: fn.dayOfMonth(f.placedAt),
+    hour: fn.hour({ date: f.placedAt, timezone: "Europe/Oslo" }),
+    minute: fn.minute(f.placedAt),
+    second: fn.second(f.placedAt),
+    ms: fn.millisecond(f.placedAt),
+    dow: fn.dayOfWeek(f.placedAt),
+    doy: fn.dayOfYear(f.placedAt),
+    week: fn.week(f.placedAt),
+    isoWeek: fn.isoWeek(f.placedAt),
+    isoYear: fn.isoWeekYear(f.placedAt),
+    isoDow: fn.isoDayOfWeek(f.placedAt),
+    idYear: fn.year(f._id),
+    added: fn.dateAdd({ startDate: f.placedAt, unit: "day", amount: 1 }),
+    subtracted: fn.dateSubtract({ startDate: f.placedAt, unit: "hour", amount: 2 }),
+    diff: fn.dateDiff({ startDate: f.placedAt, endDate: fn.now(), unit: "day" }),
+    trunc: fn.dateTrunc({ date: f.placedAt, unit: "month" }),
+    fromParts: fn.dateFromParts({ year: 2024, month: 2, day: 29 }),
+    fromIso: fn.dateFromParts({ isoWeekYear: 2024, isoWeek: 10 }),
+    parts: fn.dateToParts({ date: f.placedAt }),
+    isoParts: fn.dateToParts({ date: f.placedAt, iso8601: true }),
+    parsed: fn.dateFromString({ dateString: "2024-05-01" }),
+    parsedOr: fn.dateFromString({ dateString: "nope", onError: null }),
+    formatted: fn.dateToString({ date: f.placedAt, format: "%Y-%m-%d" }),
+    tsSecond: fn.tsSecond(Vars.CLUSTER_TIME),
+    tsIncrement: fn.tsIncrement(Vars.CLUSTER_TIME),
+    now: fn.now(),
+  }));
+
+  static readonly misc = Pipeline.from(Order).project((f) => ({
+    and: fn.bitAnd(6, 3),
+    or: fn.bitOr(6, 3),
+    xor: fn.bitXor(6, 3),
+    not: fn.bitNot(5),
+    longAnd: fn.bitAnd(f.points, 3n),
+    rand: fn.rand(),
+    cosine: fn.similarityCosine([1, 0], [0, 1]),
+    dot: fn.similarityDotProduct({
+      vectors: [
+        [1, 2],
+        [3, 4],
+      ],
+      score: true,
+    }),
+    euclid: fn.similarityEuclidean([0, 0], [3, 4]),
+  }));
+}

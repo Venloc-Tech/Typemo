@@ -1,0 +1,302 @@
+---
+title: События операций
+description: "Как подписаться на операции Typemo, найти медленные и упавшие запросы и не отдать данные пользователей наружу"
+icon: Activity
+---
+
+Каждая операция Typemo сообщает о себе **событиями**: началась, закончилась, упала. Вы подписываетесь на них функцией и получаете журнал запросов, замеры времени и список ошибок без обёрток вокруг каждого вызова. Такая подписка стоит ничего, пока подписчиков нет: ядро не строит события, которых никто не ждёт.
+
+Событие — обычный объект с полем `type`. Подписчик — объект с функцией `handle`, которую вызывает ядро. Те же события используют готовые пакеты [OpenTelemetry](./opentelemetry.mdx) и [Sentry](./sentry.mdx), а если вам нужна другая система, читайте [Своя интеграция](./custom-integration.mdx).
+
+## Что предполагается
+
+Примеры используют клиент из [быстрого старта](../getting-started/quick-start.mdx) и модель банковского счёта. В коллекции `accounts` один счёт `{ title: "Main", balance: 100 }`.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true })
+  balance!: number;
+}
+```
+
+## Быстрый путь
+
+Подпишитесь на клиент и обработайте нужный тип события. По полю `type` TypeScript сам выбирает форму события:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const subscription = client.instrument({
+  handle: (event) => {
+    if (event.type === "operation.end") {
+      console.log(`${event.model}.${event.operation}: ${event.documentCount} шт.`);
+    }
+  },
+});
+
+await Accounts.find({ balance: { $gt: 50 } }).plain();
+// → "Account.find: 1 шт."
+
+subscription.unsubscribe();
+```
+
+Для всех клиентов процесса вместо `client.instrument` вызовите [`Typemo.instrument`](../reference/connection/typemo.mdx#typemoinstrument). Остальная страница разбирает типичные задачи.
+
+## Найти медленные операции
+
+Ситуация: приложение стало отвечать дольше, и вы не знаете, какой запрос виноват. Событие [`operation.end`](../reference/observability/events.mdx#operationendevent) несёт длительность в миллисекундах, а модель и имя операции лежат в общей части всех событий. У операции уровня базы (раздел ниже) модели нет, поэтому в подписях ниже вместо неё подставляется база.
+
+```ts twoslash title="monitoring/slow-operations.ts"
+import { TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank" });
+// ---cut---
+const SLOW_MS = 100;
+
+client.instrument({
+  handle: (event) => {
+    if (event.type === "operation.end" && event.durationMS > SLOW_MS) {
+      console.warn(`медленно: ${event.model ?? event.database}.${event.operation}, ${Math.round(event.durationMS)} мс`);
+    }
+  },
+});
+```
+
+`durationMS` считает время от начала операции до конца, вместе с приведением типов, вашими хуками и ожиданием базы. Чтобы понять, куда ушло время, подпишитесь ещё и на шаги: [`steps`](../reference/observability/events.mdx#instrumentationsubscriber) включены по умолчанию, и событие `operation.step` называет шаг (`cast`, `validate`, `hooksPre`, `populate`, `hooksPost`) и его длительность. Для запроса `find` модели с хуками `@Pre` и `@Post` запуск дал шаги в порядке `cast`, `validate`, `hooksPre`, `populate`, `hooksPost`.
+
+## Записать упавшие операции
+
+Ситуация: нужно знать, какие операции падают и почему, не оборачивая каждый вызов в `try`. Событие [`operation.error`](../reference/observability/events.mdx#operationerrorevent) приходит вместо `operation.end` и называет шаг, на котором операция упала, и вид сбоя.
+
+```ts twoslash title="monitoring/errors.ts"
+import { TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank" });
+// ---cut---
+client.instrument({
+  handle: (event) => {
+    if (event.type === "operation.error") {
+      const { kind, name, retryable } = event.classification;
+      console.error(`${event.operation}: ${name} (${kind}), шаг ${event.failedStep}, повтор: ${retryable}`);
+    }
+  },
+});
+```
+
+Запуск `find(...).orFail()` на пустом результате вывел `find: DocumentNotFoundError (not-found), шаг postProcess, повтор: false`. Классификация даёт `kind` (`cast`, `validation`, `duplicate-key`, `timeout`, `connection`…), а `retryable` подсказывает, имеет ли смысл повторять операцию. Событие приходит, даже если вызывающий код сам ловит ошибку: подписчик видит всё, что упало.
+
+Обратите внимание: это событие не заменяет обработку ошибок. Вызывающий код по-прежнему получает исключение, а подписчик его только наблюдает. Как обрабатывать ошибки, см. [Обработка ошибок](../errors/handling.mdx).
+
+## Увидеть транзакции и курсоры
+
+Ситуация: вас интересует не одна операция, а вся транзакция или выгрузка курсором. Транзакция даёт события `transaction.start`, затем `transaction.commit` или `transaction.abort`, а между ними при повторе `transaction.retry`. У операций внутри неё в `transactionId` тот же номер.
+
+```ts twoslash title="monitoring/transactions.ts"
+import { TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank" });
+// ---cut---
+client.instrument({
+  handle: (event) => {
+    if (event.type === "transaction.retry") console.warn(`повтор транзакции ${event.transactionId}, попытка ${event.attempt}`);
+    if (event.type === "transaction.abort") console.error(`откат транзакции ${event.transactionId}`);
+  },
+});
+```
+
+Транзакция, упавшая с ошибкой, дала пару `transaction.start` и `transaction.abort` с исходной ошибкой и длительностью. Курсор даёт `cursor.batch` на каждую пачку: для двух документов в коллекции пришла одна пачка `{ batch: 0, size: 2 }`, а `operation.end` после неё — с `mode: "cursor"` и `documentCount: 2`.
+
+## Операции уровня базы
+
+Ситуация: вы запускаете агрегацию не над коллекцией модели, а над всей базой ([`connection.aggregate`](../reference/connection/connection.mdx#connectionaggregate): `$documents`, `$currentOp`, `$listLocalSessions`). У такой операции нет модели, поэтому в событии `model` равно `null`, `collection` тоже `null` (у `Pipeline.sessions()` это `"system.sessions"`), `schema` — `null`, а база называется в `database`. Подписчик, который собирает подпись из `model`, должен предусмотреть `null`: компилятор этого потребует.
+
+```ts twoslash title="monitoring/database-level.ts"
+import { Pipeline, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank" });
+// ---cut---
+client.instrument({
+  handle: (event) => {
+    if (event.type === "operation.end") {
+      console.log(`${event.model ?? `database ${event.database}`}: ${event.operation}`);
+    }
+  },
+});
+
+await client.connection.aggregate(Pipeline.database().documents([{ n: 1 }]).plan());
+// → "database bank: aggregate"
+```
+
+События такой операции устроены как обычно: `operation.start`, шаги, команда драйвера `aggregate` (если вы просили команды), `operation.end`. Подробнее об операциях уровня базы — в руководстве [Запросы уровня базы](../aggregation/database-level.mdx).
+
+## Видеть команды драйвера и пул соединений
+
+Ситуация: операции Typemo мало, нужно знать, на какой сервер ушла команда и сколько соединений занято. Эти события дороже, поэтому они выключены и включаются в подписчике: `driverCommands` для команд и `poolEvents` для пула. Команды драйвера требуют, чтобы клиент был создан с `monitorCommands: true`.
+
+```ts twoslash title="monitoring/driver.ts"
+import { TypemoClient } from "@venloc/typemo";
+// ---cut---
+const client = await TypemoClient.connect("mongodb://localhost:27017", {
+  dbName: "bank",
+  monitorCommands: true,
+});
+
+client.instrument({
+  driverCommands: true,
+  poolEvents: true,
+  handle: (event) => {
+    if (event.type === "driver.command.succeeded") {
+      console.log(`${event.commandName} на ${event.address}: ${event.durationMS} мс`);
+    }
+    if (event.type === "driver.pool") console.log(event.name);
+  },
+});
+```
+
+Одна операция `find` дала события `driver.pool` `connectionCheckOutStarted`, `connectionCheckedOut`, `connectionCheckedIn`, а команда `find` связана с операцией по `operationId`. Команда, которую Typemo не отправлял (рукопожатие драйвера, ваш код с драйвером напрямую), приходит с `operationId: undefined`.
+
+## Не отдать данные пользователей
+
+Ситуация: события уходят в логи, трассировку, стороннюю систему, а фильтры содержат имена, e-mail, номера счетов. Поэтому по умолчанию (`sensitive: "mask"`) ядро оставляет в событии только форму запроса: ключи и операторы остаются, значения заменяются на `"?"`.
+
+```ts twoslash title="monitoring/masking.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String, { sensitive: "mask" }) iban?: string;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank" });
+const Accounts = client.db().model(Account);
+// ---cut---
+client.instrument({
+  handle: (event) => {
+    if (event.type === "operation.start") console.log(JSON.stringify(event.summary.filter));
+  },
+});
+
+await Accounts.find({ balance: { $gt: 50 }, iban: "DE00" }).plain();
+// → {"balance":{"$gt":"?"},"iban":"?"}
+```
+
+Если для отладки нужны реальные значения, выберите `sensitive: "show"`: тогда `balance` придёт как `{"$gt":50}`. Но `iban` останется `"?"`: поле помечено `sensitive` в схеме, и подписчик не может отменить пометку. Так значения секретных полей не попадут ни в один подписчик, в том числе чужой. Режимы `"hide"` (все непомеченные условия становятся `"[hidden]"`) и `{ mask }` (своя функция) описаны в справочнике [`SubscriberSensitive`](../reference/observability/events.mdx#subscribersensitive). Пометки полей — в руководстве [Скрытые и чувствительные поля](../schemas/hidden-and-sensitive.mdx).
+
+Маскируется и ошибка в событии: `CastError` для `balance: "abc"` пришёл вызвавшему коду с текстом `Cast to number failed at path "$set.balance" for "abc" (string): expected a number [type]`, а подписчику — с `for "?"`.
+
+## Как выбрать
+
+Задайте себе один вопрос: **кто должен видеть эти события?** Если всё приложение, включая библиотеки, которые создают свои клиенты, используйте [`Typemo.instrument`](../reference/connection/typemo.mdx#typemoinstrument): один вызов при старте процесса. Если события нужны одному клиенту (например, отдельной базе аналитики), используйте [`client.instrument`](../reference/connection/typemo-client.mdx#clientinstrument): чужой код тогда не попадёт в ваш журнал. Подробнее про выбор уровня — в руководстве [Несколько клиентов и расширения](../connection/clients-and-extensions.mdx).
+
+Если подписчик нужен только на время (тест, разовая диагностика), заведите его через `using`: `using subscription = client.instrument(...)`. Подписка снимется на выходе из блока. Запуск показал: внутри блока `handle` получал события, а операция после блока — нет.
+
+## Когда это не нужно
+
+Если вам нужны трассы, а не журнал, не пишите подписчика: подключите [`@venloc/typemo-opentelemetry`](../reference/observability/opentelemetry.mdx). Если нужны ошибки в трекере, подключите [`@venloc/typemo-sentry`](../reference/observability/sentry.mdx). Если нужно изменить операцию (добавить условие, отклонить запись), подписчик бессилен: он только наблюдает; для этого есть [хуки](../hooks/operation-hooks.mdx).
+
+## Частые ошибки
+
+### Регистрация падает: нужны события команд
+
+```ts twoslash
+import { TypemoClient } from "@venloc/typemo";
+// клиент без monitorCommands
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank" });
+// ---cut---
+client.instrument({ handle: () => {}, driverCommands: true });
+// во время работы: ConfigurationError
+```
+
+Компилятор код пропускает, а во время работы клиент без `monitorCommands: true` не может отдать события команд: `ConfigurationError: TypemoClient "default": driver command events need the client option monitorCommands: true`. Создайте клиент с `monitorCommands: true` (см. [опции клиента](../reference/connection/typemo-client.mdx#опции-клиента)).
+
+### `handle` бросил исключение
+
+Исключение из `handle` не ломает операцию: ядро ловит его и пишет в `console.error` строку `[typemo] an instrumentation subscriber threw on "operation.start":` и ошибку. Запуск показал: `find` вернул документы при подписчике, который бросает всегда. Но повторять исключение на каждое событие дорого, поэтому оберните тело `handle` в `try` и не бросайте из него.
+
+### Событие целиком уходит в `JSON.stringify`
+
+Каждое событие операции несёт `event.schema`: ссылку на описание схемы модели. Она не копируется и не предназначена для сериализации. Выбирайте нужные поля: `event.operation`, `event.model`, `event.durationMS`, `event.summary`.
+
+### Неверный `sensitive`
+
+`client.instrument({ handle, sensitive: "x" })` бросает `ConfigurationError: the sensitive option of an instrumentation subscriber is "mask", "show", "hide" or { mask: (value, { path }) => json }`. Допустимы только четыре формы.
+
+## Полный пример
+
+```ts twoslash title="monitoring/monitoring.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank", monitorCommands: true });
+const Accounts = client.db().model(Account);
+// ---cut---
+const SLOW_MS = 100;
+
+const monitoring = client.instrument({
+  driverCommands: true,
+  handle: (event) => {
+    switch (event.type) {
+      case "operation.end":
+        // медленные операции
+        if (event.durationMS > SLOW_MS) console.warn(`медленно: ${event.model ?? event.database}.${event.operation}`);
+        break;
+      case "operation.error":
+        // упавшие операции: шаг и вид сбоя
+        console.error(`${event.operation}: ${event.classification.name}, шаг ${event.failedStep}`);
+        break;
+      case "transaction.retry":
+        console.warn(`повтор транзакции ${event.transactionId}`);
+        break;
+      case "driver.command.failed":
+        console.error(`команда ${event.commandName} упала на ${event.address}`);
+        break;
+    }
+  },
+});
+
+await Accounts.find({ balance: { $gt: 50 } }).plain();
+
+// при остановке приложения
+monitoring.unsubscribe();
+```
+
+<Callout type="migration">
+
+В Mongoose для наблюдения за запросами пользуются `mongoose.set("debug", …)` и глобальными хуками, а значения запросов при этом попадают в журнал как есть. В Typemo значения по умолчанию заменены на `"?"`, события типизированы по полю `type`, а подписка снимается своим `unsubscribe()`.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="События (справочник)" href="../reference/observability/events.mdx">
+  Все поля всех событий, `sensitive`, `wrap` и ошибки регистрации.
+</Card>
+<Card title="OpenTelemetry" href="./opentelemetry.mdx">
+  Готовые спаны и метрики поверх этих событий.
+</Card>
+<Card title="Sentry" href="./sentry.mdx">
+  Ошибки с контекстом и breadcrumbs в Sentry.
+</Card>
+<Card title="Своя интеграция" href="./custom-integration.mdx">
+  Собственный адаптер: метрики, журнал, другая система мониторинга.
+</Card>
+</Cards>

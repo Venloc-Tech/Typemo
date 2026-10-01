@@ -1,0 +1,260 @@
+---
+title: Не потерять параллельные изменения
+description: "Как Typemo защищает документ, который меняют одновременно несколько клиентов: версия __v, VersionError и повтор операции"
+icon: GitMerge
+---
+
+Если два клиента одновременно прочитали один документ и оба его сохранили, побеждает тот, кто сохранил последним, а правка первого молча теряется. Чтобы этого не случалось, Typemo ведёт в документе **версию** — число в поле `__v` — и проверяет её при сохранении: если документ изменили после вашего чтения, [`$save`](../reference/documents/document-api.mdx#save) бросает [`VersionError`](../reference/errors/query-errors.mdx#versionerror) вместо того, чтобы затереть чужую правку.
+
+Версия включается базовым классом `Versioned` и работает в двух режимах. По умолчанию она защищает изменения **массивов по позиции**. Опция схемы `optimisticConcurrency` защищает **любое** изменение. Документ без `Versioned` версий не имеет, и защиты у него нет.
+
+## Что предполагается
+
+Примеры используют главный пример заказа (он наследует `Versioned`, так что защита массивов включена) и счёт `Ledger` с включённой `optimisticConcurrency`. Основы изменения документа — в руководстве [Изменить и сохранить документ](./change-and-save.mdx).
+
+```ts twoslash title="models/ledger.ts"
+import { Entity, Prop, Schema, Versioned } from "@venloc/typemo";
+
+@Schema({ collection: "ledgers", optimisticConcurrency: true })
+export class Ledger extends Versioned(Entity) {
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { required: true })
+  balance!: number;
+}
+```
+
+## Быстрый путь
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, VersionError, Versioned } from "@venloc/typemo";
+@Schema({ collection: "ledgers", optimisticConcurrency: true })
+class Ledger extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Ledgers = client.db().model(Ledger);
+// ---cut---
+const created = await Ledgers.create({ owner: "ann", balance: 10 });
+const first = await Ledgers.findById(created._id).orFail();
+const second = await Ledgers.findById(created._id).orFail();
+
+first.balance = 20;
+await first.$save();
+console.log(first.__v);
+// → 1
+
+second.balance = 30;
+await second.$save().catch((error) => console.log(error instanceof VersionError));
+// → true
+```
+
+Второй клиент не перезаписал баланс молча, а получил ошибку. Остальная страница объясняет, что в ней, как повторить операцию и когда версия работает без `optimisticConcurrency`.
+
+## Поймать конфликт
+
+Ошибка называет модель, версию, которую вы прочитали, и изменённые пути. В базе остаётся то, что записал первый клиент.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, VersionError, Versioned } from "@venloc/typemo";
+@Schema({ collection: "ledgers", optimisticConcurrency: true })
+class Ledger extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Ledgers = client.db().model(Ledger);
+const created = await Ledgers.create({ owner: "ann", balance: 10 });
+const first = await Ledgers.findById(created._id).orFail();
+const second = await Ledgers.findById(created._id).orFail();
+first.balance = 20;
+await first.$save();
+second.balance = 30;
+// ---cut---
+try {
+  await second.$save();
+} catch (error) {
+  if (error instanceof VersionError) {
+    console.log(error.version, error.modifiedPaths);
+    // → 0 ["balance"]
+  }
+}
+```
+
+```text
+VersionError: Ledger: no document at version 0 (it was changed or deleted since it was read); modified: balance
+```
+
+Сообщение говорит «изменён или удалён», потому что по версии одно от другого не отличить. Если документ действительно удалили, Typemo это выясняет одним дополнительным чтением и вместо `VersionError` бросает [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#documentnotfounderror):
+
+```text
+DocumentNotFoundError: Ledger.save: the document is no longer in the collection (deleted since it was read, or out of the scope of the operation's policies); nothing was written
+```
+
+## Повторить операцию
+
+Правильная реакция на `VersionError` — прочитать документ заново, применить изменение к свежему состоянию и сохранить снова. Повторять слепо старый документ нельзя: он всё ещё содержит устаревшую версию.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, VersionError, Versioned } from "@venloc/typemo";
+@Schema({ collection: "ledgers", optimisticConcurrency: true })
+class Ledger extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Ledgers = client.db().model(Ledger);
+// ---cut---
+export const deposit = async (ledgerId: Ledger["_id"], amount: number) => {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ledger = await Ledgers.findById(ledgerId).orFail();
+    ledger.balance += amount;
+    try {
+      await ledger.$save();
+      return ledger.balance;
+    } catch (error) {
+      if (!(error instanceof VersionError)) throw error;
+    }
+  }
+  throw new Error("the ledger is busy, try again later");
+};
+```
+
+Число попыток ограничено: если конфликты повторяются, лучше сообщить об этом, чем крутиться бесконечно. Для счётчиков, которые меняют многие клиенты, надёжнее атомарный `$inc` через [`updateOne`](../reference/writes/writes.mdx#updateone): он не конфликтует вовсе.
+
+## Защитить массивы без optimisticConcurrency
+
+У документа с `Versioned` без `optimisticConcurrency` защищены только изменения массивов **по позиции**. Причина в том, что операция вроде `tags.1 = "B"` ссылается на индекс, а если другой клиент успел убрать первый элемент, индекс `1` теперь указывает на другой элемент, и правка попала бы не туда. Typemo делает такое обновление условным по версии.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+import { VersionError } from "@venloc/typemo";
+// ---cut---
+const created = await Orders.create({ customer: "alice", tags: ["a", "b", "c"], lines: [] });
+const mine = await Orders.findById(created._id).orFail();
+const theirs = await Orders.findById(created._id).orFail();
+
+theirs.tags.pull("a");
+await theirs.$save(); // версия 0 → 1
+
+mine.tags.set(1, "B"); // я хотел заменить "b", но после чужого удаления это "c"
+try {
+  await mine.$save();
+} catch (error) {
+  console.log(error instanceof VersionError && error.modifiedPaths);
+  // → ["tags.1"]
+}
+```
+
+Изменения, которые не зависят от позиций, версию не требуют: скалярное поле, `push`, `pull`, `addToSet` дают обновления, которые применяются независимо. Поэтому два клиента, один из которых поменял `customer`, а другой добавил тег, не конфликтуют.
+
+## Что делает optimisticConcurrency
+
+С опцией `optimisticConcurrency: true` **каждое** сохранение условно по версии и увеличивает её: два клиента, изменившие разные скалярные поля, тоже конфликтуют. Это дороже по числу конфликтов, но полностью исключает потерянные обновления. Вместо `true` можно передать список путей: тогда так ведёт себя только сохранение, затрагивающее эти пути, а остальное защищается как у обычного `Versioned`. Описание опции — в справочнике [`@Schema`](../reference/schemas/schema.mdx).
+
+## Как выбрать
+
+Спросите себя: **что случится, если правка одного клиента пропадёт?** Если это только удобство (пометка, тег), хватит `Versioned` по умолчанию. Если это деньги, остаток, состояние, которое нельзя терять, включайте `optimisticConcurrency` или меняйте значение атомарным оператором.
+
+## Когда это не нужно
+
+Если документ меняет один клиент (настройки пользователя, черновик), версия ничего не даёт: не подключайте `Versioned`. Если изменение можно выразить атомарной операцией ([`$inc`](../reference/writes/update-operators.mdx), `$push`) на стороне базы, конфликты и повторы не нужны.
+
+## Частые ошибки
+
+### Документ прочитан без версии
+
+Если вы прочитали документ с проекцией, которая не включает `__v`, а сохранение требует версию, [`$save`](../reference/documents/document-api.mdx#save) отказывается работать: молча пропустить проверку значило бы отключить защиту.
+
+```text
+QueryError: Order: this save needs the version "__v", but the document was read without it (a projection left it out); select it, or read the document again — the check is never skipped silently
+```
+
+Исправление: добавьте `__v` в проекцию или прочитайте документ целиком.
+
+### Версия изменена вручную
+
+Поле `__v` ведёт ядро. Присвоить ему значение можно только в обход типов, и тогда сохранение откажется работать, а [`$getChanges`](../reference/documents/document-api.mdx#getchanges) покажет причину в `$problems`:
+
+```text
+QueryError: Ledger.__v is the version key: the core maintains it; it cannot be changed by hand
+```
+
+Исправление: не трогайте `__v`; чтобы защититься от конфликтов, включите `optimisticConcurrency`.
+
+### Повтор применяет чужую версию
+
+Повторять `$save` того же объекта после `VersionError` бесполезно: версия в нём устарела. Исправление: прочитайте документ заново, как в функции `deposit` выше.
+
+## Полный пример
+
+```ts twoslash title="ledgers/ledgers.service.ts"
+import { Entity, Prop, Schema, TypemoClient, VersionError, Versioned } from "@venloc/typemo";
+@Schema({ collection: "ledgers", optimisticConcurrency: true })
+class Ledger extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Ledgers = client.db().model(Ledger);
+// ---cut---
+export const withdraw = async (ledgerId: Ledger["_id"], amount: number) => {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ledger = await Ledgers.findById(ledgerId).orFail();
+    if (ledger.balance < amount) throw new Error("not enough money");
+    ledger.balance -= amount;
+    try {
+      await ledger.$save();
+      return ledger.balance;
+    } catch (error) {
+      if (!(error instanceof VersionError)) throw error;
+    }
+  }
+  throw new Error("the ledger is busy, try again later");
+};
+```
+
+## Если вы пришли из Mongoose
+
+<Callout type="migration">
+
+Поле `__v` и `VersionError` есть и в Mongoose, но там проверка версии молча пропускалась для документа, прочитанного без `__v`. В Typemo версия появляется только с `Versioned`, а сохранение без нужной версии — ошибка. Пустое сохранение при `optimisticConcurrency` ничего не отправляет и версию не увеличивает.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="VersionError" href="../reference/errors/query-errors.mdx#versionerror">
+  Поля ошибки и все обстоятельства, при которых она возникает.
+</Card>
+<Card title="Метки времени и версии" href="../schemas/timestamps-and-versions.mdx">
+  Как подключить `Versioned` и `Timestamped` в схеме.
+</Card>
+<Card title="Транзакции" href="../transactions/transactions.mdx">
+  Как объединить несколько записей и как повторять операцию при конфликте.
+</Card>
+</Cards>

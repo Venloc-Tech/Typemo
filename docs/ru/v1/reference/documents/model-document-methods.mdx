@@ -1,0 +1,314 @@
+---
+title: Методы модели для документов
+description: "Model.new, Model.hydrate, Model.castObject и Model.validate: создать документ в памяти, оживить сохранённые данные, привести и проверить объект"
+icon: FilePlus
+---
+
+На этой странице четыре метода модели, которые работают с документами и данными **вне запроса к базе**: [`Model.new`](#modelnew) создаёт новый документ в памяти, [`Model.hydrate`](#modelhydrate) превращает данные, прочитанные где-то ещё, в гидратированный документ, [`Model.castObject`](#modelcastobject) приводит обычный объект к типам схемы, а [`Model.validate`](#modelvalidate) приводит и проверяет его. Обращений к базе ни один из них не делает.
+
+Если вы только начинаете, сначала прочитайте руководства [Жизненный цикл документа](../../documents/lifecycle.mdx) и [Валидация документа](../../documents/validation.mdx). Методы самого документа (`$save`, `$set` и другие) — в справочнике [API документа](./document-api.mdx). Чтение и запись через модель ([`create`](../writes/writes.mdx#create), [`find`](../query/reading.mdx#modelfind)) описаны в своих разделах.
+
+Все примеры используют одну модель: у неё есть обязательное поле, число с границами и значением по умолчанию, поле с перечислением и асинхронный валидатор.
+
+```ts twoslash title="models/product.ts"
+import { type Defaulted, Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+export class Product extends Entity {
+  @Prop(() => String, {
+    required: true,
+    validate: async (value: string) => value !== "bad" || "the name is taken",
+  })
+  name!: string;
+
+  @Prop(() => Number, { min: 0, max: 10, default: 1 })
+  size!: Defaulted<number>;
+
+  @Prop(() => String, { enum: ["a", "b"] })
+  kind?: "a" | "b";
+}
+```
+
+---
+
+## Model.new
+
+`Model.new` создаёт новый гидратированный документ в памяти: значения по умолчанию подставлены, `_id` выдан, каждое поле приведено к своему типу. В базе документа пока нет: он появится после [`$save`](./document-api.mdx#save). Метод нужен, когда вы собираете документ по частям, хотите проверить его до записи или сохранить пачкой через [`Model.bulkSave`](../writes/writes.mdx#bulksave).
+
+Приведение типов идёт сразу: значение неверного типа или поле, которого нет в модели, бросают [`CastError`](../errors/data-errors.mdx#casterror) на вызове `new`, а не при сохранении. А вот обязательность и правила вроде `min` и `enum` проверяются при [`$validate`](./document-api.mdx#validate) и [`$save`](./document-api.mdx#save): документ без обязательного поля создать в памяти можно, сохранить нельзя.
+
+```ts twoslash
+import { type Defaulted, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, {
+    required: true,
+    validate: async (value: string) => value !== "bad" || "the name is taken",
+  })
+  name!: string;
+  @Prop(() => Number, { min: 0, max: 10, default: 1 }) size!: Defaulted<number>;
+  @Prop(() => String, { enum: ["a", "b"] }) kind?: "a" | "b";
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const product = Products.new({ name: "lamp" });
+console.log(product.$isNew(), product.size, product._id.constructor.name);
+// → true 1 "ObjectId"
+
+await product.$save();
+console.log(product.$isNew());
+// → false
+```
+
+<Returns type="HydratedDoc<T>">
+
+Новый несохранённый документ: [`$isNew`](./document-api.mdx#isnew) равен `true`, значения по умолчанию заполнены, `_id` создан. Поле версии `__v` у нового документа не задано.
+
+</Returns>
+
+<Params>
+<Param name="doc" type="CreateInput<T>" required>
+
+Начальные данные. Тип подсказывает поля модели, обязательные поля обязательны, поля со значением по умолчанию можно не передавать. Значения приводятся к типам полей; для идентификаторов и int64 принимаются и строковые записи.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+new(doc: CreateInput<T>): HydratedDoc<T>;
+```
+
+</FullType>
+
+### Ошибки
+
+Неверный тип значения и неизвестный ключ — `CastError` на вызове (в коде без типов; компилятор остановит вас раньше):
+
+```text
+CastError: Cast to string failed at path "name" for 5 (number): expected a string [type]
+CastError: Cast to Product failed at path "nope" for 1 (number): not a field of Product [unknown-key]
+```
+
+Отсутствие обязательного поля выяснится только при сохранении:
+
+```text
+ValidationError: Validation failed: "name": the field is required [required]
+```
+
+### Когда не подходит
+
+Если документ нужно сразу записать, используйте [`create`](../writes/writes.mdx#create): он создаёт документ, проверяет и вставляет его одной операцией и возвращает сохранённый документ. Если вы читаете данные из базы, гидратированные документы вернёт [`find`](../query/reading.mdx#modelfind), а `new` для этого не нужен.
+
+---
+
+## Model.hydrate
+
+`Model.hydrate` оживляет данные, прочитанные не через Typemo: превращает объект **в сохранённой форме** (с именами полей базы) в гидратированный документ с типизированными коллекциями и отслеживанием изменений. Метод нужен, когда документ пришёл из кеша, из очереди сообщений, из драйвера или из фикстуры теста, а вам нужны `$`-методы.
+
+Такой документ считается **загруженным**: [`$isNew`](./document-api.mdx#isnew) равен `false`, изменений нет, а любое последующее изменение попадёт в обновление при [`$save`](./document-api.mdx#save). Данные не приводятся к типам и не проверяются заранее: метод верит, что перед ним то, что лежит в базе. Хуки `document.init` выполняются сразу, поэтому они должны быть синхронными.
+
+```ts twoslash
+import { ObjectId } from "mongodb";
+import { type Defaulted, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { min: 0, max: 10, default: 1 }) size!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const product = Products.hydrate({ _id: new ObjectId(), name: "lamp", size: 3, tags: ["home"] });
+console.log(product.$isNew(), product.$isModified(), product.tags.constructor.name);
+// → false false "StrictArray"
+
+product.name = "desk lamp";
+console.log(product.$getChanges());
+// → { $set: { name: "desk lamp" } }
+```
+
+<Returns type="HydratedDoc<T>">
+
+Загруженный документ, у которого массивы, Map и поддокументы уже типизированные коллекции (`constructor.name` массива значений — `StrictArray`). Ключи, которых нет в схеме, в документ не попадают.
+
+</Returns>
+
+<Params>
+<Param name="raw" type="Readonly<Record<string, unknown>>" required>
+
+Сохранённый документ: обычный объект с именами полей базы (`dbName`, если он задан в `@Prop`), значениями BSON (`ObjectId`, `Date`, `bigint`) и вложенными данными.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+hydrate(raw: Readonly<Record<string, unknown>>): HydratedDoc<T>;
+```
+
+</FullType>
+
+### Ошибки
+
+Если `raw` не обычный объект, [`QueryError`](../errors/query-errors.mdx#queryerror):
+
+```text
+QueryError: hydrate: a stored document (plain object)
+```
+
+Документ, которого нет в базе, `hydrate` создаёт без возражений, но его сохранение не найдёт запись:
+
+```text
+DocumentNotFoundError: Product.save: the document is no longer in the collection (deleted since it was read, or out of the scope of the operation's policies); nothing was written
+```
+
+### Когда не подходит
+
+Если данные лежат в базе, читайте их запросом: [`find`](../query/reading.mdx#modelfind) сам вернёт гидратированные документы и учтёт проекции и политики. Если у вас есть объект, которого в базе ещё нет, используйте [`Model.new`](#modelnew): он приведёт и проверит значения, а `hydrate` им поверит на слово.
+
+---
+
+## Model.castObject
+
+`Model.castObject` приводит обычный объект к типам схемы и возвращает приведённые поля. Метод нужен, когда надо проверить и нормализовать данные без создания документа и без записи: ответ внешнего сервиса, строка импорта, значение из настроек.
+
+Метод приводит только то, что вы передали. Значения по умолчанию не подставляются, обязательность не проверяется, правила `min`, `enum` и асинхронные валидаторы не запускаются — для этого есть [`Model.validate`](#modelvalidate). Число не принимает строку `"3"`: приведение в Typemo строгое, оно превращает значение в нужный тип только там, где преобразование однозначно (например, строку в `ObjectId`).
+
+```ts twoslash
+import { type Defaulted, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { min: 0, max: 10, default: 1 }) size!: Defaulted<number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+console.log(Products.castObject({ name: "lamp", size: 3 }));
+// → { name: "lamp", size: 3 }
+
+console.log(Products.castObject({}));
+// → {}
+```
+
+<Returns type="Partial<DataFields<T>>">
+
+Приведённые поля. Отсутствующие в входе поля остаются отсутствующими.
+
+</Returns>
+
+<Params>
+<Param name="input" type="unknown" required>
+
+Объект, который нужно привести.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+castObject(input: unknown): Partial<DataFields<T>>;
+```
+
+</FullType>
+
+### Ошибки
+
+Первое поле, которое не приводится, и любой неизвестный ключ — [`CastError`](../errors/data-errors.mdx#casterror):
+
+```text
+CastError: Cast to number failed at path "size" for "3" (string): expected a number [type]
+CastError: Cast to document failed at path "nope" for 1 (number): not a field of Product [unknown-key]
+```
+
+Метод останавливается на первой ошибке. Чтобы собрать все проблемы сразу, используйте [`Model.validate`](#modelvalidate).
+
+---
+
+## Model.validate
+
+`Model.validate` приводит объект и проверяет его по всем правилам схемы: обязательность, границы, перечисления, свои и асинхронные валидаторы. Метод нужен, когда вы принимаете данные снаружи (тело запроса, файл импорта) и хотите либо получить корректное значение, либо полный список проблем. Документ при этом не создаётся, в базу ничего не пишется.
+
+В отличие от [`Model.castObject`](#modelcastobject), метод подставляет значения по умолчанию (в том числе `_id`) и возвращает готовое значение. Проблемы собираются все вместе в одну [`ValidationError`](../errors/data-errors.mdx#validationerror). Сам объект, который вы передали, не меняется.
+
+```ts twoslash
+import { type Defaulted, Entity, Prop, Schema, TypemoClient, ValidationError } from "@venloc/typemo";
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, {
+    required: true,
+    validate: async (value: string) => value !== "bad" || "the name is taken",
+  })
+  name!: string;
+  @Prop(() => Number, { min: 0, max: 10, default: 1 }) size!: Defaulted<number>;
+  @Prop(() => String, { enum: ["a", "b"] }) kind?: "a" | "b";
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const value = await Products.validate({ name: "lamp" });
+console.log(value.name, value.size, value._id.constructor.name);
+// → "lamp" 1 "ObjectId"
+
+try {
+  await Products.validate({ name: "bad", size: 99, kind: "z" });
+} catch (error) {
+  if (error instanceof ValidationError) {
+    console.log(error.issues.map((issue) => [issue.path.join("."), issue.reason]));
+    // → [["name", "validator"], ["size", "max"], ["kind", "enum"]]
+  }
+}
+```
+
+<Returns type="Promise<DataFields<T>>">
+
+Приведённое значение со значениями по умолчанию. Если найдена хотя бы одна проблема, вместо этого — ошибка.
+
+</Returns>
+
+<Params>
+<Param name="input" type="unknown" required>
+
+Объект для проверки.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+validate(input: unknown): Promise<DataFields<T>>;
+```
+
+</FullType>
+
+### Ошибки
+
+Все найденные проблемы в одной `ValidationError`. Асинхронные валидаторы дожидаются, а пункты идут в порядке полей схемы, как они объявлены в классе, независимо от того, какой валидатор закончил раньше:
+
+```text
+ValidationError: Validation failed: "name": the name is taken [validator]; "size": must be at most 10 [max]; "kind": must be one of "a", "b" [enum]
+ValidationError: Validation failed: "name": the field is required [required]
+```
+
+Значение, которое не приводится, попадает в тот же список с причиной `cast` (сама `CastError` лежит в `cause` пункта), а не бросает `CastError`, как `castObject`. У каждого поля не больше одного пункта: если значение не приводится, ограничения этого поля (`min`, `enum`) не проверяются, потому что проверять нечего:
+
+```text
+ValidationError: Validation failed: "size": Cast to number failed at path "size" for "4" (string): expected a number [type] [cast]
+```
+
+Не объект вообще:
+
+```text
+ValidationError: Validation failed: "": Cast to Product failed for 5 (number): expected an object [type] [cast]
+```
+
+### Когда не подходит
+
+Чтобы проверить уже созданный документ, используйте [`$validate`](./document-api.mdx#validate). Если нужно только привести значения, не проверяя правила, достаточно [`Model.castObject`](#modelcastobject).

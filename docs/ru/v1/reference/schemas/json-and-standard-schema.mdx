@@ -1,0 +1,273 @@
+---
+title: JsonSchemaGenerator и StandardSchema
+description: "Как схема модели превращается в валидатор коллекции MongoDB и в Standard Schema для форм и внешних библиотек"
+icon: FileCheck
+---
+
+Схема модели описывает данные один раз, а использовать её можно в двух других форматах. **JSON Schema** — формат, которым MongoDB проверяет документы на стороне сервера: `JsonSchemaGenerator` строит его из схемы. **Standard Schema** — общий интерфейс проверки значений, который понимают формы, tRPC и другие библиотеки: `StandardSchema` даёт его для моделей и принимает чужой (zod, valibot, arktype) для проверки строк результата. Сюда приходят, чтобы уточнить, что попадает в валидатор и как работает `~standard`.
+
+Руководство с задачами — [JSON Schema и Standard Schema](../../schemas/json-and-standard-schema.mdx). Эта страница — справочник.
+
+Примеры используют модель пользователя: обязательное имя и роль из двух значений. Результаты `// →` получены запуском.
+
+Методы `JsonSchemaGenerator` и `StandardSchema.of` принимают **источник схемы** `SchemaSource`: модель, полученную от подключения (`client.db().model(User)`), или её свойство `schema`. Оба результата одинаковы. Класс без модели, пустой объект и `null` не подходят: сообщение называет ожидаемое (`JsonSchemaGenerator.generate: a model (connection.model(Entity)) or its schema (model.schema) is expected, got object`).
+
+---
+
+## JsonSchemaGenerator
+
+`JsonSchemaGenerator` строит из схемы документ `$jsonSchema` — подмножество JSON Schema, которое понимает сервер MongoDB (`bsonType` вместо `type`). Сервер применяет его как валидатор коллекции и отвергает документы, нарушающие схему, **даже если их пишет другая программа**. Проверки Typemo при этом остаются: валидатор — второй рубеж, а не замена.
+
+Валидатор создаётся опцией [`validator`](./schema.mdx#validator) схемы, и в коллекции оказывается ровно то, что строит генератор. Вот что сервер получает для модели с ограничениями:
+
+```ts twoslash
+import { CollectionNaming, Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, StandardSchema, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+}
+@Schema({ collection: "users", validator: true }) // [!code highlight]
+class User extends Entity {
+  @Prop(() => String, { required: true, minLength: 2, maxLength: 10, match: /^[a-z]+$/ }) name!: string;
+  @Prop(() => Number, { min: 0, max: 150 }) age?: number;
+  @Prop(() => String, { enum: ["user", "admin"] as const, default: "user" }) role!: Defaulted<"user" | "admin">;
+  @Prop(() => String, { nullable: true }) nickname?: string | null;
+  @Prop(() => [String]) tags?: string[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => BigInt) big?: bigint;
+}
+```
+
+Получившийся документ:
+
+```json
+{
+  "bsonType": "object",
+  "properties": {
+    "_id": { "bsonType": "objectId" },
+    "name": { "bsonType": "string", "minLength": 2, "maxLength": 10, "pattern": "^[a-z]+$" },
+    "age": { "bsonType": ["int", "double", "long"], "minimum": 0, "maximum": 150 },
+    "role": { "bsonType": "string", "enum": ["user", "admin"] },
+    "nickname": { "bsonType": ["string", "null"] },
+    "tags": { "bsonType": "array", "items": { "bsonType": "string" } },
+    "address": {
+      "bsonType": "object",
+      "properties": { "city": { "bsonType": "string" } },
+      "required": ["city"],
+      "additionalProperties": false
+    },
+    "big": { "bsonType": "long" }
+  },
+  "required": ["_id", "name"],
+  "additionalProperties": false
+}
+```
+
+Правила построения видны в результате. `bsonType` берётся из типа поля, а `"null"` добавляется только у `nullable`-полей (в Mongoose null был допустим у каждого вложенного объекта). `required` собирается из явных `required: true` и `_id`. Строгость абсолютная: `additionalProperties: false` на каждом уровне, поэтому лишнее поле сервер отвергнет. `enum`, `minimum`/`maximum`, `minLength`/`maxLength` переносятся как есть, а `pattern` — только для регулярного выражения без флагов. У иерархии дискриминаторов документ — `oneOf` по корню и каждому наследнику, ключ выбирает вариант (`enum` со значением дискриминатора).
+
+Сервер **не** может выразить: собственные функции [`validate`](./prop.mdx#validate), границы дат, число измерений вектора, правила ключей Map. Их проверяет только Typemo.
+
+### JsonSchemaGenerator.generate
+
+`generate(source)` возвращает узел `$jsonSchema` (тип `BsonJsonSchema`) для схемы модели. Аргумент — модель или её `schema`.
+
+<Params>
+<Param name="source" type="SchemaSource" required>
+
+Модель (`connection.model(Entity)`) или её `schema`. Другое — `ConfigurationError`.
+
+</Param>
+</Params>
+
+<Returns type="BsonJsonSchema">
+
+Объект `$jsonSchema`: `bsonType`, `properties`, `required`, `additionalProperties`, `items`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `oneOf`, `description`.
+
+</Returns>
+
+Вызов с моделью и с её `schema` даёт один результат. Класс, а не модель, компилятор отклоняет: `JsonSchemaGenerator.generate(User)` — ошибка типа.
+
+```ts twoslash
+import { Entity, JsonSchemaGenerator, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true, minLength: 2 }) name!: string;
+}
+const Users = client.db().model(User);
+const fromModel = JsonSchemaGenerator.generate(Users); // [!code highlight]
+const fromSchema = JsonSchemaGenerator.generate(Users.schema); // [!code highlight]
+console.log(JSON.stringify(fromModel) === JSON.stringify(fromSchema), fromModel.required);
+// → true ["_id", "name"]
+```
+
+### JsonSchemaGenerator.validator
+
+`validator(source)` возвращает то, что нужно передать серверу: `{ validator: { $jsonSchema }, validationLevel, validationAction }` (тип `CollectionValidator`). Уровень и действие берутся из опций `validationLevel` и `validationAction` схемы; по умолчанию `strict` и `error`.
+
+<FullType>
+
+```ts
+class JsonSchemaGenerator {
+  static generate(source: SchemaSource): BsonJsonSchema;
+  static validator(source: SchemaSource): CollectionValidator;
+}
+
+type SchemaSource = SchemaInfo | { readonly schema: SchemaInfo };
+```
+
+</FullType>
+
+---
+
+## StandardSchema
+
+`StandardSchema` — адаптер между схемой Typemo и интерфейсом Standard Schema v1. Он работает в двух направлениях.
+
+**Наружу:** каждая модель сама является Standard Schema, её свойство `~standard` типизировано моделью: вход — `CreateInput`, выход — `DataFields`. Форма или tRPC-процедура, которая умеет читать Standard Schema, проверяет данные приведением типов и валидаторами модели, ничего не зная о Typemo. Проверка приводит типы строгими каскадами, подставляет значения по умолчанию, запускает `required` и все `validate` (асинхронные тоже: тогда результат — `Promise`) и возвращает либо приведённое значение, либо **все** проблемы.
+
+```ts twoslash
+import { CollectionNaming, Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, StandardSchema, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true, trim: true, lowercase: true, minLength: 3 })
+  name!: string;
+  @Prop(() => String, { enum: ["user", "admin"] as const, default: "user" })
+  role!: Defaulted<"user" | "admin">;
+}
+const Users = client.db().model(User);
+const standard = Users["~standard"];
+console.log(standard.version, standard.vendor);
+// → 1 typemo
+const good = await standard.validate({ name: " Zed " });
+console.log(good);
+// → { value: { _id: "…", name: "zed", role: "user" } }
+const bad = await standard.validate({ name: "a" });
+console.log(bad);
+// → { issues: [{ message: "must be at least 3 characters long", path: ["name"] }] }
+```
+
+Значение `_id` в результате выдумывает ядро при проверке, поэтому в комментарии оно сокращено. Служебные поля, которые ядро заполняет при сохранении (метки времени, версия), проверка не требует. Путь проблемы — список ключей; индексы массива — числа.
+
+**Внутрь:** запросы `.parse(schema)` у lean-запросов, агрегаций и курсоров проверяют каждую строку любым Standard Schema (zod, valibot, arktype), без зависимости ядра от них. Проблемы превращаются в один [`ValidationError`](../errors/data-errors.mdx#validationerror) с причиной `schema`. Чужие схемы внутри `@Prop` не принимаются.
+
+<Returns type="StandardSchemaV1<Input, Output>">
+
+Объект со свойством `~standard`: `version: 1`, `vendor: "typemo"`, `validate(value)` и типовое поле `types`.
+
+</Returns>
+
+### StandardSchema.of
+
+`of(source)` создаёт валидатор Standard Schema для входа документов схемы: то же, что у модели в `~standard`. Принимает модель или её `schema`: `StandardSchema.of(Users)` и `StandardSchema.of(Users.schema)` дают одинаковый валидатор. Другой аргумент — `ConfigurationError` (`StandardSchema.of: a model (connection.model(Entity)) or its schema (model.schema) is expected, got null`).
+
+### StandardSchema.isSchema
+
+`isSchema(value)` — предикат: `true`, если значение — объект или функция со свойством `~standard`, у которого `version` равен `1`, а `validate` — функция. Он же проверяет аргумент `.parse`.
+
+```ts twoslash
+import { CollectionNaming, Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, StandardSchema, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true, trim: true, lowercase: true, minLength: 3 })
+  name!: string;
+  @Prop(() => String, { enum: ["user", "admin"] as const, default: "user" })
+  role!: Defaulted<"user" | "admin">;
+}
+const Users = client.db().model(User);
+console.log(StandardSchema.isSchema(Users), StandardSchema.isSchema({}));
+// → true false
+```
+
+### StandardSchema.require
+
+`require(schema, where)` возвращает аргумент как Standard Schema или бросает [`QueryError`](../errors/query-errors.mdx#queryerror) с текстом `<where>: a Standard Schema v1 validator (an object with "~standard": { version: 1, validate })`.
+
+<Params>
+<Param name="schema" type="unknown" required>
+
+Проверяемый аргумент.
+
+</Param>
+<Param name="where" type="string" required>
+
+Название вызова для текста ошибки.
+
+</Param>
+</Params>
+
+### StandardSchema.validateRows
+
+`validateRows(schema, rows, indexed, offset?)` проверяет строки чужой схемой и возвращает выходные значения или бросает один `ValidationError` со всеми проблемами всех строк. Если `indexed` равен `true`, путь проблемы начинается с индекса строки, а текст — со слов `row N:`. Синхронные схемы остаются синхронными, асинхронные ждут все вместе; исключение, отклонение или ответ не-объектом — `QueryError` (`parse: the Standard Schema (vendor) threw instead of reporting issues`).
+
+<Params>
+<Param name="schema" type="AnyStandardSchema" required>
+
+Валидатор, которым проверяются строки.
+
+</Param>
+<Param name="rows" type="readonly unknown[]" required>
+
+Строки.
+
+</Param>
+<Param name="indexed" type="boolean" required>
+
+Начинать ли пути проблем с индекса строки.
+
+</Param>
+<Param name="offset" type="number" default="0">
+
+Индекс первой строки, прибавляемый к индексам в путях.
+
+</Param>
+</Params>
+
+### StandardSchema.issue
+
+`issue(issue)` переводит проблему Typemo (`SchemaIssue`) в формат Standard Schema: `{ message, path }`.
+
+### StandardSchema.vendor
+
+`StandardSchema.vendor` — строка `"typemo"`, имя поставщика в `~standard.vendor`.
+
+<FullType>
+
+```ts
+class StandardSchema {
+  static readonly vendor: "typemo";
+  static of<Input = unknown, Output = Record<string, unknown>>(source: SchemaSource): StandardSchemaV1<Input, Output>;
+  static issue(issue: SchemaIssue): StandardSchemaIssue;
+  static isSchema(value: unknown): value is AnyStandardSchema;
+  static require(schema: unknown, where: string): AnyStandardSchema;
+  static validateRows(schema: AnyStandardSchema, rows: readonly unknown[], indexed: boolean, offset?: number): unknown[] | Promise<unknown[]>;
+}
+```
+
+</FullType>
+
+## Типы
+
+Экспортируются `SchemaSource` (модель или её `schema`, аргумент генератора и `StandardSchema.of`), `StandardSchemaV1`, `AnyStandardSchema`, `StandardSchemaProps`, `StandardSchemaResult`, `StandardSchemaIssue`, `StandardSchemaInput` и `StandardSchemaOutput` (по ним выводятся вход и выход валидатора), а также `BsonJsonSchema` и `CollectionValidator`.
+
+## Когда не подходит
+
+Если вам нужен валидатор на сервере, не вызывайте генератор вручную: включите [`validator`](./schema.mdx#validator) в `@Schema`. Генератор нужен, чтобы посмотреть или проверить в тесте, что уйдёт серверу. Если нужна проверка данных до записи в самом приложении, вызывайте `~standard.validate` или методы модели. Простой JSON Schema (draft 2020-12) Typemo не экспортирует: генератор выдаёт только диалект MongoDB.
+
+## Что дальше
+
+<Cards>
+<Card title="JSON Schema и Standard Schema" href="../../schemas/json-and-standard-schema.mdx">
+  Как подключить валидатор коллекции и `~standard` к реальным задачам.
+</Card>
+<Card title="@Schema" href="./schema.mdx">
+  Опции `validator`, `validationLevel` и `validationAction`.
+</Card>
+</Cards>

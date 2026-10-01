@@ -1,0 +1,267 @@
+---
+title: "SoftDelete и untrusted"
+description: "SoftDelete.restore и SoftDelete.purge для мягко удалённых документов, untrusted и Untrusted.check для данных из запроса клиента"
+icon: ShieldAlert
+---
+
+На странице четыре элемента. Первые два, [`SoftDelete.restore`](#softdeleterestore) и [`SoftDelete.purge`](#softdeletepurge), делают то, чего не может обычное удаление модели с [мягким удалением](./schema-options.mdx#опция-softdelete): возвращают помеченные документы или стирают их навсегда. Вторые два, [`untrusted`](#untrusted) и [`Untrusted.check`](#untrustedcheck), помечают данные из запроса клиента и отказывают, если внутри них прячется оператор запроса. Если вы только начинаете, прочитайте руководства [Мягкое удаление](../../policies/soft-delete.mdx) и [Недоверенный ввод](../../policies/untrusted-input.mdx). Эта страница — справочник.
+
+Примеры первой половины используют блог: у поста есть заголовок и метка удаления.
+
+```ts twoslash title="posts/post.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "posts", softDelete: true })
+export class Post extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Date, { nullable: true })
+  deletedAt?: Date | null;
+}
+```
+
+## SoftDelete.restore
+
+`restore` возвращает документы, помеченные удалёнными: их метка снова становится `null`. Обычными операциями модели это сделать нельзя, потому что они удалённых документов не видят. Функция нужна для кнопки «Отменить удаление», для корзины и для исправления ошибочной очистки. Это обычная запись модели: она ленивая (ничего не отправляется до `await`), у неё работают [`.session()`](../query/options.mdx#session) и [`.policy()`](../query/options.mdx#policy), хуки, аудит и политика тенанта. Внутри она вызывает `updateMany` с `onlyDeleted`, поэтому живые документы никогда не затрагиваются.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, SoftDelete } from "@venloc/typemo";
+@Schema({ collection: "posts", softDelete: true })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Date, { nullable: true }) deletedAt?: Date | null;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Posts = client.connection.model(Post);
+// ---cut---
+await Posts.deleteOne({ title: "Two" });
+console.log(await Posts.countDocuments());
+// → 2
+
+const result = await SoftDelete.restore(Posts, { title: "Two" });
+console.log(result.matchedCount, result.modifiedCount);
+// → 1 1
+console.log(await Posts.countDocuments());
+// → 3
+```
+
+<Returns type="WriteBuilder<UpdateResult>">
+
+Строитель записи. После `await` вы получаете результат обновления: `matchedCount` — сколько удалённых документов подошло под фильтр, `modifiedCount` — сколько восстановлено. Если подходящих удалённых документов нет, оба счётчика равны нулю; ошибки при этом нет.
+
+</Returns>
+
+<Params>
+<Param name="model" type="Model<T>" required>
+
+Модель с включённым `softDelete`. Для модели без мягкого удаления бросается `ConfigurationError`: `SoftDelete.restore: Plain has no soft delete; declare @Schema({ softDelete })`. Ошибка бросается сразу, при вызове, а не при `await`.
+
+</Param>
+<Param name="filter" type="Filter<T>" required>
+
+Какие удалённые документы вернуть. Фильтр может назвать любой путь модели. Он обязателен и подчиняется тем же правилам, что фильтр `updateMany`: пустой фильтр отвергается [`StrictModeError`](./violations.mdx#empty-filter), а «все удалённые» пишется как `Filters.all()` (см. [Пустые фильтры](../../writes/empty-filters.mdx)).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static restore<T extends object>(model: Model<T>, filter: Filter<T, true>): WriteBuilder<UpdateResult<IdOf<T>>>
+```
+
+</FullType>
+
+## SoftDelete.purge
+
+`purge` стирает мягко удалённые документы навсегда. Он нужен для очистки корзины по сроку давности и для исполнения просьбы «удалить мои данные»: обычное удаление модели с политикой только помечает документ. Живые документы `purge` не трогает никогда: он работает в режиме «только удалённые». Поэтому нельзя случайно стереть живую запись, перепутав фильтр: сначала документ нужно удалить обычным образом.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, SoftDelete } from "@venloc/typemo";
+@Schema({ collection: "posts", softDelete: true })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Date, { nullable: true }) deletedAt?: Date | null;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Posts = client.connection.model(Post);
+// ---cut---
+await Posts.deleteOne({ title: "Three" });
+const purged = await SoftDelete.purge(Posts, { title: "Three" });
+console.log(purged.deletedCount);
+// → 1
+
+const live = await SoftDelete.purge(Posts, { title: "One" });
+console.log(live.deletedCount);
+// → 0
+```
+
+<Returns type="WriteBuilder<DeleteResult>">
+
+Строитель записи. После `await` вы получаете результат удаления, `deletedCount` — сколько документов стёрто. Живой документ под фильтр не подходит: счётчик равен нулю, ошибки нет.
+
+</Returns>
+
+<Params>
+<Param name="model" type="Model<T>" required>
+
+Модель с включённым `softDelete`. Иначе — `ConfigurationError: SoftDelete.purge: Plain has no soft delete; declare @Schema({ softDelete })`.
+
+</Param>
+<Param name="filter" type="Filter<T>" required>
+
+Какие удалённые документы стереть. Правила те же, что у `restore`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static purge<T extends object>(model: Model<T>, filter: Filter<T, true>): WriteBuilder<DeleteResult>
+```
+
+</FullType>
+
+Под капотом `purge` — это [`deleteMany`](../writes/writes.mdx#deletemany) с `onlyDeleted: true` и `hardDelete: true`. Те же два флага можно передать через [`.policy()`](../query/options.mdx#policy), но так сделано намеренно лишь для `purge`: на одиночном `deleteOne` с одним `hardDelete: true` живой документ будет стёрт навсегда, потому что `hardDelete` отключает только превращение удаления в пометку, а видимость определяет `onlyDeleted`.
+
+## untrusted
+
+`untrusted(value, place?)` помечает **данные из запроса клиента** — тело запроса, строку запроса, разобранный JSON — перед тем как вы положите их в фильтр, обновление или проекцию. Второй аргумент говорит, куда данные попадут: от этого зависит только текст ошибки. Внутри помеченного значения на любой глубине ключ, начинающийся с `$`, запрещён: иначе клиент подменил бы значение оператором. Пример: приложение ищет `find({ name: req.body.name })`, а клиент присылает `{"name": {"$ne": "zzz"}}`. Условие «имя равно» становится «имя не равно zzz», и находятся все документы. Ключ с `+` тоже запрещён: в проекции `+путь` добавляет [скрытое поле](../schemas/field-markers.mdx#hidden), и клиент мог бы получить хеш пароля.
+
+```ts twoslash title="users/users.service.ts"
+import { Entity, Prop, Schema, TypemoClient, untrusted } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Users = client.connection.model(User);
+// ---cut---
+export const findByName = async (body: unknown) => {
+  return Users.find(untrusted({ name: (body as { name: unknown }).name }) as { name: string }).plain();
+};
+```
+
+Функция возвращает то же значение, что получила, без изменений. Проверяет она только форму: ключи. Типы, диапазоны и допустимые поля она не проверяет, поэтому `untrusted` — **дополнительная** защита, а не замена проверки ввода. Проверьте данные схемой валидации и постройте фильтр сами из проверенных значений; `untrusted` поймает то, что проверка пропустила.
+
+Запрет срабатывает на любой глубине, включая массивы и `Map`. Вот ошибка на глубине массива (текст получен запуском):
+
+```ts twoslash
+import { untrusted, StrictModeError } from "@venloc/typemo";
+// ---cut---
+try {
+  untrusted({ a: [{ b: { $gt: 1 } }] });
+} catch (error) {
+  if (error instanceof StrictModeError) {
+    console.log(error.message);
+    // → untrusted value: "$gt" at "a.0.b.$gt" — an operator inside data from outside (query selector injection); validate the input and build the filter yourself [sanitize]
+    console.log(error.reason, error.path);
+    // → "sanitize" "a.0.b.$gt"
+  }
+}
+```
+
+### UntrustedPlace
+
+Тип `UntrustedPlace` — `"filter" | "update" | "projection"`: куда попадут данные. Проверка для всех трёх мест одна и та же, меняются только слова ошибки: по месту она объясняет, чем грозит оператор именно там. Без аргумента предполагается фильтр. Тексты получены запуском:
+
+```text
+"filter": untrusted value: "$ne" at "title.$ne" — an operator inside data from outside (query selector injection); validate the input and build the filter yourself [sanitize]
+"update": untrusted value: "$set" at "$set" — an operator inside data from outside would change what the update does (update operator injection); validate the input and build the update yourself [sanitize]
+"projection": untrusted value: "$slice" at "a.$slice" — an operator inside data from outside would turn the projection into a computed expression; validate the input and build the projection yourself [sanitize]
+```
+
+Ключ с `+` тоже называется по месту. В проекции он добавил бы скрытое поле, а в фильтре и обновлении это не имя поля вовсе:
+
+```text
+"projection": untrusted value: "+passwordHash" at "+passwordHash" — a "+path" key inside data from outside would select a Hidden field; validate the input and build the projection yourself [sanitize]
+"filter":     untrusted value: "+passwordHash" at "+passwordHash" — a "+path" key inside data from outside is not a field name (in a projection it selects a Hidden field); validate the input and build the filter yourself [sanitize]
+```
+
+Если место передали не из этих трёх (это возможно только без типов), бросается `QueryError`: `untrusted(value, place): place must be "filter", "update" or "projection", got string "nope"`.
+
+Для ключа с `+` в обычном случае (проекция) сообщение такое: `untrusted value: "+passwordHash" at "+passwordHash" — a "+path" key inside data from outside would select a Hidden field; validate the input and build the projection yourself [sanitize]`.
+
+<Returns type="V">
+
+То же значение, тот же тип. Ничего не копируется и не преобразуется.
+
+</Returns>
+
+<Params>
+<Param name="value" type="V" required>
+
+Данные из запроса клиента. Не проходят проверку значения, которые устроены как данные по определению: даты, регулярные выражения, двоичные представления, значения BSON.
+
+</Param>
+<Param name="place" type="UntrustedPlace" default='"filter"'>
+
+Куда попадут данные: `"filter"`, `"update"` или `"projection"`. Меняет только текст ошибки.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+type UntrustedPlace = "filter" | "update" | "projection";
+
+const untrusted: <const V>(value: V, place?: UntrustedPlace) => V
+```
+
+</FullType>
+
+### Что untrusted не делает
+
+Он не проверяет значение, которое вы не пометили: помеченным должно быть каждое значение, пришедшее из внешнего мира. Он не превращает объект в скаляр и не проверяет, что поле вообще можно запрашивать. Важно и то, что фильтр Typemo допускает операторы полей (`$gt`, `$ne`) как обычное условие, поэтому без `untrusted` фильтр `{"name":{"$ne":"zzz"}}` из JSON считается корректным и выполняется как «имя не равно zzz». Отвергнуть его без `untrusted` может только приведение типа, когда значение не подходит полю: например, `null` для обязательной строки даёт `CastError: Cast to string failed at path "title.$ne" for null: null is not a value of this path (it is not nullable); an absent field is { $exists: false } [null]`.
+
+## Untrusted.check
+
+`Untrusted.check` — та же проверка, которую выполняет [`untrusted`](#untrusted), но как явный вызов, без возврата значения. Она нужна, когда значение надо проверить, но не пропускать через функцию: например, проверить целый объект настроек перед сохранением.
+
+```ts twoslash
+import { Untrusted } from "@venloc/typemo";
+// ---cut---
+Untrusted.check({ d: new Date() });
+// → нормально: дата — данные, внутрь не смотрим
+
+try {
+  Untrusted.check(new Map([["$x", 1]]));
+} catch (error) {
+  console.log((error as Error).message);
+  // → untrusted value: "$x" at "$x" — an operator inside data from outside (query selector injection); validate the input and build the filter yourself [sanitize]
+}
+```
+
+<Returns type="void">
+
+Ничего не возвращает. Если внутри найден ключ с `$` или `+`, бросает [`StrictModeError`](./violations.mdx#sanitize) с причиной `sanitize`; `path` ошибки показывает, где он найден. Если `place` не одно из трёх допустимых значений, бросает [`QueryError`](../errors/query-errors.mdx#queryerror). Циклические ссылки не вызывают бесконечного обхода.
+
+</Returns>
+
+<Params>
+<Param name="value" type="unknown" required>
+
+Что проверить.
+
+</Param>
+<Param name="place" type="UntrustedPlace" default='"filter"'>
+
+Куда попадёт значение; выбирает слова ошибки, как у [`untrusted`](#untrusted). Стоит вторым, сразу после значения. Других параметров у метода нет: обход вложенных объектов и защита от циклов устроены внутри.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static check(value: unknown, place?: UntrustedPlace): void
+```
+
+</FullType>
+
+## Когда не подходит
+
+Мягкое удаление не заменяет архив: помеченные документы остаются в той же коллекции и занимают место, а уникальные индексы без частичного условия продолжают их учитывать (см. [опцию `softDelete`](./schema-options.mdx#опция-softdelete)). `untrusted` не заменяет проверку ввода. Строгие правила фильтров, включая защиту от неизвестных операторов и `$where`, работают всегда и без него: [Нарушения политик](./violations.mdx#sanitize).

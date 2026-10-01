@@ -1,0 +1,581 @@
+---
+title: REST API для счетов
+description: "Как построить полный набор обработчиков создания, чтения, изменения и удаления с фильтрами, страницами и ответами об ошибках"
+icon: Server
+---
+
+Чтобы отдать данные по HTTP, вам нужны пять обработчиков — список, один объект, создание, изменение и удаление — и общее правило, как превратить ошибку библиотеки в ответ клиенту. Эта страница собирает их в один работающий пример для банковских счетов: страницы списка идут по ключу, фильтры приходят из строки запроса, а у каждой ошибки есть свой код ответа.
+
+Обработчики здесь — обычные функции. Они принимают уже разобранный ввод (строки из адреса, объект из тела запроса) и возвращают данные или бросают ошибку с пометкой (`__NotFound__`, `__BadRequest__`, `__Conflict__`). Пометка двойными подчёркиваниями означает, что класс ваш: как именно он превращается в статус 404, 400 или 409, решает ваш веб-слой, а Typemo от него не зависит. Поэтому пример подойдёт к любому серверу.
+
+## Что предполагается
+
+Клиент подключён так, как описано в руководстве [Подключиться к базе](../connection/connect.mdx). Пакеты `@venloc/typemo` и `mongodb` установлены. В примерах используются файлы `accounts/account.ts` (модель), `http/errors.ts` (ваши ошибки), `accounts/accounts.service.ts` (обработчики).
+
+## Быстрый путь
+
+Самый частый обработчик — «один объект по id из адреса». [`findById`](../reference/query/reading.mdx#modelfindbyid) принимает строку как есть, [`.orFail()`](../reference/query/reading.mdx#orfail) превращает «не нашлось» в ошибку, а [`.plain()`](../reference/query/reading.mdx#plain) отдаёт обычный объект, готовый для JSON:
+
+```ts twoslash
+import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true, minLength: 2 }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { enum: ["open", "frozen"], default: "open" }) status!: Defaulted<"open" | "frozen">;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.db().model(Account);
+class __NotFound__ extends Error {}
+class __BadRequest__ extends Error {
+  constructor(message: string, readonly issues?: unknown) { super(message); }
+}
+class __Conflict__ extends Error {}
+const guard = async <R>(work: () => Promise<R>): Promise<R> => work();
+// ---cut---
+export const getAccount = async (id: string) => Accounts.findById(id).orFail().plain();
+```
+
+Остальная страница строит вокруг него полный набор обработчиков: сначала общий перевод ошибок, потом чтение, создание, изменение и удаление.
+
+## Описать модель и свои ошибки
+
+Начните с модели. У счёта пока два поля: название и владелец. Название уникально: два счёта с одним названием в одном банке не нужны.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema, Timestamped } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true, minLength: 2 })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+}
+```
+
+[`Timestamped`](../reference/schemas/base-classes.mdx#timestamped) добавляет `createdAt` и `updatedAt`: Typemo ведёт их сам при каждой записи. Границу приложения задают ваши классы ошибок, по одному на код ответа:
+
+```ts twoslash title="http/errors.ts"
+export class __NotFound__ extends Error {}
+
+export class __BadRequest__ extends Error {
+  constructor(message: string, readonly issues?: unknown) {
+    super(message);
+  }
+}
+
+export class __Conflict__ extends Error {}
+```
+
+## Перевести ошибки библиотеки в ответы
+
+Ошибки Typemo описывают, что пошло не так в данных, а не что ответить клиенту. Перевод нужен в одном месте, иначе каждый обработчик обрастёт своим `try/catch`. Функция `toHttpError` разбирает ошибку по классу, а `guard` оборачивает тело обработчика и бросает уже переведённую ошибку:
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { CastError, DocumentNotFoundError, DuplicateKeyError, KeysetTokenError, QueryError, StrictModeError, ValidationError } from "@venloc/typemo";
+class __NotFound__ extends Error {}
+class __BadRequest__ extends Error {
+  constructor(message: string, readonly issues?: unknown) { super(message); }
+}
+class __Conflict__ extends Error {}
+// ---cut---
+const toHttpError = (error: unknown): unknown => {
+  if (error instanceof DocumentNotFoundError) return new __NotFound__(`${error.model} not found`);
+  if (error instanceof ValidationError) return new __BadRequest__("validation failed", error.toJSON().issues);
+  if (error instanceof DuplicateKeyError) return new __Conflict__("title is taken");
+  if (
+    error instanceof CastError ||
+    error instanceof StrictModeError ||
+    error instanceof KeysetTokenError ||
+    error instanceof QueryError
+  ) {
+    return new __BadRequest__(error.message);
+  }
+  return error;
+};
+
+const guard = async <R>(work: () => Promise<R>): Promise<R> => {
+  try {
+    return await work();
+  } catch (error) {
+    throw toHttpError(error);
+  }
+};
+```
+
+Каждая ветка — ошибка, за которую отвечает клиент. [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#documentnotfounderror) значит «нет такого счёта». [`ValidationError`](../reference/errors/data-errors.mdx#validationerror) значит, что поля не прошли схему, и её [`toJSON()`](../reference/errors/data-errors.mdx#ответ-клиенту) можно отдать клиенту: в нём пути и причины, но нет самих значений. [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicatekeyerror) приходит от сервера, когда уникальный индекс отверг запись; хватает самого класса, а `message` (`duplicate key on title_1: { title: "Main" } (code 11000 DuplicateKey)`) в ответ не кладут: в нём значение ключа. Остальные четыре — неверный формат id или значения ([`CastError`](../reference/errors/data-errors.mdx#casterror)), лишнее поле ([`StrictModeError`](../reference/errors/data-errors.mdx#strictmodeerror)), испорченный токен страницы ([`KeysetTokenError`](../reference/errors/query-errors.mdx#keysettokenerror)) и запрос, который библиотека отвергла до отправки ([`QueryError`](../reference/errors/query-errors.mdx#queryerror)).
+
+Всё остальное — сеть, сервер, ошибка в вашем коде — проходит дальше без перевода. Это правильно: такие ошибки клиент исправить не может, и ваш веб-слой должен ответить на них статусом 500, а не 400.
+
+## Прочитать один счёт
+
+Обработчик `getAccount` получает id из адреса и возвращает счёт. Ничего, кроме `guard`, добавлять не нужно: формат id проверит сама библиотека.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true, minLength: 2 }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { enum: ["open", "frozen"], default: "open" }) status!: Defaulted<"open" | "frozen">;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.db().model(Account);
+class __NotFound__ extends Error {}
+class __BadRequest__ extends Error {
+  constructor(message: string, readonly issues?: unknown) { super(message); }
+}
+class __Conflict__ extends Error {}
+const guard = async <R>(work: () => Promise<R>): Promise<R> => work();
+// ---cut---
+export const getAccount = (id: string) =>
+  guard(async () => Accounts.findById(id).orFail().plain());
+
+const account = await getAccount("6abd2c26093f52b7931dca2a").catch(() => null);
+//    ^?
+```
+
+Тип результата показывает, что `_id` в plain-виде — строка, а даты остались `Date`: этот объект без потерь превращается в JSON. Подробнее о видах результата — в руководстве [Чтение данных](../queries/reading-data.mdx). Если id не найден, клиент получает `__NotFound__` (`Account not found`), а если строка не похожа на id — `__BadRequest__` с текстом `Cast to ObjectId failed at path "_id" for "abc" (string): not a 24-character hex string [format]`.
+
+## Отдать счёт вместе с менеджером
+
+Ситуация: клиент просит `GET /accounts/:id?expand=manager` и хочет увидеть имя менеджера, а не его идентификатор. У счёта появляется ссылка `manager` на сотрудника. Счёт, прочитанный без [`populate`](../reference/populate/populate.mdx), хранит в `manager` идентификатор, а с `populate("manager")` — документ сотрудника, и эти два состояния имеют разные типы. Функцию, которая строит ответ для любого из них, описывают параметром [`AnyPopulationDoc<Account>`](../reference/populate/populate-types.mdx#anypopulationdoc), а ветку выбирает [`isPopulated`](../reference/populate/populate-types.mdx#ispopulated): внутри `if` компилятор знает, что `account.manager` — загруженный документ или `null` (сотрудника могли удалить).
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { type AnyPopulationDoc, Entity, isPopulated, Prop, Schema, Timestamped, TypemoClient, Types, type Ref } from "@venloc/typemo";
+@Schema({ collection: "employees" })
+class Employee extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true, minLength: 2 }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Employee }) manager?: Ref<Employee>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.db().model(Account);
+class __NotFound__ extends Error {}
+const guard = async <R>(work: () => Promise<R>): Promise<R> => work();
+// ---cut---
+const toResponse = (account: AnyPopulationDoc<Account>) => ({
+  id: String(account._id),
+  title: account.title,
+  manager: isPopulated(account, "manager") ? (account.manager?.name ?? null) : undefined,
+});
+
+export const getAccountView = (id: string, expand?: "manager") =>
+  guard(async () => {
+    if (expand === "manager") return toResponse(await Accounts.findById(id).populate("manager").orFail());
+    return toResponse(await Accounts.findById(id).orFail());
+  });
+```
+
+Запуск на счёте `Main` с менеджером `Bob Manager` дал `{ id: "…", title: "Main" }` без `expand` и `{ id: "…", title: "Main", manager: "Bob Manager" }` с ним. Если у счёта менеджера нет, `populate` ничего не подставляет: поле `manager` в ответе тоже отсутствует (`isPopulated` вернул `false`). Если менеджера удалили, а ссылка осталась, поле загружено и равно `null`, и ответ содержит `manager: null`. Подробнее о типах загруженных документов — в руководстве [Принять документ в любом состоянии](../populate/type-checks.mdx#принять-документ-в-любом-состоянии).
+
+## Отдать список страницами с фильтрами
+
+Список нельзя отдавать целиком: коллекция растёт, а клиенту нужна страница. Страницы «пропусти N строк» ([`.skip`](../reference/query/reading.mdx#skip)) чем глубже, тем дороже: база каждый раз отсчитывает пропущенное заново. К тому же, если между запросами страниц кто-то добавил счёт, строка окажется на двух страницах сразу. Поэтому список идёт по ключу: [`keysetPage`](../reference/query/keyset.mdx#modelkeysetpage) возвращает страницу и токен, с которого начинается следующая. Подробности — в руководстве [Пагинация по ключу](../queries/keyset-pagination.mdx).
+
+Сначала добавьте в модель поле `status`, по которому будем фильтровать:
+
+```ts twoslash title="accounts/account.ts"
+import { type Defaulted, Entity, Prop, Schema, Timestamped } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true, minLength: 2 })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => String, { enum: ["open", "frozen"], default: "open" }) // [!code ++]
+  status!: Defaulted<"open" | "frozen">; // [!code ++]
+}
+```
+
+Параметры запроса приходят строками, и клиенту нельзя верить: `limit=1000000` выгрузил бы всё. Обработчик проверяет их сам и собирает фильтр только из известных ключей:
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true, minLength: 2 }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { enum: ["open", "frozen"], default: "open" }) status!: Defaulted<"open" | "frozen">;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.db().model(Account);
+class __NotFound__ extends Error {}
+class __BadRequest__ extends Error {
+  constructor(message: string, readonly issues?: unknown) { super(message); }
+}
+class __Conflict__ extends Error {}
+const guard = async <R>(work: () => Promise<R>): Promise<R> => work();
+// ---cut---
+const isStatus = (value: string): value is "open" | "frozen" => value === "open" || value === "frozen";
+
+export const listAccounts = (query: {
+  owner?: string | undefined;
+  status?: string | undefined;
+  limit?: string | undefined;
+  after?: string | undefined;
+}) =>
+  guard(async () => {
+    const limit = query.limit === undefined ? 20 : Number(query.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new __BadRequest__("limit must be an integer from 1 to 100");
+    }
+    const status = query.status;
+    if (status !== undefined && !isStatus(status)) throw new __BadRequest__("status must be open or frozen");
+    const filter = {
+      ...(query.owner !== undefined && { owner: query.owner }),
+      ...(status !== undefined && { status }),
+    };
+    const page = await Accounts.keysetPage({ filter, sort: [["createdAt", "desc"]], limit, after: query.after ?? null });
+    return { items: page.items.map((account) => account.$toPlain()), next: page.nextCursor };
+  });
+```
+
+Порядок задан по `createdAt`, самым новым счетам вперёд. У моделей на `Timestamped` ключом страницы годятся `createdAt` и `updatedAt`, а `_id` Typemo добавляет последним ключом сам, поэтому два счёта с одинаковым временем не повторяются и не пропадают. `updatedAt` для ленты не подходит: он меняется при каждой записи, и счёт «прыгает» между страницами. Токен `next` клиент присылает обратно в `after`, а поддельный токен приведёт к `KeysetTokenError`, то есть к ответу 400. Документы страницы превращены в plain-вид через [`$toPlain()`](../reference/documents/document-api.mdx#toplain): так поля вроде `_id` становятся строками.
+
+В коллекции три счёта: `Main` и `Second` у `alice`, `Other` у `bob`. Первая страница списка `alice` по одному счёту:
+
+```ts twoslash
+import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true, minLength: 2 }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { enum: ["open", "frozen"], default: "open" }) status!: Defaulted<"open" | "frozen">;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.db().model(Account);
+class __NotFound__ extends Error {}
+class __BadRequest__ extends Error {
+  constructor(message: string, readonly issues?: unknown) { super(message); }
+}
+class __Conflict__ extends Error {}
+const guard = async <R>(work: () => Promise<R>): Promise<R> => work();
+const listAccounts = async (query: { owner?: string | undefined; limit?: string | undefined; after?: string | undefined }) => ({ items: [] as { title: string }[], next: null as string | null });
+// ---cut---
+const first = await listAccounts({ owner: "alice", limit: "1" });
+console.log(first.items.map((item) => item.title));
+// → ["Second"]
+
+const second = await listAccounts({ owner: "alice", limit: "1", after: first.next ?? undefined });
+console.log(second.items.map((item) => item.title), second.next);
+// → ["Main"] null
+```
+
+Последняя страница возвращает `next: null`, и клиент понимает, что дальше идти некуда.
+
+## Создать счёт
+
+Тело запроса приходит из JSON, и Typemo проверяет его по схеме при записи: обязательные поля, длину, значения из списка. Неизвестное поле он не отбрасывает молча, а отвергает, поэтому клиент, который прислал `role: "admin"`, получит ошибку, а не незаметно потерянное поле.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true, minLength: 2 }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { enum: ["open", "frozen"], default: "open" }) status!: Defaulted<"open" | "frozen">;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.db().model(Account);
+class __NotFound__ extends Error {}
+class __BadRequest__ extends Error {
+  constructor(message: string, readonly issues?: unknown) { super(message); }
+}
+class __Conflict__ extends Error {}
+const guard = async <R>(work: () => Promise<R>): Promise<R> => work();
+// ---cut---
+export const createAccount = (body: { title: string; owner: string }) =>
+  guard(async () => (await Accounts.create(body)).$toPlain());
+```
+
+[`create`](../reference/writes/writes.mdx#create) возвращает документ, поэтому `$toPlain()` превращает его в ответ. Результаты для трёх ошибочных тел:
+
+```ts twoslash
+import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true, minLength: 2 }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { enum: ["open", "frozen"], default: "open" }) status!: Defaulted<"open" | "frozen">;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.db().model(Account);
+class __NotFound__ extends Error {}
+class __BadRequest__ extends Error {
+  constructor(message: string, readonly issues?: unknown) { super(message); }
+}
+class __Conflict__ extends Error {}
+const guard = async <R>(work: () => Promise<R>): Promise<R> => work();
+const createAccount = async (body: { title: string; owner: string }) => ({ ...body });
+// ---cut---
+await createAccount({ title: "x", owner: "alice" }).catch((error) => console.log(error.message, error.issues));
+// → validation failed [{ path: "title", reason: "minLength", message: "must be at least 2 characters long" }]
+
+await createAccount({ title: "Main", owner: "bob" }).catch((error) => console.log(error.message));
+// → title is taken
+
+await createAccount({ title: "Zed", owner: "bob", role: "admin" } as never).catch((error) => console.log(error.message));
+// → Cast to Account failed at path "role" for "admin" (string): not a field of Account [unknown-key]
+```
+
+Проверка уникальности — работа индекса, а не вашего кода: `findOne` перед записью не защитил бы от двух одновременных запросов.
+
+## Изменить счёт
+
+Частичное изменение (PATCH) присылает только те поля, которые нужно поменять. Обработчик загружает счёт (нет счёта — 404), присваивает через [`$set`](../reference/documents/document-api.mdx#set) только разрешённые поля и сохраняет документ методом [`$save`](../reference/documents/document-api.mdx#save): в базу уйдёт обновление только изменённых полей.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true, minLength: 2 }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { enum: ["open", "frozen"], default: "open" }) status!: Defaulted<"open" | "frozen">;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.db().model(Account);
+class __NotFound__ extends Error {}
+class __BadRequest__ extends Error {
+  constructor(message: string, readonly issues?: unknown) { super(message); }
+}
+class __Conflict__ extends Error {}
+const guard = async <R>(work: () => Promise<R>): Promise<R> => work();
+// ---cut---
+export const updateAccount = (id: string, body: { title?: string | undefined; status?: "open" | "frozen" | undefined }) =>
+  guard(async () => {
+    const account = await Accounts.findById(id).orFail();
+    if (body.title !== undefined) account.$set("title", body.title);
+    if (body.status !== undefined) account.$set("status", body.status);
+    await account.$save();
+    return account.$toPlain();
+  });
+```
+
+Список разрешённых полей здесь задан кодом: `owner` менять через API нельзя, и `$set` для него просто не вызывается, а лишние ключи тела игнорируются. Значения проверяются так же, как при создании: `status: "gone"` вернёт `__BadRequest__` с причиной `enum` (`must be one of "open", "frozen"`), а переименование в занятое название — `__Conflict__`. Пустое тело ничего не меняет и возвращает счёт как есть: PATCH без изменений — не ошибка.
+
+## Удалить счёт
+
+[`deleteOne`](../reference/writes/writes.mdx#deleteone) с `.orFail()` отвечает 404, если удалять нечего. Без `orFail` клиент получил бы «успех» на удаление несуществующего счёта, что затрудняет поиск опечатки в адресе.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true, minLength: 2 }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { enum: ["open", "frozen"], default: "open" }) status!: Defaulted<"open" | "frozen">;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.db().model(Account);
+class __NotFound__ extends Error {}
+class __BadRequest__ extends Error {
+  constructor(message: string, readonly issues?: unknown) { super(message); }
+}
+class __Conflict__ extends Error {}
+const guard = async <R>(work: () => Promise<R>): Promise<R> => work();
+// ---cut---
+export const deleteAccount = (id: string) =>
+  guard(async () => {
+    await Accounts.deleteOne({ _id: id }).orFail();
+  });
+```
+
+## Как выбрать
+
+**Страницы по ключу или `skip`/`limit`.** Спросите себя, листает ли пользователь вперёд или прыгает на страницу с номером. Если вперёд («ещё», бесконечная лента, выгрузка) — используйте `keysetPage`. Если нужны номера страниц и общее число, вам подойдут [`.skip`](../reference/query/reading.mdx#skip), [`.limit`](../reference/query/reading.mdx#limit) и [`countDocuments`](../reference/query/reading.mdx#modelcountdocuments), но глубокие страницы будут медленнее.
+
+**Загрузить и сохранить или изменить одним запросом.** Обработчик выше загружает документ, потому что часть полей меняется по условию, а типы проверяют каждый `$set` отдельно. Если новые значения известны целиком, [`findByIdAndUpdate`](../reference/writes/writes.mdx#findbyidandupdate) делает то же одной операцией без предварительного чтения. Руководство [Изменить и сохранить документ](../documents/change-and-save.mdx) объясняет, что при сохранении уходит в базу.
+
+## Когда это не нужно
+
+Если ответ строится из нескольких коллекций или из подсчётов, обычные обработчики над одной моделью не годятся: используйте [связанные данные](../populate/basics.mdx) или конвейер агрегации. Если вам нужен только пакетный вход для админки, сравните с [`bulkWrite`](../reference/writes/writes.mdx#bulkwrite): один запрос вместо пяти обработчиков.
+
+## Частые ошибки
+
+### Клиент прислал токен страницы, который не читается
+
+Клиент подменил или обрезал токен `after`. `keysetPage` отказывает ошибкой [`KeysetTokenError`](../reference/errors/query-errors.mdx#keysettokenerror) с текстом `keysetPage: invalid cursor — it cannot be read`, и `guard` превращает её в ответ 400. Токен нельзя разбирать самому и подправлять: он содержит позицию, значения ключей и проверку, и любая правка делает его недействительным. Пусть клиент начнёт список с первой страницы.
+
+### Клиент меняет поля, которые менять нельзя
+
+Если передать тело в обновление целиком (`{ $set: body }`), клиент сможет поменять любое поле, которое допускает схема, включая `owner`. Схема не знает, какие поля вы разрешили клиенту. Правильно — вызывать `$set` только для разрешённых ключей, как в `updateAccount`.
+
+### Клиент получает ответ 500 на неверный id
+
+Ошибка `CastError` — ошибка клиента, но обработчик без `guard` пропустил бы её как обычную. Оберните каждый обработчик в `guard`: перевод ошибок должен быть в одном месте.
+
+## Полный пример
+
+Все части в одном файле. Разделите его по файлам, как показано в комментариях, или оставьте как есть: код рабочий.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import {
+  type AnyPopulationDoc,
+  CastError,
+  type Defaulted,
+  DocumentNotFoundError,
+  DuplicateKeyError,
+  Entity,
+  isPopulated,
+  KeysetTokenError,
+  Prop,
+  QueryError,
+  type Ref,
+  Schema,
+  StrictModeError,
+  Timestamped,
+  TypemoClient,
+  Types,
+  ValidationError,
+} from "@venloc/typemo";
+
+// http/errors.ts: your own error classes, one per response code
+export class __NotFound__ extends Error {}
+export class __BadRequest__ extends Error {
+  constructor(message: string, readonly issues?: unknown) {
+    super(message);
+  }
+}
+export class __Conflict__ extends Error {}
+
+// accounts/account.ts: the models
+@Schema({ collection: "employees" })
+export class Employee extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+}
+
+@Schema({ collection: "accounts" })
+export class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true, minLength: 2 })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => String, { enum: ["open", "frozen"], default: "open" })
+  status!: Defaulted<"open" | "frozen">;
+
+  @Prop(() => Types.ObjectId, { ref: () => Employee })
+  manager?: Ref<Employee>;
+}
+
+// db/client.ts: one client for the whole process
+export const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.db().model(Account);
+
+// the only place that turns library errors into your response errors
+const toHttpError = (error: unknown): unknown => {
+  if (error instanceof DocumentNotFoundError) return new __NotFound__(`${error.model} not found`);
+  if (error instanceof ValidationError) return new __BadRequest__("validation failed", error.toJSON().issues);
+  if (error instanceof DuplicateKeyError) return new __Conflict__("title is taken");
+  if (
+    error instanceof CastError ||
+    error instanceof StrictModeError ||
+    error instanceof KeysetTokenError ||
+    error instanceof QueryError
+  ) {
+    return new __BadRequest__(error.message);
+  }
+  return error;
+};
+
+const guard = async <R>(work: () => Promise<R>): Promise<R> => {
+  try {
+    return await work();
+  } catch (error) {
+    throw toHttpError(error);
+  }
+};
+
+// accounts/accounts.service.ts: the handlers
+export const getAccount = (id: string) => guard(async () => Accounts.findById(id).orFail().plain());
+
+// one response builder for an account in any state of population
+const toResponse = (account: AnyPopulationDoc<Account>) => ({
+  id: String(account._id),
+  title: account.title,
+  manager: isPopulated(account, "manager") ? (account.manager?.name ?? null) : undefined,
+});
+
+export const getAccountView = (id: string, expand?: "manager") =>
+  guard(async () => {
+    if (expand === "manager") return toResponse(await Accounts.findById(id).populate("manager").orFail());
+    return toResponse(await Accounts.findById(id).orFail());
+  });
+
+const isStatus = (value: string): value is "open" | "frozen" => value === "open" || value === "frozen";
+
+export const listAccounts = (query: {
+  owner?: string | undefined;
+  status?: string | undefined;
+  limit?: string | undefined;
+  after?: string | undefined;
+}) =>
+  guard(async () => {
+    const limit = query.limit === undefined ? 20 : Number(query.limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new __BadRequest__("limit must be an integer from 1 to 100");
+    }
+    const status = query.status;
+    if (status !== undefined && !isStatus(status)) throw new __BadRequest__("status must be open or frozen");
+    const filter = {
+      ...(query.owner !== undefined && { owner: query.owner }),
+      ...(status !== undefined && { status }),
+    };
+    const page = await Accounts.keysetPage({ filter, sort: [["createdAt", "desc"]], limit, after: query.after ?? null });
+    return { items: page.items.map((account) => account.$toPlain()), next: page.nextCursor };
+  });
+
+export const createAccount = (body: { title: string; owner: string }) =>
+  guard(async () => (await Accounts.create(body)).$toPlain());
+
+export const updateAccount = (id: string, body: { title?: string; status?: "open" | "frozen" }) =>
+  guard(async () => {
+    const account = await Accounts.findById(id).orFail();
+    if (body.title !== undefined) account.$set("title", body.title);
+    if (body.status !== undefined) account.$set("status", body.status);
+    await account.$save();
+    return account.$toPlain();
+  });
+
+export const deleteAccount = (id: string) =>
+  guard(async () => {
+    await Accounts.deleteOne({ _id: id }).orFail();
+  });
+```
+
+Вызов из вашего веб-слоя выглядит одинаково для любого сервера: разобрать адрес и тело, вызвать обработчик, а `__NotFound__`, `__BadRequest__` и `__Conflict__` превратить в статусы 404, 400 и 409.
+
+<Callout type="migration">
+
+В Mongoose список чаще всего строили на `.skip()` и `.limit()`, а ошибки разбирали по `error.name` и коду 11000. Здесь ту же работу делают [`keysetPage`](../reference/query/keyset.mdx#modelkeysetpage) и классы ошибок, которые проверяются через `instanceof`. Приведение id из строки тоже делает сама библиотека: `mongoose.Types.ObjectId(id)` в обработчике не нужен.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Обработка ошибок" href="../errors/handling.mdx">
+  Как ловить ошибки библиотеки и что в них есть, чтобы отвечать клиенту точнее.
+</Card>
+<Card title="Пагинация по ключу" href="../queries/keyset-pagination.mdx">
+  Почему `skip` дорогой и как устроен токен следующей страницы.
+</Card>
+<Card title="Многотенантное приложение" href="./multi-tenant.mdx">
+  Как тот же API разделить между несколькими клиентами, чтобы они не видели чужих счетов.
+</Card>
+<Card title="Кеширование ответов" href="./caching.mdx">
+  Как не ходить в базу за одним и тем же счётом при каждом запросе.
+</Card>
+</Cards>

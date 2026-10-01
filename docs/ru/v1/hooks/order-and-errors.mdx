@@ -1,0 +1,241 @@
+---
+title: Порядок и ошибки хуков
+description: "В каком порядке выполняются хуки, что происходит при ошибке в pre, post и postError и как хуки ведут себя в транзакции"
+icon: ListOrdered
+---
+
+Хуки нескольких классов, плагинов и фаз выполняются в строго определённом порядке, и от него зависит результат: один хук видит то, что изменил предыдущий, а ошибка в одном из них решает, дойдёт ли операция до базы. Эта страница отвечает на два вопроса: что выполняется раньше и что происходит с операцией и с данными, когда хук бросает ошибку.
+
+Если вы ещё не писали хуки, начните с руководств [Вмешаться в операцию](./operation-hooks.mdx) и [Выполнить код при сохранении документа](./document-hooks.mdx). Здесь порядок и ошибки, которые у обоих видов хуков устроены одинаково.
+
+## Что предполагается
+
+Примеры используют модель счёта с тремя хуками `@Pre("document.save")`, одним `@Post` и одним `@PostError`. Каждый хук записывает своё имя в общий журнал `log`. `Accounts` — модель счёта, полученная у клиента.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Post, PostError, Pre, Prop, Schema } from "@venloc/typemo";
+
+export const log: string[] = [];
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Pre("document.save")
+  async first(this: Account): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    log.push("pre 1 (async)");
+  }
+
+  @Pre("document.save")
+  second(this: Account): void {
+    log.push("pre 2");
+  }
+
+  @Pre("document.save")
+  third(this: Account): void {
+    log.push("pre 3");
+  }
+
+  @Post("document.save")
+  after(this: Account): void {
+    log.push("post");
+  }
+
+  @PostError("document.save")
+  failed(this: Account, error: unknown): void {
+    log.push(`postError ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+```
+
+## Быстрый путь
+
+Хуки одной операции выполняются так: все `@Pre` по очереди, сама операция, затем все `@Post`. Если что-то из этого бросает ошибку, вместо `@Post` выполняются `@PostError`.
+
+```ts twoslash
+import { Entity, Post, Pre, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const log: string[] = [];
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Pre("document.save") async first(this: Account): Promise<void> { await new Promise((resolve) => setTimeout(resolve, 30)); log.push("pre 1 (async)"); }
+  @Pre("document.save") second(this: Account): void { log.push("pre 2"); }
+  @Pre("document.save") third(this: Account): void { log.push("pre 3"); }
+  @Post("document.save") after(this: Account): void { log.push("post"); }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.create({ title: "Main" });
+console.log(log);
+// → ["pre 1 (async)", "pre 2", "pre 3", "post"]
+```
+
+Остальная страница разбирает порядок, каждую ошибку и транзакции.
+
+## Порядок хуков
+
+Хуки одного события и одной фазы выполняются строго друг за другом, и каждый дожидается предыдущего. Первый хук в примере асинхронный и ждёт 30 миллисекунд, а второй всё равно стартует только после него: хуки никогда не выполняются параллельно, поэтому один хук может рассчитывать на результат предыдущего.
+
+Порядок между хуками определяется так. Сначала хуки базового класса, потом хуки самого класса в порядке объявления в файле, потом хуки плагинов ([`@Plugin`](../reference/hooks/plugins.mdx#plugin), `Typemo.plugin`). Запуск: базовый класс с `@Pre("query.find")`, наследник с двумя такими же хуками и плагин с третьим выполнили их в порядке `base`, `class #1`, `class #2`, `plugin`. Хуки `@Post` идут в том же порядке, что и `@Pre`, а не в обратном.
+
+Между фазами порядок такой: все `@Pre`, операция, все `@Post`. Если ваш хук `@Pre` изменил операцию через [`.modify`](../reference/hooks/operation-context.mdx#modify), следующий `@Pre` видит уже изменённую операцию: после каждого хука Typemo пересобирает её. У документов с поддокументами порядок сложнее: сначала `pre` корня, затем поддокументов, затем `post` поддокументов и корня; подробно об этом в руководстве [Выполнить код при сохранении документа](./document-hooks.mdx#поддокументы).
+
+Пустая вставка тоже вызывает хуки: `insertMany([])` и `bulkWrite([])` запускают `@Pre` и `@Post`, хотя ничего в базу не отправляют.
+
+У [`bulkWrite`](../reference/writes/writes.mdx#bulkwrite) порядок такой. Сначала `@Pre` хуки документов вставок вместе с проверкой, затем `@Pre` хуки операций пакета по порядку списка, затем `@Pre` хуки `model.bulkWrite` и сам запрос. После запроса идёт `@Post` хука `model.bulkWrite`, затем `@Post` хуки операций и документов по порядку. Если пакет не удался, то операции, которые сервер успел применить, заканчиваются `@Post`, а остальные — `@PostError`; подробности и примеры — в руководстве [Пакетная запись](../writes/bulk.mdx#хуки-операций-внутри-bulkwrite).
+
+## Ошибка в pre-хуке
+
+Ситуация: хук проверяет условие и бросает ошибку, если оно нарушено. Операция при этом не выполняется: до базы дело не доходит.
+
+```ts twoslash
+import { Entity, Post, PostError, Pre, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const log: string[] = [];
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Pre("document.save") second(this: Account): void {
+    log.push("pre 2");
+    if (this.title === "forbidden") throw new Error("pre 2 failed");
+  }
+  @Pre("document.save") third(this: Account): void { log.push("pre 3"); }
+  @Post("document.save") after(this: Account): void { log.push("post"); }
+  @PostError("document.save") failed(this: Account, error: unknown): void {
+    log.push(`postError ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.create({ title: "forbidden" }).catch((error: Error) => console.log(error.message));
+// → pre 2 failed
+console.log(log);
+// → ["pre 2", "postError pre 2 failed"]
+```
+
+Что произошло. Вызывающий код получил ту самую ошибку, которую бросил хук: Typemo её не оборачивает. Остальные `@Pre` (`pre 3`) не выполнились, `@Post` тоже, а `@PostError` выполнился и получил ошибку. Документ в базу не попал: запуск показал, что число документов после ошибки не изменилось.
+
+`@PostError` вызывается на любую ошибку операции, а не только на ошибку хука. Ошибка приведения фильтра ещё до `@Pre` тоже даёт `@PostError`, а хуки `@Pre` в этом случае не запускаются: запуск `find({ nope: 1 })` вызвал только `@PostError` со `StrictModeError`. Поэтому в `@PostError` нельзя рассчитывать, что `@Pre` уже отработали.
+
+## Ошибка в post-хуке
+
+Ситуация: хук после операции бросает ошибку, например при отправке сообщения. `@PostError` при этом не выполнится, потому что операция к этому моменту уже успешно завершилась. А что получит вызывающий код, зависит от операции.
+
+```ts twoslash
+import { Entity, Post, PostError, PostHookError, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const log: string[] = [];
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Post("document.save") after(this: Account): void {
+    log.push("post");
+    throw new Error("post failed");
+  }
+  @PostError("document.save") failed(this: Account): void { log.push("postError"); }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+try {
+  await Accounts.create({ title: "Main" });
+} catch (error) {
+  if (error instanceof PostHookError) {
+    console.log(error.applied, error.operation, (error.cause as Error).message);
+    // → true create post failed
+  }
+}
+console.log(log, await Accounts.countDocuments());
+// → ["post"] 1
+```
+
+Что произошло. Документ **сохранён**: запись выполнена до хука. Это самая коварная ошибка хуков: приложение, которое повторит `create` после ошибки, создаст дубликат. Поэтому Typemo не отдаёт ошибку хука как есть, а оборачивает её в [`PostHookError`](../reference/errors/hierarchy.mdx#posthookerror) с полем `applied: true` («запись применена, не повторяйте»), названием вызванного метода в `operation`, результатом записи в `result` и ошибкой хука в `cause`. Так происходит у записей вне транзакции. Для чтения вызывающий код получает ошибку хука как есть, потому что читать повторно безопасно.
+
+Всё равно не бросайте ошибки из `@Post` для действий, о которых вызывающему коду знать не нужно (отправка письма, запись в журнал): ловите их внутри хука и сообщайте другим способом. Если побочное действие обязательно, выполняйте всю операцию в [транзакции](../transactions/transactions.mdx): тогда ошибка в `@Post` откатит запись, а вызывающий код получит саму ошибку хука.
+
+## Ошибка внутри @PostError
+
+Если ошибку бросает сам `@PostError`, вызывающий код получит её вместо исходной, но исходная не теряется: она лежит в `cause`. Запуск: хук `@PostError`, бросивший `Error("postError failed")`, подменил `StrictModeError` неверного фильтра, и в `error.cause` остался `StrictModeError`. Всё равно `@PostError` должен записать ошибку в журнал и вернуть управление, а не бросать новую.
+
+## Хуки и транзакции
+
+Хуки выполняются внутри транзакции, если операция в ней выполняется: у хука операции `this.inTransaction` равно `true`, а `this.session` — сессия транзакции. Запуск: `countDocuments` внутри `client.transaction(...)` показал `inTransaction=true session=true`, а вне транзакции `inTransaction=false session=false`.
+
+Ошибка хука, которая вышла из колбэка транзакции, откатывает всю транзакцию. Запуск: в транзакции создан счёт `in-tx`, затем хук `@Pre` следующего `create` бросил ошибку, и после отката счёта `in-tx` в базе нет. То же с ошибкой в `@Post`: запись сделана внутри транзакции, поэтому откатывается вместе с ней, а вызывающий код получает саму ошибку хука, а не `PostHookError`: повторять нечего, запись не применена. Вне транзакции, как показано выше, запись остаётся.
+
+## Как выбрать
+
+Задайте себе один вопрос: **что случится, если действие хука не выполнится?** Если операцию нельзя выполнять без него (проверка, условие), делайте его в `@Pre` и бросайте ошибку: операция не выполнится, и данные останутся прежними. Если операция должна остаться в силе, а действие хука второстепенно (журнал, оповещение), делайте его в `@Post` и ловите ошибки внутри хука. Если хук должен быть частью «всё или ничего» вместе с записью, оберните операцию в [транзакцию](../transactions/transactions.mdx).
+
+## Когда это не нужно
+
+Если вы хотите обработать ошибку операции в месте вызова, достаточно `try`/`catch`: смотрите [Обработка ошибок](../errors/handling.mdx). `@PostError` нужен, когда реакция на ошибку одна для всех путей к операции, например запись в журнал сбоев.
+
+## Частые ошибки
+
+### После ошибки в post документ всё равно сохранён
+
+Вызывающий код получил `PostHookError` (или саму ошибку хука при чтении), но запись есть в базе. Операция выполнилась до `@Post`. Не повторяйте вызов: смотрите `error.applied`. Ловите ошибки внутри `@Post` или используйте транзакцию.
+
+### postError не вызвался
+
+`@PostError` не вызывается, если ошибку бросил `@Post`: операция успешна. Он вызывается только на ошибку операции или `@Pre`.
+
+## Полный пример
+
+Файл с моделью и транзакцией, которая откатывается из-за ошибки хука:
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { Entity, Pre, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  // Запрещённое название отменяет сохранение.
+  @Pre("document.save")
+  rejectForbidden(this: Account): void {
+    if (this.title === "forbidden") throw new Error("title is forbidden");
+  }
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+
+export const openBoth = async (): Promise<void> => {
+  await client.transaction(async () => {
+    await Accounts.create({ title: "in-tx" });
+    await Accounts.create({ title: "forbidden" }); // ошибка откатывает и первый счёт
+  });
+};
+
+try {
+  await openBoth();
+} catch (error) {
+  console.log((error as Error).message, await Accounts.countDocuments({ title: "in-tx" }));
+}
+// → title is forbidden 0
+```
+
+<Callout type="migration">
+
+В Mongoose `post`-хук не вызывался для пустого `insertMany`, а `pre`-хуки `bulkSave` выполнялись параллельно, так что порядок был непредсказуемым. В Typemo хуки всегда выполняются друг за другом, `insertMany([])` и `bulkWrite([])` тоже вызывают хуки, а на каждый путь операции приходится ровно один из двух: `@Post` или `@PostError`.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Вмешаться в операцию" href="./operation-hooks.mdx">
+  Как менять и пропускать запросы из хуков.
+</Card>
+<Card title="Транзакции" href="../transactions/transactions.mdx">
+  Как выполнять несколько операций как одну и что происходит при откате.
+</Card>
+<Card title="@Pre, @Post и @PostError" href="../reference/hooks/pre-post.mdx">
+  Все события хуков и их результаты.
+</Card>
+</Cards>

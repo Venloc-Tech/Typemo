@@ -1,0 +1,305 @@
+---
+title: Поиск по тексту и смыслу
+description: "Как сделать поиск по справочным статьям: текстовый на любом сервере, векторный в Atlas и запасной путь, когда векторного поиска нет"
+icon: Search
+---
+
+Поиск в справочном центре состоит из двух частей, и они устроены по-разному. **Текстовый поиск** находит статьи, где встречаются слова запроса, и работает на любом сервере MongoDB. **Поиск по смыслу** находит статьи, близкие по значению, даже без общих слов («машина» — «автомобиль»): для него каждая статья превращается в вектор, а сервер ищет ближайшие векторы. Этот вид поиска доступен только в Atlas или в его локальной среде. Эта страница строит поиск, который использует смысл, когда он есть, и молча остаётся на тексте, когда его нет.
+
+<Callout type="warning">
+
+Векторная часть этого рецепта **не выполнялась**: тестовый сервер документации не Atlas, а на обычном сервере `$vectorSearch` отвечает ошибкой. Проверены: текстовый поиск, объявление поискового индекса (код компилируется), ошибка сервера без Atlas и запасной путь на неё. Результаты настоящего векторного поиска на этой странице не приводятся.
+
+</Callout>
+
+## Что предполагается
+
+Клиент подключён по руководству [Подключиться к базе](../connection/connect.mdx), база `help`. Эмбеддинг (число-вектор, описывающий смысл текста) строит ваша модель эмбеддингов: в примерах это функция `__embed__`. Устройство обоих видов поиска разобрано в руководстве [Полнотекстовый и векторный поиск](../queries/text-and-vector-search.mdx).
+
+## Быстрый путь
+
+Текстовый поиск — условие [`$text`](../reference/query/filter-operators.mdx#text) плюс [`.textScore`](../reference/query/search-and-explain.mdx#textscore), который добавляет оценку релевантности. Он требует текстового индекса, описанного декоратором [`@Index`](../reference/schemas/index-decorators.mdx):
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, SearchIndex, ServerError, Spec, TypemoClient, type Vector } from "@venloc/typemo";
+class __BadRequest__ extends Error {}
+declare const __embed__: (text: string) => Promise<number[]>;
+@Index({ title: "text", body: "text" })
+@SearchIndex({
+  name: "embedding_index",
+  type: "vectorSearch",
+  definition: { fields: [{ type: "vector", path: "embedding", numDimensions: 3, similarity: "cosine" }] },
+})
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) embedding?: Vector;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/help");
+const Articles = client.db().model(Article);
+// ---cut---
+await Articles.createIndexes();
+await Articles.create({ title: "Typed queries", body: "queries in mongodb" });
+
+const found = await Articles.find({ $text: { $search: "typed" } }).textScore().plain();
+console.log(found.map((article) => article.title));
+// → ["Typed queries"]
+```
+
+Остальная страница строит из этого настоящий поиск: проверку ввода, порядок по релевантности, векторный поиск и запасной путь.
+
+## Описать модель и индексы
+
+У статьи название, текст и вектор. Текстовый индекс покрывает название и текст. Векторный поисковый индекс задаёт [`@SearchIndex`](../reference/schemas/index-decorators.mdx): путь к полю с вектором, размерность и способ сравнения. Размерность должна совпадать с вашей моделью эмбеддингов; здесь для краткости три числа.
+
+```ts twoslash title="articles/article.ts"
+import { Entity, Index, Prop, Schema, SearchIndex, Spec, type Vector } from "@venloc/typemo";
+
+@Index({ title: "text", body: "text" })
+@SearchIndex({
+  name: "embedding_index",
+  type: "vectorSearch",
+  definition: {
+    fields: [{ type: "vector", path: "embedding", numDimensions: 3, similarity: "cosine" }],
+  },
+})
+@Schema({ collection: "articles" })
+export class Article extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 }))
+  embedding?: Vector;
+}
+```
+
+Индексы создаёт синхронизация, а не запись: обычные индексы — [`createIndexes`](../reference/collections/model-indexes.mdx), поисковые — [`syncSearchIndexes`](../reference/collections/model-indexes.mdx#modelsyncsearchindexes). На обычном `mongod` вторая завершается ошибкой, поэтому в разработке без Atlas не вызывайте её, а `createIndexes` достаточно для текстового поиска.
+
+## Проверить запрос
+
+Текст запроса приходит от пользователя. Пустая строка в `$text` не ошибка, а пустой результат, и без проверки страница «ничего не найдено» скроет пустое поле поиска. Слишком длинный запрос тоже отсекают: он бесполезен и дорог.
+
+```ts twoslash title="articles/search.service.ts"
+class __BadRequest__ extends Error {}
+// ---cut---
+const cleanQuery = (text: string): string => {
+  const query = text.trim();
+  if (query === "" || query.length > 200) throw new __BadRequest__("the query must have 1 to 200 characters");
+  return query;
+};
+```
+
+`$text` понимает и служебный синтаксис: `-слово` исключает слово, кавычки ищут фразу. Пользователю это можно разрешить: запрос `"queries in" -tips` в тестовой коллекции нашёл только «Typed queries». Если такой синтаксис не нужен, уберите из запроса кавычки и минусы перед поиском.
+
+## Искать по словам и упорядочить по релевантности
+
+`$text` сам не упорядочивает результат: порядок задаёт оценка. Опция `{ sort: true }` у [`.textScore`](../reference/query/search-and-explain.mdx#textscore) сортирует строки по убыванию оценки на сервере, поэтому [`.limit`](../reference/query/reading.mdx#limit) после неё оставляет лучшие статьи, а не произвольные. Подробнее о сортировке по оценке — в руководстве [Полнотекстовый и векторный поиск](../queries/text-and-vector-search.mdx#отсортировать-по-релевантности).
+
+```ts twoslash title="articles/search.service.ts"
+import { Entity, Index, Prop, Schema, SearchIndex, ServerError, Spec, TypemoClient, type Vector } from "@venloc/typemo";
+class __BadRequest__ extends Error {}
+declare const __embed__: (text: string) => Promise<number[]>;
+@Index({ title: "text", body: "text" })
+@SearchIndex({
+  name: "embedding_index",
+  type: "vectorSearch",
+  definition: { fields: [{ type: "vector", path: "embedding", numDimensions: 3, similarity: "cosine" }] },
+})
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) embedding?: Vector;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/help");
+const Articles = client.db().model(Article);
+const cleanQuery = (text: string): string => text.trim();
+// ---cut---
+export const searchByWords = (text: string, limit: number) =>
+  Articles.find({ $text: { $search: cleanQuery(text) } })
+    .textScore("score", { sort: true })
+    .limit(limit)
+    .select({ title: 1 })
+    .plain();
+```
+
+Две статьи: «Typed queries» (в тексте «queries in mongodb») и «Mongo tips» (в тексте слово «typed» три раза). Запрос `typed` даёт оценки 0.75 и 1.53125 и ставит «Mongo tips» первым, а `searchByWords("typed", 1)` возвращает только его. Числа зависят от данных и версии сервера: сравнивайте их между собой.
+
+## Искать по смыслу
+
+Векторный поиск — стадия [`vectorSearch`](../reference/aggregation/stages.mdx#vectorsearch) конвейера агрегации: вы называете индекс, поле с векторами, вектор запроса и число кандидатов. `numCandidates` — сколько ближайших сервер просматривает, прежде чем выбрать `limit` лучших; больше кандидатов — точнее и медленнее.
+
+```ts twoslash title="articles/search.service.ts"
+import { Entity, Index, Prop, Schema, SearchIndex, ServerError, Spec, TypemoClient, type Vector } from "@venloc/typemo";
+class __BadRequest__ extends Error {}
+declare const __embed__: (text: string) => Promise<number[]>;
+@Index({ title: "text", body: "text" })
+@SearchIndex({
+  name: "embedding_index",
+  type: "vectorSearch",
+  definition: { fields: [{ type: "vector", path: "embedding", numDimensions: 3, similarity: "cosine" }] },
+})
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) embedding?: Vector;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/help");
+const Articles = client.db().model(Article);
+// ---cut---
+export const searchBySense = async (text: string, limit: number) => {
+  const queryVector = await __embed__(text);
+  return Articles.aggregate((pipeline) =>
+    pipeline.vectorSearch({ index: "embedding_index", path: "embedding", queryVector, limit, numCandidates: limit * 10 }),
+  ).plain();
+};
+```
+
+Это единственное место, которое не запускалось на тестовом сервере: код проверен компилятором, а результат поиска — нет.
+
+## Вернуться к тексту, когда смысла нет
+
+На сервере без Atlas векторный запрос завершается [`ServerError`](../reference/errors/server-errors.mdx#servererror) с кодом [`ServerErrorCodes.SearchNotEnabled`](../reference/errors/server-errors.mdx#servererrorcodes) (31082, `codeName` равен `SearchNotEnabled`). Сообщение ошибки — причина и код: `Using $search and $vectorSearch aggregation stages requires additional configuration. (code 31082 SearchNotEnabled)`; полный текст сервера с советом подключиться к Atlas лежит в поле `serverMessage`. Приложение не должно падать из-за этого в разработке: оно ловит именно эту ошибку и отвечает текстовым поиском. Все остальные ошибки пробрасываются, чтобы сбой сети не выглядел как «поиска по смыслу нет».
+
+```ts twoslash title="articles/search.service.ts"
+import { ServerError, ServerErrorCodes } from "@venloc/typemo";
+const searchBySense = async (text: string, limit: number): Promise<{ title: string }[]> => [];
+const searchByWords = async (text: string, limit: number): Promise<{ title: string }[]> => [];
+// ---cut---
+export const search = async (text: string, limit = 10): Promise<{ title: string }[]> => {
+  try {
+    return await searchBySense(text, limit);
+  } catch (error) {
+    if (error instanceof ServerError && error.code === ServerErrorCodes.SearchNotEnabled) return searchByWords(text, limit);
+    throw error;
+  }
+};
+```
+
+Запасной путь проверен на тестовом сервере: `search("typed")` вернул те же статьи, что и `searchByWords`.
+
+## Как выбрать
+
+Спросите себя: **ищут ли пользователи по словам, которые есть в тексте?** Если да (артикулы, названия, точные термины), хватит текстового поиска, а векторный только усложнит. Если формулировки запросов и текстов расходятся (вопросы человеческим языком к справочнику), нужен поиск по смыслу. Часто выигрывает сочетание: текст ловит точные слова, смысл — остальное. Комбинировать два списка (слияние оценок) — отдельная задача, для неё в конвейере есть стадии объединения результатов, см. [`rankFusion`](../reference/aggregation/stages.mdx#rankfusion).
+
+## Когда это не нужно
+
+Если статей десятки, отфильтруйте их обычным запросом по подстроке в коде. Если нужны нечёткий поиск, подсветка и фасеты, вам нужна стадия [`search`](../reference/aggregation/stages.mdx#search) Atlas Search, а не `$text`. Векторный поиск не заменяет текстовый для точных значений: артикул `SKU-4471` по смыслу не найдётся.
+
+## Частые ошибки
+
+### `text index required for $text query`
+
+Запрос `$text` выполнен до создания текстового индекса. Вызовите `createIndexes()` при старте или выполните синхронизацию индексов до первого запроса.
+
+### Лучшие статьи не попадают в результат
+
+Вы поставили [`.limit`](../reference/query/reading.mdx#limit), но не сортировали по оценке: без сортировки порядок строк не определён, и сервер отсёк произвольные строки. Сортируйте по оценке на сервере, `.textScore("score", { sort: true })` или `.sort({ score: -1 })`, как в `searchByWords`.
+
+### Без Atlas приложение падает на `ServerError`
+
+Вы вызываете векторный поиск без запасного пути или `syncSearchIndexes` при старте на обычном `mongod`. Ловите ошибку с кодом `ServerErrorCodes.SearchNotEnabled` и не объявляйте `@SearchIndex` на моделях, которые запускаются без Atlas: на них [`connection.init()`](../reference/connection/connection.mdx#connectioninit) тоже бросает [`SyncError`](../reference/errors/configuration-errors.mdx#syncerror) с тем же текстом сервера в причине.
+
+## Полный пример
+
+```ts twoslash title="articles/search.service.ts"
+import {
+  Entity,
+  Index,
+  Prop,
+  Schema,
+  SearchIndex,
+  ServerError,
+  ServerErrorCodes,
+  Spec,
+  TypemoClient,
+  type Vector,
+} from "@venloc/typemo";
+
+export class __BadRequest__ extends Error {}
+// your code: turns a text into a vector (an embedding model)
+declare const __embed__: (text: string) => Promise<number[]>;
+
+// articles/article.ts
+@Index({ title: "text", body: "text" })
+@SearchIndex({
+  name: "embedding_index",
+  type: "vectorSearch",
+  definition: { fields: [{ type: "vector", path: "embedding", numDimensions: 3, similarity: "cosine" }] },
+})
+@Schema({ collection: "articles" })
+export class Article extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 }))
+  embedding?: Vector;
+}
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/help");
+const Articles = client.db().model(Article);
+
+// the query comes from a user
+const cleanQuery = (text: string): string => {
+  const query = text.trim();
+  if (query === "" || query.length > 200) throw new __BadRequest__("the query must have 1 to 200 characters");
+  return query;
+};
+
+// by words: works on any server; the best matches first, sorted by the server
+export const searchByWords = (text: string, limit: number) =>
+  Articles.find({ $text: { $search: cleanQuery(text) } })
+    .textScore("score", { sort: true })
+    .limit(limit)
+    .select({ title: 1 })
+    .plain();
+
+// by sense: Atlas only (not run on the test server)
+export const searchBySense = async (text: string, limit: number) => {
+  const queryVector = await __embed__(cleanQuery(text));
+  return Articles.aggregate((pipeline) =>
+    pipeline.vectorSearch({ index: "embedding_index", path: "embedding", queryVector, limit, numCandidates: limit * 10 }),
+  ).plain();
+};
+
+// sense first, words when the server cannot search by sense
+export const search = async (text: string, limit = 10): Promise<{ title: string }[]> => {
+  try {
+    return await searchBySense(text, limit);
+  } catch (error) {
+    if (error instanceof ServerError && error.code === ServerErrorCodes.SearchNotEnabled) return searchByWords(text, limit);
+    throw error;
+  }
+};
+```
+
+<Callout type="migration">
+
+В Mongoose `$text` и `$vectorSearch` работали через `find` и `aggregate` без проверки индексов и типов вектора, а ошибка «нет Atlas» приходила общим `MongoServerError`. Здесь вектор объявляется типом `Vector` с размерностью, а ошибка сервера приходит классом `ServerError` с кодом, по которому её можно поймать.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Полнотекстовый и векторный поиск" href="../queries/text-and-vector-search.mdx">
+  Как устроены `$text`, оценка релевантности и поиск в Atlas.
+</Card>
+<Card title="Поисковые индексы" href="../collections/search-indexes.mdx">
+  Как синхронизировать поисковые индексы и что происходит без Atlas.
+</Card>
+<Card title="Кеширование ответов" href="./caching.mdx">
+  Как не выполнять один и тот же поиск при каждом запросе.
+</Card>
+<Card title="Индексы" href="../schemas/indexes.mdx">
+  Все виды индексов, которые можно описать в схеме.
+</Card>
+</Cards>

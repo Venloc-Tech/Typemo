@@ -1,0 +1,476 @@
+---
+title: Маски ответа
+description: "Как показать клиенту только часть значения (почту, телефон, номер карты) в запросах, агрегациях и сериализации документа"
+icon: EyeOff
+---
+
+Чтобы показать значение поля, но не целиком, замаскируйте его: [`.mask`](../reference/query/masks.mdx#mask) заменяет `alice@gmail.com` на `a***@gmail.com`, а номер карты — на `************4242`. Это нужно там, где поле надо показать, но не раскрыть: сотруднику поддержки важно понять, о какой карте речь, а полный номер ему видеть незачем. Маска применяется к тому, что получит вызывающий код, а данные в базе и в памяти приложения остаются настоящими.
+
+Если поле клиенту не нужно совсем, его лучше не читать: для этого есть [`.select`](../reference/query/reading.mdx#select) и [`hidden`](../reference/schemas/prop.mdx#hidden). Маска — для случая «показать часть».
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель клиента магазина из файла `customers/customer.ts`.
+
+```ts twoslash title="customers/customer.ts"
+import { Entity, Prop, Schema, Spec } from "@venloc/typemo";
+
+@Schema()
+export class Card {
+  @Prop(() => String, { required: true })
+  number!: string;
+
+  @Prop(() => String)
+  holder?: string;
+}
+
+@Schema({ collection: "customers" })
+export class Customer extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => String, { required: true })
+  email!: string;
+
+  @Prop(() => String, { nullable: true })
+  phone!: string | null;
+
+  @Prop(() => Number)
+  age?: number;
+
+  @Prop(() => [Card])
+  cards!: Card[];
+
+  @Prop(() => Spec.map(String))
+  notes?: Map<string, string>;
+}
+```
+
+В коллекции два клиента. Alice: почта `alice@gmail.com`, телефон `+79161234567`, 30 лет, две карты (`4242 4242 4242 4242` с владельцем `Alice A` и `5555 5555 5555 4444` без владельца), заметка `vip` со значением `yes`. Bob: почта `bob@example.org`, телефон `null`, 17 лет, карт нет.
+
+## Быстрый путь
+
+Два самых частых случая. Маска у запроса: вы передаёте объект «путь → маска», где маска — готовая из набора [`Mask`](../reference/query/masks.mdx#пресеты-mask) или строка `"mask"`:
+
+```ts twoslash
+import { Entity, Mask, Prop, Schema, Spec, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Card { @Prop(() => String, { required: true }) number!: string; @Prop(() => String) holder?: string; }
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => String, { nullable: true }) phone!: string | null;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [Card]) cards!: Card[];
+  @Prop(() => Spec.map(String)) notes?: Map<string, string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Customers = client.db().model(Customer);
+// ---cut---
+const rows = await Customers.find().sort({ name: 1 }).plain().mask({ email: Mask.email(), phone: Mask.phone() });
+console.log(rows.map((row) => [row.email, row.phone]));
+// → [["a***@gmail.com", "+7********67"], ["b***@example.org", "?"]]
+```
+
+Маска у уже загруженного документа: параметр `mask` его сериализации.
+
+```ts twoslash
+import { Entity, Mask, Prop, Schema, Spec, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Card { @Prop(() => String, { required: true }) number!: string; @Prop(() => String) holder?: string; }
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => String, { nullable: true }) phone!: string | null;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [Card]) cards!: Card[];
+  @Prop(() => Spec.map(String)) notes?: Map<string, string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Customers = client.db().model(Customer);
+// ---cut---
+const alice = await Customers.findOne({ name: "Alice" }).orFail();
+console.log(alice.$toPlain({ mask: { email: Mask.email() } }).email);
+// → "a***@gmail.com"
+```
+
+Остальная страница разбирает каждый вариант на задачах.
+
+## Показать сотруднику поддержки часть данных
+
+Допустим, страница поддержки показывает почту, телефон и возраст клиента, но не полностью. Маска применяется **последним шагом**: после чтения, подстановки связанных документов и превращения в обычные объекты. Поэтому её вызывают после [`.plain()`](../reference/query/reading.mdx#plain) или [`.lean()`](../reference/query/reading.mdx#lean).
+
+```ts twoslash title="customers/support.service.ts"
+import { Entity, Mask, Prop, Schema, Spec, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Card { @Prop(() => String, { required: true }) number!: string; @Prop(() => String) holder?: string; }
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => String, { nullable: true }) phone!: string | null;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [Card]) cards!: Card[];
+  @Prop(() => Spec.map(String)) notes?: Map<string, string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Customers = client.db().model(Customer);
+// ---cut---
+export const listForSupport = () =>
+  Customers.find()
+    .sort({ name: 1 })
+    .plain()
+    .mask({ email: Mask.email(), phone: Mask.phone(), age: Mask.bucket([18, 35, 60]) });
+
+const customers = await listForSupport();
+console.log(customers.map((customer) => [customer.email, customer.phone, customer.age]));
+// → [["a***@gmail.com", "+7********67", "18–35"], ["b***@example.org", "?", "<18"]]
+```
+
+`Mask.bucket([18, 35, 60])` превращает возраст в подпись диапазона: 30 попадает в `"18–35"`, 17 — в `"<18"`. Телефон Bob был `null`, а стал `"?"`: значения `null` и `undefined` в маскируемом поле маска не вызывает, а всегда заменяет на `"?"`. Так по маске нельзя отличить «нет значения» от «значение скрыто», зато функции маски не нужно проверять `null`.
+
+Тип результата тоже изменился, и компилятор его знает:
+
+```ts twoslash
+import { Entity, Mask, Prop, Schema, Spec, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Card { @Prop(() => String, { required: true }) number!: string; @Prop(() => String) holder?: string; }
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => String, { nullable: true }) phone!: string | null;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [Card]) cards!: Card[];
+  @Prop(() => Spec.map(String)) notes?: Map<string, string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Customers = client.db().model(Customer);
+// ---cut---
+const rows = await Customers.find().plain().mask({ email: Mask.email(), age: "mask" });
+const first = rows[0];
+console.log(first?.age);
+//                 ^?
+```
+
+Поле с `"mask"` получило тип `"?"`, а поле с готовой маской — `SensitiveJson` (любое JSON-значение), потому что маска вправе вернуть и строку, и объект. Компилятор ещё и проверяет пути: опечатка в имени поля не скомпилируется, а маска для числа не подойдёт к строковому полю.
+
+## Замаскировать вложенные значения
+
+Путь через массив проходит по каждому элементу, поэтому `cards.number` маскирует номер каждой карты. Значения словаря маскируются через `$*`: ключ остаётся, маскируется только значение.
+
+```ts twoslash
+import { Entity, Mask, Prop, Schema, Spec, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Card { @Prop(() => String, { required: true }) number!: string; @Prop(() => String) holder?: string; }
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => String, { nullable: true }) phone!: string | null;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [Card]) cards!: Card[];
+  @Prop(() => Spec.map(String)) notes?: Map<string, string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Customers = client.db().model(Customer);
+// ---cut---
+const [alice] = await Customers.find({ name: "Alice" }).plain().mask({
+  "cards.number": Mask.card(),
+  "cards.holder": Mask.initials(),
+  "notes.$*": "mask",
+});
+console.log(alice?.cards, [...(alice?.notes ?? [])]);
+// → [{ number: "************4242", holder: "A. A." }, { number: "************4444" }] [["vip", "?"]]
+```
+
+У второй карты владельца нет, и в результате его тоже нет: отсутствующее поле остаётся отсутствующим, маска его не выдумывает.
+
+## Своя маска
+
+Если готовых масок не хватает, передайте функцию: она получает настоящее значение и возвращает то, что увидит вызывающий код. Функция вызывается только для значений, которые есть.
+
+```ts twoslash
+import { Entity, Mask, Prop, Schema, Spec, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Card { @Prop(() => String, { required: true }) number!: string; @Prop(() => String) holder?: string; }
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => String, { nullable: true }) phone!: string | null;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [Card]) cards!: Card[];
+  @Prop(() => Spec.map(String)) notes?: Map<string, string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Customers = client.db().model(Customer);
+// ---cut---
+const rows = await Customers.find().sort({ name: 1 }).plain().mask({ name: (name) => `${name[0]}…` });
+console.log(rows.map((row) => row.name));
+// → ["A…", "B…"]
+```
+
+Если функция бросила ошибку, запрос завершается `QueryError: mask: the mask of "email" (model Customer) threw`. Молча отдать настоящее значение вместо маски было бы утечкой, поэтому ошибка всегда громкая.
+
+## Замаскировать документ
+
+У загруженного документа есть три способа превратить его в данные: [`$toPlain`](../reference/documents/document-api.mdx#toplain), [`$toObject`](../reference/documents/document-api.mdx#toobject) и [`$toJSON`](../reference/documents/document-api.mdx#tojson). Опция `mask` принимает тот же объект «путь → маска» и работает на копии: сам документ и его следующее сохранение не меняются. Пути называют поля той формы, в которую сериализуется документ.
+
+```ts twoslash
+import { Entity, Mask, Prop, Schema, Spec, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Card { @Prop(() => String, { required: true }) number!: string; @Prop(() => String) holder?: string; }
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => String, { nullable: true }) phone!: string | null;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [Card]) cards!: Card[];
+  @Prop(() => Spec.map(String)) notes?: Map<string, string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Customers = client.db().model(Customer);
+// ---cut---
+const alice = await Customers.findOne({ name: "Alice" }).orFail();
+
+const json = alice.$toJSON({ mask: { "cards.number": Mask.card() } });
+console.log(json.cards.map((card) => card.number), alice.email);
+// → ["************4242", "************4444"] "alice@gmail.com"
+```
+
+Документ остался нетронутым: `alice.email` по-прежнему настоящая почта. Так вы можете отдать клиенту замаскированную копию и продолжать работать с настоящими данными.
+
+## Замаскировать результат агрегации
+
+Агрегация тоже возвращает данные, которые уходят наружу, и у неё есть свой [`.mask`](../reference/aggregation/pipeline.mdx) с теми же правилами: после `.plain()` или `.lean()`.
+
+```ts twoslash
+import { Entity, Mask, Prop, Schema, Spec, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Card { @Prop(() => String, { required: true }) number!: string; @Prop(() => String) holder?: string; }
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => String, { nullable: true }) phone!: string | null;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [Card]) cards!: Card[];
+  @Prop(() => Spec.map(String)) notes?: Map<string, string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Customers = client.db().model(Customer);
+// ---cut---
+const rows = await Customers.aggregate((p) => p.match({ name: "Alice" }))
+  .plain()
+  .mask({ email: Mask.email() });
+console.log(rows.map((row) => row.email));
+// → ["a***@gmail.com"]
+```
+
+## Читать большими выборками
+
+У запроса с маской есть [`.cursor()`](../reference/query/cursor.mdx): маска применяется к каждой строке по мере чтения, поэтому память не растёт вместе с выборкой.
+
+```ts twoslash
+import { Entity, Mask, Prop, Schema, Spec, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Card { @Prop(() => String, { required: true }) number!: string; @Prop(() => String) holder?: string; }
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+  @Prop(() => String, { nullable: true }) phone!: string | null;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [Card]) cards!: Card[];
+  @Prop(() => Spec.map(String)) notes?: Map<string, string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Customers = client.db().model(Customer);
+// ---cut---
+const cursor = Customers.find().sort({ name: 1 }).plain().mask({ email: Mask.email() }).cursor();
+for await (const row of cursor) console.log(row.email);
+// → "a***@gmail.com"
+// → "b***@example.org"
+```
+
+## Как выбрать
+
+Задайте себе один вопрос: **нужно ли клиенту видеть это поле хоть в каком-то виде?** Если нет, не читайте его: исключение через `.select` или `hidden` в модели надёжнее любой маски, потому что значение вообще не покидает базу. Если поле нужно в узнаваемой, но неполной форме (последние цифры карты, домен почты, диапазон возраста), используйте `.mask` одного запроса. Если поле должно быть замаскировано **везде**, включая журналы, события и тексты ошибок, задайте `sensitive` в модели: те же `Mask.*`, но действуют они постоянно, а не в одном запросе. Подробности — в руководстве [Скрытые и чувствительные поля](../schemas/hidden-and-sensitive.mdx).
+
+## Когда это не нужно
+
+Маска не защищает сама по себе: она скрывает значение только в том результате, к которому применена. Если нужно, чтобы поле не покидало базу, используйте `.select` или `hidden`. Если вы храните и отдаёте данные с разным уровнем доступа, решайте это на уровне запросов и моделей, а не расстановкой масок в каждом обработчике: одна забытая маска — и значение ушло полностью. Проверка путей у `.mask` ловит опечатки, но не забытые вызовы.
+
+## Частые ошибки
+
+### `.mask` не компилируется на документе
+
+Вы вызвали `.mask` у запроса без `.plain()` или `.lean()`. Документ с замаскированными значениями можно случайно сохранить, и в базе окажется маска вместо данных, поэтому Typemo запрещает это: маска работает только на обычных объектах. Из кода без типов вызов бросает `QueryError` с тем же текстом, что показывает компилятор.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Customers = client.db().model(Customer);
+// ---cut---
+// неправильно: у документа нет масок
+// @errors: 2684
+await Customers.find().mask({ email: "mask" });
+// компилятор: … 'PathError<"mask() masks rows: call .lean() or .plain() first — a hydrated document with masked values could be saved">'
+
+// правильно: маска у обычных объектов
+await Customers.find().plain().mask({ email: "mask" });
+```
+
+### Компилятор не принимает путь
+
+Путь, которого нет в строке результата, не компилируется, и опечатку в имени поля маска не пропустит:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) email!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Customers = client.db().model(Customer);
+// ---cut---
+// @errors: 2322
+await Customers.find().plain().mask({ emial: "mask" });
+// компилятор: Type '"mask"' is not assignable to type '"mask" & PathError<"mask: \"emial\" is not a path of the result row">'
+```
+
+Если объект масок собран из данных, которых компилятор не видит, путь проверяет сам Typemo: несуществующий путь ничего не замаскировал бы, а значение ушло бы настоящим, поэтому `.mask` бросает `StrictModeError` сразу при вызове, до запроса к базе:
+
+```text
+StrictModeError: mask: "emial" is not a path of Customer's rows, so it would mask nothing; name a field of the rows [unknown-path]
+```
+
+Заменить осторожность проверка не может: не полагайтесь на маску как на единственную защиту.
+
+### Готовая маска не подходит к типу поля
+
+Маска типизирована значением, которое принимает. `Mask.email()` принимает строку, поэтому для числового поля она не скомпилируется:
+
+```ts twoslash
+import { Entity, Mask, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number) age?: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Customers = client.db().model(Customer);
+// ---cut---
+// неправильно: почтовая маска на числе
+// @errors: 2322
+await Customers.find().plain().mask({ age: Mask.email() });
+
+// правильно: маска для чисел
+await Customers.find().plain().mask({ age: Mask.bucket([18, 35, 60]) });
+```
+
+### Маска показала `"?"` вместо значения
+
+Готовая маска не бросает ошибку из-за данных: значение не того вида (почта без `@`, слишком короткий номер) она заменяет на `"?"`, потому что потерять деталь лучше, чем раскрыть значение. Если вы видите `"?"` там, где ждали частичное значение, проверьте само значение в базе.
+
+## Полный пример
+
+Один файл собирает всё: запрос для поддержки с масками, вложенные значения и маска документа. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="customers/support.service.ts"
+import { Entity, Mask, Prop, Schema, Spec, TypemoClient } from "@venloc/typemo";
+
+@Schema()
+class Card {
+  @Prop(() => String, { required: true })
+  number!: string;
+
+  @Prop(() => String)
+  holder?: string;
+}
+
+@Schema({ collection: "customers" })
+class Customer extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => String, { required: true })
+  email!: string;
+
+  @Prop(() => String, { nullable: true })
+  phone!: string | null;
+
+  @Prop(() => Number)
+  age?: number;
+
+  @Prop(() => [Card])
+  cards!: Card[];
+
+  @Prop(() => Spec.map(String))
+  notes?: Map<string, string>;
+}
+
+// код читателя: ошибка на границе приложения
+class __NotFound__ extends Error {}
+
+export const createSupportService = (client: TypemoClient) => {
+  const Customers = client.db().model(Customer);
+
+  // список: контакты и возраст показываются частично
+  const list = () =>
+    Customers.find()
+      .sort({ name: 1 })
+      .plain()
+      .mask({ email: Mask.email(), phone: Mask.phone(), age: Mask.bucket([18, 35, 60]) });
+
+  // карточка клиента: номера карт скрыты, заметки закрыты целиком
+  const card = async (name: string) => {
+    const [customer] = await Customers.find({ name })
+      .plain()
+      .mask({ "cards.number": Mask.card(), "notes.$*": "mask" });
+    if (customer === undefined) throw new __NotFound__(`customer ${name} is missing`);
+    return customer;
+  };
+
+  // документ уже загружен: копия для ответа с маской, оригинал не тронут
+  const forResponse = async (name: string) => {
+    const customer = await Customers.findOne({ name }).orFail();
+    return customer.$toJSON({ mask: { email: Mask.email(), "cards.number": Mask.card() } });
+  };
+
+  return { list, card, forResponse };
+};
+```
+
+<Callout type="migration">
+
+В Mongoose масок ответа нет: значения прятали в геттерах схемы или вручную перед отправкой. Typemo делает это отдельным шагом запроса: [`.mask`](../reference/query/masks.mdx#mask) применяется после чтения к копии, документ не меняется, тип результата учитывает маски, а путь и тип маски проверяет компилятор.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник: Маски" href="../reference/query/masks.mdx">
+  Все готовые маски `Mask.*` с примерами и правилами, точные типы и ошибки.
+</Card>
+<Card title="Скрытые и чувствительные поля" href="../schemas/hidden-and-sensitive.mdx">
+  Как замаскировать поле везде, а не в одном запросе, и когда лучше скрыть его совсем.
+</Card>
+<Card title="Проверка формы ответа" href="./contracts.mdx">
+  Как зафиксировать форму ответа контрактом, чтобы она не менялась незаметно.
+</Card>
+<Card title="Сериализация" href="../documents/serialization.mdx">
+  `$toPlain`, `$toObject` и `$toJSON`: в каком виде документ уходит из приложения.
+</Card>
+</Cards>

@@ -1,0 +1,1616 @@
+---
+title: Pipeline и Model.aggregate
+description: "Точки входа конвейера (коллекция, база, сервер, сессии), две формы плана и методы запроса агрегации: что принимают и где могут удивить"
+icon: Workflow
+---
+
+На этой странице собраны все способы начать **конвейер** (pipeline) — цепочку **стадий**, через которую MongoDB пропускает документы, — и все методы запроса агрегации: то, что вы получаете из [`Model.aggregate`](#modelaggregate) и что можно к нему добавить. Агрегации базы целиком (`Pipeline.database`, `Pipeline.admin`, `Pipeline.sessions`) выполняют [`connection.aggregate`](../connection/connection.mdx#connectionaggregate) и [`client.aggregate`](../connection/typemo-client.mdx#clientaggregate), а их запрос — тот же, что у `Model.aggregate`. Сами стадии описаны в справочнике [Стадии](./stages.mdx), а выражения внутри стадий — на страницах `expr-*`.
+
+Если вы только начинаете, сначала прочитайте руководство [Первая агрегация](../../aggregation/first-aggregation.mdx). Эта страница — справочник: к ней возвращаются, чтобы уточнить деталь.
+
+Все примеры используют одну модель заказа магазина. В ней есть обязательные поля, поле типа `BigInt` (после агрегации оно покажет разницу между видами результата), индекс по `status` (для подсказки `hint`) и скрытое поле `internalNote`.
+
+```ts twoslash title="models/order.ts"
+import { Entity, type Hidden, Index, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true })
+  status!: string;
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => BigInt)
+  points?: bigint;
+
+  @Prop(() => String, { hidden: true })
+  internalNote?: Hidden<string>;
+}
+```
+
+В коллекции три заказа: Alice, `paid`, 120, 10 баллов, заметка `vip`; Bob, `open`, 40, 5 баллов; Alice, `paid`, 60, 7 баллов. Результаты в комментариях `// →` получены на этих данных. Идентификаторы в результатах сокращены до `"…"`: база выдаёт их заново при каждой загрузке данных.
+
+Строитель конвейера неизменяемый: каждая стадия возвращает новый строитель, а прежний остаётся как был. Ошибки в форме полей ловит компилятор, а типы строк результата вычисляются по стадиям: после `group` строка уже не заказ, а группа. Про сам строитель и его стадии — в [Стадиях](./stages.mdx).
+
+---
+
+## Pipeline.from
+
+`Pipeline.from` начинает конвейер над коллекцией модели. Это основной способ построить агрегацию заранее, отдельно от запроса: вы получаете строитель, добавляете стадии и в конце вызываете [`.plan()`](#pipelinebuilderplan) — готовый план, который затем принимает [`Model.aggregate`](#modelaggregate). Обычно вы не вызываете его сами: `Model.aggregate((p) => …)` делает это за вас и передаёт колбэку такой строитель.
+
+Строки конвейера начинаются как сохранённые документы модели, но **без скрытых полей** ([`Hidden`](../../schemas/hidden-and-sensitive.mdx)). Конвейер, который читал бы скрытое поле молча, выдал бы пароль или заметку в отчёт, поэтому Typemo убирает такие поля первой стадией. Чтобы оставить нужное скрытое поле, назовите его в `options.include`.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const paid = Pipeline.from(Order).match({ status: "paid" }).sort({ total: -1 }).plan();
+console.log(paid.pipeline);
+// → [{ $match: { status: "paid" } }, { $sort: { total: -1 } }]
+const rows = await Orders.aggregate(paid);
+console.log(rows.map((row) => row.total));
+// → [120, 60]
+```
+
+<Returns type="PipelineBuilder<…, &quot;collection&quot;, &quot;empty&quot;>">
+
+Пустой строитель над сохранёнными документами источника. Пока в нём нет ни одной стадии, у него нет [`.plan()`](#pipelinebuilderplan): пустой конвейер компилятор не пропустит.
+
+</Returns>
+
+<Params>
+<Param name="source" type="EntityClass | Model" required>
+
+Класс сущности или модель. От источника зависят типы полей и коллекция, из которой читает конвейер.
+
+</Param>
+<Param name="options.hint" type="string | { [path]: 1 | -1 | &quot;text&quot; | … }">
+
+Индекс, который должен использовать сервер: имя (`"status_1"`) или спецификация ключей (`{ status: 1 }`). Пути проверяет компилятор, а `Pipeline.from` проверяет ещё и во время работы, что такой индекс объявлен в схеме.
+
+</Param>
+<Param name="options.collation" type="CollationOptions">
+
+Правило сортировки строк для всей агрегации.
+
+</Param>
+<Param name="options.allowDiskUse" type="boolean">
+
+Разрешает стадиям писать временные файлы на диск, когда им не хватает памяти.
+
+</Param>
+<Param name="options.comment" type="string">
+
+Комментарий команды, виден в журнале сервера и профилировщике. То же делает [`.comment`](#comment) запроса.
+
+</Param>
+<Param name="options.batchSize" type="number">
+
+Сколько документов курсор получает за один обмен с сервером. То же делает [`.batchSize`](#batchsize) запроса.
+
+</Param>
+<Param name="options.bypassDocumentValidation" type="boolean">
+
+Не проверять документы правилами валидации коллекции при записи стадиями `$out` и `$merge`.
+
+</Param>
+<Param name="options.include" type="readonly HiddenPath[]">
+
+Пути скрытых полей, которые нужно оставить в строках. Компилятор принимает только пути, помеченные как `Hidden`, и добавляет их в тип строки.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static from<const Src extends SourceInput, const Inc extends HiddenOf<Src> = never>(
+  source: Src,
+  options?: AggregateOptions<DocOf<Src>> & { readonly include?: readonly Inc[] },
+): PipelineBuilder<DocOf<Src, Inc>, "collection", "empty">
+```
+
+</FullType>
+
+### Скрытые поля
+
+Без `include` скрытого поля в строках нет ни в типе, ни в данных. С `include` оно появляется и там, и там:
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const plan = Pipeline.from(Order, { include: ["internalNote"] })
+  .match({ customer: "Alice" })
+  .sort({ total: -1 })
+  .limit(1)
+  .plan();
+const [row] = await Orders.aggregate(plan);
+//     ^?
+console.log(row?.internalNote);
+// → "vip"
+```
+
+Такой же запрос без `include` вернул бы ту же строку без ключа `internalNote`. Через `Orders.aggregate((p) => …)` включить скрытое поле нельзя: у колбэка нет `options`. Если вам нужно скрытое поле, соберите план через `Pipeline.from(…, { include })` и передайте его в `aggregate`.
+
+### Подсказка индекса
+
+`hint` сверяется со схемой в момент вызова `Pipeline.from`, а не когда запрос дойдёт до базы. Если такого индекса схема не объявляет, вы получаете ошибку сразу:
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+// @errors: 2353
+Pipeline.from(Order, { hint: { nope: 1 } });
+```
+
+Путь, которого нет в модели, останавливает компилятор. Если же путь есть, но индекса под него нет (`total` не индексирован), остановит Typemo:
+
+```text
+ConfigurationError: Order: hint {"total":1} matches no declared index (declared: _id_, status_1)
+```
+
+Без этой проверки сервер отверг бы `hint` только при выполнении, и ошибка пришла бы из базы, а не из места, где вы её написали.
+
+---
+
+## Pipeline.database
+
+`Pipeline.database` начинает конвейер, который читает не коллекцию, а базу целиком. Так пишутся агрегации, у которых нет своих документов: стадия [`documents`](./stages.mdx#documents) выдаёт литеральные документы, [`listLocalSessions`](./stages.mdx#listlocalsessions) и [`listClusterCatalog`](./stages.mdx#listclustercatalog) читают служебные данные сервера.
+
+У такого плана нет модели, поэтому [`Model.aggregate`](#modelaggregate) его не принимает. Его выполняют [`connection.aggregate`](../connection/connection.mdx#connectionaggregate) (база этого подключения) и [`client.aggregate`](../connection/typemo-client.mdx#clientaggregate) (база клиента по умолчанию): это обычная операция Typemo с транзакциями, `timeoutMS`, ошибками Typemo, курсором и `explain`, только без хуков. Руководство с примерами — [Запросы уровня базы](../../aggregation/database-level.mdx).
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const plan = Pipeline.database()
+  .documents([{ n: 1 }, { n: 2 }])
+  .plan();
+console.log(plan.target, plan.pipeline);
+// → { kind: "database", admin: false } [{ $documents: [{ n: 1 }, { n: 2 }] }]
+const rows = await client.aggregate(plan);
+//    ^?
+console.log(rows);
+// → [{ n: 1 }, { n: 2 }]
+```
+
+<Returns type="PipelineBuilder<never, &quot;database&quot;, &quot;empty&quot;>">
+
+Пустой строитель, не привязанный к коллекции. Строка начинается как `never`: типы строк задают стадии.
+
+</Returns>
+
+<Params>
+<Param name="options" type="AggregateOptions<never>">
+
+Те же настройки, что у [`Pipeline.from`](#pipelinefrom): `collation`, `allowDiskUse`, `comment`, `batchSize`, `bypassDocumentValidation`. Они уходят в команду как есть. `hint` и `include` здесь бессмысленны: у плана нет схемы, по которой их можно было бы проверить.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static database(options?: AggregateOptions<never>): PipelineBuilder<never, "database", "empty">
+```
+
+</FullType>
+
+База, в которой выполнится план, определяется тем, чем его запустили: `connection.aggregate` берёт базу своего подключения, `client.aggregate` — базу клиента по умолчанию. Если отдать такой план в `Model.aggregate`, вы получите ошибку, а не чтение чужой базы (текст получен запуском):
+
+```text
+ConfigurationError: Order.aggregate: the plan reads a database, not this model's collection "orders"; run it with connection.aggregate(plan) or client.aggregate(plan)
+```
+
+Служебные стадии привязаны к месту запуска, и компилятор это проверяет. [`documents`](./stages.mdx#documents) и [`listClusterCatalog`](./stages.mdx#listclustercatalog) доступны и в `Pipeline.database()`, и в `Pipeline.admin()`, [`currentOp`](./stages.mdx#currentop) — только в `Pipeline.admin()`, а [`listSessions`](./stages.mdx#listsessions) — только в `Pipeline.sessions()`.
+
+---
+
+## Pipeline.admin
+
+`Pipeline.admin` — то же, что [`Pipeline.database`](#pipelinedatabase), но для базы `admin`. Здесь живут служебные стадии, которые сервер разрешает только там: [`currentOp`](./stages.mdx#currentop) (что выполняется прямо сейчас), [`queryStats`](./stages.mdx#querystats), [`querySettings`](./stages.mdx#querysettings), [`listSampledQueries`](./stages.mdx#listsampledqueries), [`shardedDataDistribution`](./stages.mdx#shardeddatadistribution).
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const plan = Pipeline.admin().currentOp({ idleConnections: false }).limit(1).plan();
+console.log(plan.target, plan.pipeline);
+// → { kind: "database", admin: true } [{ $currentOp: { idleConnections: false } }, { $limit: 1 }]
+const operations = await client.aggregate(plan);
+console.log(operations.length);
+// → 1
+```
+
+<Returns type="PipelineBuilder<never, &quot;admin&quot;, &quot;empty&quot;>">
+
+Пустой строитель базы `admin`. В плане `target.admin` равен `true`, поэтому `connection.aggregate` и `client.aggregate` знают, в какую базу отправить конвейер: план `admin` выполняется в `admin` независимо от того, с какого подключения вы его запустили.
+
+</Returns>
+
+<Params>
+<Param name="options" type="AggregateOptions<never>">
+
+Те же настройки, что у [`Pipeline.database`](#pipelinedatabase).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static admin(options?: AggregateOptions<never>): PipelineBuilder<never, "admin", "empty">
+```
+
+</FullType>
+
+Подробнее о служебных агрегациях — в руководстве [Служебные агрегации](../../aggregation/system.mdx).
+
+---
+
+## Pipeline.sessions
+
+`Pipeline.sessions` начинает конвейер над коллекцией `config.system.sessions`. Это единственное место, где сервер принимает стадию [`listSessions`](./stages.mdx#listsessions): над любой другой коллекцией он отвечает `$listSessions may only be run against config.system.sessions`. Поэтому `listSessions` есть только у `Pipeline.sessions()`, а у `Pipeline.from`, `Model.aggregate`, `Pipeline.database()` и `Pipeline.admin()` её нет: компилятор не даёт поставить стадию туда, где сервер её всё равно отвергнет. После неё доступны обычные стадии (`match`, `project`, `sort`, `group`).
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const plan = Pipeline.sessions().listSessions({ allUsers: true }).plan();
+console.log(plan.target, plan.pipeline);
+// → { kind: "sessions" } [{ $listSessions: { allUsers: true } }]
+const sessions = await client.aggregate(plan);
+//    ^?
+```
+
+План выполняют `client.aggregate` и `connection.aggregate`; он всегда идёт в `config.system.sessions`, с какого бы подключения вы его ни запустили. В событиях операции `collection` равен `"system.sessions"`, а `database` — `"config"`.
+
+<Returns type="PipelineBuilder<never, &quot;sessions&quot;, &quot;empty&quot;>">
+
+Пустой строитель, привязанный к `config.system.sessions`. Это план только для чтения: у него нет [`out`](./stages.mdx#out) и [`merge`](./stages.mdx#merge).
+
+</Returns>
+
+<Params>
+<Param name="options" type="AggregateOptions<never>">
+
+Те же настройки, что у [`Pipeline.database`](#pipelinedatabase).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static sessions(options?: AggregateOptions<never>): PipelineBuilder<never, "sessions", "empty">
+```
+
+</FullType>
+
+Если поставить `listSessions` не туда или добавить запись, компилятор остановит вас сразу (сообщения получены компилятором):
+
+```ts twoslash
+// @errors: 2684 2769
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+Orders.aggregate((p) => p.listSessions());
+Pipeline.sessions().listSessions().out("copy");
+```
+
+Сервер записывает свежие сессии в `config.system.sessions` не сразу, поэтому на только что запущенном сервере результат пуст. Сессии, которые известны одному узлу и ещё не записаны, показывает стадия [`listLocalSessions`](./stages.mdx#listlocalsessions) в `Pipeline.database()`.
+
+---
+
+## Pipeline.update
+
+`Pipeline.update` собирает **конвейер обновления**: стадии, которые `updateOne` и `updateMany` принимают вместо обычного документа с операторами. Так поле вычисляется из других полей самого документа: удвоить сумму, склеить имя из двух частей. Обычный обновляющий оператор вроде `$set` так не умеет.
+
+В этом режиме у строителя только шесть стадий: [`addFields`](./stages.mdx#addfields), [`set`](./stages.mdx#set), [`project`](./stages.mdx#project), [`unset`](./stages.mdx#unset), [`replaceRoot`](./stages.mdx#replaceroot), [`replaceWith`](./stages.mdx#replacewith). Остальных методов у него нет, поэтому компилятор не даст добавить `group` туда, где сервер его всё равно отвергнет.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const stages = Pipeline.update(Order)
+  .set((f) => ({ total: fn.multiply(f.total, 2) }))
+  .unset("points")
+  .build();
+console.log(stages);
+// → [{ $set: { total: { $multiply: ["$total", 2] } } }, { $unset: "points" }]
+```
+
+<Returns type="PipelineBuilder<StoredDocOf<Src>, &quot;update&quot;, &quot;empty&quot;>">
+
+Пустой строитель в режиме обновления. Результат берётся через [`.build()`](#pipelinebuilderbuild), а не `.plan()`: это не агрегация, а список стадий для команды обновления.
+
+</Returns>
+
+<Params>
+<Param name="source" type="EntityClass | Model" required>
+
+Сущность, документ которой обновляет конвейер. Нужна только ради типа: строки — это её сохранённые документы.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static update<const Src extends SourceInput>(_source: Src): PipelineBuilder<StoredDocOf<Src>, "update", "empty">
+```
+
+</FullType>
+
+Запись через модель принимает такой конвейер в [`updateOne`](../writes/writes.mdx#updateone) и [`updateMany`](../writes/writes.mdx#updatemany).
+
+Когда конвейер уходит в запись, Typemo проверяет его по схеме модели до отправки. `unset` обязательного поля, константа не того типа, стадия, которая потеряла неизменяемое поле, и пустой конвейер останавливают обновление с ошибкой Typemo. Например, `unset("title")` у модели с обязательным `title` даёт `ValidationError: Validation failed: "title": update.0.$unset: the field is required; the pipeline would remove it [required]`, а пустой конвейер — `QueryError: an update pipeline needs at least one stage`. Все проверки описаны в справочнике [Конвейеры обновления](../writes/pipeline-updates.mdx#updatepipelines).
+
+---
+
+## Pipeline.view
+
+`Pipeline.view` собирает **определение представления** (view): сохранённый на сервере конвейер над другой коллекцией, который читается как обычная коллекция. Представление хранит не данные, а способ их получить.
+
+Обычно вы не вызываете `Pipeline.view` напрямую: [`TypedView.define`](../collections/typed-view.mdx#typedviewdefine) делает это за вас. Метод нужен, когда вы создаёте представление сами и хотите получить проверенное определение.
+
+Конвейер проверяется на соответствие классу представления: строки должны содержать все поля класса с совместимыми типами. Если поле пропало или у него не тот тип, компилятор называет его. В режиме представления у строителя нет [`out`](./stages.mdx#out) и [`merge`](./stages.mdx#merge): представление не может писать.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+@Schema({ collection: "paid_orders" })
+class PaidOrder extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+
+const definition = Pipeline.view(PaidOrder, {
+  on: Order,
+  pipeline: (p) => p.match({ status: "paid" }).project({ customer: 1, total: 1 }),
+});
+console.log(definition);
+// → { viewOn: "orders", pipeline: [{ $match: { status: "paid" } }, { $project: { customer: 1, total: 1 } }] }
+```
+
+<Returns type="ViewDefinition">
+
+Замороженный объект с двумя полями: `viewOn` — имя коллекции-источника и `pipeline` — массив сериализованных стадий. Его можно передать в команду `create` драйвера. Сама коллекция-представление создаётся не этим методом.
+
+</Returns>
+
+<Params>
+<Param name="view" type="EntityClass" required>
+
+Класс строки представления. Нужен для проверки типов, во время работы не используется.
+
+</Param>
+<Param name="definition.on" type="EntityClass | Model" required>
+
+Источник: коллекция или другое представление, которое читает конвейер.
+
+</Param>
+<Param name="definition.pipeline" type="(p) => ViewPipelineCheck<R, View>" required>
+
+Колбэк, который получает пустой строитель в режиме представления и возвращает конвейер хотя бы с одной стадией. Если строки конвейера не подходят классу, колбэк обязан вернуть не конвейер, а описание проблемы: [`ViewPipelineCheck`](#viewpipelinecheck) делает это за вас, и компилятор останавливает вызов.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static view<View extends abstract new () => object, const Src extends SourceInput, R extends StagedPipeline>(
+  _view: View,
+  definition: {
+    readonly on: Src;
+    readonly pipeline: (p: PipelineBuilder<DocOf<Src>, "view", "empty">) => ViewPipelineCheck<R, InstanceType<View>>;
+  },
+): ViewDefinition
+```
+
+</FullType>
+
+`ViewDefinition` — публичный тип с полями `viewOn: string` и `pipeline: readonly PipelineStage[]`.
+
+### Конвейер не подходит классу представления
+
+Класс представления описывает, какие строки вы будете читать, поэтому конвейер обязан отдавать все его поля с совместимыми типами. Три частые ошибки: в строках потерялось поле, которое есть в классе, поле стало другого типа или у строки пропал `_id` (текст каждой ошибки получен компилятором):
+
+```ts twoslash
+// @errors: 2741 2741 2741
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+@Schema({ collection: "paid_orders" })
+class PaidOrder extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+// ---cut---
+Pipeline.view(PaidOrder, { on: Order, pipeline: (p) => p.project({ customer: 1, total: 1, _id: 0 }) });
+Pipeline.view(PaidOrder, { on: Order, pipeline: (p) => p.project({ customer: 1 }) });
+Pipeline.view(PaidOrder, { on: Order, pipeline: (p) => p.project((f) => ({ customer: 1, total: fn.toString_(f.total) })) });
+```
+
+Первая строка потеряла `_id` (класс получил его от `Entity`), вторая — `total`, третья сделала `total` строкой. Компилятор отвечает на каждую одинаково: `Property 'error' is missing in type 'PipelineBuilder<…>' but required in type 'PathError<…>'`. Причина записана в самом `PathError`: `the pipeline result does not match the fields of the view class: check the field "_id"` (во второй и третьей строках поле называется `"total"`).
+
+Записать результат в представлении нельзя вообще: у строителя в режиме представления нет `out` и `merge`, поэтому вызов `p.out("copy")` не скомпилируется, а колбэк, вернувший запись, получит причину `a view pipeline cannot end with $out or $merge (MongoDB does not allow them in a view)`.
+
+---
+
+## ViewPipelineCheck
+
+`ViewPipelineCheck<R, V>` — тип, по которому [`Pipeline.view`](#pipelineview) решает, что вернуть из колбэка конвейера. Если строки конвейера `R` подходят классу `V`, тип равен самому `R` и ничего не меняется. Иначе он равен `PathError` с текстом причины, и компилятор печатает именно этот текст, а не длинное пересечение типа конвейера с типом ошибки. Читать тип вам не нужно: он нужен, чтобы вы видели в ошибке «check the field "_id"», а не простыню вывода типов.
+
+Тип проверяет два условия. Конвейер не должен заканчиваться записью (`$out` и `$merge` в представлении запрещены сервером). И каждое поле класса должно быть в строках конвейера с совместимым типом: `_id` обязателен, если класс его объявляет (его даёт `Entity`), и необязателен, если не объявляет.
+
+<FullType>
+
+```ts
+type ViewPipelineCheck<R, V> = [ViewRowProblems<ViewRowsOf<R>, V>] extends [never]
+  ? R
+  : PathError<"…">
+```
+
+</FullType>
+
+Цель записи тоже сверяется с полями строки: для [`out`](./stages.mdx#out) и [`merge`](./stages.mdx#merge) в модель-цель действует такая же проверка полей.
+
+---
+
+## Pipeline.watch
+
+`Pipeline.watch` собирает конвейер для **подписки на изменения** (change stream): строки такого конвейера — события драйвера (`ChangeStreamDocument`), а не документы модели. Поэтому здесь можно фильтровать и переписывать события, но не группировать их.
+
+Допустимы только [`match`](./stages.mdx#match), [`project`](./stages.mdx#project), [`addFields`](./stages.mdx#addfields), [`set`](./stages.mdx#set), [`unset`](./stages.mdx#unset), [`replaceRoot`](./stages.mdx#replaceroot), [`replaceWith`](./stages.mdx#replacewith), [`redact`](./stages.mdx#redact) и в самом конце [`changeStreamSplitLargeEvent`](./stages.mdx#changestreamsplitlargeevent).
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const stages = Pipeline.watch(Order).match({ operationType: "insert" }).build();
+console.log(stages);
+// → [{ $match: { operationType: "insert" } }]
+```
+
+<Returns type="PipelineBuilder<ChangeStreamDocument<…>, &quot;watch&quot;, &quot;empty&quot;>">
+
+Пустой строитель в режиме подписки. Строки — события изменений документов источника.
+
+</Returns>
+
+<Params>
+<Param name="source" type="EntityClass | Model" required>
+
+Сущность, коллекцию которой слушает подписка.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+static watch<const Src extends SourceInput>(
+  source: Src,
+): PipelineBuilder<ChangeStreamDocument<…>, "watch", "empty">
+```
+
+</FullType>
+
+Подписку открывает [`Model.watch`](../change-streams/watch.mdx), а не этот метод: он лишь готовит стадии. Для стадии `$changeStream` внутри обычной агрегации есть [`changeStream`](./stages.mdx#changestream).
+
+---
+
+## PipelineBuilder.plan
+
+`.plan()` завершает конвейер верхнего уровня и возвращает **план агрегации** (`AggregatePlan`): замороженный объект с источником, стадиями и опциями конвейера. План — это то, что принимают [`Model.aggregate`](#modelaggregate), [`connection.aggregate`](../connection/connection.mdx#connectionaggregate) и [`client.aggregate`](../connection/typemo-client.mdx#clientaggregate). Метод есть только у строителя, в котором уже есть хотя бы одна стадия, и только у строителей, которые запускаются отдельной агрегацией: у `Pipeline.from`, `Pipeline.database`, `Pipeline.admin` и `Pipeline.sessions`. План не знает ни модели, ни параметров запуска (`session`, `timeoutMS`): он запускается на любой модели своей коллекции. Чем он отличается от плана, который отдаёт сам запрос, — в разделе [Две формы плана](#две-формы-плана).
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const plan = Pipeline.from(Order).match({ status: "paid" }).plan();
+console.log(plan.op, plan.target.kind, plan.pipeline, plan.options);
+// → aggregate collection [{ $match: { status: "paid" } }] {}
+```
+
+<Returns type="AggregatePlan<Row>">
+
+Замороженный план с полями `op` (всегда `"aggregate"`), `target` (откуда читает конвейер), `pipeline` (стадии) и `options` (`hint`, `collation`, `allowDiskUse`, `comment`, `batchSize`, `bypassDocumentValidation`, `include` из `Pipeline.from(…, options)`). `target` бывает трёх видов: `{ kind: "collection", collection, entity, discriminator }`, `{ kind: "database", admin }` и `{ kind: "sessions" }`. Тип строки (`Row`) хранится только в типе и во время работы не существует.
+
+</Returns>
+
+<FullType>
+
+```ts
+interface AggregatePlan<Row> {
+  readonly op: "aggregate";
+  readonly target: PipelineTarget;
+  readonly pipeline: readonly PipelineStage[];
+  readonly options: AggregateOptions<unknown>;
+}
+```
+
+</FullType>
+
+Пустой конвейер компилятор не пропустит. Если строитель пришёл из нетипизированного кода, Typemo бросит ошибку сам:
+
+```text
+ConfigurationError: an empty pipeline does not run: add a stage
+```
+
+Сервер тоже отверг бы пустую агрегацию, но текст ошибки Typemo называет причину и лечение.
+
+## PipelineBuilder.build
+
+
+`.build()` отдаёт только массив стадий, без источника и опций. Он нужен там, где стадии уходят не в агрегацию Typemo: во вложенный конвейер (`lookup`, `facet`), в определение представления, в конвейер обновления или подписки, в драйвер.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const stages = Pipeline.from(Order).match({ status: "paid" }).build();
+console.log(stages);
+// → [{ $match: { status: "paid" } }]
+```
+
+<Returns type="readonly PipelineStage[]">
+
+Замороженный массив сериализованных стадий. Каждая стадия — объект вида `{ $match: … }`.
+
+</Returns>
+
+---
+
+## Model.aggregate
+
+`Model.aggregate` запускает агрегацию над коллекцией модели: пропускает документы через конвейер и возвращает строки результата. Это самый частый путь. Для отчётов по заказам, суммирования, группировки, соединения коллекций вы пишете колбэк, а Typemo передаёт ему строитель над сохранёнными документами.
+
+Как и [`find`](../query/reading.mdx#modelfind), метод не ходит в базу сразу: он возвращает **запрос агрегации** (`AggregateQuery`), который уходит на сервер при `await`. К запросу можно добавить опции, а результат получить массивом, курсором, планом сервера или проверенным по схеме.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const byStatus = await Orders.aggregate((p) =>
+  p.group((f) => ({ _id: f.status, revenue: fn.sum(f.total), orders: fn.count() })).sort({ _id: 1 }),
+);
+console.log(byStatus);
+// → [{ _id: "open", revenue: 40, orders: 1 }, { _id: "paid", revenue: 180, orders: 2 }]
+```
+
+<Returns type="AggregateQuery<Row>">
+
+Запрос агрегации. После `await` вы получаете массив строк; тип строки вычисляет компилятор по стадиям. Запрос неизменяемый: каждый метод (`.plain()`, `.session()`, …) возвращает новый запрос, старый не меняется.
+
+</Returns>
+
+<Params>
+<Param name="build" type="(p) => StagedPipeline | TerminalPipeline | AggregatePlan" required>
+
+Колбэк, который получает пустой строитель над сохранёнными документами модели, или готовый план из [`Pipeline.from`](#pipelinefrom). Конвейер должен заканчиваться хотя бы одной стадией. Стадии [`out`](./stages.mdx#out) и [`merge`](./stages.mdx#merge) завершают конвейер и превращают запрос в запись: строк у него нет.
+
+</Param>
+<Param name="options.session" type="ClientSession | null">
+
+Явная сессия. `null` выполняет запрос вне текущей транзакции. То же делает [`.session`](#session).
+
+</Param>
+<Param name="options.timeoutMS" type="number">
+
+Ограничение времени на стороне клиента в миллисекундах. То же делает [`.timeoutMS`](#timeoutms).
+
+</Param>
+<Param name="options.policy" type="PolicyValues">
+
+Значения политик для этой агрегации: тенант, актор, режим мягкого удаления. То же делает [`.policy`](#policy).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+aggregate<B extends AggregateResult>(
+  build: AggregateBuild<T, B>,
+  options?: ModelAggregateOptions,
+): AggregateQuery<AggregateRows<B>>;
+aggregate<R>(plan: AggregatePlan<R>, options?: ModelAggregateOptions): AggregateQuery<R>;
+```
+
+</FullType>
+
+### Строки без схемы
+
+Сохранённые документы модели проходят через схему, а строки агрегации — нет: у результата `group` или `project` нет класса, по которому его можно было бы собрать. Поэтому значения остаются такими, какими их вернул драйвер: идентификатор — `ObjectId`, поле `points` — `bigint`. Как отдать их клиенту, показывает [`.plain()`](#plain).
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const [row] = await Orders.aggregate((p) => p.match({ customer: "Bob" }));
+console.log(row?._id.constructor.name, typeof row?.points);
+// → ObjectId bigint
+```
+
+### Один запрос — одно выполнение
+
+Запрос на чтение выполняется один раз на объект: повторный `await` того же запроса отдаёт те же строки, не обращаясь к базе. Чтобы выполнить его ещё раз, вызовите [`.exec({ force: true })`](#exec).
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const query = Orders.aggregate((p) => p.limit(1));
+const first = await query;
+const second = await query;
+console.log(first === second);
+// → true
+```
+
+### Чужая коллекция
+
+План собирается над одной коллекцией. Если вы отдадите модели план, собранный над другой, вы получите ошибку сразу при вызове, ещё до обращения к базе: политики модели относятся к её коллекции, и чужие данные они не прикроют. Для плана другой коллекции, плана базы и плана сессий тексты разные (получены запуском):
+
+```text
+ConfigurationError: Order.aggregate: the plan reads "other", not this model's collection "orders"
+ConfigurationError: Order.aggregate: the plan reads a database, not this model's collection "orders"; run it with connection.aggregate(plan) or client.aggregate(plan)
+ConfigurationError: Order.aggregate: the plan reads config.system.sessions, not this model's collection "orders"; run it with connection.aggregate(plan) or client.aggregate(plan)
+```
+
+Планы базы и сессий выполняют [`connection.aggregate`](../connection/connection.mdx#connectionaggregate) и [`client.aggregate`](../connection/typemo-client.mdx#clientaggregate). Если первый аргумент не колбэк и не план, метод бросает `QueryError`:
+
+```text
+QueryError: aggregate: a pipeline callback or an aggregation plan
+```
+
+### Транзакции и политики
+
+Внутри [`transaction`](../transactions/transactions.mdx#transaction) запрос автоматически выполняется в сессии транзакции.
+
+<Callout type="migration">
+
+В Mongoose у `Model.aggregate` нет типов строк: результат всегда `any[]`, а скрытые (`select: false`) поля в конвейер попадают как есть. В Typemo тип строки вычисляется по стадиям, а скрытые поля убираются первой стадией.
+
+</Callout>
+
+---
+
+## .plain
+
+`.plain()` переводит строки в **plain-вид**: значения, которые безопасно сериализовать в JSON и отдать клиенту. Идентификаторы, `bigint`, `Decimal128` и `UUID` становятся строками, `Date` и `RegExp` остаются, двоичные данные становятся `Uint8Array`, вектор — массивом чисел.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const [row] = await Orders.aggregate((p) => p.match({ customer: "Bob" })).plain();
+//     ^?
+console.log(typeof row?._id, typeof row?.points);
+// → string string
+```
+
+Метода `.lean()` у запроса агрегации нет, и он не нужен: строки агрегации никогда не бывают гидратированными документами, то есть уже «lean». Единственное второе представление — plain.
+
+<Returns type="AggregateQuery<PlainValue<Row>>">
+
+Новый запрос с тем же конвейером; строки в plain-виде, а тип строки — `PlainValue` от прежнего. Повторный `.plain()` возвращает тот же запрос: строки не преобразуются дважды. После него доступны [`.parse`](#parse), [`.expect`](#expect) и [`.cursor`](#cursor).
+
+</Returns>
+
+<FullType>
+
+```ts
+plain(): AggregateQuery<PlainValue<Row>>
+```
+
+</FullType>
+
+У строки нет схемы, поэтому сохранённое поле `Map` в строке — обычный объект, и `.plain()` оставляет его объектом: превратить его в `Map` может только схема. Подробнее о видах результата — в концепции [Чтение и типы результата](../../concepts/reading-types.mdx).
+
+---
+
+## .cursor
+
+`.cursor()` отдаёт строки по одной, по мере чтения из базы, вместо того чтобы собрать весь результат в массив. Это нужно для больших отчётов и выгрузок: память занята одной строкой, а не всем результатом.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const seen: number[] = [];
+for await (const row of Orders.aggregate((p) => p.sort({ total: 1 })).batchSize(1).cursor()) {
+  seen.push(row.total);
+}
+console.log(seen);
+// → [40, 60, 120]
+```
+
+<Returns type="QueryCursor<Row>">
+
+Курсор строк. Его методы описаны в справочнике [Курсор](../query/cursor.mdx). Курсор применяет [`.plain()`](#plain), [`.parse`](#parse) и [`.mask`](#mask), если они были на запросе: каждая строка преобразуется в момент чтения.
+
+</Returns>
+
+<FullType>
+
+```ts
+cursor(): QueryCursor<Row>
+```
+
+</FullType>
+
+
+---
+
+## .exec
+
+`.exec()` выполняет запрос и возвращает промис строк. Это то же, что `await query`, но с настройкой: запрос можно выполнить ещё раз принудительно.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const query = Orders.aggregate((p) => p.limit(1));
+const first = await query;
+const again = await query.exec({ force: true });
+console.log(first === again, again.length);
+// → false 1
+```
+
+<Returns type="Promise<Row[]>">
+
+Строки результата. Обычное чтение выполняется один раз на объект и потом отдаёт кешированный результат.
+
+</Returns>
+
+<Params>
+<Param name="options.force" type="boolean">
+
+`true` выполняет запрос заново, даже если он уже выполнялся.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+exec(options?: ExecOptions): Promise<Row[]>
+```
+
+</FullType>
+
+### Запись через агрегацию
+
+Агрегация, которая кончается на [`out`](./stages.mdx#out) или [`merge`](./stages.mdx#merge), — запись, и Typemo относится к ней иначе: второй `await` того же запроса не повторяет запись, а бросает ошибку. Молчаливая повторная запись стёрла бы или задвоила результат.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const write = Orders.aggregate((p) => p.match({ status: "paid" }).out("paid_orders"));
+await write;
+await write.exec();
+```
+
+```text
+QueryError: aggregate: this operation was already executed; build a new one, or run it again deliberately with exec({ force: true }) (a write runs once per builder)
+```
+
+Если вы действительно хотите записать ещё раз, скажите это явно: `write.exec({ force: true })`. Ошибка называет `aggregate`: тот метод, который вы вызвали.
+
+---
+
+## .explain
+
+`.explain()` спрашивает у сервера **план запроса**: какие индексы он выберет, сколько документов просмотрит. Сам запрос при этом не выполняется в том смысле, что вы не получаете строки. Нужен, когда агрегация медленная и надо понять почему.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const plan = await Orders.aggregate((p) => p.match({ status: "paid" })).explain("executionStats");
+console.log(Object.keys(plan));
+// → ["explainVersion", "queryPlanner", "executionStats", "queryShapeHash", "command", …]
+```
+
+<Returns type="Promise<ExplainResult>">
+
+Ответ сервера. Ключи `queryPlanner`, `executionStats` и `serverInfo` — в ответе сервера всегда, `executionStats` — при уровне подробности не ниже `"executionStats"`.
+
+</Returns>
+
+<Params>
+<Param name="verbosity" type="&quot;queryPlanner&quot; | &quot;executionStats&quot; | &quot;allPlansExecution&quot;" default="&quot;queryPlanner&quot;">
+
+Насколько подробен ответ. `queryPlanner` показывает выбранный план, `executionStats` выполняет запрос и добавляет счётчики, `allPlansExecution` показывает и отвергнутые планы. Другое значение (возможно только без типов) — `QueryError` до обращения к базе.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+explain(verbosity?: ExplainVerbosity): Promise<ExplainResult>
+```
+
+</FullType>
+
+Такой же метод есть у запросов чтения: [`.explain`](../query/search-and-explain.mdx#explain).
+
+---
+
+## .parse
+
+`.parse(schema)` проверяет каждую строку результата по **Standard Schema** — общему интерфейсу проверки, который реализуют zod, valibot, arktype и схемы моделей Typemo (`~standard`). Строки результата после проверки — это то, что вернула схема. Нужен на границе с внешним миром: сервер может вернуть то, чего вы не ожидали, а `parse` останавливает это до того, как строки уйдут дальше.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+import type { StandardSchemaV1 } from "@venloc/typemo";
+// ---cut---
+const rowSchema: StandardSchemaV1<unknown, { status: string; orders: number }> = {
+  "~standard": {
+    version: 1,
+    vendor: "example",
+    validate: (row) => {
+      const value = row as { _id: string; orders: number };
+      return typeof value.orders === "number"
+        ? { value: { status: value._id, orders: value.orders } }
+        : { issues: [{ message: "orders must be a number", path: ["orders"] }] };
+    },
+  },
+};
+const rows = await Orders.aggregate((p) =>
+  p.group((f) => ({ _id: f.status, orders: fn.count() })).sort({ _id: 1 }),
+).parse(rowSchema);
+console.log(rows);
+// → [{ status: "open", orders: 1 }, { status: "paid", orders: 2 }]
+```
+
+<Returns type="ParsedQuery<Output[]>">
+
+Запрос, который отдаёт проверенные строки — выход схемы. Асинхронные схемы дожидаются. У `.parse` тот же набор методов, что описан в [`.parse`](../query/contracts.mdx#parse) запроса чтения; `.cursor()` проверяет строки по мере чтения.
+
+</Returns>
+
+<Params>
+<Param name="schema" type="StandardSchema" required>
+
+Любой объект со свойством `~standard`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+parse<Sch extends AnyStandardSchema>(
+  schema: Sch,
+): ParsedQuery<StandardSchemaOutput<Sch>[], StandardSchemaOutput<Sch>, true>
+```
+
+</FullType>
+
+Если строка не подходит, вы получаете `ValidationError`, у которого путь начинается с номера строки:
+
+```text
+ValidationError: Validation failed: "0.orders": row 0: nope [schema]; "1.orders": row 1: nope [schema]
+```
+
+Обе строки названы в одном сообщении: проверяются все строки, а не только первая.
+
+---
+
+## .expect
+
+`.expect<Shape>()` проверяет **контракт** результата на этапе компиляции: строка должна быть в точности такой формы, как вы ждёте. Во время работы он ничего не делает и ничего не стоит. Нужен, когда результат отдаётся потребителю с фиксированной формой (ответ API, отчёт): при изменении конвейера компилятор скажет, что форма разошлась.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const report = Orders.aggregate((p) =>
+  p.group((f) => ({ _id: f.status, revenue: fn.sum(f.total) })),
+).expect<{ _id: string; revenue: number }>();
+```
+
+<Returns type="AggregateQuery<Row>">
+
+Тот же запрос. Если форма строки не совпадает точно, компилятор сообщает, чего не хватает (`missing`), что лишнее (`extra`) или что имеет другой тип (`mismatch`). Подробнее о контрактах — в справочнике [`.expect`](../query/contracts.mdx#expect).
+
+</Returns>
+
+<FullType>
+
+```ts
+expect<Shape>(this: AggregateQuery<Row> & ExpectRows<Row, Shape>): AggregateQuery<Row>
+```
+
+</FullType>
+
+---
+
+## .mask
+
+`.mask(spec)` скрывает значения в строках результата перед тем, как их увидит вызывающий код: e-mail, номер карты, любые пути строки. Ключи — пути **итоговой** строки конвейера, значения — `"mask"` (заменить на `"?"`) или функция маски из [`Mask`](../query/masks.mdx#пресеты-mask).
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p.group((f) => ({ _id: f.customer, revenue: fn.sum(f.total) })).sort({ revenue: 1 }),
+).mask({ _id: "mask" });
+console.log(rows);
+// → [{ _id: "?", revenue: 40 }, { _id: "?", revenue: 180 }]
+```
+
+<Returns type="MaskedQuery<…>">
+
+Запрос, который отдаёт замаскированные строки. Хуки, события и аудит видят настоящие строки. `.cursor()` маскирует каждую строку при чтении.
+
+</Returns>
+
+<Params>
+<Param name="spec" type="{ [path]: &quot;mask&quot; | MaskFunction }" required>
+
+Пути итоговой строки. Предустановки `"sensitive"` для агрегации нет: маскируются только перечисленные пути, а скрыть поле совсем — задача [`project`](./stages.mdx#project) или [`unset`](./stages.mdx#unset).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+mask<const Sp extends object>(
+  spec: Sp & MaskSpecCheck<Row, Sp>,
+): MaskedQuery<ApplyMask<Row, Sp>[], ApplyMask<Row, Sp>, true>
+```
+
+</FullType>
+
+Путь, которого нет в итоговой строке, останавливает агрегацию: маска, которая ничего не скрыла бы, была бы тихой дырой в защите. Текст получен запуском:
+
+```text
+StrictModeError: mask: "nope" matched nothing in the rows of Order's aggregation, so nothing would be masked there; name a field of the final rows [unknown-path]
+```
+
+Все маски и их пресеты описаны в справочнике [Маски ответа](../query/masks.mdx#mask).
+
+---
+
+## .session
+
+`.session(session)` выполняет запрос в указанной сессии — обычно потому, что вы открыли её вручную. Внутри [`transaction`](../transactions/transactions.mdx#transaction) сессию подставляет Typemo, и метод нужен редко.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const session = await client.startSession();
+const rows = await Orders.aggregate((p) => p.limit(1)).session(session);
+await session.endSession();
+```
+
+<Returns type="AggregateQuery<Row>">
+
+Новый запрос с указанной сессией.
+
+</Returns>
+
+<Params>
+<Param name="session" type="ClientSession | null" required>
+
+Сессия драйвера. `null` выполняет запрос вне текущей транзакции: например, отчёт, которому не нужна изоляция.
+
+</Param>
+</Params>
+
+Подробнее: [`.session` запроса чтения](../query/options.mdx#session).
+
+---
+
+## .policy
+
+`.policy(values)` задаёт значения политик для этой агрегации поверх текущих (тенант, актор, видимость удалённых документов). Нужен в фоновой задаче, где нет входящего запроса, из которого Typemo взял бы тенанта.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) => p.limit(1)).policy({ actor: "report-job" });
+```
+
+<Returns type="AggregateQuery<Row>">
+
+Новый запрос с объединёнными значениями политик. Неизвестный ключ — `QueryError`, а не молчаливое игнорирование: `aggregate.policy: unknown policy value "nope" (known: tenant, allTenants, actor, includeDeleted, onlyDeleted, hardDelete)`.
+
+</Returns>
+
+<Params>
+<Param name="values" type="PolicyValues" required>
+
+Объект с необязательными полями: `tenant`, `allTenants`, `actor`, `includeDeleted`, `onlyDeleted`, `hardDelete`.
+
+</Param>
+</Params>
+
+Подробнее: [`.policy` запроса чтения](../query/options.mdx#policy).
+
+---
+
+## .batchSize
+
+`.batchSize(n)` задаёт, сколько строк курсор получает от сервера за один обмен. Меньший размер — меньше памяти на пачку, больше обменов. Нужен вместе с [`.cursor()`](#cursor) на больших выгрузках.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const query = Orders.aggregate((p) => p.sort({ total: 1 })).batchSize(100);
+```
+
+<Returns type="AggregateQuery<Row>">
+
+Новый запрос. Значение должно быть положительным целым: ноль, отрицательное и нецелое число — `QueryError`. Ноль отвергается намеренно: драйвер читает `0` как «по умолчанию сервера», и случайный ноль молча отменил бы ваш размер пачки.
+
+</Returns>
+
+<Params>
+<Param name="n" type="number" required>
+
+Размер пачки, положительное целое число.
+
+</Param>
+</Params>
+
+```text
+QueryError: batchSize must be a positive integer, got -1 (number)
+QueryError: batchSize must be a positive integer, got 0 (number) (the driver reads 0 as "the server default"; leave batchSize out for the default)
+```
+
+У запросов чтения `.batchSize` есть только у `find`: [`.batchSize`](../query/options.mdx#batchsize).
+
+---
+
+## .comment
+
+`.comment(text)` прикрепляет к команде комментарий, который виден в журнале сервера и профилировщике. Нужен, чтобы отличить тяжёлый отчёт от остальных запросов, когда вы разбираете медленные операции.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const query = Orders.aggregate((p) => p.limit(1)).comment("monthly-report");
+```
+
+<Returns type="AggregateQuery<Row>">
+
+Новый запрос с комментарием.
+
+</Returns>
+
+<Params>
+<Param name="comment" type="string" required>
+
+Текст комментария.
+
+</Param>
+</Params>
+
+Подробнее: [`.comment` запроса чтения](../query/options.mdx#comment).
+
+---
+
+## .timeoutMS
+
+`.timeoutMS(ms)` ограничивает время всей операции на стороне клиента. Если сервер не успел, драйвер прерывает запрос. Нужен, чтобы отчёт не держал соединение бесконечно.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const query = Orders.aggregate((p) => p.limit(1)).timeoutMS(5000);
+```
+
+<Returns type="AggregateQuery<Row>">
+
+Новый запрос. Отрицательное или нецелое значение — ошибка:
+
+</Returns>
+
+```text
+QueryError: timeoutMS must be a non-negative integer, got -1 (number)
+```
+
+<Params>
+<Param name="ms" type="number" required>
+
+Время в миллисекундах, целое неотрицательное.
+
+</Param>
+</Params>
+
+Подробнее: [`.timeoutMS` запроса чтения](../query/options.mdx#timeoutms).
+
+---
+
+## .readPreference
+
+`.readPreference(mode)` выбирает, с какого члена набора реплик читать: с первичного, со вторичного, с ближайшего. Нужен, чтобы тяжёлые отчёты не нагружали первичный сервер.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const query = Orders.aggregate((p) => p.limit(1)).readPreference("secondaryPreferred");
+```
+
+<Returns type="AggregateQuery<Row>">
+
+Новый запрос с выбранным режимом.
+
+</Returns>
+
+<Params>
+<Param name="mode" type="ReadPreferenceMode" required>
+
+Режим чтения драйвера: `"primary"`, `"primaryPreferred"`, `"secondary"`, `"secondaryPreferred"`, `"nearest"`.
+
+</Param>
+</Params>
+
+Подробнее: [`.readPreference` запроса чтения](../query/options.mdx#readpreference).
+
+---
+
+## .readConcern
+
+`.readConcern(level)` задаёт уровень изоляции чтения: что сервер вправе показать, например только данные, подтверждённые большинством (`"majority"`). Нужен, когда отчёт не должен видеть данные, которые потом откатятся.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const query = Orders.aggregate((p) => p.limit(1)).readConcern("majority");
+```
+
+<Returns type="AggregateQuery<Row>">
+
+Новый запрос с выбранным уровнем.
+
+</Returns>
+
+<Params>
+<Param name="level" type="ReadConcernLevel" required>
+
+Уровень драйвера: `"local"`, `"available"`, `"majority"`, `"linearizable"`, `"snapshot"`.
+
+</Param>
+</Params>
+
+Внутри транзакции действуют настройки самой транзакции, поэтому уровень чтения здесь — ошибка:
+
+```text
+StrictModeError: Order.aggregate: readConcern "majority" inside a transaction — the transaction's own settings apply (set them on transaction()) [transaction-option]
+```
+
+Подробнее: [`.readConcern` запроса чтения](../query/options.mdx#readconcern).
+
+---
+
+## .build
+
+`.build()` у запроса агрегации отдаёт **план выполнения** (`AggregateExecutionPlan`): конвейер, опции и сущность, которые уйдут в операцию. Нужен для отладки: посмотреть, во что превратился ваш колбэк и какие параметры запуска к нему добавили вызовы запроса. Подробнее — в разделе [Две формы плана](#две-формы-плана).
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const plan = Orders.aggregate((p) => p.match({ status: "paid" })).timeoutMS(500).build();
+console.log(plan.entity.name, plan.pipeline, plan.options.timeoutMS);
+// → Order [{ $match: { status: "paid" } }] 500
+```
+
+<Returns type="AggregateExecutionPlan">
+
+Замороженный план выполнения. Это не то же самое, что [`PipelineBuilder.plan`](#pipelinebuilderplan): у плана выполнения есть сущность и параметры запуска, а у плана строителя — только источник и стадии.
+
+</Returns>
+
+---
+
+## Две формы плана
+
+Слово «план» в агрегации означает два разных объекта. Они похожи, но получаются разными способами и служат разным задачам, поэтому их легко перепутать.
+
+**`AggregatePlan`** — план конвейера. Его возвращает [`.plan()`](#pipelinebuilderplan) строителя. В нём источник (`target`), стадии и опции конвейера, а модели и параметров запуска нет. Поэтому план можно собрать в одном модуле и запустить где угодно: на модели той же коллекции через [`Model.aggregate`](#modelaggregate), а план базы или сессий — через [`connection.aggregate`](../connection/connection.mdx#connectionaggregate) и [`client.aggregate`](../connection/typemo-client.mdx#clientaggregate).
+
+**`AggregateExecutionPlan`** — план выполнения. Его возвращает [`.build()`](#build) запроса, когда конвейер уже привязан к модели. В нём сущность модели (`entity`), стадии (`pipeline`), опции конвейера (`aggregateOptions`) и параметры этого запуска (`options`: `session`, `timeoutMS`, `policy`, `comment`, `batchSize`…). Именно его выполняет конвейер операций. Тип экспортирован, чтобы функция могла принять и вернуть такой план, но руками его собирают редко.
+
+```ts twoslash
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const plan = Pipeline.from(Order).match({ status: "paid" }).plan();
+console.log(Object.keys(plan));
+// → ["op", "target", "pipeline", "options"]
+
+const execution = Orders.aggregate(plan).timeoutMS(500).build();
+//    ^?
+console.log(Object.keys(execution));
+// → ["op", "entity", "pipeline", "aggregateOptions", "options"]
+```
+
+Стадии в обоих планах одни и те же; различаются обёртка и то, что к ним добавлено. У `AggregatePlan` есть `target`, у `AggregateExecutionPlan` вместо него `entity`. Опции конвейера (`hint`, `collation`, `allowDiskUse`…) в первом лежат в `options`, а во втором — в `aggregateOptions`, потому что `options` занято параметрами запуска. Обратной дороги нет: `AggregateExecutionPlan` нельзя передать в `aggregate`, он принимает только `AggregatePlan`.
+
+<FullType>
+
+```ts
+interface AggregatePlan<Row> {
+  readonly op: "aggregate";
+  readonly target: PipelineTarget;
+  readonly pipeline: readonly PipelineStage[];
+  readonly options: AggregateOptions<unknown>;
+}
+
+interface AggregateExecutionPlan {
+  readonly op: "aggregate";
+  readonly entity: EntityClass;
+  readonly pipeline: readonly PipelineStage[];
+  readonly aggregateOptions: AggregateOptions<unknown>;
+  readonly options: PlanOptions;
+}
+```
+
+</FullType>
+
+Какой план нужен вам, подскажет вопрос: вы описываете конвейер или смотрите, что будет выполнено? Если описываете, берите `AggregatePlan` из `.plan()`. Если отлаживаете или пишете тест на то, какие параметры ушли в операцию, смотрите `AggregateExecutionPlan` из `.build()`. Для плана базы (`connection.aggregate`) `entity` — служебный класс с именем вызванного метода (`connection` или `client`): у такой агрегации нет модели.
+
+---
+
+## Когда не подходит
+
+Если вам нужны документы модели с методами и виртуальными полями, а не строки-отчёты, используйте [`find`](../query/reading.mdx#modelfind): агрегация не возвращает документов. Для простого подсчёта или списка уникальных значений есть [`countDocuments`](../query/reading.mdx#modelcountdocuments) и [`distinct`](../query/reading.mdx#modeldistinct), они проще и не требуют конвейера.
+
+Для постоянно хранимого результата агрегации смотрите [`TypedView.define`](../collections/typed-view.mdx#typedviewdefine) (представление, которое вычисляется при каждом чтении) и [материализованные представления](../collections/materialized.mdx) (результат записан в коллекцию).

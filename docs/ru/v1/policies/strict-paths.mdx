@@ -1,0 +1,76 @@
+---
+title: Не допустить опечатку в имени поля
+description: "Что происходит, когда фильтр, обновление, проекция или сортировка называют поле, которого нет в схеме"
+icon: SpellCheck
+---
+
+Каждый путь в фильтре, обновлении, проекции, сортировке и конвейере проверяется по схеме. Если поля нет, Typemo не отправляет операцию и бросает [`StrictModeError`](../reference/policies/violations.mdx#unknown-path) с причиной `unknown-path`. Без этого опечатка `nmae` дала бы фильтр, который ничего не находит, или обновление, которое молча ничего не пишет. Компилятор ловит такую опечатку в типизированном коде; проверка во время работы нужна там, где путь приходит из данных, например из JSON клиента.
+
+## Что предполагается
+
+Примеры используют модель пользователя.
+
+```ts twoslash title="users/user.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+}
+```
+
+## Быстрый путь
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, StrictModeError } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Users = client.connection.model(User);
+// ---cut---
+const filter = JSON.parse('{"nope":1}');
+try {
+  await Users.find(filter);
+} catch (error) {
+  if (error instanceof StrictModeError) console.log(error.reason, error.path);
+  // → "unknown-path" "filter.nope"
+}
+```
+
+## Где проверяются пути
+
+Проверка охватывает разные места, а `path` в ошибке говорит, в каком именно. Запуск дал: фильтр — `filter.nope`, внутри `$or` — `filter.$or.0.nope`, обновление — `$set.nope`, проекция — `projection.nope`, сортировка — `sort.nope`. Текст везде вида `filter: "nope" is not a field of User [unknown-path]`: путь до места ввода печатается один раз, затем имя неизвестного поля в кавычках. Внутри `$or` место длиннее: `filter.$or.0: "nope" is not a field of User [unknown-path]`.
+
+То же касается ключа `+путь` в проекции, который добавляет скрытое поле: `+nope` тоже проверяется, и неизвестное имя после плюса даёт `StrictModeError` с причиной `unknown-path` и путём `projection.+nope`. Опечатка в `+passwordHash` поэтому не превращается в проекцию, которая молча ничего не добавила.
+
+## Неизвестные поля в данных документа
+
+Проверка путей относится к запросам. Лишние поля в **создаваемом документе** — отдельная тема, см. [Неизвестные поля](../documents/unknown-fields.mdx).
+
+## Как выбрать
+
+Смягчить проверку нельзя: нет опции, которая разрешила бы неизвестный путь. Если поле действительно нужно, добавьте его в схему. Если работа идёт с данными без схемы, используйте [`client.unsafeDriver()`](../reference/connection/typemo-client.mdx#clientunsafedriver).
+
+## Когда это не нужно
+
+В типизированном коде компилятор остановит опечатку раньше. Проверка во время работы нужна, когда путь приходит извне.
+
+## Частые ошибки
+
+### Путь через точку в динамическом ключе
+
+Путь собирается строкой из данных и содержит поле, которого нет. Ошибка называет весь путь в `path`. Проверьте список допустимых полей до сборки фильтра.
+
+## Что дальше
+
+<Cards>
+<Card title="Нарушения политик" href="../reference/policies/violations.mdx#unknown-path">
+  Тексты всех ошибок строгих путей.
+</Card>
+<Card title="Недоверенный ввод" href="./untrusted-input.mdx">
+  Как защитить фильтр от операторов внутри данных клиента.
+</Card>
+</Cards>

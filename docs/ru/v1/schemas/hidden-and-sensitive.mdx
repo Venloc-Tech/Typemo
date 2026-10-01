@@ -1,0 +1,401 @@
+---
+title: Скрытые и чувствительные поля
+description: "Как не отдать хеш пароля в ответ и не оставить номер карты в журнале аудита, событиях и ошибках"
+icon: EyeOff
+---
+
+В модели почти всегда есть данные, которые нужны базе и приложению, но не должны попасть дальше: хеш пароля, токен сброса, номер карты. Typemo защищает такие поля двумя разными опциями, потому что «дальше» бывает двух видов. Опция [`hidden`](../reference/schemas/prop.mdx#hidden) не пускает поле в **результаты запросов**: пока вы не попросили его явно, оно не читается из базы и не попадает в ответ. Опция [`sensitive`](../reference/schemas/prop.mdx#sensitive) прячет значение в **побочных каналах** — в журнале аудита, в событиях наблюдения (а через них в трассировках) и в текстах ошибок. Данные в самой базе не меняет ни одна из них.
+
+Если вы впервые видите слово «аудит» или «событие наблюдения», достаточно знать: это записи о том, что делало приложение, и они живут дольше и дальше, чем ответ одного запроса, поэтому секрет в них попадает чаще, чем кажется.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель пользователя сервиса из файла `users/user.ts`. Модель растёт по ходу страницы: сначала одно скрытое поле, потом чувствительные.
+
+## Быстрый путь
+
+Скрытое поле — это `hidden: true` в [`@Prop`](../reference/schemas/prop.mdx#prop) и тип `Hidden<T>` у поля. Обычное чтение не вернёт его ни в типе, ни в данных, а `+` перед именем в [`select`](../reference/query/reading.mdx#select) возвращает:
+
+```ts twoslash title="users/user.ts"
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+await Users.create({ name: "gina", passwordHash: "h1" });
+
+const plain = await Users.find({ name: "gina" }).plain();
+// → [{ _id: "…", name: "gina" }]
+
+const withHash = await Users.find({ name: "gina" }).select({ "+passwordHash": true }).lean();
+// → [{ _id: ObjectId("…"), name: "gina", passwordHash: "h1" }]
+```
+
+Чувствительное поле — `sensitive` со значением `"show"`, `"mask"`, `"hide"` или готовой маской из [`Mask`](../reference/query/masks.mdx#пресеты-mask). Данные и результаты запросов остаются настоящими, а журнал аудита, события и ошибки получают безопасную копию:
+
+```ts twoslash title="users/user.ts"
+import { Entity, type Hidden, Mask, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users", audit: true })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+  @Prop(() => String, { sensitive: Mask.email() }) email?: string;
+  @Prop(() => String, { sensitive: "hide" }) resetToken?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+try {
+  await Users.create({ name: "gina", email: 5 as never });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to string failed at path "email" for "?" (string): expected a string [type]
+```
+
+Остальная страница разбирает оба механизма на реальных задачах.
+
+## Не читать поле из базы
+
+Ситуация: пользователь входит по паролю, и приложению нужен его хеш, но список пользователей на странице администратора не должен его даже загружать. `hidden: true` делает так, чтобы по умолчанию поле не читалось: запрос добавляет к проекции исключение поля, и значение не приходит по сети и не оказывается в памяти приложения. Тип результата тоже не содержит поля, поэтому обращение `row.passwordHash` в обычном результате не скомпилируется.
+
+```ts twoslash title="users/users.service.ts"
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+export const listUsers = async () => Users.find().plain();
+
+const [first] = await listUsers();
+// @errors: 2339
+first?.passwordHash;
+```
+
+Скрытое поле остаётся обычным полем для записи и фильтра: создавать и обновлять его можно, искать по нему тоже. Читать его обратно приходится явно. Так устроено потому, что защита нужна ответам, а не логике: проверка «есть ли пользователь с таким хешем» законна, а вот случайный `find()` в обработчике не должен выдать хеш клиенту.
+
+Документ, который вы только что создали, хранит значение, которое вы ему дали: оно уже в памяти. Но и в этом случае `$toPlain()` его не включает.
+
+```ts twoslash title="users/users.service.ts"
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+const created = await Users.create({ name: "gina", passwordHash: "h1" });
+console.log(created.passwordHash, created.$toPlain());
+// → "h1" { _id: "…", name: "gina" }
+
+const found = await Users.find({ passwordHash: "h1" }).plain();
+// → [{ _id: "…", name: "gina" }]
+```
+
+## Прочитать скрытое поле
+
+Чтобы прочитать хеш при входе, поставьте `+` перед именем поля в `select`. Знак не превращает выбор во включение: вы получаете все обычные поля и скрытое вместе с ними. В типе результата поле тоже появляется.
+
+```ts twoslash title="users/auth.ts"
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+export const findForLogin = async (name: string) =>
+  Users.findOne({ name }).select({ "+passwordHash": true }).lean();
+
+const user = await findForLogin("gina");
+console.log(user?.passwordHash);
+// → "h1"
+```
+
+Другой способ — назвать поле в обычном включении, `select({ passwordHash: 1 })`: скрытое поле тогда тоже читается, но в ответе будут только оно и `_id`. Подробности выбора полей — в руководстве [Выбор полей и тип результата](../queries/projections.mdx#прочитать-скрытое-поле).
+
+## Отдать скрытое поле клиенту
+
+Прочитать поле не значит отдать его. Plain-вид, [`.plain()`](../reference/query/reading.mdx#plain), и [`$toPlain()`](../reference/documents/document-api.mdx#toplain) — те виды, которые уходят за пределы приложения, — не включают скрытые поля даже тогда, когда вы загрузили их через `+`. Причина в том, что запрос с `+passwordHash` бывает нужен внутри сервера, а его результат потом передают в общий сериализатор: без этого правила хеш ушёл бы клиенту одной лишней строкой.
+
+```ts twoslash title="users/auth.ts"
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+const doc = await Users.findOne({ name: "gina" }).select({ "+passwordHash": true }).orFail();
+console.log(doc.passwordHash);
+// → "h1"
+console.log(doc.$toPlain());
+// → { _id: "…", name: "gina" }
+console.log(doc.$toPlain({ hidden: true }));
+// → { _id: "…", name: "gina", passwordHash: "h1" }
+```
+
+Опция `{ hidden: true }` есть у `$toPlain`, `$toJSON` и у `.plain()`. Обычный вид — lean, `.lean()` — отдаёт то, что вы загрузили, без правил отдачи: он предназначен для внутренней работы. Сами виды описаны в руководстве [Чтение данных](../queries/reading-data.mdx#отдать-данные-клиенту).
+
+## Скрытое поле в агрегации
+
+Агрегация обходит модель документа, поэтому защита стоит в самой [`Pipeline`](../reference/query/reading.mdx): перед первой стадией ядро добавляет `$unset` скрытых путей, так что ни одна стадия и ни одна строка результата их не видит. То же относится к присоединённым коллекциям (`$lookup`, `$unionWith`, `$graphLookup`). Если поле нужно намеренно, назовите его в `include`.
+
+Некоторые стадии сервер принимает только первыми: `$search`, `$searchMeta`, `$vectorSearch`, `$geoNear`, `$collStats`, `$indexStats` и другие служебные. Если конвейер начинается с такой стадии, `$unset` встаёт сразу после неё: стадия остаётся первой, а скрытых полей нет ни в следующих стадиях, ни в результате. Конвейер `geoNear` модели со скрытым полем отправляется как `[{ $geoNear: … }, { $unset: ["passwordHash"] }]`, и в строках поля нет.
+
+```ts twoslash title="users/report.ts"
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+import { Pipeline } from "@venloc/typemo";
+// ---cut---
+const hidden = await Users.aggregate(Pipeline.from(User).match({ name: "gina" }).plan());
+// → [{ _id: ObjectId("…"), name: "gina" }]
+
+const included = await Users.aggregate(Pipeline.from(User, { include: ["passwordHash"] }).match({ name: "gina" }).plan());
+// → [{ _id: ObjectId("…"), name: "gina", passwordHash: "h1" }]
+```
+
+## Не показать значение в аудите, событиях и ошибках
+
+Ситуация: у пользователя появился адрес почты и токен сброса пароля, а модель ведёт журнал аудита (`audit: true` в [`@Schema`](../reference/schemas/schema.mdx#audit)). **Журнал аудита** — коллекция, куда каждая запись в модель добавляет свой отчёт: что записали, по какому фильтру. Если оставить всё как есть, адрес и токен окажутся в журнале открытым текстом, а журнал читают чаще и шире, чем сами данные.
+
+`sensitive` принимает четыре значения. `"show"` показывает настоящее значение. `"mask"` заменяет его знаком `?`. `"hide"` заменяет **всё условие или значение поля** на `[hidden]`: ключ остаётся, поэтому видно, что поле было, а операторы вроде `$gt` не видны. Четвёртое значение — готовая маска [`Mask.*`](../reference/query/masks.mdx#пресеты-mask) или ваша функция в виде `{ mask: (value) => … }`, тип значения выводится из поля.
+
+```ts twoslash title="users/user.ts"
+import { Entity, type Hidden, Mask, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users", audit: true })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+  @Prop(() => String, { sensitive: Mask.email() }) email?: string;
+  @Prop(() => String, { sensitive: "hide" }) resetToken?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+const user = await Users.create({ name: "gina", passwordHash: "h1", email: "gina@example.com", resetToken: "tok" });
+// в коллекции users_audit появилась запись:
+// → documents: [{ _id: "…", name: "gina", passwordHash: "?", email: "g***@example.com", resetToken: "[hidden]" }]
+```
+
+Обратите внимание: у `name` нет отметки, поэтому в журнал оно попало как есть, а у `passwordHash` — только `hidden` без `sensitive`. Скрытое поле без отметки в побочных каналах выглядит как `"mask"`: если поле нельзя отдавать в ответе, оно не должно выходить и в журнал. Отметка на поле сильнее этого правила: `sensitive: "show"` на скрытом поле показывает значение.
+
+Журнал лежит в коллекции `<коллекция>_audit` (или в той, что задана в `audit: { collection }`), и маскируются не только документы: фильтр и обновление записываются в тех же формах. Так выглядит запись об обновлении по скрытому полю, полученная запуском:
+
+```ts twoslash title="users/user.ts"
+import { Entity, type Hidden, Mask, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users", audit: true })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+  @Prop(() => String, { sensitive: Mask.email() }) email?: string;
+  @Prop(() => String, { sensitive: "hide" }) resetToken?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+await Users.updateOne({ name: "gina" }, { $set: { passwordHash: "h2" } });
+// запись журнала: filter: { name: "gina" }, update: { $set: { passwordHash: "?" } }
+```
+
+Журнал не подписчик, поэтому неотмеченные поля в нём остаются настоящими, а ошибка функции маски приводит к ошибке аудита (запись откатывается). Запись аудита описывает операцию так, как её вызвали: `updateMany({ status: "open" }, …)` оставит в журнале фильтр `{ status: "open" }` и счётчики `matchedCount` и `modifiedCount`, а не идентификаторы затронутых документов. Для истории одного документа пишите по `_id` (`updateOne({ _id }, …)`, `$save`) или сначала прочитайте идентификаторы в транзакции и запишите по `{ _id: { $in: ids } }`. Как устроен аудит целиком, описано в руководстве [Аудит](../policies/audit.mdx).
+
+## Значения в событиях наблюдения
+
+**События наблюдения** — сообщения, которые Typemo отправляет подписчикам, зарегистрированным через [`client.instrument`](../reference/connection/typemo-client.mdx#clientinstrument): начало операции, ошибка, транзакция. OpenTelemetry и Sentry работают через них. В сводке операции (`summary`) фильтры и обновления показаны в замаскированном виде, и отметки полей здесь главные.
+
+Для значений, у которых отметки нет, режим выбирает подписчик опцией `sensitive`. По умолчанию это `"mask"`: любое неотмеченное значение в фильтре превращается в `?`. Ниже один и тот же запрос, увиденный тремя подписчиками; поле `card` отмечено `Mask.card()`, поэтому его вид не зависит от подписчика.
+
+```ts twoslash title="observability/logging.ts"
+import { Entity, Mask, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "payments" })
+class Payment extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { sensitive: Mask.card() }) card?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Payments = client.db().model(Payment);
+// ---cut---
+client.instrument({
+  sensitive: "show",
+  handle: (event) => {
+    if (event.type === "operation.start") console.log(event.summary);
+  },
+});
+await Payments.find({ owner: "ann", card: "4242 4242 4242 4242" }).plain();
+// → { filter: { owner: "ann", card: "************4242" } }
+// при sensitive по умолчанию ("mask"): { filter: { owner: "?", card: "************4242" } }
+// при sensitive: "hide": { filter: { owner: "[hidden]", card: "************4242" } }
+```
+
+Так работает и для полей внутри поддокументов, массивов и Map, и для путей с `dbName`: маска строится по обоим именам поля, кодовому и базовому. Поле, отмеченное `"show"`, видно всегда, даже при `"mask"` у подписчика.
+
+## Значения в ошибках
+
+Значение поля попадает и в тексты ошибок: «не удалось привести», «нарушено ограничение», «дубликат ключа». Ошибка живёт дольше запроса: её пишут в журнал и отправляют в систему отслеживания ошибок, поэтому она следует отметкам полей. Ошибка приведения типа для отмеченного поля показывает `?` или `[hidden]` вместо значения. Функция маски вызывается только для значения объявленного типа: если пришло значение другого типа (число в строковом поле), вместо вызова подставляется `?`, поэтому неподходящее значение не ломает саму ошибку. У [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicatekeyerror) замаскированы значения ключа в `keyValue` и в тексте, потому что уникальный индекс чаще всего стоит именно на секретном поле (паспорт, токен). Индекс создаёт `init()`, поэтому в примере он вызван до записи.
+
+```ts twoslash title="users/user.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { sensitive: "mask", unique: true, sparse: true }) passport?: string;
+  @Prop(() => String, { sensitive: "hide" }) resetToken?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+try {
+  await Users.create({ resetToken: 5 as never });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to string failed at path "resetToken" for "[hidden]" (string): expected a string [type]
+
+await client.db().init();
+await Users.create({ passport: "P123" });
+try {
+  await Users.create({ passport: "P123" });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → duplicate key on passport_1: { passport: "?" } (code 11000 DuplicateKey)
+```
+
+В таком случае `cause` ошибки — замаскированная копия ошибки драйвера, а не оригинал: системы отслеживания сериализуют всю цепочку `cause`, и сырое значение в ней было бы утечкой.
+
+## Как выбрать
+
+Задайте себе один вопрос: **где значение не должно оказаться?** Если в ответе клиенту и в памяти приложения, когда оно не нужно, — `hidden`. Если в журналах, трассировках и сообщениях об ошибках — `sensitive`. Для настоящего секрета нужны обе: у хеша пароля `hidden: true`, а `sensitive` он получит сам, потому что скрытое поле без отметки маскируется. Отдельная отметка нужна, когда вы хотите другое поведение: `"hide"` вместо `?` или маска, сохраняющая часть значения, например последние четыре цифры карты.
+
+Из режимов `sensitive` выбирайте по тому, что читатель журнала должен уметь понять. `"mask"` говорит «здесь было значение». `"hide"` скрывает даже форму условия. Готовая маска оставляет пригодную для разбора часть: домен почты, хвост карты, хеш, по которому можно сопоставлять записи.
+
+## Когда это не нужно
+
+Ни `hidden`, ни `sensitive` не шифруют данные: в базе поле лежит открытым текстом, и любой, кто читает базу напрямую, его видит. Для настоящей защиты используйте шифрование на стороне приложения и храните в поле уже зашифрованное значение. `sensitive` не убирает поле из результатов: если вам нужно не отдать значение клиенту, это `hidden`, а если отдать часть значения — [маска ответа](../queries/response-masks.mdx). `hidden` на поле, которое читает каждый запрос, только добавляет `+` в каждый вызов.
+
+## Частые ошибки
+
+### Скрытое поле не скомпилировалось без `Hidden<T>`
+
+Опция и тип должны быть парой: компилятор проверяет их согласованность в обе стороны. Если поле с `hidden: true` объявлено обычным типом, вы получите ошибку прямо на декораторе.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+// ---cut---
+// @errors: 1240
+@Schema({ collection: "users" })
+class User extends Entity {
+  // неправильно: hidden без Hidden<T>
+  @Prop(() => String, { hidden: true })
+  passwordHash?: string;
+
+  // правильно
+  @Prop(() => String, { hidden: true })
+  apiKey?: Hidden<string>;
+}
+```
+
+Симметричная проверка есть и в обратную сторону: `Hidden<T>` без `hidden: true` тоже не компилируется. Так тип результата не может разойтись с тем, что делает запрос.
+
+### Скрытое поле загружено, но в ответе его нет
+
+Вы добавили `+passwordHash`, проверили `doc.passwordHash` в отладчике, а в ответе клиента поля нет. Это не потеря: [`.plain()`](../reference/query/reading.mdx#plain) и [`$toPlain()`](../reference/documents/document-api.mdx#toplain) не включают скрытые поля без `{ hidden: true }`. Добавляйте опцию только там, где вы действительно собираетесь отдать поле.
+
+### Функция маски на поддокументе
+
+Функция `{ mask: … }` работает со значением поля, а у поддокумента значение — целый объект. Typemo отказывает при описании модели, а не в момент записи:
+
+```text
+ConfigurationError: Payment.card: a "sensitive" mask function is for values; on a subdocument use "mask" or "hide"
+```
+
+Поставьте `"mask"` или `"hide"` на поддокумент целиком (тогда всё его содержимое маскируется) или отметьте нужные поля внутри него.
+
+## Полный пример
+
+Один файл собирает всё вместе: модель со скрытым хешем, чувствительной почтой и токеном, вход по паролю и ответ клиенту. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="users/users.service.ts"
+import { Entity, type Hidden, Mask, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "users", audit: true })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+
+  // хеш: не читается по умолчанию, в журналах "?"
+  @Prop(() => String, { hidden: true })
+  passwordHash?: Hidden<string>;
+
+  // почта: в журналах остаётся начало и домен
+  @Prop(() => String, { sensitive: Mask.email() })
+  email?: string;
+
+  // токен: в журналах и ошибках "[hidden]"
+  @Prop(() => String, { sensitive: "hide" })
+  resetToken?: string;
+}
+
+// код читателя: ошибка на границе приложения и проверка пароля
+class __Unauthorized__ extends Error {}
+const __verifyPassword__ = (password: string, hash: string | undefined): boolean => hash === `hash:${password}`;
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+
+// регистрация: хеш пишется как обычное поле
+export const signUp = async (name: string, email: string, password: string) =>
+  Users.create({ name, email, passwordHash: `hash:${password}` });
+
+// вход: хеш читаем явно и только здесь
+export const signIn = async (name: string, password: string) => {
+  const user = await Users.findOne({ name }).select({ "+passwordHash": true }).lean();
+  if (user === null || !__verifyPassword__(password, user.passwordHash)) throw new __Unauthorized__();
+  return user._id;
+};
+
+// профиль для клиента: хеша нет ни в типе, ни в данных
+export const profile = async (name: string) => Users.findOne({ name }).plain().orFail();
+```
+
+<Callout type="migration">
+
+Опция `hidden` заменяет `select: false` из Mongoose. Отличие в том, что скрытое поле отсутствует и в типе результата, а в plain-виде и в `$toPlain` оно не появляется, даже если вы его загрузили: чтобы отдать поле, нужно попросить его дважды, `+` при чтении и `{ hidden: true }` при отдаче. Опции `sensitive` в Mongoose нет: маскировка значений в журналах, событиях и ошибках — отдельный механизм Typemo.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Аудит" href="../policies/audit.mdx">
+  Что попадает в журнал, как читать записи и что делать, если запись в журнал не удалась.
+</Card>
+<Card title="Маски ответа" href="../queries/response-masks.mdx">
+  Как отдать клиенту не всё значение, а его безопасную часть.
+</Card>
+<Card title="Справочник: @Prop" href="../reference/schemas/prop.mdx">
+  Все опции поля, в том числе `hidden` и `sensitive`, с точными типами и ошибками.
+</Card>
+<Card title="Справочник: маркерные типы" href="../reference/schemas/field-markers.mdx">
+  `Hidden`, `Immutable` и другие типы-метки, которые связывают опции с типом результата.
+</Card>
+</Cards>

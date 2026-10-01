@@ -1,0 +1,319 @@
+---
+title: Заменить документ
+description: "Как заменить документ целиком методами replaceOne и findOneAndReplace и чем замена отличается от обновления"
+icon: Replace
+---
+
+Чтобы заменить документ целиком, вызовите [`replaceOne`](../reference/writes/writes.mdx#replaceone): вы передаёте новое содержимое, и всё, чего в нём нет, из документа исчезает. `_id` при этом остаётся прежним. Замена нужна, когда новое состояние известно полностью: импорт записи из внешней системы, форма «сохранить как есть», синхронизация с источником, в котором вы не знаете, какие поля поменялись.
+
+Если вам нужно поменять несколько полей и сохранить остальные, замена не подходит: используйте [обновление](./update.mdx). Разница в том, что замена **удаляет** поля, которые вы не передали, а обновление трогает только названные.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx). Модель счёта наследует `Timestamped(Entity)`: базовый класс добавляет служебные поля `createdAt` и `updatedAt`, и ядро ведёт их само. В коллекции лежит счёт `Main` с владельцем `alice`, балансом 10, тегами `a`, `b` и прозвищем `al`.
+
+```ts twoslash title="accounts/account.ts"
+import { type Defaulted, Entity, Prop, Schema, Timestamped } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { min: 0, default: 0 })
+  balance!: Defaulted<number>;
+
+  @Prop(() => String)
+  nickname?: string;
+}
+```
+
+## Быстрый путь
+
+Замена без результата — `replaceOne`, замена с получением документа — `findOneAndReplace`:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const result = await Accounts.replaceOne({ title: "Main" }, { title: "Main", owner: "carol" });
+console.log(result.modifiedCount);
+// → 1
+
+const account = await Accounts.findOneAndReplace({ title: "Main" }, { title: "Main", owner: "frank" }).plain();
+console.log(account?.owner);
+// → "frank"
+```
+
+Остальная страница разбирает, что именно заменяется, как ведут себя служебные поля и когда замена вредна.
+
+## Заменить документ целиком
+
+Ситуация: внешняя система прислала актуальное состояние счёта. Вы записываете его целиком, а всё, что устарело, должно исчезнуть.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+export const syncAccount = async (title: string, owner: string) => {
+  const result = await Accounts.replaceOne({ title }, { title, owner });
+  return result.modifiedCount === 1;
+};
+```
+
+Что произошло. Документ `Main` теперь содержит только `title`, `owner` и значения по умолчанию (`balance: 0`). Поля `tags` и `nickname`, которые лежали в нём раньше, **пропали**: замена не «дописывает» к старому, а записывает новое поверх. Эта разница — главное, что нужно помнить: если забыть в замене необязательное поле, оно исчезнет из документа, и ни компилятор, ни база этого не заметят.
+
+Замена не содержит операторов, только поля документа. `_id` не передаётся: компилятор его не принимает, а сам идентификатор остаётся прежним. Фильтр у `replaceOne` обязателен и непуст: при пустом фильтре замена выбрала бы произвольный документ, поэтому `{}` не компилируется, а пустой объект во время работы вызывает `StrictModeError` с причиной `empty-filter` (подробнее — [Пустые фильтры в записи](./empty-filters.mdx)). Если ничего не подошло под фильтр, метод не бросает ошибку и возвращает `matchedCount: 0`; чтобы получить ошибку, добавьте [`.orFail()`](../reference/writes/writes.mdx#orfail).
+
+## Служебные поля
+
+Служебные поля `createdAt`, `updatedAt` и `__v` ведёт ядро. При замене `createdAt` и `__v` сохраняются, а `updatedAt` получает время замены: вам не нужно ни передавать их, ни беспокоиться, что замена сотрёт историю документа.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const before = await Accounts.findOne({ title: "Main" }).orFail();
+await Accounts.replaceOne({ title: "Main" }, { title: "Main", owner: "carol" });
+const after = await Accounts.findOne({ title: "Main" }).orFail();
+console.log(before.createdAt.getTime() === after.createdAt.getTime());
+// → true
+console.log(before.updatedAt.getTime() === after.updatedAt.getTime());
+// → false
+```
+
+Если вы передадите служебное поле сами, замена откажется: это решение ядра, а не ваше, и вы не должны его подменять.
+
+```text
+StrictModeError: a replacement of Account carries the service field "createdAt": the core keeps createdAt/__v and bumps updatedAt itself; leave it out [immutable]
+```
+
+## Заменить и получить документ
+
+Ситуация: вы заменили документ и хотите вернуть его клиенту. [`findOneAndReplace`](../reference/writes/writes.mdx#findoneandreplace) делает замену и чтение одной командой. По умолчанию он возвращает документ **после** замены; чтобы получить старое состояние, передайте `returnDocument: "before"`.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const previous = await Accounts.findOneAndReplace(
+  { title: "Main" },
+  { title: "Main", owner: "gina" },
+  { returnDocument: "before" },
+).plain();
+console.log(previous?.owner);
+// → "alice"
+```
+
+Как и [`findOneAndUpdate`](../reference/writes/writes.mdx#findoneandupdate), метод принимает `upsert`: если документа нет, замена вставляется как новый документ. Фильтр у `findOneAndReplace` обязателен и непуст, потому что метод выбирает документ для замены: пустой фильтр выбрал бы произвольный.
+
+```text
+StrictModeError: findOneAndReplace with an empty filter would change or remove an arbitrary document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]
+```
+
+## Как выбрать
+
+Задайте себе один вопрос: **что известно о новом состоянии документа?** Если вы знаете его целиком и хотите, чтобы всё лишнее исчезло, берите замену. Если вы знаете только то, что изменилось, берите [обновление](./update.mdx): оно не затрёт чужие поля, добавленные другим кодом, и безопасно при параллельных изменениях, потому что операторы вроде `$inc` не теряют чужих прибавлений.
+
+## Когда это не нужно
+
+Если вы поменяли одно-два поля, замена лишь усложняет код и рискует затереть остальное. Используйте [`updateOne`](../reference/writes/writes.mdx#updateone) с [`$set`](../reference/writes/update-operators.mdx#set). Если документ уже загружен и изменён в памяти, сохраните его через [`$save`](../reference/documents/document-api.mdx#save): он отправит только изменения.
+
+## Частые ошибки
+
+### После замены пропали поля
+
+Симптом: в документе не хватает `nickname`, `tags` и других полей, которые вы не меняли. Причина: замена записывает ровно то, что вы передали. Правильно: передайте в замену все поля, которые должны остаться, либо используйте обновление: `$set` только на изменившиеся поля.
+
+### Оператор в замене
+
+Неправильно: `replaceOne({ title: "Main" }, { $set: { owner: "h" } })`. Замена не понимает операторов, поэтому Typemo останавливает её:
+
+```text
+QueryError: replacement: "$set" — a replacement has no operators
+```
+
+Правильно: если нужен оператор, это обновление, [`updateOne`](../reference/writes/writes.mdx#updateone). Если нужна замена, передайте обычные поля.
+
+### Идентификатор в замене
+
+Неправильно: передать `_id` в замене, даже тот же самый. Компилятор не примет поле `_id`. Если типы обойдены, замену отвергнет Typemo до отправки:
+
+```text
+StrictModeError: a replacement of Account carries "_id": a replacement keeps the stored _id and cannot change it; leave "_id" out and select the document by _id in the filter [immutable]
+```
+
+Правильно: не передавайте `_id`. Он остаётся прежним автоматически, а нужный документ выбирайте по `_id` в фильтре.
+
+### Замена расходится с полем `immutable`
+
+Допустим, у другой модели, `Pinned`, есть обязательное поле `region` и необязательное `code`, оба с `immutable`. Замена переписывает документ целиком, поэтому про такие поля она обязана сказать то же, что уже хранится: то же значение, если поле в документе есть, и ничего, если его нет. Сохранённый документ знает только сервер, поэтому Typemo добавляет это условие в фильтр замены, и сервер сравнивает значения сам, в той же операции. Расхождение не записывается, а Typemo называет поле.
+
+Неправильно: передать в замене другое значение.
+
+```text
+StrictModeError: a replacement of Pinned changes the immutable field "region"; the document was not replaced. Carry the stored value [immutable]
+```
+
+Неправильно: не передать поле, которое в документе есть. Замена потеряла бы его:
+
+```text
+StrictModeError: a replacement of Pinned without the immutable field "code" would drop it from the stored document; the document was not replaced. Include the stored value, or update the other fields with $set [immutable]
+```
+
+Неправильно: передать поле, которого в документе нет. Неизменяемое поле получает значение только при создании документа:
+
+```text
+StrictModeError: a replacement of Pinned sets the immutable field "code", which the stored document does not have; the document was not replaced. An immutable field gets its value when the document is created [immutable]
+```
+
+Правильно: передавайте сохранённое значение, а необязательное поле, которого в документе нет, не передавайте вовсе. Такая замена проходит, и лишнего обращения к серверу при этом нет. Если фильтр не нашёл документ, результат обычный (`matchedCount: 0` или `null`): чтобы отличить «документа нет» от «значение другое», Typemo один раз читает документ по вашему фильтру, только когда замена ничего не нашла. Внутри [транзакции](../transactions/transactions.mdx) это чтение идёт в той же сессии.
+
+Замену с `upsert: true` Typemo проверяет чтением до записи: сервер не принимает такое условие в фильтре `upsert`, а без проверки расхождение превратилось бы во вставку нового документа. Вне транзакции документ, который появится между чтением и записью, уже не сравнивается, поэтому для гонок берите транзакцию. Так же, чтением до отправки, проверяется `replaceOne` в [`bulkWrite`](../reference/writes/writes.mdx#bulkwrite): в неупорядоченном пакете отвергнутая операция попадает в `writeErrors`, а остальные записываются, упорядоченный пакет при расхождении не отправляется вовсе.
+
+## Полный пример
+
+Файл собирает описанное: синхронизация записи из внешнего источника и получение прежнего состояния.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Timestamped(Entity) {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+// Записать актуальное состояние счёта из внешней системы
+export const syncAccount = async (title: string, owner: string): Promise<boolean> => {
+  const result = await Accounts.replaceOne({ title }, { title, owner });
+  return result.matchedCount === 1;
+};
+
+// Заменить счёт и вернуть то, что в нём было
+export const archiveAndReplace = async (title: string, owner: string) => {
+  return Accounts.findOneAndReplace({ title }, { title, owner }, { returnDocument: "before" }).plain();
+};
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Обновить документы" href="./update.mdx">
+  Как менять отдельные поля, не затирая остальные.
+</Card>
+<Card title="Операторы обновления" href="./update-operators.mdx">
+  `$set`, `$inc`, `$push` и остальные операторы на задачах.
+</Card>
+<Card title="Запись: справочник" href="../reference/writes/writes.mdx#replaceone">
+  Точное описание `replaceOne` и `findOneAndReplace` с ошибками.
+</Card>
+</Cards>

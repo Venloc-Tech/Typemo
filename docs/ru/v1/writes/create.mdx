@@ -1,0 +1,427 @@
+---
+title: Создать документы
+description: "Как создать один или много документов, получить значения по умолчанию, разобрать ошибки валидации и дубликаты"
+icon: FilePlus
+---
+
+Чтобы записать новые данные, вызовите у модели [`create`](../reference/writes/writes.mdx#create): он принимает данные документа и возвращает готовый **документ** — объект класса модели, в котором уже есть `_id` и значения по умолчанию. Перед отправкой в базу Typemo проверяет данные: приводит значения к типам схемы, отвергает неизвестные поля и запускает валидаторы. Поэтому неверная запись останавливается в вашем коде, а не превращается в мусор в коллекции. Любой из этих способов запускает хуки документа `document.validate` и `document.save`, так что правило, повешенное на сохранение, сработает при каждом.
+
+У создания несколько вариантов: [`create`](../reference/writes/writes.mdx#create) (один документ или упорядоченный список), [`insertOne`](../reference/writes/writes.mdx#insertone) (та же запись одного документа) и [`insertMany`](../reference/writes/writes.mdx#insertmany) (список одним запросом, с неупорядоченным режимом), а также [`Model.new`](../reference/documents/model-document-methods.mdx#modelnew) с [`$save`](../reference/documents/document-api.mdx#save), когда документ нужно подготовить и изменить до записи. Если вы впервые работаете с MongoDB, вам достаточно знать, что документ — это запись в **коллекции**, а `_id` — её уникальный идентификатор, который база выдаёт сама.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель счёта. В ней два обязательных поля и уникальное имя, а индекс `unique` создан заранее вызовом `connection.init()`.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+}
+```
+
+## Быстрый путь
+
+Один документ создаёт `create`, много документов — `create` со списком или `insertMany`. Результат каждого — документы с `_id`:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const one = await Accounts.create({ title: "Main", owner: "alice" });
+console.log(one.title, one.balance);
+// → "Main" 0
+
+const many = await Accounts.create([
+  { title: "Salary", owner: "alice" },
+  { title: "Savings", owner: "alice" },
+]);
+console.log(many.length);
+// → 2
+
+const inserted = await Accounts.insertOne({ title: "Cash", owner: "bob" });
+console.log(inserted.owner);
+// → "bob"
+```
+
+Остальная страница разбирает значения по умолчанию, ошибки, списки документов, `Model.new` и выбор между методами.
+
+## Создать один документ
+
+Ситуация: пользователь открывает счёт, и вам нужно записать его и сразу получить `_id`. Вызовите `create` с данными документа. Обязательные поля модели нужно передать, остальное подставит Typemo.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+export const openAccount = async (owner: string, title: string) => {
+  const account = await Accounts.create({ owner, title });
+  return account._id;
+};
+```
+
+Что произошло. Typemo проверил данные, добавил `_id` и значения по умолчанию, записал документ и вернул его **гидратированным**: это экземпляр класса `Account`, а не голый объект. Такой документ помнит, что он уже сохранён, поэтому его дальнейшие изменения [`$save`](../reference/documents/document-api.mdx#save) отправит как обновление, а не как вставку. Когда `_id` нужен в чистом виде, для ответа клиенту у документа есть [`$toPlain()`](../reference/documents/document-api.mdx#toplain).
+
+## Значения по умолчанию и проверки
+
+Поле может иметь **значение по умолчанию** и **границы**. Допустим, счёт получает баланс, который не бывает отрицательным, и стартует с нуля. Так модель растёт:
+
+```ts title="accounts/account.ts"
+import { type Defaulted, Entity, Prop, Schema } from "@venloc/typemo"; // [!code highlight]
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  // …поля выше
+
+  @Prop(() => Number, { min: 0, default: 0 }) // [!code ++]
+  balance!: Defaulted<number>; // [!code ++]
+}
+```
+
+Тип `Defaulted<number>` сообщает компилятору, что при создании поле можно не передавать: значение подставит библиотека. Без такой пометки поле было бы обязательным и в типе входа. Массив — исключение: поле `tags!: string[]` без `required` и без `default` тоже можно не передавать, новый документ получит пустой массив `[]`, и пометка `Defaulted` для него не нужна.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const account = await Accounts.create({ title: "Zero", owner: "carol" });
+console.log(account.balance);
+// → 0
+```
+
+Нарушение границы останавливает создание ещё до отправки в базу, ошибкой [`ValidationError`](../reference/errors/data-errors.mdx#validationerror):
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+try {
+  await Accounts.create({ title: "Negative", owner: "carol", balance: -1 });
+} catch (error) {
+  console.log(error instanceof ValidationError);
+  // → true
+}
+```
+
+```text
+ValidationError: Validation failed: "balance": must be at least 0 [min]
+ValidationError: Validation failed: "title": the field is required [required]
+```
+
+Поле неизвестного имени или значение не того типа даёт [`CastError`](../reference/errors/data-errors.mdx#casterror): Typemo не сохраняет то, чего нет в схеме, потому что опечатка в имени поля иначе превратилась бы в лишнее поле в базе.
+
+```text
+CastError: Cast to Account failed at path "zzz" for 1 (number): not a field of Account [unknown-key]
+CastError: Cast to string failed at path "title" for 5 (number): expected a string [type]
+```
+
+## Создать много документов
+
+Ситуация: импорт, начальное заполнение, пакет событий. Передайте в `create` список: документы уйдут **одной упорядоченной записью**, в том порядке, в котором вы их передали. Результат — массив документов в том же порядке.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const created = await Accounts.create([
+  { title: "Salary", owner: "alice" },
+  { title: "Savings", owner: "alice" },
+]);
+console.log(created.map((account) => account.title));
+// → ["Salary", "Savings"]
+```
+
+Запись упорядоченная не случайно. Если бы документы создавались параллельно, при ошибке нельзя было бы сказать, какие уже записаны. Здесь запись идёт по порядку и останавливается на первой ошибке базы.
+
+Список проверяется целиком до отправки: если хотя бы один документ не проходит валидацию, не записывается **ничего**.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+try {
+  await Accounts.create([
+    { title: "C1", owner: "o" },
+    { title: "C2", owner: "o", balance: -1 }, // не пройдёт проверку
+  ]);
+} catch (error) {
+  console.log(await Accounts.countDocuments({ title: "C1" }));
+  // → 0
+}
+```
+
+### Неупорядоченная вставка: insertMany
+
+Если порядок не важен и нужно записать всё, что проходит проверку, используйте [`insertMany`](../reference/writes/writes.mdx#insertmany). Он проверяет значения и запускает хуки документа так же, как `create`, но уходит в базу одним запросом и умеет **неупорядоченную** вставку: с `ordered: false` записывается всё, что можно, а ошибки собираются и сообщаются в конце.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+try {
+  await Accounts.insertMany(
+    [
+      { title: "U1", owner: "d" },
+      { title: "Main", owner: "d" }, // такой title уже есть
+      { title: "U3", owner: "d", balance: -5 }, // не пройдёт проверку
+      { title: "U4", owner: "d" },
+    ],
+    { ordered: false },
+  );
+} catch (error) {
+  if (error instanceof BulkWriteError) {
+    console.log(error.writeErrors.map((failure) => [failure.index, failure.error.name]));
+    // → [[1, "DuplicateKeyError"], [2, "ValidationError"]]
+    console.log(error.result.insertedCount);
+    // → 2
+  }
+}
+```
+
+Что произошло. `U1` и `U4` записаны, второй и третий документы — нет. В [`BulkWriteError`](../reference/errors/server-errors.mdx#bulkwriteerror) индекс каждой неудачи — это позиция во входном списке, а `result.insertedCount` называет число записанных. Ошибка проверки Typemo и ошибка сервера лежат в одном списке `writeErrors`, потому что для вызывающего кода это одно: документ не записан.
+
+## Создать документ через new и $save
+
+Ситуация: документ нужно сначала подготовить, изменить, проверить и только потом записать. [`Model.new`](../reference/documents/model-document-methods.mdx#modelnew) создаёт документ **в памяти**: значения приведены к типам, значения по умолчанию подставлены, но в базе его ещё нет. Записывает его [`$save`](../reference/documents/document-api.mdx#save).
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const draft = Accounts.new({ title: "Draft", owner: "erin" });
+console.log(draft.$isNew());
+// → true
+
+draft.note = "opened by phone";
+await draft.$save();
+console.log(draft.$isNew());
+// → false
+```
+
+Что произошло. `new` проверил данные и вернул документ, `$isNew()` показал, что он ещё не записан. `$save` вставил его. Этот путь нужен, когда с документом что-то делают между созданием и записью; в остальных случаях `create` короче и делает то же самое.
+
+## Дубликаты
+
+Ситуация: `title` должен быть уникален. Уникальность гарантирует индекс `unique` в базе, а не Typemo: сам по себе он проверить её не может, потому что видит один документ, а не всю коллекцию. Поэтому индекс нужно создать заранее: [`connection.init()`](../reference/connection/connection.mdx#connectioninit) или [`Model.syncIndexes`](../reference/collections/model-indexes.mdx#modelsyncindexes). Пока индекса нет, базе нечем отвергнуть повтор.
+
+Повторное значение бросает [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicatekeyerror), а не общую ошибку сервера. У ошибки есть разобранные поля `keyPattern` и `keyValue`:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+try {
+  await Accounts.create({ title: "Main", owner: "bob" });
+} catch (error) {
+  console.log(error instanceof DuplicateKeyError);
+  // → true
+}
+```
+
+```text
+DuplicateKeyError: duplicate key on title_1: { title: "Main" } (code 11000 DuplicateKey)
+```
+
+Сообщение короткое: индекс, значение ключа и код. Полный текст сервера лежит в `serverMessage`, а оригинальная ошибка драйвера — в `cause`. Значение ключа в сообщении подчиняется [`sensitive`](../schemas/hidden-and-sensitive.mdx) так же, как и в `keyValue`.
+
+Если дубликат случился внутри списка, ошибка приходит как `BulkWriteError`, а `DuplicateKeyError` лежит в `writeErrors[0].error`. Документы до неё уже записаны, а следующие за ней нет:
+
+```text
+BulkWriteError: Account.create: 1 write(s) failed (first at index 1: duplicate key on title_1 (code 11000 DuplicateKey))
+```
+
+Обратите внимание: в тексте стоит `Account.create`, то есть метод, который вызвали вы, а не механизм записи внутри. С `insertMany` там будет `Account.insertMany`.
+
+## Как выбрать
+
+Задайте себе один вопрос: **что вы будете делать с документом после записи?** Если вы будете его читать, менять и сохранять, например вернёте из функции сервиса и дальше поработаете с ним как с объектом, берите [`create`](../reference/writes/writes.mdx#create): он даёт документ, проходит хуки сохранения и записывает список упорядоченно. Если вам нужно просто загрузить много данных и вы готовы разбирать частичные ошибки, берите [`insertMany`](../reference/writes/writes.mdx#insertmany) с `ordered: false`: это единственный способ записать всё, что проходит проверку, а `create` со списком всегда упорядочен. Если документ нужно подготовить и изменить до записи, начинайте с `Model.new`.
+
+## Когда это не нужно
+
+Если вы записываете **разные** операции вперемешку (вставки, изменения, удаления), вам нужен [`bulkWrite`](../reference/writes/writes.mdx#bulkwrite), см. [Пакетная запись](./bulk.mdx). Если запись нужно вставить или обновить, смотря по тому, есть ли она уже, используйте [`upsert`](../reference/writes/writes.mdx#upsert), см. [Обновить документы](./update.mdx). Если данные уже лежат в базе и вы хотите их изменить, `create` не нужен: используйте [`updateOne`](../reference/writes/writes.mdx#updateone).
+
+## Частые ошибки
+
+### Список создан наполовину
+
+Симптом: `create` или `insertMany` бросил `BulkWriteError`, а часть документов в коллекции есть. Причина в том, что список записывается **последовательно**: то, что стояло до ошибки, уже сохранено. Если запись должна быть «всё или ничего», выполните её в транзакции (руководство [Транзакции](../transactions/transactions.mdx)); тогда сбой откатит всё, что было записано до него.
+
+### Опечатка в имени поля
+
+Неправильно:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+// @errors: 2769
+await Accounts.create({ title: "Typo", owner: "o", ownr: "oops" });
+```
+
+Компилятор указывает на лишнее поле, а если данные пришли из внешнего мира, поле остановит [`CastError`](../reference/errors/data-errors.mdx#casterror) во время работы: `Cast to Account failed at path "ownr" … not a field of Account`. Исправьте имя поля.
+
+## Полный пример
+
+Файл собирает описанное: открытие счёта, импорт списка с разбором частичных ошибок и черновик через `new`.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+// Открыть один счёт и вернуть его id
+export const openAccount = async (owner: string, title: string) => {
+  const account = await Accounts.create({ owner, title });
+  return account._id;
+};
+
+// Загрузить список счетов и отчитаться, что не записалось
+export const importAccounts = async (rows: { owner: string; title: string }[]) => {
+  try {
+    const created = await Accounts.insertMany(rows, { ordered: false });
+    return { saved: created.length, failed: [] as number[] };
+  } catch (error) {
+    if (error instanceof BulkWriteError) {
+      return {
+        saved: error.result.insertedCount,
+        failed: error.writeErrors.map((failure) => failure.index),
+      };
+    }
+    throw error;
+  }
+};
+
+// Подготовить черновик и записать позже
+export const saveDraft = async (owner: string, title: string, note: string) => {
+  const draft = Accounts.new({ owner, title });
+  draft.note = note;
+  await draft.$save();
+  return draft;
+};
+```
+
+<Callout type="migration">
+
+В Mongoose `Model.create([...])` создавал документы параллельно. В Typemo список записывается одной упорядоченной записью. `Model.new` заменяет `new Model(data)`: он сразу приводит все поля и отвергает неизвестные. Значения по умолчанию подставляются при создании, а проверки, которые в Mongoose были опциями, здесь работают всегда.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Обновить документы" href="./update.mdx">
+  Как изменить документ, получить его обратно и вставить, если его ещё нет.
+</Card>
+<Card title="Пакетная запись" href="./bulk.mdx">
+  Много разных операций одним запросом и разбор частичных ошибок.
+</Card>
+<Card title="Запись: справочник" href="../reference/writes/writes.mdx">
+  Все методы записи, их опции, результаты и ошибки.
+</Card>
+<Card title="Транзакции" href="../transactions/transactions.mdx">
+  Как сделать запись «всё или ничего».
+</Card>
+</Cards>

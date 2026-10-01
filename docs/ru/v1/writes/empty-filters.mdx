@@ -1,0 +1,246 @@
+---
+title: Пустые фильтры в записи
+description: "Почему методы записи отвергают пустой фильтр, почему пустой литерал не компилируется и как намеренно изменить или удалить все документы"
+icon: ShieldAlert
+---
+
+Если передать в [`updateMany`](../reference/writes/writes.mdx#updatemany), [`deleteMany`](../reference/writes/writes.mdx#deletemany) или любой другой метод, который меняет или удаляет документы, пустой фильтр `{}`, Typemo не выполнит запись. Пустой литерал `{}` не скомпилируется, а пустой объект, который получился во время работы, вызовет ошибку. В MongoDB пустой фильтр подходит **каждому** документу, поэтому такое обновление изменило бы всю коллекцию, а такое удаление очистило бы её. Фильтры часто собираются из данных: из параметров запроса, из настроек, из необязательных полей формы. Одна опечатка или один пропущенный параметр, и вместо нескольких записей пострадали бы все.
+
+Если вам действительно нужно изменить или удалить всё, это записывается явно: [`Filters.all()`](../reference/policies/violations.mdx#filtersall). Тогда намерение видно в коде и в журнале команд.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель счёта из руководства [Создать документы](./create.mdx). В коллекции три счёта: `Main` и `Second` у `alice`, `Other` у `bob`.
+
+```ts twoslash title="accounts/account.ts"
+import { type Defaulted, Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { min: 0, default: 0 })
+  balance!: Defaulted<number>;
+
+  @Prop(() => String)
+  note?: string;
+}
+```
+
+## Быстрый путь
+
+Пустой фильтр отвергается, а явное «всё» разрешено:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const filter: { owner?: string } = {}; // фильтр, который собрался пустым
+try {
+  await Accounts.updateMany(filter, { $set: { note: "x" } });
+} catch (error) {
+  console.log(error instanceof StrictModeError);
+  // → true
+}
+
+const result = await Accounts.updateMany(Filters.all(), { $set: { note: "audited" } });
+console.log(result.matchedCount);
+// → 3
+```
+
+Остальная страница объясняет, какие методы отвергают пустой фильтр, что проверяет компилятор, как устроено `Filters.all` и откуда пустой фильтр берётся на практике.
+
+## Что происходит с пустым фильтром
+
+Typemo проверяет фильтр **до** отправки в базу. Ошибка называется [`StrictModeError`](../reference/errors/data-errors.mdx#strictmodeerror) с причиной `empty-filter`, и в её тексте стоит имя вызванного метода:
+
+```text
+StrictModeError: updateMany with an empty filter would affect every document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]
+StrictModeError: deleteOne with an empty filter would change or remove an arbitrary document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]
+```
+
+Текст зависит от формы метода. У `updateMany` и `deleteMany` он говорит «would affect every document». У `updateOne`, `deleteOne`, `replaceOne` и `findOneAnd*` — «would change or remove an arbitrary document»: затронут был бы один документ, но какой именно, не гарантирует база. Теми же словами отвечает компилятор на литерал `{}`. Смысл правила один: фильтр обязан сказать, что вы имеете в виду.
+
+Проверяется именно фильтр, который написали вы. Условия, которые ядро добавляет само (тенант, мягкое удаление), не делают пустой фильтр допустимым: иначе «удалить всё» превращалось бы в «удалить всё внутри тенанта» незаметно для того, кто это писал.
+
+Пустой фильтр отвергают все методы, которые меняют или удаляют документы: [`updateMany`](../reference/writes/writes.mdx#updatemany), [`deleteMany`](../reference/writes/writes.mdx#deletemany), [`updateOne`](../reference/writes/writes.mdx#updateone), [`deleteOne`](../reference/writes/writes.mdx#deleteone), [`replaceOne`](../reference/writes/writes.mdx#replaceone), [`findOneAndUpdate`](../reference/writes/writes.mdx#findoneandupdate), [`findOneAndReplace`](../reference/writes/writes.mdx#findoneandreplace) и [`findOneAndDelete`](../reference/writes/writes.mdx#findoneanddelete). Первые два затрагивают много документов. Остальные затрагивают один, но **выбирают его** по фильтру: пустой фильтр выбрал бы произвольный документ, а не тот, который вы имели в виду. Тем же правилом проверяются операции внутри [`bulkWrite`](../reference/writes/writes.mdx#bulkwrite): `updateOne`, `updateMany`, `replaceOne`, `deleteOne` и `deleteMany`. Чтение — [`find`](../reference/query/reading.mdx#modelfind) — принимает `{}`: чтение ничего не портит.
+
+## Изменить или удалить всё намеренно
+
+Ситуация: миграция данных, очистка тестовой коллекции, массовое обновление всех документов. Передайте `Filters.all()` вместо пустого объекта.
+
+```ts twoslash title="accounts/maintenance.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+export const markAllAudited = async () => {
+  return Accounts.updateMany(Filters.all(), { $set: { note: "audited" } });
+};
+
+export const wipeAccounts = async () => {
+  return Accounts.deleteMany(Filters.all());
+};
+```
+
+Что произошло. `Filters.all()` — настоящий фильтр `{ _id: { $exists: true } }`: он подходит любому хранимому документу, потому что у каждого документа есть `_id`. Это обычное условие, которое сервер выполняет как любое другое, поэтому в журнале команд видно, что вы этого хотели, а через план записи ничего особенного не проходит. Тип модели указывать не нужно: `Filters.all()` подходит любому методу записи любой модели. Полное описание фильтра и его границ — в разделе [нарушения политик](../reference/policies/violations.mdx#filtersall). Пустой литерал вместо него компилятор не принимает:
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+// @errors: 2345
+await Accounts.deleteMany({});
+```
+
+Компилятор отвечает ошибкой про свойство `"filter error"` с текстом `an empty filter would affect every document; pass a filter, or Filters.all() to mean every document on purpose`. Текст зависит от формы метода, как и во время работы: у `updateMany` и `deleteMany` он говорит «would affect every document», а у `updateOne`, `deleteOne`, `replaceOne`, `findOneAndUpdate`, `findOneAndReplace` и `findOneAndDelete` — «would change or remove an arbitrary document». Проверка есть у всех этих методов (тип [`WriteFilterCheck`](../reference/writes/writes.mdx#writefiltercheck)). Она работает только на пустой литерал: фильтр, объявленный как `Filter<Account>`, или объект, собранный по условиям, компилируется, и для него остаётся проверка во время работы. Поэтому одной проверки компилятора недостаточно, и правило во время работы остаётся главным.
+
+## Откуда берётся пустой фильтр
+
+Пустой фильтр редко пишут руками. Он получается сам, когда фильтр собирается из данных. Например, из объекта, поля которого добавляются по условию:
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+type Search = { owner?: string; title?: string };
+
+export const clearNotes = async (search: Search) => {
+  const filter: { owner?: string; title?: string } = {};
+  if (search.owner !== undefined) filter.owner = search.owner;
+  if (search.title !== undefined) filter.title = search.title;
+  return Accounts.updateMany(filter, { $unset: { note: "" } });
+};
+```
+
+Если вызвать `clearNotes({})`, фильтр останется пустым, и `updateMany` откажется. Это то, ради чего правило нужно: без него вызов с пустым поиском очистил бы заметки у всех счетов.
+
+Второй частый источник — значение `undefined`. Фильтр `{ owner }`, где `owner` оказалось `undefined`, Typemo тоже отвергает, но другой ошибкой: `undefined` в фильтре не «нет условия», а неверное значение.
+
+```text
+QueryError: filter: undefined at "owner" (use $exists: false / $unset; undefined is never a value)
+```
+
+## Как выбрать
+
+Задайте себе один вопрос: **знаю ли я, какие документы затрагиваю?** Если да, опишите их фильтром, пусть даже широким, например `{ balance: { $gte: 0 } }`. Если вы намеренно затрагиваете всё, пишите `Filters.all()`, и это будет видно при ревью. Если фильтр приходит извне и может оказаться пустым, не превращайте пустоту в «всё» сами: проверьте условие до вызова и верните ошибку клиенту.
+
+## Когда это не нужно
+
+Если вам нужно затронуть один документ, берите [`updateOne`](../reference/writes/writes.mdx#updateone) или [`deleteOne`](../reference/writes/writes.mdx#deleteone): они тоже требуют условие: «один документ» должен быть выбран фильтром, например по `_id`.
+
+## Частые ошибки
+
+### Фильтр собрался пустым
+
+Симптом: `StrictModeError … [empty-filter]` при вызове с необязательными условиями. Причина: ни одно условие не пришло. Правильно: проверьте, что условие есть, до вызова, а если «всё» действительно нужно, вызовите `Filters.all()` явно.
+
+### Пустой литерал не компилируется
+
+Симптом: ошибка компиляции `TS2345` (а у `updateOne` и `updateMany` — `TS2769` «No overload matches this call») с текстом про `"filter error"`. Причина: вы написали `{}` там, где нужен фильтр. Правильно: условие, например `{ owner: "alice" }`, а если нужны все документы, `Filters.all()`.
+
+### Пустой фильтр в bulkWrite
+
+Неправильно: операция `{ deleteMany: { filter: {} } }` в [`bulkWrite`](../reference/writes/writes.mdx#bulkwrite). Правило то же, что у отдельного метода:
+
+```text
+StrictModeError: deleteMany with an empty filter would affect every document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]
+```
+
+Правильно: `{ deleteMany: { filter: Filters.all() } }`.
+
+## Полный пример
+
+Файл собирает описанное: безопасная очистка по поиску и явная очистка всего.
+
+```ts twoslash title="accounts/maintenance.ts"
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+// Очистить заметки по условиям поиска; без условий — отказ
+export const clearNotes = async (owner?: string, title?: string) => {
+  const filter: { owner?: string; title?: string } = {};
+  if (owner !== undefined) filter.owner = owner;
+  if (title !== undefined) filter.title = title;
+  if (Object.keys(filter).length === 0) {
+    throw new Error("укажите, чьи заметки очистить");
+  }
+  return Accounts.updateMany(filter, { $unset: { note: "" } });
+};
+
+// Очистить заметки у всех счетов намеренно
+export const clearAllNotes = async () => {
+  return Accounts.updateMany(Filters.all(), { $unset: { note: "" } });
+};
+```
+
+<Callout type="migration">
+
+В Mongoose опция `requireFilter`, которая запрещала пустой фильтр, была выключена по умолчанию: одна ошибка в собранном фильтре очищала коллекцию. В Typemo запрет включён всегда и отключить его нельзя, а «всё» записывается явно через `Filters.all`.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Обновить документы" href="./update.mdx">
+  Как применять обновления к одному и многим документам.
+</Card>
+<Card title="Удалить документы" href="./delete.mdx">
+  Все способы удаления, в том числе мягкого.
+</Card>
+<Card title="Нарушения политик" href="../reference/policies/violations.mdx">
+  Все причины `StrictModeError`, включая `empty-filter`, с текстами.
+</Card>
+<Card title="Запись: справочник" href="../reference/writes/writes.mdx#updatemany">
+  Что принимают `updateMany` и `deleteMany`.
+</Card>
+</Cards>

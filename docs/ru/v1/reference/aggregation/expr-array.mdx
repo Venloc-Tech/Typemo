@@ -1,0 +1,355 @@
+---
+title: Выражения: массивы
+description: "Операторы fn для массивов: доступ, срезы, множества, map, filter, reduce"
+icon: List
+---
+
+На этой странице собраны операторы каталога `fn` для работы с массивами внутри одной строки: доступ по индексу, срезы, множества, `map`, `filter`, `reduce`. Они вычисляются сервером для каждой строки в стадиях вроде [`project`](./stages.mdx#project) или [`addFields`](./stages.mdx#addfields).
+
+Если вы только начинаете, сначала прочитайте руководство [Выражения](../../aggregation/expressions.mdx). Эта страница — справочник. Выражения пишутся только колбэком: сырой объект с `$expr` Typemo не принимает.
+
+Все примеры используют одну модель заказа магазина.
+
+```ts twoslash title="models/order.ts"
+import { Timestamp } from "mongodb";
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema()
+export class Line {
+  @Prop(() => String, { required: true })
+  sku!: string;
+
+  @Prop(() => Number, { required: true })
+  qty!: number;
+}
+
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  sku!: string;
+
+  @Prop(() => Number, { required: true })
+  price!: number;
+
+  @Prop(() => Number, { required: true })
+  quantity!: number;
+
+  @Prop(() => Number, { required: true })
+  delta!: number;
+
+  @Prop(() => Number, { required: true })
+  ratio!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Date, { required: true })
+  shippedAt!: Date;
+
+  @Prop(() => Timestamp)
+  stamp?: Timestamp;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => [Line])
+  lines!: Line[];
+}
+```
+
+В коллекции один заказ: `title` — `"  Blue Pen  "` (с пробелами по краям), `sku` — `"PEN-001"`, `price` — 19.99, `quantity` — 3, `delta` — -5, `ratio` — 0.5, `placedAt` — 15 марта 2026, 10:30:45.123 UTC, `shippedAt` — 18 марта 2026, 08:00 UTC, `stamp` — временная метка с секундами 1700000000 и приращением 5, `tags` — `["new", "sale", "pen"]`, `prices` — `[30, 10, 20]`, `lines` — две строки (`pen`×2 и `ink`×1). Поля `discount` у заказа нет. Результаты в комментариях `// →` получены запуском на этих данных.
+
+---
+
+## Размер, порядок и доступ
+
+Чтение массива без его изменения. Для `null` и отсутствующего поля большинство операторов возвращают `null`, а `size` на не-массиве падает.
+
+Один запрос считает сразу все операторы группы:
+
+```ts twoslash
+import { Timestamp } from "mongodb";
+import { Entity, fn, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) quantity!: number;
+  @Prop(() => Number, { required: true }) delta!: number;
+  @Prop(() => Number, { required: true }) ratio!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+  @Prop(() => Date, { required: true }) shippedAt!: Date;
+  @Prop(() => Timestamp) stamp?: Timestamp;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Number]) prices!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const [row] = await Orders.aggregate((p) =>
+  p.project((f) => ({
+    size: fn.size(f.tags),
+    arrayElemAt: fn.arrayElemAt(f.tags, 0),
+    indexOfArray: fn.indexOfArray(f.tags, "sale"),
+    slice: fn.slice(f.tags, 1, 1),
+    reverseArray: fn.reverseArray(f.tags),
+    sortArray: fn.sortArray({ input: f.prices, sortBy: 1 }),
+    range: fn.range(0, 5, 2),
+    _id: 0,
+  })),
+);
+console.log(row);
+// → {size: 3, arrayElemAt: "new", indexOfArray: 1, slice: ["sale"], reverseArray: ["pen", "sale", "new"], sortArray: [10, 20, 30], range: [0, 2, 4]}
+```
+
+Ниже каждый оператор описан отдельно.
+
+### fn.size
+
+Число элементов; на не-массиве — ошибка сервера. `fn.size(array)`.
+
+Пример: `fn.size(f.tags)` даёт `3`.
+
+### fn.arrayElemAt
+
+Элемент по индексу; отрицательный индекс считается с конца, выход за границы даёт отсутствующее значение. `fn.arrayElemAt(array, index)`.
+
+Пример: `fn.arrayElemAt(f.tags, 0)` даёт `"new"`.
+
+### fn.indexOfArray
+
+Индекс значения, `-1` если нет. `fn.indexOfArray(array, значение, от?, до?)`.
+
+Пример: `fn.indexOfArray(f.tags, "sale")` даёт `1`.
+
+### fn.slice
+
+Срез: первые `n` (отрицательное — последние `n`) или `n` элементов с позиции. `fn.slice(array, n)` и `fn.slice(array, позиция, n)`.
+
+Пример: `fn.slice(f.tags, 1, 1)` даёт `["sale"]`.
+
+### fn.reverseArray
+
+Массив в обратном порядке. `fn.reverseArray(array)`.
+
+Пример: `fn.reverseArray(f.tags)` даёт `["pen", "sale", "new"]`.
+
+### fn.sortArray
+
+Сортирует: `sortBy` — `1` или `-1` для чисел и строк, объект по полям для документов. `fn.sortArray({ input, sortBy })`.
+
+Пример: `fn.sortArray({ input: f.prices, sortBy: 1 })` даёт `[10, 20, 30]`.
+
+### fn.range
+
+Целые числа от `start` до `end` не включая, с шагом `step` (по умолчанию 1). `fn.range(start, end, step?)`.
+
+Пример: `fn.range(0, 5, 2)` даёт `[0, 2, 4]`.
+
+---
+
+## Объединение и множества
+
+Множества считают массив набором уникальных значений без порядка: результат `setUnion` и подобных не содержит повторов, а порядок не гарантируется.
+
+Один запрос считает сразу все операторы группы:
+
+```ts twoslash
+import { Timestamp } from "mongodb";
+import { Entity, fn, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) quantity!: number;
+  @Prop(() => Number, { required: true }) delta!: number;
+  @Prop(() => Number, { required: true }) ratio!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+  @Prop(() => Date, { required: true }) shippedAt!: Date;
+  @Prop(() => Timestamp) stamp?: Timestamp;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Number]) prices!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const [row] = await Orders.aggregate((p) =>
+  p.project((f) => ({
+    concatArrays: fn.concatArrays(f.tags, ["x"]),
+    setUnion: fn.setUnion(f.tags, ["sale", "big"]),
+    setIntersection: fn.setIntersection(f.tags, ["sale", "x"]),
+    setDifference: fn.setDifference(f.tags, ["sale"]),
+    setIsSubset: fn.setIsSubset(["sale"], f.tags),
+    setEquals: fn.setEquals(f.tags, ["pen", "sale", "new"]),
+    zip: fn.zip({ inputs: [f.tags, f.prices] }),
+    _id: 0,
+  })),
+);
+console.log(row);
+// → {concatArrays: ["new", "sale", "pen", "x"], setUnion: ["big", "new", "pen", "sale"], setIntersection: ["sale"], setDifference: ["new", "pen"], setIsSubset: true, setEquals: true, zip: [["new", 30], ["sale", 10], ["pen", 20]]}
+```
+
+Ниже каждый оператор описан отдельно.
+
+### fn.concatArrays
+
+Склеивает массивы. `fn.concatArrays(a, b, …)`.
+
+Пример: `fn.concatArrays(f.tags, ["x"])` даёт `["new", "sale", "pen", "x"]`.
+
+### fn.setUnion
+
+Объединение множеств. `fn.setUnion(a, b, …)`.
+
+Пример: `fn.setUnion(f.tags, ["sale", "big"])` даёт `["big", "new", "pen", "sale"]`.
+
+### fn.setIntersection
+
+Пересечение множеств. `fn.setIntersection(a, b, …)`.
+
+Пример: `fn.setIntersection(f.tags, ["sale", "x"])` даёт `["sale"]`.
+
+### fn.setDifference
+
+Элементы первого массива, которых нет во втором. `fn.setDifference(a, b)`.
+
+Пример: `fn.setDifference(f.tags, ["sale"])` даёт `["new", "pen"]`.
+
+### fn.setIsSubset
+
+Каждый элемент первого массива есть во втором. `fn.setIsSubset(a, b)`.
+
+Пример: `fn.setIsSubset(["sale"], f.tags)` даёт `true`.
+
+### fn.setEquals
+
+Множества состоят из одних и тех же значений. `fn.setEquals(a, b, …)`.
+
+Пример: `fn.setEquals(f.tags, ["pen", "sale", "new"])` даёт `true`.
+
+### fn.zip
+
+Транспонирует массивы: пары элементов с одним индексом. `useLongestLength` дополняет короткие массивы значениями `defaults`. `fn.zip({ inputs, useLongestLength?, defaults? })`.
+
+Пример: `fn.zip({ inputs: [f.tags, f.prices] })` даёт `[["new", 30], ["sale", 10], ["pen", 20]]`.
+
+---
+
+## Проверки и преобразования
+
+Операторы, которые считают по элементам: `map` применяет выражение к каждому, `filter` оставляет подходящие, `reduce` сворачивает в одно значение. Внутри колбэка элемент — прокси, как поле `f`.
+
+Один запрос считает сразу все операторы группы:
+
+```ts twoslash
+import { Timestamp } from "mongodb";
+import { Entity, fn, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) quantity!: number;
+  @Prop(() => Number, { required: true }) delta!: number;
+  @Prop(() => Number, { required: true }) ratio!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+  @Prop(() => Date, { required: true }) shippedAt!: Date;
+  @Prop(() => Timestamp) stamp?: Timestamp;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Number]) prices!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const [row] = await Orders.aggregate((p) =>
+  p.project((f) => ({
+    allElementsTrue: fn.allElementsTrue(f.prices),
+    anyElementTrue: fn.anyElementTrue(f.prices),
+    map: fn.map({ input: f.prices, in: (price) => fn.multiply(price, 2) }),
+    filter: fn.filter({ input: f.prices, cond: (price) => fn.gt(price, 15) }),
+    reduce: fn.reduce({ input: f.prices, initialValue: 0, in: (acc, price) => fn.add(acc, price) }),
+    arrayToObject: fn.arrayToObject(fn.map({ input: f.lines, in: (line) => ({ k: line.sku, v: line.qty }) })),
+    _id: 0,
+  })),
+);
+console.log(row);
+// → {allElementsTrue: true, anyElementTrue: true, map: [60, 20, 40], filter: [30, 20], reduce: 60, arrayToObject: {pen: 2, ink: 1}}
+```
+
+Ниже каждый оператор описан отдельно.
+
+### fn.allElementsTrue
+
+Все элементы истинны; пустой массив даёт `true`. `fn.allElementsTrue(array)`.
+
+Пример: `fn.allElementsTrue(f.prices)` даёт `true`.
+
+### fn.anyElementTrue
+
+Хотя бы один элемент истинный; пустой массив даёт `false`. `fn.anyElementTrue(array)`.
+
+Пример: `fn.anyElementTrue(f.prices)` даёт `true`.
+
+### fn.map
+
+Применяет выражение к каждому элементу. `fn.map({ input, in: (item) => … })`.
+
+Пример: `fn.map({ input: f.prices, in: (price) => fn.multiply(price, 2) })` даёт `[60, 20, 40]`.
+
+### fn.filter
+
+Оставляет элементы, для которых `cond` истинно; `limit` ограничивает число. `fn.filter({ input, cond: (item) => …, limit? })`.
+
+Пример: `fn.filter({ input: f.prices, cond: (price) => fn.gt(price, 15) })` даёт `[30, 20]`.
+
+### fn.reduce
+
+Сворачивает массив; тип результата — тип `initialValue`. `fn.reduce({ input, initialValue, in: (acc, item) => … })`.
+
+Пример: `fn.reduce({ input: f.prices, initialValue: 0, in: (acc, price) => fn.add(acc, price) })` даёт `60`.
+
+### fn.arrayToObject
+
+Массив пар `{ k, v }` или `[k, v]` в документ. `fn.arrayToObject(array)`.
+
+Пример: `fn.arrayToObject(fn.map({ input: f.lines, in: (line) => ({ k: line.sku, v: line.qty }) }))` даёт `{pen: 2, ink: 1}`.
+
+## Особые случаи
+
+`fn.size` на значении не-массива сервер отвергает: для строки — `The argument to $size must be an array, but was of type: string`. Поэтому `size` принимает только поля-массивы, и компилятор остановит вызов над строкой.
+
+## Когда не подходит
+
+Если нужно превратить элементы массива в отдельные строки, используйте стадию [`unwind`](./stages.mdx#unwind). Если нужно собрать значения из многих строк в массив, используйте аккумуляторы `fn.push` и `fn.addToSet` в [`group`](./stages.mdx#group).

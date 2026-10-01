@@ -1,0 +1,383 @@
+---
+title: Вычисления в агрегации
+description: "Как ссылаться на поля через f, считать значения функциями fn, работать с отсутствующими полями и почему сырой $expr запрещён"
+icon: Calculator
+---
+
+**Выражение** — это вычисление над полями документа: сложить цену и налог, склеить строки, выбрать одно из двух значений. Стадии агрегации принимают выражения там, где нужно посчитать новое значение: в [`addFields`](../reference/aggregation/stages.mdx#addfields), [`project`](../reference/aggregation/stages.mdx#project), [`match`](../reference/aggregation/stages.mdx#match) и [`group`](../reference/aggregation/stages.mdx#group). Сервер MongoDB записывает выражения строками вроде `"$price"` и объектами с операторами вроде `{ $add: [...] }`. В Typemo вы пишете обычный TypeScript: поля берёте из параметра `f`, операции из объекта [`fn`](../reference/aggregation/expr-arithmetic.mdx).
+
+Так вычисления проверяются компилятором. Опечатка в имени поля, сложение числа со строкой, аккумулятор там, где нужно обычное значение — всё это ошибки компиляции, а не пустая строка или `null` в результате через час работы отчёта.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель товара магазина. Про стадии и запуск агрегации рассказывает [Первая агрегация](first-aggregation.mdx). В коллекции `products` три товара: чайник с ценой 40 и скидкой 5, лампа с ценой 25 без скидки и кружка «$5 mug» с ценой 8 и скидкой 1.
+
+```ts twoslash title="products/product.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+export class Product extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true })
+  price!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [String], { required: true })
+  tags!: string[];
+}
+```
+
+## Быстрый путь
+
+Колбэк стадии получает `f` — описание полей текущей строки — и возвращает объект с новыми значениями. Значения считают функции `fn`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, Vars, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => [String], { required: true }) tags!: string[];
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.connection.model(Product);
+// ---cut---
+const query = Products.aggregate((p) =>
+  p.project((f) => ({
+    title: 1,
+    _id: 0,
+    label: fn.concat(f.title, " (", fn.toString_(f.price), ")"),
+    tier: fn.cond(fn.gte(f.price, 30), "premium", "basic"),
+  })),
+);
+const rows = await query;
+//    ^?
+// → [{ title: "Kettle", label: "Kettle (40)", tier: "premium" }, { title: "Lamp", … "basic" }, …]
+```
+
+Остальная страница разбирает поля, вложенные и отсутствующие значения, условия, массивы и то, что вместо сырых строк с `$` вы пишете код.
+
+## Сослаться на поле
+
+`f.price` — не значение цены, а **ссылка на поле**: сервер прочитает его сам для каждого документа. Поэтому `f.price` нельзя сравнить с числом оператором `>`; для этого есть [`fn.gt`](../reference/aggregation/expr-logic.mdx#fngt). Зато у ссылки есть тип: редактор подсказывает поля модели, а неизвестное поле не скомпилируется.
+
+```ts twoslash
+// @errors: 2551
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, Vars, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => [String], { required: true }) tags!: string[];
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.connection.model(Product);
+// ---cut---
+await Products.aggregate((p) => p.addFields((f) => ({ x: fn.add(f.prise, 1) })));
+```
+
+Компилятор предлагает ближайшее имя (`price`). Вложенные документы доступны по цепочке: `f.address.city`. Если родитель необязателен или может быть `null`, каждое поле под ним получает `| undefined`: сервер прочитает отсутствующее значение как «нет значения», и тип честно об этом сообщает.
+
+## Посчитать новое поле
+
+Чтобы добавить к строке вычисленное поле, используйте `addFields`: он оставляет все старые поля и добавляет новые. Тип строки при этом растёт на ваши поля.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, Vars, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => [String], { required: true }) tags!: string[];
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.connection.model(Product);
+// ---cut---
+const withTax = Pipeline.from(Product).addFields((f) => ({
+  gross: fn.multiply(f.price, 1.2),
+}));
+type Row = RowOf<typeof withTax>;
+//   ^?
+```
+
+Оператор называется как в MongoDB, но без `$`: `fn.add`, `fn.concat`, `fn.size`. Два имени отличаются от серверных: [`fn.toString_`](../reference/aggregation/expr-conversion.mdx#fntostring_) (`toString` уже занят в JavaScript у каждого объекта) и [`fn.typeOf`](../reference/aggregation/expr-conversion.mdx#fntypeof) (серверный `$type`). Полный перечень операторов по темам — в справочнике: [арифметика](../reference/aggregation/expr-arithmetic.mdx), [строки](../reference/aggregation/expr-string.mdx), [даты](../reference/aggregation/expr-date.mdx), [массивы](../reference/aggregation/expr-array.mdx).
+
+## Отсутствующее значение и `null`
+
+У лампы скидки нет: поле `discount` в документе отсутствует. Если вычитать его из цены, сервер вернёт `null`, а не цену: любая арифметика с отсутствующим значением даёт `null`. Тип это знает: результат `fn.subtract(f.price, f.discount)` — `number | null`, и присвоить его полю `number` нельзя.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, Vars, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => [String], { required: true }) tags!: string[];
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.connection.model(Product);
+// ---cut---
+const query = Products.aggregate((p) =>
+  p.project((f) => ({ title: 1, _id: 0, final: fn.subtract(f.price, f.discount) })),
+);
+const rows = await query;
+//    ^?
+// → [{ title: "Kettle", final: 35 }, { title: "Lamp", final: null }, { title: "$5 mug", final: 7 }]
+```
+
+Чтобы подставить значение вместо отсутствующего, используйте [`fn.ifNull`](../reference/aggregation/expr-logic.mdx#fnifnull): первый аргумент — значение, второй — замена. Тип результата уже без `null`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, Vars, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => [String], { required: true }) tags!: string[];
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.connection.model(Product);
+// ---cut---
+const query = Products.aggregate((p) =>
+  p.project((f) => ({ title: 1, _id: 0, final: fn.subtract(f.price, fn.ifNull(f.discount, 0)) })),
+);
+const rows = await query;
+//    ^?
+// → [{ title: "Kettle", final: 35 }, { title: "Lamp", final: 25 }, { title: "$5 mug", final: 7 }]
+```
+
+Так работает сервер, и Typemo ничего не скрывает: результат не превращается в `0` без вашего решения. Решение «что считать нулём» принимаете вы.
+
+## Выбрать значение по условию
+
+[`fn.cond`](../reference/aggregation/expr-logic.mdx#fncond) выбирает из двух значений, а [`fn.switch`](../reference/aggregation/expr-logic.mdx#fnswitch) — из нескольких. Тип результата — объединение обоих вариантов: в быстром пути выше `tier` получил тип `"premium" | "basic"`, потому что обе ветки — литералы.
+
+Условие в отборе пишется так же. [`match`](../reference/aggregation/stages.mdx#match) принимает либо объект-фильтр, либо функцию, которая возвращает булево выражение. Функция нужна, когда нужно сравнить два поля одного документа или посчитать значение перед сравнением. Обычный фильтр `{ price: { $gt: 20 } }` такого не умеет.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, Vars, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => [String], { required: true }) tags!: string[];
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.connection.model(Product);
+// ---cut---
+const cheap = await Products.aggregate((p) =>
+  p.match((f) => fn.lt(fn.subtract(f.price, fn.ifNull(f.discount, 0)), 30)).project({ title: 1, _id: 0 }),
+);
+// → [{ title: "Lamp" }, { title: "$5 mug" }]
+```
+
+## Работать с массивами
+
+Функции над массивами принимают колбэк, а внутри него — ссылку на текущий элемент. Как и `f`, она типизирована: у `tags` элемент — строка.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, Vars, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => [String], { required: true }) tags!: string[];
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.connection.model(Product);
+// ---cut---
+const query = Products.aggregate((p) =>
+  p.project((f) => ({
+    title: 1,
+    _id: 0,
+    kitchen: fn.filter({ input: f.tags, cond: (tag) => fn.eq(tag, "kitchen") }),
+    upper: fn.map({ input: f.tags, in: (tag) => fn.toUpper(tag) }),
+  })),
+);
+const rows = await query;
+//    ^?
+// → [{ title: "Kettle", kitchen: ["kitchen"], upper: ["KITCHEN", "SALE"] }, …]
+```
+
+Вложенные колбэки не путают элементы: внутренний `map` внутри внешнего видит свой элемент и, при необходимости, элемент внешнего. Typemo даёт переменным уникальные имена сам.
+
+## Строка с `$` — это строка
+
+В MongoDB строка, начинающаяся с `$`, — путь к полю: `"$price"` читает цену. Если вы хотите записать в результат текст «$5 off», обычная агрегация прочитает его как поле `5 off`, которого нет. Typemo не даёт ошибиться: строка в позиции значения всегда литерал, а пути пишутся только через `f`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, Vars, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => [String], { required: true }) tags!: string[];
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.connection.model(Product);
+// ---cut---
+const plan = Pipeline.from(Product)
+  .project(() => ({ note: "$5 off" }))
+  .plan();
+console.log(JSON.stringify(plan.pipeline));
+// → [{"$project":{"note":{"$literal":"$5 off"}}}]
+```
+
+Значение уходит на сервер как `{ $literal: "$5 off" }`, и в результате вы получаете ровно то, что написали. Явный [`fn.literal`](../reference/aggregation/expr-logic.mdx#fnliteral) нужен редко: для значения, которое лежит внутри объекта или массива и не должно проходить разбор.
+
+## Убрать поле и получить время
+
+Системные переменные MongoDB собраны в классе [`Vars`](../reference/aggregation/expr-misc.mdx#vars); для двух самых частых есть короткие вызовы: [`fn.now()`](../reference/aggregation/expr-misc.mdx#vars) даёт текущее время, одинаковое для всей агрегации, а [`fn.remove()`](../reference/aggregation/expr-misc.mdx#vars) удаляет поле, которому присвоен.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, Vars, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => [String], { required: true }) tags!: string[];
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.connection.model(Product);
+// ---cut---
+const noDiscount = Pipeline.from(Product).addFields(() => ({ discount: fn.remove(), seenAt: fn.now() }));
+type Row = RowOf<typeof noDiscount>;
+//   ^?
+```
+
+Поле `discount` пропало из типа строки, а `seenAt` — дата. Исчезновение поля записано в типе, а не в комментарии, поэтому обратиться к нему в следующей стадии нельзя.
+
+## Как выбрать
+
+Задайте себе вопрос: значение считается для каждого документа или собирается по многим? Для каждого документа отдельно (цена со скидкой, склеенное имя, метка по условию) — выражение `fn.*` в `addFields`, `project` или `match`. Если значение сворачивает много документов в одно (сумма, среднее, число), это **аккумулятор**, он живёт только в `group` и подобных стадиях: см. [Группировка и отчёты](grouping.mdx).
+
+## Когда это не нужно
+
+Если вам нужно просто отобрать документы по значению поля, используйте [`find`](../reference/query/reading.mdx#modelfind) с обычным фильтром: он проще и использует индексы. Выражения в `match` оправданы, когда сравниваются два поля одного документа или значение считается на лету. Если нужно изменить документы в базе, а не только посчитать значение для ответа, смотрите [обновление конвейером](../writes/pipeline-updates.mdx).
+
+## Частые ошибки
+
+### Сырой `$expr` в фильтре
+
+Привычка из драйвера: записать в `$expr` объект с операторами. Typemo отвергает его сразу, потому что такой объект обошёл бы все проверки типов. Вместо объекта пишется функция.
+
+```ts twoslash
+// @errors: 2353
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, Vars, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => [String], { required: true }) tags!: string[];
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.connection.model(Product);
+// ---cut---
+await Products.find({ $expr: { $gt: ["$price", 20] } });
+```
+
+Во время работы (если типы обошли приведением) — `QueryError: filter: $expr is a callback (f) => fn.… (a raw $expr object is not typed)`. Запишите условие функцией: `$expr: (f) => fn.gt(f.price, 20)`.
+
+### Цена, сравниваемая со строкой
+
+`fn.gt(f.price, "20")` не скомпилируется: сервер сравнивает значения разных типов по особому порядку, и результат почти никогда не тот, который вы ждёте. Типы аргументов у `fn.*` совпадают с серверными, поэтому число нужно сравнивать с числом.
+
+```ts twoslash
+// @errors: 2345
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, Vars, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => [String], { required: true }) tags!: string[];
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.connection.model(Product);
+// ---cut---
+await Products.aggregate((p) => p.match((f) => fn.gt(f.price, "20")));
+```
+
+## Полный пример
+
+```ts twoslash title="products/products.service.ts"
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, Vars, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => [String], { required: true }) tags!: string[];
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.connection.model(Product);
+// ---cut---
+export const priceList = () =>
+  Products.aggregate((p) =>
+    p
+      .addFields((f) => ({
+        final: fn.subtract(f.price, fn.ifNull(f.discount, 0)),
+      }))
+      .match((f) => fn.gt(f.final, 10))
+      .project((f) => ({
+        _id: 0,
+        title: 1,
+        final: 1,
+        tier: fn.cond(fn.gte(f.final, 30), "premium", "basic"),
+        tags: fn.map({ input: f.tags, in: (tag) => fn.toUpper(tag) }),
+      }))
+      .sort({ final: "descending" }),
+  ).plain();
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Группировка и отчёты" href="./grouping.mdx">
+  Аккумуляторы: как свернуть много документов в одно значение.
+</Card>
+<Card title="Справочник: арифметика" href="../reference/aggregation/expr-arithmetic.mdx">
+  Все арифметические операторы `fn` с типами.
+</Card>
+<Card title="Справочник: логика и сравнение" href="../reference/aggregation/expr-logic.mdx">
+  `cond`, `switch`, `ifNull`, сравнения и логические операторы.
+</Card>
+</Cards>

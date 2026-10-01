@@ -1,0 +1,313 @@
+---
+title: Работать с вложенными объектами
+description: "Как менять вложенный объект и строки массива поддокументов, узнавать путь, родителя и позицию элемента и проверять вложенные поля"
+icon: Boxes
+---
+
+Чтобы работать с вложенным объектом или строкой массива, обращайтесь к нему как к обычному объекту: читайте и присваивайте поля, а Typemo запишет точные пути вроде `address.city` или `lines.1.qty`. У такого объекта, который называется **поддокументом**, есть ещё набор `$`-методов: узнать родителя, путь в документе и позицию в массиве, заменить поле с проверкой типа, получить обычную копию.
+
+Поддокумент — не отдельная запись в базе, а часть документа. Поэтому у него нет своего `$save`: сохраняется всегда весь документ-владелец, а Typemo отправляет только то, что изменилось внутри. Понимать, какой путь у поддокумента, полезно, когда вы разбираете ошибки, пишете хуки или показываете пользователю, какая строка заказа неверна.
+
+## Что предполагается
+
+Примеры используют заказ из руководства [Изменить и сохранить документ](./change-and-save.mdx): адрес доставки `address` (вложенный объект без `_id`) и строки `lines` (поддокументы с `_id`).
+
+## Быстрый путь
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({
+  customer: "alice",
+  tags: [],
+  lines: [{ sku: "A1", qty: 2 }, { sku: "B2", qty: 1 }],
+  address: { city: "Oslo" },
+});
+
+order.address!.city = "Rome";
+order.lines[1]!.qty = 9;
+console.log(order.$getChanges());
+// → { $set: { "lines.1.qty": 9, "address.city": "Rome" } }
+```
+
+Остальная страница объясняет, как поддокумент связан с родителем, как его заменить и как проверяются его поля.
+
+## Изменить поле вложенного объекта
+
+Поле вложенного объекта присваивается обычно: `order.address.city = "Rome"`. Typemo записывает путь до поля, а не весь объект, поэтому изменение соседнего поля другим клиентом не пропадёт. Сам объект может быть не задан (`address?`), поэтому TypeScript требует проверки: `order.address!` или условие.
+
+Вложенный класс с `@Schema()` или `@Schema({ nested: true })` хранится как часть документа, без собственной идентичности: `_id` у него нет. Класс, унаследованный от `Entity`, получает `_id`: так устроены строки заказа, чтобы их можно было найти и убрать по идентификатору. Объявить `_id` у класса с `nested: true` нельзя: схема не соберётся (`ConfigurationError: Bad: a nested object (no _id, no own hooks) — it declares _id`).
+
+## Заменить вложенный объект целиком
+
+Поле-поддокумент присваиванием не заменить: `order.address = { city: "Rome" }` не проходит компиляцию, а в обход типов [`$save`](../reference/documents/document-api.mdx#save) откажется писать. Для замены используйте [`$set`](../reference/documents/document-api.mdx#set): он приведёт значение и сделает новый объект отслеживаемым.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+const order = Orders.new({ customer: "alice", tags: [], lines: [], address: { city: "Oslo" } });
+// ---cut---
+// @errors: 2322
+order.address = { city: "Rome" };
+
+order.$set("address", { city: "Rome" });
+console.log(order.address?.city);
+// → "Rome"
+```
+
+```text
+DirectWriteError: "address" was changed around its methods: the field was replaced by assignment; use $set("address", value) or the container's methods
+```
+
+## Узнать родителя, путь и позицию
+
+Каждый поддокумент знает, где он лежит. Путь и позиция **вычисляются при вызове**, поэтому не устаревают после `unshift`, `splice` или `reverse` у массива: если элемент сдвинулся, метод вернёт новую позицию.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await Orders.create({ customer: "alice", tags: [], lines: [{ sku: "A1", qty: 2 }, { sku: "B2", qty: 1 }] });
+const line = order.lines[1]!;
+
+console.log(line.$fullPath(), line.$index());
+// → "lines.1" 1
+console.log(Object.is(line.$parentArray(), order.lines), Object.is(line.$ownerDocument(), order));
+// → true true
+
+order.lines.unshift({ sku: "C3", qty: 1 });
+console.log(line.$fullPath(), line.$index());
+// → "lines.2" 2
+```
+
+Методы [`$parent`](../reference/documents/typed-collections.mdx#subdocument) (ближайший владелец), `$parentArray` (массив, в котором лежит элемент), `$fullPath`, `$ownerDocument` (корневой документ) и `$index` описаны в справочнике. У элемента, ещё не прикреплённого к массиву (`lines.create(…)`), путь и родитель не заданы: `$parent`, `$parentArray`, `$fullPath` и `$ownerDocument` возвращают `undefined`, а `$index` — `-1`. То же `-1` у одиночного вложенного объекта: он не в массиве.
+
+## Узнать, новый ли поддокумент и что в нём изменилось
+
+У поддокумента есть три метода, общие с корневым документом: [`$isNew()`, `$isModified()` и `$isRoot()`](../reference/documents/typed-collections.mdx#subdocument). Они нужны прежде всего в хуках: хук документа, объявленный в классе `Line`, запускается на каждой строке заказа, и `this` в нём — поддокумент.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = Orders.new({ customer: "alice", tags: [], lines: [{ sku: "A1", qty: 2 }] });
+const line = order.lines[0]!;
+console.log(line.$isNew(), line.$isRoot(), order.$isRoot());
+// → true false true
+
+await order.$save();
+line.qty = 3;
+console.log(line.$isNew(), line.$isModified("qty"), line.$isModified("sku"));
+// → false true false
+```
+
+Что произошло. `$isNew()` поддокумента повторяет ответ документа, которому он принадлежит: пока заказ не вставлен, его строки новые, после вставки — нет. Строка, добавленная в уже сохранённый заказ, тоже отвечает `false`: в базу она попадёт вместе с заказом. `$isModified()` смотрит только на поля самой строки, а `$isRoot()` у поддокумента всегда `false`. В хуке класса эта проверка сужает тип `this`: после `if (this.$isRoot())` доступны методы корня, например `$getChanges()`. Подробно — в руководстве [Выполнить код при сохранении документа](../hooks/document-hooks.mdx#поддокументы).
+
+## Проверить вложенные поля
+
+Правила вложенных полей (`min`, `required`, `enum` и другие) проверяются вместе с документом. Путь ошибки называет и строку, и поле, так что пользователь видит, что именно исправлять.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+import { ValidationError } from "@venloc/typemo";
+// ---cut---
+const order = Orders.new({ customer: "alice", tags: [], lines: [{ sku: "A1", qty: 2 }] });
+order.lines.push({ sku: "B2", qty: -1 });
+
+try {
+  await order.$validate();
+} catch (error) {
+  if (error instanceof ValidationError) console.log(error.issues.map((issue) => issue.path.join(".")));
+  // → ["lines.1.qty"]
+}
+```
+
+## Получить обычную копию
+
+[`$toObject`](../reference/documents/typed-collections.mdx#subdocument) поддокумента возвращает обычный объект без отслеживания, [`$toPlain`](../reference/documents/typed-collections.mdx#subdocument) — то же, что даёт `$toPlain()` документа по этому пути (идентификаторы строками). Копию можно менять, документ она не затронет.
+
+## Как выбрать
+
+Спросите себя: **нужно ли находить или убирать этот объект отдельно от документа?** Если да (строка заказа, комментарий), делайте его классом с `_id` (наследник `Entity`): тогда работают [`lines.id(id)`](../reference/documents/typed-collections.mdx#subdocumentarrayid) и `lines.pull(id)`. Если объект — просто часть значения (адрес, координаты), достаточно вложенного класса `@Schema({ nested: true })` без `_id`.
+
+## Когда это не нужно
+
+Если строки заказа нужно искать и считать отдельно от заказа (все строки с товаром `A1` по всем заказам), поддокументы неудобны: выберите отдельную коллекцию и связь [`ref`](../schemas/references.mdx). Массив, в котором тысячи поддокументов, тоже стоит вынести: документ MongoDB ограничен в размере.
+
+## Частые ошибки
+
+### Замена поддокумента присваиванием
+
+```text
+DirectWriteError: "address" was changed around its methods: the field was replaced by assignment; use $set("address", value) or the container's methods
+```
+
+Причина в том, что присваивание не говорит, хотите вы заменить объект или дополнить его. Исправление: [`$set`](../reference/documents/document-api.mdx#set) документа или `$set` родителя.
+
+### Хук `query.find` в классе строки не срабатывает
+
+В классе `Line` объявлен хук операции, например [`@Pre("query.find")`](../reference/hooks/pre-post.mdx#хук-операции-в-классе-поддокумента), а `Orders.find()` его не вызывает. Ошибки нет ни при компиляции, ни при создании модели: запуск показал ноль вызовов. У поддокумента нет своих операций: `find`, `updateMany` и агрегации выполняет модель `Order`, и запускаются хуки операций её класса. Хуки документа (`document.save`, `document.validate`) в `Line` работают на каждой строке, как описано [выше](#узнать-новый-ли-поддокумент-и-что-в-нём-изменилось). Исправление: перенесите хук операции в класс `Order`. Подробнее — [Вмешаться в операцию](../hooks/operation-hooks.mdx#хук-операции-в-классе-поддокумента-не-вызывается).
+
+## Полный пример
+
+```ts twoslash title="orders/orders.service.ts"
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+export const describeLine = async (orderId: Order["_id"], lineId: Order["lines"][number]["_id"]) => {
+  const order = await Orders.findById(orderId).orFail();
+  const line = order.lines.id(lineId);
+  if (line === undefined) return undefined;
+  return { path: line.$fullPath(), position: line.$index(), sku: line.sku };
+};
+
+export const moveOrder = async (orderId: Order["_id"], city: string) => {
+  const order = await Orders.findById(orderId).orFail();
+  order.$set("address", { city });
+  await order.$save();
+};
+```
+
+## Если вы пришли из Mongoose
+
+<Callout type="migration">
+
+Поддокумент и массив поддокументов соответствуют `Subdocument` и `DocumentArray` в Mongoose. Разница в строгости: присваивание объекта полю-поддокументу и индекса массиву закрыто типами, замена идёт через `$set`, а `$parent`, `$index` и `$fullPath` вычисляются при вызове и не устаревают.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Массивы и Map в документе" href="./typed-collections.mdx">
+  Методы массивов поддокументов: `create`, `id`, `pull`.
+</Card>
+<Card title="Вложенные объекты и поддокументы" href="../schemas/nested-and-subdocuments.mdx">
+  Как описать вложенные классы в схеме.
+</Card>
+<Card title="Типизированные коллекции" href="../reference/documents/typed-collections.mdx">
+  Все методы поддокумента и массива поддокументов.
+</Card>
+</Cards>

@@ -1,0 +1,110 @@
+---
+title: Не стереть коллекцию пустым фильтром
+description: "Обязательный фильтр в массовой записи, запрет пустых логических операторов, undefined и неположительного limit"
+icon: Filter
+---
+
+Несколько значений в базе означают не то, что ожидает человек: пустой фильтр — «все документы», `limit: 0` — «без ограничения», `undefined` драйвер отправляет как `null`, пустой `$or` сервер отвергает, а «исправление» изменило бы смысл. Typemo останавливает такие значения до отправки. Проверки работают всегда и не отключаются.
+
+## Что предполагается
+
+Примеры используют модель пользователя.
+
+```ts twoslash title="users/user.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => Number)
+  age?: number;
+}
+```
+
+## Быстрый путь
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, Filters, StrictModeError } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number) age?: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Users = client.connection.model(User);
+// ---cut---
+try {
+  await Users.deleteMany(JSON.parse("{}"));
+} catch (error) {
+  if (error instanceof StrictModeError) console.log(error.reason);
+  // → "empty-filter"
+}
+await Users.updateMany(Filters.all(), { $set: { age: 1 } });
+```
+
+Пустой литерал `{}` в таких вызовах остановит уже компилятор, а до базы дойдёт только фильтр, который собрался пустым во время работы, например из JSON клиента.
+
+## Пустой фильтр в записи
+
+`updateOne`, `updateMany`, `deleteOne`, `deleteMany`, `replaceOne` и `findOneAnd*` с пустым фильтром отвергаются до отправки. `updateOne({})` не исключение: пустой фильтр выбрал бы произвольный документ коллекции, и какой именно, база не гарантирует, поэтому изменить или удалить «какой-нибудь» документ так же опасно, как все. Ошибка та же, и внутри `bulkWrite` тоже: запуск дал `deleteMany with an empty filter would affect every document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]`. Для форм `One` и `findOneAnd*` текст называет тот же вызов, но говорит иначе: `deleteOne with an empty filter would change or remove an arbitrary document; …`, потому что затронут был бы один документ. Причина `empty-filter` и способ исправления от формы не зависят. Пустой фильтр в чтении разрешён: `find({})` вернёт всё.
+
+Литерал `{}` в `updateOne`, `updateMany`, `deleteOne`, `deleteMany` и `replaceOne` не компилируется: компилятор называет то же правило раньше, чем запустится код.
+
+```ts twoslash
+// @errors: 2769
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number) age?: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Users = client.connection.model(User);
+// ---cut---
+await Users.updateOne({}, { $set: { age: 1 } });
+```
+
+Фильтр, объявленный как `Filter<User>`, компилируется: компилятор не знает, пуст ли он. У `findOneAnd*` литерал `{}` тоже компилируется, и ошибка приходит только во время работы. Динамические фильтры вроде `Record<string, unknown>` проверяются только во время работы. Если «все» — намерение, напишите [`Filters.all()`](../reference/policies/violations.mdx#filtersall): это настоящий фильтр `{ _id: { $exists: true } }` без аргумента типа, а намерение видно в коде и в журнале команд. Подробнее — руководство [Пустые фильтры](../writes/empty-filters.mdx).
+
+## Пустые логические операторы
+
+Пустой `$or`, `$and` или `$nor` даёт `QueryError: filter: $or must be a non-empty array (at "$or")` (для `$nor` и `$and` в тексте стоит их имя). Список условий обычно собирается из данных, и пустой список выглядит как «условий нет»; сервер такой оператор отвергает, а молчаливое отбрасывание нашло бы всё. Проверьте список до сборки.
+
+## undefined вместо значения
+
+`{ name: undefined }` даёт `QueryError: filter: undefined at "name" (use $exists: false / $unset; undefined is never a value)`, в обновлении — `update: undefined at "$set.age" …`. Драйвер отправил бы `null`. Не передавайте ключ, используйте `$exists: false` или `$unset`.
+
+## Пустое обновление
+
+`{}` и `{ $set: {} }` дают `QueryError: update: an empty update changes nothing` и `update: operator "$set" is empty`: пустое обновление не должно выглядеть успехом. Конвейер обновления без стадий — тоже `QueryError`: `an update pipeline needs at least one stage`. А массив вместо функции-строителя отвергается с подсказкой: `update: an update pipeline is built with the pipeline builder: updateOne(filter, (p) => p.set({ … })), not passed as an array`.
+
+## limit и skip
+
+`limit(0)`, `limit(-1)` и `limit(1.5)` дают `QueryError: limit must be a positive integer, got 0 (number)`; строка тоже не подходит: `limit("3")` — `limit must be a positive integer, got "3" (string)`. Для `skip(-1)` текст такой: `skip must be a non-negative integer, got -1 (number)`. Значение печатается вместе с типом, чтобы было видно, что пришла строка, а не число. В драйвере `0` означает «без ограничения», а ноль легко получить из пустого параметра запроса и выгрузить всю коллекцию. Чтобы не ограничивать, не вызывайте `limit`. По той же причине `batchSize(0)` отвергается: драйвер читает ноль как «размер по умолчанию».
+
+## Как выбрать
+
+Задайте вопрос: **хочу ли я изменить все документы?** Если да, напишите `Filters.all()`. Если нет, значит, фильтр собрался пустым по ошибке: найдите, откуда он взялся.
+
+## Когда это не нужно
+
+Для чтения пустой фильтр нормален: `find()` возвращает всё. Ограничение касается только записи.
+
+## Частые ошибки
+
+### Фильтр собрался пустым из данных клиента
+
+Симптом — `[empty-filter]` в записи, в том числе в `updateOne` или `deleteOne`. Причина: клиент не прислал условия, а код собрал из них пустой объект. Проверьте вход и не превращайте отсутствие условий в «все».
+
+## Что дальше
+
+<Cards>
+<Card title="Пустые фильтры" href="../writes/empty-filters.mdx">
+  Как менять и удалять всё намеренно, откуда берётся пустой фильтр.
+</Card>
+<Card title="Нарушения политик" href="../reference/policies/violations.mdx">
+  Причины и тексты всех ошибок строгости.
+</Card>
+</Cards>

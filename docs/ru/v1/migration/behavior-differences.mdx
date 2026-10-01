@@ -1,0 +1,530 @@
+---
+title: Отличия в поведении
+description: "Что в Typemo ведёт себя как в Mongoose, а где он строже и почему: приведение, пустые фильтры, тенанты, пакетная запись, дискриминаторы, синхронизация"
+icon: GitCompare
+---
+
+Typemo отвечает ошибкой там, где Mongoose молча делает что-то своё: приводит строку к числу, отбрасывает неизвестное поле, превращает `undefined` в `null`, пропускает пустое обновление. Все различия в поведении растут из одного решения: **строгость по умолчанию** и без выключателя. У Mongoose такой выключатель есть почти на каждый случай (`strict`, `strictQuery`, `runValidators`, `sanitizeFilter`), а у Typemo его нет.
+
+Страница нужна, когда вы перенесли код и что-то стало вести себя иначе, или когда хотите заранее понять, что сломается. Различия делятся на две группы. Сначала идёт то, что Typemo делает так же, как Mongoose, хотя вы могли ждать иного: здесь код переносится без правок. Затем идёт то, где Typemo строже, по темам и с причиной у каждой. Справочный перечень «метод — аналог» лежит в [Соответствии API](../reference/migration/api-mapping.mdx), а список того, чего в Typemo нет совсем, — в руководстве [Чего нет в Typemo](./missing-features.mdx).
+
+## Что предполагается
+
+Примеры используют блог: модель поста растёт по ходу страницы, `Posts` — модель Typemo, `MPost` — модель Mongoose 9.10.2 над теми же данными. Результаты и тексты ошибок получены запуском обеих библиотек на настоящей MongoDB.
+
+## Быстрый путь
+
+Три различия, о которые спотыкаются первыми: числовая строка перестала быть числом, обновление без операторов перестало работать, а `findOneAndUpdate` возвращает уже изменённый документ.
+
+<Compare>
+
+```ts
+await MPost.create({ title: "Hello", views: "42" }); // views: 42
+await MPost.updateOne({ title: "Hello" }, { views: 10 }); // обёрнуто в $set
+const post = await MPost.findOneAndUpdate({ title: "Hello" }, { $inc: { views: 1 } });
+// post.views → значение до изменения
+```
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number) views?: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Posts = client.db().model(Post);
+// ---cut---
+await Posts.create({ title: "Hello", views: 42 });
+await Posts.updateOne({ title: "Hello" }, { $set: { views: 10 } });
+const post = await Posts.findOneAndUpdate({ title: "Hello" }, { $inc: { views: 1 } });
+console.log(post?.views);
+// → 11
+```
+
+</Compare>
+
+Остальная страница разбирает каждое различие отдельно.
+
+## Что теперь совпадает с Mongoose
+
+Два поведения, на которых переносимый код спотыкался бы зря: оба у Typemo теперь такие же, как у Mongoose, и править в коде ничего не нужно.
+
+**Массив по умолчанию пустой.** Поле-массив без `default` и без `required` получает `[]` при создании документа. Mongoose поступает так же: код, который читает `post.tags.length` у только что созданного документа, продолжает работать. Typemo подставляет `[]` и там, где вы этого не видите: у нового поддокумента и при вставке через `upsert`. Гидратированное чтение документа, в котором ключа массива нет в базе, тоже даёт `[]`, и следующий `$save` его запишет; [`lean`](../reference/query/reading.mdx#lean) отдаёт документ как хранится. У поля с `required: true` умолчания нет.
+
+<Compare>
+
+```ts
+const post = await MPost.create({ title: "a" });
+console.log(post.tags);
+// → []
+```
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Posts = client.db().model(Post);
+// ---cut---
+const post = await Posts.create({ title: "a" });
+console.log(post.tags);
+// → []
+```
+
+</Compare>
+
+Поле при этом не нужно помечать `Defaulted`, и в `create` массив необязателен: тип поля — просто `string[]`. Читатель документа получает не `string[]`, а [`StrictArray`](../reference/documents/typed-collections.mdx#strictarray) (изменяемый только своими методами), а `lean` и `plain` отдают обычный массив.
+
+**Имя ключа дискриминатора меняется опцией.** В Mongoose ключ по умолчанию `__t`, а `discriminatorKey` в опциях схемы задаёт другое имя. Typemo устроен так же: опция называется `discriminatorKey`, значение записывается в документ под этим именем. Отличие только в том, что класс объявляет ключ типом, чтобы его видел компилятор: `declare readonly kind?: Discriminators<…>`. Полностью устройство иерархии описано в руководстве [Наследование и дискриминаторы](../schemas/discriminators.mdx#базовая-модель-знает-наследников).
+
+<Compare>
+
+```ts
+const Base = mongoose.model("Base", new Schema({ amount: Number }, { discriminatorKey: "kind" }));
+const Card = Base.discriminator("Card", new Schema({ last4: String }));
+await Card.create({ amount: 1, last4: "1" });
+// в базе: { amount: 1, last4: "1", kind: "Card" }
+```
+
+```ts twoslash
+import { Discriminator, Entity, Prop, Schema, TypemoClient, type Discriminators, type DiscriminatorValue } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ collection: "payments", discriminatorKey: "kind", discriminators: () => [CardPayment] })
+class Payment extends Entity {
+  declare readonly kind?: Discriminators<CardPayment>;
+  @Prop(() => Number, { required: true }) amount!: number;
+}
+
+@Discriminator("card")
+class CardPayment extends Payment {
+  declare readonly kind: DiscriminatorValue<"card">;
+  @Prop(() => String, { required: true }) last4!: string;
+}
+
+const card = await client.db().model(CardPayment).create({ amount: 1, last4: "1" });
+// в базе: { amount: 1, last4: "1", kind: "card" }
+```
+
+</Compare>
+
+Остальное в Typemo строже, и разбирается ниже.
+
+## Строка больше не превращается в число
+
+Сценарий: данные приходят из формы или из параметров адреса, и в них `"42"` вместо `42`. Mongoose приводит значение к типу поля и молчит, что оно было другим. Typemo принимает только значение нужного типа.
+
+<Compare>
+
+```ts
+const post = await MPost.create({ title: "Hello", views: "42" });
+console.log(post.views);
+// → 42
+```
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number) views?: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Posts = client.db().model(Post);
+// ---cut---
+// @errors: 2769
+await Posts.create({ title: "Hello", views: "42" });
+// компилятор: No overload matches this call (Type 'string' is not assignable to type 'number')
+// во время работы: Cast to number failed at path "views" for "42" (string): expected a number [type]
+```
+
+</Compare>
+
+Причина в том, что у приведения в Mongoose много неочевидных правил. `" "` становится `0`, `"0x10"` — `16`, `true` — `1`, пустая строка в поле-числе — `null`, а результат для дат зависит от часового пояса сервера. Каждое правило работает, пока данные приходят такими, как вы ожидали; когда приходят другие, ошибка тихо превращается в неверное значение. Typemo принимает `number`, а всё остальное отклоняет и сообщает [`CastError`](../reference/errors/data-errors.mdx#casterror) с причиной `type`.
+
+У правила есть три осознанных исключения, потому что у них есть каноническая строковая форма. Строка с идентификатором `ObjectId` или `UUID` принимается везде: в создании, обновлениях, фильтрах и [`findById`](../reference/query/reading.mdx#modelfindbyid). Строка с целым числом принимается для `int64` (`BigInt`), строка с десятичным числом — для `Decimal128`. Календарная дата `YYYY-MM-DD` и полная дата ISO 8601 с часовым поясом принимаются для `Date`. Всё остальное, включая `null` в поле без `nullable`, — ошибка:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number) views?: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Posts = client.db().model(Post);
+// ---cut---
+try {
+  await Posts.create({ title: "Hello", views: null as unknown as number });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to number failed at path "views" for null: null is not allowed on a path that is not nullable [null]
+```
+
+Mongoose записал бы тут `null` в любое необязательное поле. Чтобы поле могло быть `null`, объявите его [`nullable`](../reference/schemas/prop.mdx#nullable): тогда `null` и отсутствие поля — два разных состояния, и тип их различает.
+
+## Неизвестное не отбрасывается
+
+Сценарий: опечатка в имени поля. Mongoose с настройками по умолчанию (`strict: true`, `strictQuery: false`) отреагирует по-разному на три места опечатки, и ни одно из них не бросит ошибку.
+
+<Compare>
+
+```ts
+await MPost.create({ title: "d", extra: 1 });
+// extra молча выброшен
+
+const posts = await MPost.find({ nope: 1 });
+// фильтр отправлен как есть: posts.length → 0
+```
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Posts = client.db().model(Post);
+// ---cut---
+// @errors: 2769
+await Posts.create({ title: "d", extra: 1 });
+// компилятор: No overload matches this call (Object literal may only specify known properties, and 'extra' does not exist in type 'CreateInput<Post>')
+// во время работы: Cast to Post failed at path "extra" for 1 (number): not a field of Post [unknown-key]
+```
+
+</Compare>
+
+Молчание опасно тем, что оно выглядит как успех. Поле `extra` не сохранилось, и вы узнаёте об этом, когда его нет в базе. Фильтр по опечатке `nope` ничего не нашёл — и это тоже похоже на нормальный «ничего нет». В Typemo компилятор останавливает опечатку в поле, а если значение пришло из JavaScript без типов, во время работы бросается ошибка. Неизвестное поле в фильтре — [`StrictModeError`](../reference/errors/data-errors.mdx#strictmodeerror) с причиной `unknown-path`, неизвестный ключ в создаваемом документе — `CastError` с причиной `unknown-key`, неизвестный путь в обновлении — `StrictModeError` до отправки в базу.
+
+То же правило действует в другую сторону — для данных, уже лежащих в базе. Поле, которого нет в классе, при чтении и сохранении верхнего уровня остаётся в документе нетронутым. Для поддокументов Typemo строже: перезапись поддокумента с неизвестным полем вместо тихого стирания даёт [`UnknownFieldsError`](../reference/errors/data-errors.mdx#unknownfieldserror). Как это выглядит на практике и как согласиться на потерю осознанно, объяснено в руководстве [Неизвестные поля](../documents/unknown-fields.mdx).
+
+## `undefined` — не значение
+
+В JavaScript `undefined` и «поля нет» — почти одно и то же, а в базе `undefined` записывается как `null`. Mongoose в фильтре превращает `undefined` в `null`: запрос `find({ views: undefined })` ищет документы, у которых `views` равно `null` или отсутствует. Если значение пришло из необязательного параметра запроса, вы получите не «всё» и не «ошибку», а не тот срез, который имели в виду.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number) views?: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Posts = client.db().model(Post);
+const maybeViews = undefined as number | undefined;
+// ---cut---
+// @errors: 2379
+try {
+  await Posts.find({ views: maybeViews });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// компилятор: Type 'undefined' is not assignable to type 'number | ScalarOperators<number, never>'
+// во время работы (значение пришло из JavaScript без типов): filter: undefined at "views" (use $exists: false / $unset; undefined is never a value)
+```
+
+Typemo бросает [`QueryError`](../reference/errors/query-errors.mdx#queryerror) и подсказывает, что писать вместо: [`$exists: false`](../reference/query/filter-operators.mdx#exists) для «поля нет» и [`$unset`](../reference/writes/update-operators.mdx#unset) для удаления поля. Тот же принцип работает и в обновлениях: `undefined` там не пропускается и не пишется как `null`.
+
+## Значение, которое не приводится, — всегда CastError
+
+Сценарий: поле получило значение неподходящего типа: `doc.views = "abc"`. Mongoose запоминает ошибку приведения в документе и сообщает о ней при проверке вместе со всеми остальными: ошибка приведения лежит внутри `ValidationError` рядом с остальными проблемами. Запуск конструктора `new MPost({ views: "abc" })` для схемы с обязательным `title` без `title` дал одну `ValidationError` с двумя записями, `views` (`CastError`) и `title` (`required`).
+
+Typemo устроен жёстче: значение, которое не приводится, — это всегда [`CastError`](../reference/errors/data-errors.mdx#casterror), одна на поле, а ограничения этого поля (`min`, `enum`) после неё не проверяются, потому что проверять нечего. Когда ошибка приходит, зависит от пути значения. Методы, которые принимают значение (`create`, `Model.new`, `$set`, методы массивов, операторы обновления), приводят его сразу. Простое присваивание `doc.views = …` приводится на ближайшем [`$validate()`](../reference/documents/document-api.mdx#validate) или `$save()`: `CastError` приходит до любой проверки значений, и в базу ничего не уходит.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { min: 10 }) views?: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Posts = client.db().model(Post);
+// ---cut---
+const post = Posts.new({ title: "t" });
+// @errors: 2322
+post.views = "abc";
+// компилятор: Type 'string' is not assignable to type 'number'
+// во время работы (значение пришло без типов), на $validate() или $save():
+//   CastError: Cast to number failed at path "views" for "abc" (string): expected a number [type]
+```
+
+Если в документе одновременно неверное значение и отсутствует обязательное поле, `$validate()` называет только `CastError`: проверка значений начинается после того, как всё приведено. Разница сознательная. Приведение отвечает на вопрос «значение вообще имеет этот тип?», проверка — на вопрос «подходит ли оно по правилам?», и на второй вопрос не отвечают для значения, у которого нет ответа на первый.
+
+Исключение — места, где нужно собрать все проблемы разом: `Model.validate(input)` и интеграция Standard Schema для форм. Там приведение — одна из записей общего списка с причиной `cast`, а `CastError` лежит в `cause` этой записи: `Validation failed: "title": the field is required [required]; "views": Cast to number failed at path "views" for "abc" (string): expected a number [type] [cast]`.
+
+## Пустое и «почти пустое» — ошибка
+
+Сценарий: обновление или удаление, в которое из-за ошибки в коде попало пустое условие или пустое изменение. Mongoose терпит все варианты, в том числе пустой фильтр в формах `One`: `updateOne({}, …)` меняет первый попавшийся документ коллекции, `deleteOne({})` удаляет его, `replaceOne({}, …)` заменяет.
+
+<Compare>
+
+```ts
+await MPost.updateOne({ title: "a" }, {});
+// → { acknowledged: false } — ничего не сделано
+
+await MPost.updateOne({ title: "a" }, { views: 10 });
+// обёрнуто в $set, документ изменён
+
+await MPost.deleteMany({});
+// удалены все документы коллекции
+
+await MPost.deleteOne({});
+// удалён первый попавшийся документ
+```
+
+```ts twoslash
+import { Entity, Filters, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number) views?: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Posts = client.db().model(Post);
+// ---cut---
+// пустое обновление: QueryError "update: an empty update changes nothing"
+// обновление без оператора: QueryError
+//   "update: \"views\" is not an update operator (write { $set: { … } })"
+// пустой фильтр в любой из пяти записей (updateOne, updateMany, deleteOne, deleteMany, replaceOne):
+// StrictModeError до отправки в базу, например
+//   "deleteOne with an empty filter would change or remove an arbitrary document; pass a filter,
+//    or Filters.all() to mean every document on purpose [empty-filter]"
+
+// удалить все документы можно, но только намеренно:
+await Posts.deleteMany(Filters.all());
+```
+
+</Compare>
+
+Причина — цена ошибки. Одна опечатка превращает `deleteMany({ author: id })` в `deleteMany({ author: undefined })` или в `deleteMany({})`, и коллекции нет. Поэтому пустой фильтр в записи запрещён во всех пяти методах, формы `One` тоже: `updateOne({})` и `deleteOne({})` затрагивали бы один документ, но какой именно, решала бы база, а это не то, что имел в виду автор кода. Литерал `{}` в этих методах не компилируется (`an empty filter would change or remove an arbitrary document; pass a filter, or Filters.all() to mean every document on purpose`), а фильтр, собранный во время работы (из переменной, из ввода пользователя), отвергается при вызове. Пакет `bulkWrite` получает ту же проверку для каждой операции. Если нужны все документы, «удалить всё» пишется отдельным словом [`Filters.all`](../reference/policies/violations.mdx#filtersall). Подробности — в руководстве [Пустые фильтры](../writes/empty-filters.mdx). Пустое обновление Typemo тоже считает ошибкой: у него нет разумного результата, кроме «ничего не произошло», а такое не должно выглядеть как успех.
+
+## `findOneAndUpdate` возвращает документ после изменения
+
+В Mongoose метод по умолчанию возвращает документ **до** изменения (`new: false`), а чтобы получить новый, нужен `new: true` или `returnDocument: "after"`. Это одна из самых частых причин переносить код внимательно: без правки код продолжит работать, но станет читать другое значение.
+
+<Compare>
+
+```ts
+const before = await MPost.findOneAndUpdate({ title: "a" }, { $inc: { views: 1 } });
+// before.views → 1 (значение до)
+const after = await MPost.findOneAndUpdate(
+  { title: "a" }, { $inc: { views: 1 } }, { new: true },
+);
+```
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number) views?: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Posts = client.db().model(Post);
+// ---cut---
+const after = await Posts.findOneAndUpdate({ title: "a" }, { $inc: { views: 1 } });
+const before = await Posts.findOneAndUpdate(
+  { title: "a" },
+  { $inc: { views: 1 } },
+  { returnDocument: "before" },
+);
+```
+
+</Compare>
+
+В обычной жизни вы почти всегда хотите увидеть результат своей записи, поэтому Typemo считает это умолчанием. Опций `new` и `returnOriginal` нет: `returnDocument` принимает `"before"` и `"after"`, и другого способа выразить то же самое не существует. Подробнее — в справочнике [`findOneAndUpdate`](../reference/writes/writes.mdx#findoneandupdate).
+
+## Запрос выполняется один раз
+
+Mongoose разрешает собрать запрос, но выполнить его повторно нельзя: второй `await` бросает `Query was already executed: Post.find({ title: 'a' })`. Typemo для чтения ведёт себя мягче и предсказуемо: повторный `await` того же строителя возвращает тот же результат без нового запроса к базе.
+
+Для записи правило жёстче, и оно другое: строитель записи выполняется один раз, потому что повторная запись — это повторный побочный эффект. Как читать и писать в цепочке, показывает справочник [`.exec`](../reference/query/reading.mdx#exec) и раздел [«Одно выполнение на строитель»](../reference/writes/writes.mdx#одно-выполнение-на-строитель).
+
+## Массивы, документы и связи ведут себя как значения
+
+Сценарий: код работает с массивами внутри документа так, как принято в JavaScript.
+
+Первое различие — способ изменить массив. В Mongoose `post.tags[0] = "x"` отслеживается, а `post.tags.length = 0` и `delete post.tags[0]` — нет: изменение теряется без единого сообщения. В Typemo массив документа — [`StrictArray`](../reference/documents/typed-collections.mdx#strictarray): запись по индексу и в `length` не компилируется, а замены делаются методами [`set`](../reference/documents/typed-collections.mdx#strictarrayset), [`clear`](../reference/documents/typed-collections.mdx#strictarrayclear), [`splice`](../reference/documents/typed-collections.mdx#strictarraysplice) и [`replace`](../reference/documents/typed-collections.mdx#strictarrayreplace). Метод `set(i, v)` меняет только существующую позицию; дописать в конец за границей, как в Mongoose, нельзя — для этого есть `push`.
+
+Второе — заполненные связи. В Mongoose заполненный массив можно менять на месте, и `push(id)` превращает его обратно в массив идентификаторов. В Typemo заполненный массив и карта — представления только для чтения, а ссылки меняются через сами идентификаторы. Причина в том, что после `push` в Mongoose нельзя предсказать, что уйдёт в базу при сохранении: документы или идентификаторы. Подробнее — в руководстве [Заполненные связи в документе](../populate/document-populate.mdx).
+
+## Пакетная запись сообщает о каждой ошибке
+
+Сценарий: `insertMany` с тремя документами, из которых один невалиден.
+
+<Compare>
+
+```ts
+const saved = await MPost.insertMany(
+  [{ title: "e" }, { views: 5 }, { title: "f" }],
+  { ordered: false },
+);
+// saved.length → 2, промис выполнен, ошибок нет
+```
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number) views?: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Posts = client.db().model(Post);
+// ---cut---
+try {
+  await Posts.insertMany(
+    [{ title: "e" }, { views: 5 } as unknown as { title: string }, { title: "f" }],
+    { ordered: false },
+  );
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Post.insertMany: 1 write(s) failed (first at index 1: Validation failed: "title": the field is required [required])
+```
+
+</Compare>
+
+Mongoose вставляет валидные документы и молча пропускает невалидные: вы получаете массив из двух, а куда делся третий, программа не сообщает. Typemo вставляет те же валидные документы, но операция заканчивается [`BulkWriteError`](../reference/errors/server-errors.mdx#bulkwriteerror). В нём для каждого сбоя есть индекс во входном массиве, код и исходная ошибка, поэтому вы точно знаете, что вставлено, а что нет. Тот же класс ошибки приходит из [`bulkWrite`](../reference/writes/writes.mdx#bulkwrite), а сообщение сервера не теряется в `cause`.
+
+Отдельно о [`create`](../reference/writes/writes.mdx#create) со списком: в Mongoose он сохранял документы параллельно и требовал `ordered: true` внутри транзакции. Typemo вставляет список одним упорядоченным `insertMany`, никогда не параллельно, поэтому такой опции у него нет.
+
+## Пакет `bulkWrite` проверяет и вызывает хуки каждой операции
+
+Сценарий: импорт через `bulkWrite` с `upsert`. В Mongoose метод проверял схемой только `insertOne` и `replaceOne`. Значения в `updateOne` уходили в базу без проверки, а хуки отдельных операций не вызывались: работали только `pre("bulkWrite")` и `post("bulkWrite")` самого пакета. Запуск пакета с `updateOne`, `upsert: true` и ценой `-1` при `min: 0` записал документ с отрицательной ценой, а вставку без обязательного поля создал без ошибок. Хук `pre("updateOne")` не вызвался ни разу.
+
+Typemo делает каждую операцию пакета равной своему одиночному аналогу. Значения `$set` проверяются, а `upsert` проверяет и обязательные поля вставляемого документа. `insertOne` запускает хуки документа, остальные операции запускают хуки `query.updateOne`, `query.deleteMany` и так далее, а номер операции хук узнаёт по `this.bulkIndex`.
+
+```ts twoslash
+import { Entity, Pre, Prop, Schema, TypemoClient, type OperationHookContext } from "@venloc/typemo";
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) price!: number;
+
+  @Pre("query.updateOne")
+  count(this: OperationHookContext<Product, "query.updateOne">): void {
+    console.log("pre updateOne", this.bulkIndex);
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+await Products.bulkWrite(
+  [
+    { updateOne: { filter: { sku: "a" }, update: { $set: { price: 1 } }, upsert: true } },
+    { updateOne: { filter: { sku: "b" }, update: { $set: { price: -1 } }, upsert: true } },
+  ],
+  { ordered: false },
+).catch((error) => console.log((error as Error).message));
+// → pre updateOne 0
+// → Product.bulkWrite: 1 write(s) failed (first at index 1: Validation failed: "price": must be at least 0 [min])
+```
+
+Первая операция записала документ, вторая отвергнута, и номер операции назван в ошибке. Если хук операции бросает, пакет не уходит в базу целиком; подробности и порядок вызова хуков — в руководстве [Пакетная запись](../writes/bulk.mdx#хуки-операций-внутри-bulkwrite).
+
+## Хуки: другой порядок и другой `this`
+
+Сценарий: логика при сохранении. Порядок шагов у `save` в Mongoose такой: проверка значений, потом `pre("save")`. Значит, значение, которое ваш хук исправил, уже не проверяется. У Typemo порядок обратный: сначала [`@Pre("document.save")`](../reference/hooks/pre-post.mdx#pre), затем проверка, затем запись. Всё, что изменил хук, проверяется так же, как ввод пользователя.
+
+Второе различие — `this`. В хуках запроса Mongoose `this` — сам `Query`, и хук может переписать условие, подменить настройки или подмешать стадию. Это происходило уже после проверки и мимо политик: тенанта, мягкого удаления, санитизации. В Typemo хук запроса получает контекст операции только для чтения, а менять операцию можно методом [`.modify`](../reference/hooks/operation-context.mdx#modify) и только в форме, которую проверяют политики. Как это выглядит в коде, показывает руководство [Вмешаться в операцию](../hooks/operation-hooks.mdx).
+
+В хуке документа `this` — гидратированный документ или, если класс встроен в другую модель, поддокумент: хук класса запускается в обоих случаях. Его тип — [`HookThis<"document.save", Post>`](../reference/hooks/pre-post.mdx#hookthis), то есть `HydratedDoc<Post> | Subdocument<Post>`: методы `$isNew()` и `$isModified()` есть у обоих, а методы корня (`$getChanges()`, `$save()`) доступны после проверки [`this.$isRoot()`](../reference/documents/document-api.mdx#isroot). Объявить `this: HydratedDoc<Post>` компилятор не даёт: такой тип обещал бы методы корня и поддокументу, у которого их нет.
+
+Третье: события хуков — не строки и не регулярные выражения. У Mongoose `pre("deleteOne")` мог означать и документ, и запрос в зависимости от опции, а `/^find/` ловил всё подряд. В Typemo событие всегда называется с областью — `document.save`, `query.find` — и перечень явный: [`HOOK_EVENTS`](../reference/hooks/pre-post.mdx#hook_events). Хук документа `deleteOne` не сработает при `deleteOne` запроса, и наоборот.
+
+## Ключ дискриминатора нельзя изменить
+
+Сценарий: документ-карту нужно «превратить» в перевод, сменив ключ. В Mongoose результат зависит от пути и непредсказуем. Присваивание `doc.kind = "Transfer"` в сохранённом документе-наследнике даёт `ValidationError` с текстом про приведение ключа к строке (дискриминатор `Card` не принимает чужое значение). Обновление `updateOne({ _id }, { $set: { kind: "Transfer" } })` молча ничего не делает: ответ `acknowledged: false`, документ не изменился. Включить смену можно только опцией `overwriteDiscriminatorKey: true`: тогда обновление проходит.
+
+В Typemo значение ключа неизменяемо без исключений: присваивание не компилируется, обновление и `$save` после присваивания отвергаются до отправки в базу ошибкой `StrictModeError` с причиной `immutable`, а выключателя нет. Вид документа выбирается один раз при создании: чтобы сменить его, создайте документ нужного вида и удалите прежний. Повтор значения ключа у двух наследников — `ConfigurationError` уже при первом `model()`. Тексты ошибок и примеры — в справочнике [Значение ключа неизменяемо](../reference/schemas/discriminator.mdx#значение-ключа-неизменяемо).
+
+## Тенант — часть схемы
+
+В Mongoose мультитенантность строят сами: плагином, хуками `pre("find")` или условием в каждом запросе. Любой путь мимо хуков (агрегация, `lean`, драйвер) может вернуть чужие данные. В Typemo тенант — политика схемы: опция `tenant` включает её, а поле тенанта обязательно помечается декоратором [`@Tenant()`](../reference/schemas/field-markers.mdx#tenant) рядом с `@Prop` на поле типа `TenantField<T>`.
+
+```ts twoslash
+import { Entity, PolicyContext, Prop, Schema, Tenant, type TenantField, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "crm" });
+const Orders = client.db().model(Order);
+// ---cut---
+const order = await PolicyContext.run({ tenant: "acme" }, () => Orders.create({ number: "A-1" }));
+console.log(order.tenantId);
+// → acme
+
+await Orders.find().catch((error) => console.log((error as Error).message));
+// → Order.find: Order is scoped by tenant ("tenantId") and the operation has no tenant; run it inside PolicyContext.run({ tenant }, …) or add .policy({ tenant }) to the query (cross-tenant work: .policy({ allTenants: true })) [tenant]
+```
+
+Это строже по трём причинам. Схема с опцией `tenant` без пометки `@Tenant()` не собирается: `ConfigurationError: Order: the tenant field "tenantId" must be marked @Tenant() (declare it @Prop(...) @Tenant() tenantId!: TenantField<T>)`, и то же при пометке без опции или на двух полях. Операция без тенанта не возвращает «всё подряд», а падает. Пустая строка в роли тенанта тоже ошибка. Работа сразу по всем организациям записывается явно, `.policy({ allTenants: true })`. Подробности — в руководстве [Разделить данные организаций](../policies/tenants.mdx#описать-поле-тенанта) и в рецепте [Многотенантное приложение](../recipes/multi-tenant.mdx).
+
+## Ничего не создаётся неявно
+
+Mongoose при создании модели сам создаёт коллекцию и индексы (`autoCreate`, `autoIndex`), ждёт подключения в очереди команд (`bufferCommands`) и добавляет каждому документу `_id`, а модели — виртуальное свойство `id`, метки времени и версию по вашей опции. Typemo не делает ничего из этого само.
+
+Коллекции и индексы создаются вашей командой: [`connection.init()`](../reference/connection/connection.mdx#connectioninit) один раз при запуске сервиса или [`syncIndexes`](../reference/collections/model-indexes.mdx#modelsyncindexes) в шаге развёртывания. `syncIndexes` удаляет индексы, которых нет в классе, поэтому перед первым запуском на коллекции, которой раньше занимался Mongoose, посмотрите план: `syncIndexes({ dryRun: true })` ничего не пишет. Операция до подключения не встаёт в очередь: она ждёт готовности клиента внутри и по истечении времени бросает ошибку ([`client.ready`](../reference/connection/typemo-client.mdx#clientready)).
+
+Когда синхронизация не может привести коллекцию к схеме, Typemo сообщает об этом. В Mongoose `Model.init()` и `createCollection()` в такой ситуации молча пропускают коллекцию: если коллекция уже существует без опции `capped`, схема с `capped` её не меняет и ошибки нет (запуск показал `isCapped() → false`), а при `autoCreate: false` коллекция с `capped` или `collation` просто не создаётся (так устроены ошибки gh-8566 и gh-8814 в тестах Mongoose). Приложение стартует с коллекцией не той формы и узнаёт об этом по последствиям. В Typemo [`connection.init()`](../reference/connection/connection.mdx#connectioninit) и `syncAll()` выполняют все шаги, а затем бросают одну [`SyncError`](../reference/errors/configuration-errors.mdx#syncerror) со списком всех сбоев в `failures` и исходными ошибками в `cause`. Запуск на коллекции `logs`, созданной без `capped`, при схеме с `capped: { size: 100_000 }` дал `SyncError: connection.init() of "app": 1 failure(s) — collection "logs": exists with options MongoDB cannot change (capped): drop the collection and create it again`.
+
+Служебные поля тоже явные. `_id` даёт базовый класс [`Entity`](../reference/schemas/base-classes.mdx#entity), метки времени — [`Timestamped`](../reference/schemas/base-classes.mdx#timestamped), версию `__v` — [`Versioned`](../reference/schemas/base-classes.mdx#versioned). Виртуального `id` нет: идентификатор — это `_id`, а в plain-виде и в JSON он уже строка.
+
+## Чтение из базы не проверяет данные
+
+Это различие в другую сторону: Typemo строже Mongoose при записи, но при чтении не проверяет, что лежит в базе. Mongoose приводит прочитанное значение к типу схемы: строка `"5"` в поле `views` превратится в `5`. Typemo отдаёт то, что хранится.
+
+Если строка `"5"` лежит в поле `views`, [`findById`](../reference/query/reading.mdx#modelfindbyid) вернёт `views: "5"`, хотя тип обещает число. Typemo нарочно читает данные так, как они хранятся: гидратация не превращается в ещё одну проверку. Пока ваши данные писал Mongoose, поле хранит то, что схема приводила при записи, и расхождений нет; они появляются, когда в коллекцию пишет кто-то, кто схему не соблюдал. Если такие данные возможны, проверьте результат во время работы методом [`.parse`](../reference/query/contracts.mdx#parse), как в руководстве [Проверить данные из базы во время работы](../queries/contracts.mdx#проверить-данные-из-базы-во-время-работы).
+
+## Частые ошибки
+
+### После переезда тесты падают на строках вместо чисел
+
+Тесты и обработчики передавали `"42"` и получали `42`. Теперь `CastError` с причиной `type`. Исправление — привести значение на границе приложения, а не в модели: разберите параметр запроса при чтении и передавайте число.
+
+### `findOneAndUpdate` вернул уже новое значение
+
+Код вычислял разницу между старым и новым значением, читая результат `findOneAndUpdate`. Теперь результат — новое значение. Добавьте `{ returnDocument: "before" }`, если действительно нужно старое.
+
+### Фильтр с опечаткой теперь падает
+
+Раньше он молча находил ноль документов. Это не регресс, а найденная ошибка: поправьте имя поля. Если запрос строится из JavaScript без типов, ошибку даёт [`StrictModeError`](../reference/errors/data-errors.mdx#strictmodeerror) с причиной `unknown-path`.
+
+### `updateOne({})` и `deleteOne({})` в тестах и скриптах
+
+Скрипты и тесты на Mongoose часто чистят коллекцию `deleteOne({})` в цикле или обновляют «любой документ» `updateOne({}, …)`. Теперь `StrictModeError`. Назовите документ условием (`{ _id }`, `{ title }`) или, если нужно действительно любое, прочитайте его и обновите по `_id`. Для «все документы» есть [`Filters.all()`](../reference/policies/violations.mdx#filtersall).
+
+### `init()` падает на старте с `SyncError`
+
+Раньше Mongoose молча запускался на коллекции не той формы. `SyncError` называет каждую коллекцию и причину: расхождение опций, которые сервер не меняет (например, `capped`), или конфликт индексов. Исправьте коллекцию (пересоздайте её или приведите схему в соответствие), а не ловите ошибку.
+
+### Схема тенанта не собирается
+
+`ConfigurationError: …must be marked @Tenant()`: поле типа `TenantField<T>` нужно пометить декоратором, как показано в разделе о тенантах выше.
+
+### Пустой `updateOne` больше не «ничего не делает»
+
+Код обновлял по условию, которое иногда приходило пустым. Теперь [`QueryError`](../reference/errors/query-errors.mdx#queryerror). Проверьте условие до вызова: пустое обновление означало, что вы не знаете, что хотели изменить.
+
+## Что дальше
+
+<Cards>
+<Card title="Чего нет в Typemo" href="./missing-features.mdx">
+  То, что Mongoose умеет, а Typemo сознательно нет, и чем это заменить.
+</Card>
+<Card title="Пошаговая миграция" href="./step-by-step.mdx">
+  Как переносить коллекцию за коллекцией и жить с двумя библиотеками одновременно.
+</Card>
+<Card title="Соответствие API" href="../reference/migration/api-mapping.mdx">
+  Таблицы «метод Mongoose — аналог в Typemo» по областям.
+</Card>
+</Cards>

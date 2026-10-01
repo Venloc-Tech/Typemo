@@ -1,0 +1,329 @@
+---
+title: Выбрать тип поля
+description: "Какие типы у полей бывают, чем отличаются Number, Int32, BigInt и Decimal128, как хранятся даты, идентификаторы и двоичные данные"
+icon: Braces
+---
+
+Тип поля задаёт [`@Prop`](../reference/schemas/prop.mdx#prop) первым аргументом, и от него зависит сразу три вещи: как значение хранится в базе, какие значения библиотека примет и как оно выглядит в коде. Для строк и дат выбор очевиден, а для чисел, денег и идентификаторов у MongoDB несколько разных типов, и ошибка в выборе видна не сразу: число не помещается, деньги теряют копейки, идентификатор не находится по строке.
+
+Если вы впервые работаете с MongoDB, важно одно: она хранит документы в формате **BSON**, и у него больше типов, чем у JavaScript (например, `int32`, `int64`, `decimal128`). Typemo даёт для каждого свой тип поля.
+
+## Что предполагается
+
+Модель описана по руководству [Описать модель](./define-model.mdx). Примеры строят модель банковского счёта и добавляют в неё по одному полю.
+
+## Быстрый путь
+
+Чаще всего хватает пяти типов: строка, число, логическое значение, дата и идентификатор. Всё остальное подключается, когда понадобится.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) limit!: number;
+  @Prop(() => Boolean, { required: true }) active!: boolean;
+  @Prop(() => Date, { required: true }) opened!: Date;
+  @Prop(() => Types.ObjectId, { required: true }) branch!: Types.ObjectId;
+}
+```
+
+Тип поля — это конструктор JavaScript (`String`, `Number`, `Boolean`, `Date`, `BigInt`, `RegExp`) или класс из [`Types`](../reference/schemas/types-and-spec.mdx#types), либо результат построителя [`Spec`](../reference/schemas/types-and-spec.mdx#spec). Остальная страница разбирает типы по ситуациям.
+
+## Хранить числа
+
+`Number` принимает любое конечное число JavaScript. В базе целое значение лежит как `int32`, а дробное как `double`: для `5` и для `1.5` тип в базе разный, и это происходит само.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => Number, { required: true }) limit!: number;
+}
+const Accounts = client.connection.model(Account);
+// ---cut---
+await Accounts.create({ limit: 5 });
+await Accounts.create({ limit: 1.5 });
+const kinds = await client
+  .unsafeDriver()
+  .db("shop")
+  .collection("accounts")
+  .aggregate([{ $project: { _id: 0, limit: 1, type: { $type: "$limit" } } }])
+  .toArray();
+console.log(kinds);
+// → [{ limit: 5, type: "int" }, { limit: 1.5, type: "double" }]
+```
+
+Если вам нужен один определённый тип, объявите его явно: [`Types.Int32`](../reference/schemas/types-and-spec.mdx#types) принимает только целые в диапазоне `int32`, [`Types.Double`](../reference/schemas/types-and-spec.mdx#types) всегда хранит `double`. Значение, которое не подходит, — ошибка, а не округление: библиотека не станет молча превращать `1.5` в `1`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "shelves" })
+class Shelf extends Entity {
+  @Prop(() => Types.Int32) // [!code highlight]
+  slots?: number;
+}
+const Shelves = client.connection.model(Shelf);
+try {
+  await Shelves.create({ slots: 1.5 });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to Int32 failed at path "slots" for 1.5 (number): a fractional number is not an Int32 [integer]
+```
+
+`NaN` и бесконечность `Number` отвергает тоже: `Cast to number failed at path "limit" for NaN (number): NaN and Infinity are not allowed [finite]`. Строка вместо числа — `CastError` с причиной `type`: `"5"` числом не станет, потому что тогда опечатка в теле запроса превратилась бы в неверные данные.
+
+## Хранить очень большие целые
+
+Обычное число JavaScript хранит целые точно только до 2⁵³. Для больших значений (счётчик операций, внешний числовой идентификатор) используйте `BigInt`: в базе это `int64` (тип `long`), а в коде — `bigint`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "ledgers" })
+class Ledger extends Entity {
+  @Prop(() => BigInt, { required: true }) // [!code highlight]
+  operations!: bigint;
+}
+const Ledgers = client.connection.model(Ledger);
+const ledger = await Ledgers.create({ operations: 9007199254740993n });
+console.log(ledger.operations);
+// → 9007199254740993n
+console.log(ledger.$toPlain().operations);
+// → "9007199254740993"
+```
+
+В [plain-виде](../documents/serialization.mdx) и в JSON значение `int64` становится **десятичной строкой**: клиенту, который разбирает JSON как обычное число, значение больше 2⁵³ пришло бы с потерей точности, и никакой ошибки не было бы. При записи типы разрешают `bigint` и десятичную строку (`"9007199254740993"`), тип [`Int64String`](../reference/schemas/field-markers.mdx#int64string) описывает такую строку для кода на TypeScript. Строка принимается не только в `create`, но и в фильтрах и в `$inc`, `$mul`, `$min`, `$max`. Запись с плюсом, ведущим нулём или пробелами — `CastError` с причиной `format`: `Cast to Long failed at path "operations" for "+5" (string): a string must be a decimal integer (no sign +, leading zeros, -0, spaces, exponent or prefix) [format]`.
+
+Обычное число во время работы принимается, только если оно безопасное целое (до 2⁵³). Иначе значение уже потеряло точность до записи, и это `CastError` с подсказкой, что передать вместо числа: `Cast to Long failed at path "operations" for 1152921504606847000 (number): beyond Number.MAX_SAFE_INTEGER the number is already imprecise; pass a bigint (5n) or a decimal integer string ("5") [precision]`. Дробное число отвергается так же: `a fractional number is not an int64; pass a bigint (5n) or a decimal integer string ("5") [integer]`. Типы число в это поле не пропускают, поэтому такая запись возможна только в коде без типов.
+
+## Хранить деньги
+
+Для денег не подходит `double`: `0.1 + 0.2` в нём не равно `0.3`. `Types.Decimal128` хранит десятичное число точно, до 34 значащих цифр. Значение передают строкой или объектом `Decimal128`, а не числом: число JavaScript уже содержит ошибку двоичного представления, и неточность возникла бы ещё до записи.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "payments" })
+class Payment extends Entity {
+  @Prop(() => Types.Decimal128, { required: true }) // [!code highlight]
+  amount!: Types.Decimal128;
+}
+const Payments = client.connection.model(Payment);
+const payment = await Payments.create({ amount: "1.10" });
+console.log(payment.amount.toString());
+// → 1.10
+console.log(payment.$toPlain().amount);
+// → "1.10"
+```
+
+Как и `BigInt`, `Decimal128` в plain-виде и в JSON превращается в строку: число JavaScript потеряло бы копейки. Типы входных данных принимают `Decimal128` и строку, а `Types.Decimal128.fromString("1.10")` остаётся вторым способом создать значение. Строка с опечаткой — `CastError` с причиной `format`: `Cast to Decimal128 failed at path "amount" for "abc" (string): not a decimal number string [format]`. Число во время работы тоже принимается, через его короткую десятичную запись (`19.99` превращается в `"19.99"`, `NaN` и бесконечность отвергаются), но типы его не пропускают.
+
+## Хранить даты
+
+`Date` хранит момент времени в UTC с точностью до миллисекунды. Кроме объекта `Date`, поле принимает строку в формате ISO 8601: дату (`2024-01-01`) или дату со временем **и часовым поясом**. Строка без пояса, как `2024-01-01T10:00`, неоднозначна: она означала бы разное время в разных местах, поэтому библиотека её не принимает.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => Date, { required: true }) opened!: Date;
+}
+const Accounts = client.connection.model(Account);
+// ---cut---
+const account = await Accounts.create({ opened: "2024-01-02T03:04:05Z" as never });
+console.log(account.opened.toISOString());
+// → 2024-01-02T03:04:05.000Z
+try {
+  await Accounts.create({ opened: "yesterday" as never });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to Date failed at path "opened" for "yesterday" (string): not an ISO 8601 date (YYYY-MM-DD) or a full date-time with a zone (YYYY-MM-DDTHH:mm:ss[.sss](Z|±HH:mm)) [format]
+```
+
+Тип входных данных требует `Date`, поэтому в примере стоит `as never`: строка допустима во время работы, чтобы принимать данные из JSON, но код приложения обычно передаёт `Date`.
+
+## Хранить идентификаторы
+
+Ссылку на документ или внешний идентификатор хранят как `Types.ObjectId` или `Types.UUID`. Оба типа принимают и своё значение, и строку: 24 шестнадцатеричных символа для `ObjectId`, формат `8-4-4-4-12` для `UUID`. Так идентификатор из адреса запроса можно передать в `create`, в обновление и в фильтр без ручного превращения.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "transfers" })
+class Transfer extends Entity {
+  @Prop(() => Types.ObjectId, { required: true }) from!: Types.ObjectId;
+  @Prop(() => Types.UUID, { required: true }) ticket!: Types.UUID;
+}
+const Transfers = client.connection.model(Transfer);
+const transfer = await Transfers.create({
+  from: "6abcfab53690ef6b2db71493",
+  ticket: "0a1b2c3d-0000-4000-8000-000000000001",
+});
+console.log(transfer.from.constructor.name, transfer.ticket.constructor.name);
+// → ObjectId UUID
+console.log(transfer.$toPlain().ticket);
+// → "0a1b2c3d-0000-4000-8000-000000000001"
+```
+
+Неверная строка — `CastError` с причиной `format`: `Cast to ObjectId failed at path "from" for "zz" (string): not a 24-character hex string [format]`. В plain-виде и в JSON оба типа становятся строками. Если тип нужен самому идентификатору документа (`_id`), а не полю-ссылке, наследуйте [`EntityWithId`](../reference/schemas/base-classes.mdx#entitywithid): это разобрано в руководстве [Свой тип _id](./custom-ids.mdx).
+
+## Хранить двоичные данные, метки и векторы
+
+Остальные типы встречаются реже. `Types.Binary` хранит двоичные данные подтипа 0, для другого подтипа есть [`Spec.binary`](../reference/schemas/types-and-spec.mdx#specbinary). `Types.Timestamp` — внутренняя метка времени MongoDB, не путайте её с `Date`: для своих дат она не подходит. [`Spec.vector`](../reference/schemas/types-and-spec.mdx#specvector) описывает вектор чисел для поиска по смыслу; его размер и тип элемента задаются в самом описании.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "documents" })
+class Attachment extends Entity {
+  @Prop(() => Types.Binary) content?: Types.Binary;
+  @Prop(() => Spec.binary({ subtype: 128 })) custom?: Types.Binary;
+}
+```
+
+Вектор принимает обычный массив чисел (`number[]`) и хранится как двоичное значение подтипа 9. Число элементов проверяется по описанию, а в plain-виде и в JSON вектор снова становится `number[]`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "embeddings" })
+class Embedding extends Entity {
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) // [!code highlight]
+  values?: Vector;
+}
+const Embeddings = client.connection.model(Embedding);
+const embedding = await Embeddings.create({ values: [0.5, 0.25, 0.125] });
+console.log(embedding.values?.constructor.name, embedding.$toPlain().values);
+// → Binary [0.5, 0.25, 0.125]
+try {
+  await Embeddings.create({ values: [1, 2] });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to Vector<float32, 3> failed at path "values" for [array of 2]: expected 3 dimensions, got 2 [dimensions]
+```
+
+Как из вектора получить поиск, рассказывает руководство [Текстовый и векторный поиск](../queries/text-and-vector-search.mdx).
+
+## Разрешить несколько типов
+
+Иногда поле может быть строкой или числом: значение настройки, идентификатор из внешней системы. Для этого есть [`Spec.union`](../reference/schemas/types-and-spec.mdx#specunion). Каждое значение должно подойти **ровно одному** члену объединения, иначе неясно, как его хранить.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "settings" })
+class Setting extends Entity {
+  @Prop(() => Spec.union(String, Number)) // [!code highlight]
+  value?: string | number;
+}
+const Settings = client.connection.model(Setting);
+try {
+  await Settings.create({ value: true as never });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to string | number failed at path "value" for true (boolean): no member accepts this value (members: string, number) [union-no-match]
+```
+
+Как каждый тип выглядит в документе, в lean-виде, в plain-виде и в JSON, показывает справочник [Формы значений](../reference/values/value-forms.mdx).
+
+## Как выбрать тип числа
+
+Задайте себе один вопрос: **что случится, если число окажется неточным?** Если ничего страшного (рейтинг, количество просмотров), берите `Number`. Если число должно быть целым и вы хотите, чтобы дробное значение отвергалось, берите `Types.Int32`. Если целое может превысить 2⁵³ или это внешний числовой идентификатор, берите `BigInt`. Если это деньги или иная величина, где важна каждая цифра после запятой, берите `Types.Decimal128`. `Types.Double` нужен редко: когда вам важно, чтобы в базе всегда лежал именно `double`, например для совместимости с другим приложением.
+
+## Когда это не нужно
+
+Если значение — набор полей, а не одна величина, это не тип из этой страницы, а вложенный объект: [Вложенные объекты и поддокументы](./nested-and-subdocuments.mdx). Для списка значений одного типа пишут `[String]`, см. [Массивы](./arrays.mdx), а для словаря с заранее неизвестными ключами — `Spec.map`, см. [Map](./maps.mdx). Типов `Set`, `Map`, `Array` и `Object` в качестве типа поля нет: для них предназначены эти способы.
+
+## Частые ошибки
+
+### Число не сохраняется как дробное
+
+`Types.Int32` вместо `Number` отвергает `1.5`. Причина в том, что `int32` — целый тип, и округлять молча было бы потерей данных. Если дробные значения нужны, замените тип на `Number` или `Types.Double`.
+
+### Деньги «теряют» копейки
+
+Поле `Number` сохранило `0.30000000000000004`. Причина в двоичной арифметике: `double` не представляет большинство десятичных дробей точно. Храните деньги как `Types.Decimal128`, а складывайте и сравнивайте их на стороне базы или через десятичную библиотеку.
+
+### Большое число в JSON пришло другим
+
+Клиент получил `9007199254740992` вместо `9007199254740993`. Причина в том, что значение отправили обычным числом. Используйте `BigInt` и отдавайте клиенту [`$toPlain()`](../reference/documents/document-api.mdx#toplain) или `.plain()`: `int64` там уже строка.
+
+### Строка не находит документ по идентификатору
+
+`Types.ObjectId` принимает строку и в фильтре, но только правильной длины и с шестнадцатеричными символами. Опечатка в строке — `CastError` с причиной `format`, а не пустой результат: библиотека сообщает, что значение не идентификатор, вместо того чтобы вернуть «ничего не найдено».
+
+## Полный пример
+
+Один файл собирает счёт с полями разных типов, создаёт его и отдаёт клиенту plain-вид. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+// модель: по одному полю каждого частого типа
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Types.Decimal128, { required: true }) balance!: Types.Decimal128;
+  @Prop(() => BigInt, { required: true }) operations!: bigint;
+  @Prop(() => Boolean, { required: true }) active!: boolean;
+  @Prop(() => Date, { required: true }) opened!: Date;
+  @Prop(() => Types.ObjectId, { required: true }) branch!: Types.ObjectId;
+}
+
+// открытие счёта: идентификатор филиала приходит строкой
+export const openAccount = async (owner: string, branchId: string) => {
+  const Accounts = client.connection.model(Account);
+  const account = await Accounts.create({
+    owner,
+    balance: Types.Decimal128.fromString("0.00"),
+    operations: 0n,
+    active: true,
+    opened: new Date("2024-05-01T00:00:00Z"),
+    branch: branchId,
+  });
+  // клиенту: деньги и int64 уходят строками
+  return account.$toPlain();
+};
+
+const dto = await openAccount("ann", "6abcfab53690ef6b2db71493");
+console.log(dto.balance, dto.operations, dto.branch);
+// → 0.00 0 6abcfab53690ef6b2db71493
+```
+
+<Callout type="migration">
+
+В Typemo типы чисел разделены явно: `Types.Int32`, `Types.Double`, `BigInt` (int64) и `Types.Decimal128`, а значение другого типа отвергается, а не приводится тихо (`"5"` числом не станет). Вместо `Schema.Types.ObjectId` используется `Types.ObjectId`. Типа «любое значение» (`Mixed`) нет: поле без описанной схемы Typemo не допускает.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Обязательность, null и отсутствие" href="./required-and-null.mdx">
+  Как объявить, что поле обязательно, допускает `null` или может отсутствовать.
+</Card>
+<Card title="Справочник: Types и Spec" href="../reference/schemas/types-and-spec.mdx">
+  Все классы `Types` и построители `Spec` с точными ошибками.
+</Card>
+<Card title="Формы значений" href="../reference/values/value-forms.mdx">
+  Как каждый тип выглядит в документе, lean, plain и JSON.
+</Card>
+</Cards>

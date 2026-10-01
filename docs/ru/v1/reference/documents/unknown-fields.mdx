@@ -1,0 +1,291 @@
+---
+title: Неизвестные поля
+description: "UnknownFieldsError, unknownFieldsOf, isUnknownFieldsError и UnknownFields: поля в базе, которых нет в схеме, и защита от их потери"
+icon: FileWarning
+---
+
+На этой странице описано всё, что связано с **неизвестными полями**: ключами в сохранённых поддокументах, которых нет в схеме вашего класса. Они появляются, когда данные записала другая версия схемы (более старая или новая) или другая программа. Typemo не теряет такие данные молча: [`unknownFieldsOf`](#unknownfieldsof) показывает их, [`UnknownFieldsError`](#unknownfieldserror) отказывает в сохранении, которое их бы стёрло, а [`SaveOptions.dropUnknownFields`](./document-api.mdx#saveoptions) разрешает потерю осознанно.
+
+Если вы только начинаете, сначала прочитайте руководство [Неизвестные поля](../../documents/unknown-fields.mdx): оно объясняет, откуда берутся такие данные и как с ними поступать. Эта страница — справочник.
+
+Примеры используют заказ из [API документа](./document-api.mdx), в базу которого версия схемы постарше записала лишние ключи: у первой строки `oldPrice`, у адреса `legacyZip`. Ключ, которого нет в схеме, в корне документа (`rootExtra`) остаётся нетронутым: сохранение только меняет поля по путям и корень не переписывает, поэтому в список такие ключи не попадают.
+
+```ts twoslash title="models/order.ts"
+import { Entity, Prop, Schema, Versioned } from "@venloc/typemo";
+
+@Schema({ nested: true })
+export class Address {
+  @Prop(() => String, { required: true })
+  city!: string;
+}
+
+@Schema()
+export class Line extends Entity {
+  @Prop(() => String, { required: true })
+  sku!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  qty!: number;
+}
+
+@Schema({ collection: "orders" })
+export class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => [Line])
+  lines!: Line[];
+
+  @Prop(() => Address)
+  address?: Address;
+}
+```
+
+---
+
+## unknownFieldsOf
+
+`unknownFieldsOf` возвращает список поддокументов, в которых хранятся неизвестные схеме ключи. Функция нужна, когда вы хотите узнать о таких данных заранее: показать предупреждение, записать метрику, решить, стоит ли мигрировать документ, прежде чем он упадёт при сохранении.
+
+Ключи Typemo запоминает **при чтении документа**, без дополнительного запроса. Поэтому функция работает мгновенно, а у документа, созданного через [`Model.new`](./model-document-methods.mdx#modelnew), результат пуст. Пути даны в **именах полей класса** от корня документа: `lines.0`, `address`, `notes.home`. Принимается документ целиком, поддокумент или коллекция; для поддокумента путь остаётся полным, от корня.
+
+```ts twoslash
+import { ObjectId } from "mongodb";
+import { Entity, Prop, Schema, Spec, TypemoClient, Versioned, isUnknownFieldsError, unknownFieldsOf } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+const rawOrders = client.unsafeDriver().db("shop").collection("orders");
+const id = new ObjectId();
+await rawOrders.insertOne({
+  _id: id,
+  customer: "legacy",
+  lines: [{ _id: new ObjectId(), sku: "A1", qty: 1, oldPrice: 5 }, { _id: new ObjectId(), sku: "B2", qty: 2 }],
+  address: { city: "Oslo", legacyZip: "0150" },
+  __v: 0,
+});
+const order = await Orders.findById(id).orFail();
+// ---cut---
+console.log(unknownFieldsOf(order));
+// → [{ path: "lines.0", keys: ["oldPrice"] }, { path: "address", keys: ["legacyZip"] }]
+
+console.log(unknownFieldsOf(order.address!), unknownFieldsOf(order.lines[1]!));
+// → [{ path: "address", keys: ["legacyZip"] }] []
+```
+
+<Returns type="readonly UnknownFields[]">
+
+Список поддокументов с неизвестными ключами; пустой список, если таких нет. Ключи идут в порядке хранения.
+
+</Returns>
+
+<Params>
+<Param name="value" type="object" required>
+
+Гидратированный документ, поддокумент или типизированная коллекция.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+const unknownFieldsOf: (value: object) => readonly UnknownFields[];
+```
+
+</FullType>
+
+### Что не попадает в список
+
+Неизвестные ключи **корня** документа в список не входят: сохранение меняет корень только по полям схемы и остальное не трогает, поэтому терять там нечего. `lean()` и `.plain()` возвращают строки без гидратации и такие ключи не скрывают: в `lean()`-результате они видны, в гидратированном документе и в `$toObject()` — нет.
+
+---
+
+## UnknownFieldsError
+
+`UnknownFieldsError` — ошибка сохранения, которое **переписало бы** сохранённый поддокумент вместе с неизвестными полями и тем самым стёрло бы их из базы. По умолчанию Typemo отказывает: данные другой версии схемы принадлежат не вам, и молчаливая потеря — самая неприятная из возможных. В базу при этом не уходит ничего.
+
+Такая ситуация возникает, когда сохранение записывает заново поддокумент, который остаётся в документе или может остаться после записи: после `reverse`, `sort`, `splice`, `clear` или `replace` массива поддокументов, при замене поддокумента через [`$set`](./document-api.mdx#set) или `lines.set(index, …)`, при `clear()` у Map поддокументов и при `set` по уже существующему ключу Map. Изменения отдельных полей внутри поддокумента (`order.address.city = …`), `push`, `unshift`, `addToSet`, `pull`, `pop`, `shift` неизвестные поля не затрагивают, если сохранение содержит только их: правка поля внутри элемента вместе с `push` в одном сохранении записывает массив целиком, и тогда ошибка возможна. Удаление отдельным оператором потерей не считается: `pull`, `pop`, `shift` у массива и `delete(key)` у Map убирают элемент осознанно и без ошибки. А вот `splice`, `clear` и `replace` записывают массив целиком, поэтому неизвестные поля его элементов под угрозой, и сохранение отказывает.
+
+```ts twoslash
+import { ObjectId } from "mongodb";
+import { Entity, Prop, Schema, Spec, TypemoClient, Versioned, isUnknownFieldsError, unknownFieldsOf } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+const rawOrders = client.unsafeDriver().db("shop").collection("orders");
+const id = new ObjectId();
+await rawOrders.insertOne({
+  _id: id,
+  customer: "legacy",
+  lines: [{ _id: new ObjectId(), sku: "A1", qty: 1, oldPrice: 5 }, { _id: new ObjectId(), sku: "B2", qty: 2 }],
+  address: { city: "Oslo", legacyZip: "0150" },
+  __v: 0,
+});
+const order = await Orders.findById(id).orFail();
+// ---cut---
+order.address!.city = "Rome";
+order.lines.push({ sku: "C3", qty: 1 });
+await order.$save();
+console.log(unknownFieldsOf(order).length);
+// → 2
+
+order.lines.reverse();
+try {
+  await order.$save();
+} catch (error) {
+  if (isUnknownFieldsError(error)) {
+    console.log(error.fields);
+    // → [{ path: "lines.2", keys: ["oldPrice"] }]
+  }
+}
+```
+
+<Params title="Поля">
+<Param name="fields" type="readonly UnknownFields[]">
+
+Все поддокументы, которые сохранение переписало бы без их неизвестных полей. Список заморожен.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+class UnknownFieldsError extends TypemoError {
+  readonly fields: readonly UnknownFields[];
+  constructor(fields: readonly UnknownFields[]);
+}
+```
+
+</FullType>
+
+Текст ошибки называет пути и ключи и подсказывает выходы:
+
+```text
+UnknownFieldsError: the save would drop fields the schema does not know from stored data: "lines.1" (oldPrice); migrate the data or the schema, or pass { dropUnknownFields: true } to $save()/bulkSave() to accept the loss
+```
+
+### Как поступить
+
+Есть три выхода. Можно **мигрировать данные**: удалить или перенести лишние ключи. Можно **дополнить схему**: если ключ на самом деле нужен, добавьте поле в класс, и он станет известным. И можно **принять потерю**: передайте `{ dropUnknownFields: true }` в [`$save`](./document-api.mdx#save) или [`Model.bulkSave`](../writes/writes.mdx#bulksave). После такого сохранения неизвестные поля пропадают и из базы, и из экземпляров документа, и `unknownFieldsOf` перестаёт их показывать.
+
+```ts twoslash
+import { ObjectId } from "mongodb";
+import { Entity, Prop, Schema, Spec, TypemoClient, Versioned, isUnknownFieldsError, unknownFieldsOf } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+const rawOrders = client.unsafeDriver().db("shop").collection("orders");
+const id = new ObjectId();
+await rawOrders.insertOne({
+  _id: id,
+  customer: "legacy",
+  lines: [{ _id: new ObjectId(), sku: "A1", qty: 1, oldPrice: 5 }, { _id: new ObjectId(), sku: "B2", qty: 2 }],
+  address: { city: "Oslo", legacyZip: "0150" },
+  __v: 0,
+});
+const order = await Orders.findById(id).orFail();
+order.lines.reverse();
+// ---cut---
+await order.$save({ dropUnknownFields: true });
+console.log(unknownFieldsOf(order));
+// → [{ path: "address", keys: ["legacyZip"] }]
+```
+
+Обратите внимание: в примере в списке остался адрес — его в этом сохранении никто не переписывал, значит, его ключи по-прежнему в базе.
+
+### Предпросмотр: `$getChanges`
+
+[`$getChanges`](./document-api.mdx#getchanges) не бросает `UnknownFieldsError`, а записывает тот же отказ в ключ `$problems`: путь поддокумента и текст ошибки, которую бросил бы `$save`. Остальное обновление возвращается как обычно, поэтому до сохранения видно и что будет записано, и что откажет.
+
+```text
+{ $set: { "lines.0": {…} }, $problems: { "lines.0": "the save would drop fields the schema does not know from stored data: \"lines.0\" (oldPrice); migrate the data or the schema, or pass { dropUnknownFields: true } to $save()/bulkSave() to accept the loss" } }
+```
+
+### Ошибки
+
+Сама `UnknownFieldsError` других ошибок не бросает: это результат проверки перед записью. `bulkSave` применяет то же правило к каждому документу списка.
+
+---
+
+## isUnknownFieldsError
+
+`isUnknownFieldsError` — проверка типа: возвращает `true`, если значение является [`UnknownFieldsError`](#unknownfieldserror), и сужает тип до неё. Она нужна в блоке `catch`, где ошибка имеет тип `unknown`; `error instanceof UnknownFieldsError` даёт тот же результат.
+
+<Returns type="error is UnknownFieldsError">
+
+`true` для `UnknownFieldsError`, `false` для любого другого значения.
+
+</Returns>
+
+<Params>
+<Param name="error" type="unknown" required>
+
+Проверяемое значение.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+const isUnknownFieldsError: (error: unknown) => error is UnknownFieldsError;
+```
+
+</FullType>
+
+---
+
+## UnknownFields
+
+`UnknownFields` — описание одного поддокумента с неизвестными ключами; из таких элементов состоят результат [`unknownFieldsOf`](#unknownfieldsof) и поле `fields` ошибки [`UnknownFieldsError`](#unknownfieldserror).
+
+<TypeTable
+  type={{
+    path: { description: "Путь поддокумента внутри корневого документа в именах полей класса: `lines.0`, `address`, `notes.home`.", type: "string" },
+    keys: { description: "Сохранённые ключи, которых нет в схеме, в порядке хранения.", type: "readonly string[]" },
+  }}
+/>

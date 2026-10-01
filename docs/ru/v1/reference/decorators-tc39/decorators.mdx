@@ -1,0 +1,318 @@
+---
+title: "@venloc/typemo-decorators"
+description: "Декораторы TC39 для схем Typemo: Schema, Prop, Tenant, Virtual, Discriminator, Index, SearchIndex, Plugin, Pre, Post, PostError"
+icon: AtSign
+---
+
+Пакет `@venloc/typemo-decorators` содержит те же декораторы, что и ядро `@venloc/typemo`, но в форме **стандартных декораторов TC39**: они работают без флага `experimentalDecorators` и без `reflect-metadata` (`emitDecoratorMetadata` не нужен ни в одном режиме). Если у вас задан свой `lib`, `esnext.decorators` в него добавлять не требуется. Имена, аргументы и опции у них те же. Пакет ничего не описывает заново: он записывает то, что вы объявили, в тот же построитель метаданных ядра, поэтому схема, модель, запросы и типы получаются такими же, как с декораторами ядра.
+
+Как перейти на этот пакет и какие настройки `tsconfig` нужны, рассказывает руководство [Использовать TC39-декораторы](../../decorators-tc39/tc39.mdx). Эта страница — справочник: чем каждый декоратор отличается от одноимённого декоратора ядра. Полные списки опций описаны в справочнике схем, ссылки — в каждом разделе.
+
+Блоки кода этой страницы не компилируются сборкой документации: она проверяет код с legacy-декораторами, а этот пакет требует режима без `experimentalDecorators`. Поведение проверено запуском на настоящей базе в пакете с выключенными legacy-флагами.
+
+Примеры используют модель счёта:
+
+```ts title="accounts/account.ts"
+import { Entity } from "@venloc/typemo";
+import { Index, Pre, Prop, Schema } from "@venloc/typemo-decorators";
+
+@Schema({ collection: "accounts" })
+@Index({ title: 1, balance: -1 }, { unique: true })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, trim: true })
+  title!: string;
+
+  @Prop(() => Number, { min: 0 })
+  balance!: number;
+
+  @Pre("document.save")
+  touch(this: Account): void {
+    this.title = `${this.title}!`;
+  }
+}
+```
+
+Запуск: `create({ title: "  Main ", balance: 5 })` сохранил счёт с заголовком `"Main!"` (`trim` убрал пробелы, хук добавил знак), а `create({ title: "x", balance: -1 })` бросил `ValidationError: Validation failed: "balance": must be at least 0 [min]`.
+
+Общее для всех декораторов пакета: **импорт пакета до первого класса схемы**. Пакет при загрузке ставит `Symbol.metadata`, если его ещё нет в окружении (`Symbol.metadata ??= Symbol.for("Symbol.metadata")`): Bun и Node его пока не определяют. Это единственная глобальная запись пакета, и она стандартна. Обычный `import { Prop } from "@venloc/typemo-decorators"` выполняет её сам.
+
+**Нельзя смешивать пакеты.** Декоратор не того пакета бросает `ConfigurationError` сразу при объявлении класса. Запуск, где в проекте без `experimentalDecorators` стоял декоратор `@Prop` из ядра: `ConfigurationError: @Prop from "@venloc/typemo" is a legacy decorator, but it was applied as a TC39 decorator (experimentalDecorators is off). Use "@venloc/typemo-decorators" in a TC39 project; the two packages cannot be mixed`. Если метаданные обоих видов всё же встретились на одном классе или в одной иерархии (базовый класс из библиотеки, собранной в другом режиме), первый `model()` бросает `ConfigurationError: Mixed: mixes legacy decorators ("@venloc/typemo", on Mixed) and TC39 decorators ("@venloc/typemo-decorators", on Mixed) in one class hierarchy; use one decorator package per project`. Тихого слияния нет.
+
+---
+
+## @Schema
+
+`@Schema` объявляет класс схемой и принимает те же опции, что [`@Schema` ядра](../schemas/schema.mdx#schema): `collection`, `nested`, `timeseries`, `tenant`, `softDelete` и остальные. Опции проверяются компилятором с сохранением литеральных типов, как у ядра.
+
+```ts
+@Schema({ collection: "accounts" })
+class Account extends Entity {}
+```
+
+<Params>
+<Param name="options" type="SchemaOptions" default="{}">
+
+Опции схемы. Описаны в справочнике [`@Schema`](../schemas/schema.mdx#schema).
+
+</Param>
+</Params>
+
+Ошибка: применение не к классу — `ConfigurationError: @Schema is a class decorator, got <вид>`; смешивание с legacy — см. выше. Руководство: [Описать модель](../../schemas/define-model.mdx).
+
+<FullType>
+
+```ts
+const Schema: <const O extends SchemaOptions = Record<never, never>>(
+  options?: O,
+) => <C extends EntityClass>(target: C & SchemaCheck<C, O>, context: ClassDecoratorContext<C>) => void;
+```
+
+</FullType>
+
+---
+
+## @Prop
+
+`@Prop` объявляет поле схемы. Опции те же, что у [`@Prop` ядра](../schemas/prop.mdx#prop): `required`, `nullable`, `default`, `trim`, `min`, `sensitive` и остальные, и компилятор так же сверяет их с типом поля.
+
+Единственное обязательное отличие: **тип передаётся функцией**, `@Prop(() => String)`. У стандартных декораторов нет `design:type`, поэтому компилятор не знает тип поля во время работы, и его нужно назвать явно в каждом поле.
+
+```ts
+@Prop(() => String, { required: true, trim: true })
+title!: string;
+```
+
+<Params>
+<Param name="type" type="() => TypeSpec" required>
+
+Функция, возвращающая тип: `() => String`, `() => [Address]`, `() => Types.ObjectId`.
+
+</Param>
+<Param name="options" type="PropOptions<S>">
+
+Опции поля. Описаны в справочнике [`@Prop`](../schemas/prop.mdx#prop).
+
+</Param>
+</Params>
+
+Так как декоратор знает тип поля из контекста, ошибки видны в момент применения. Во время работы декоратор бросает `ConfigurationError`, если его применили не к обычному полю. Тексты, полученные запуском:
+
+- поле `#private`: `@Prop on private field "#x" (#private fields cannot be schema members)`;
+- статическое поле: `@Prop on static member "label" (static members are not schema members)`;
+- метод: `@Prop on "greet", which is a method (getters are virtuals and need no decorator)`;
+- поле с символьным именем: `@Prop on a symbol-keyed field (schema fields have string names)`;
+- без функции типа: `@Prop "name": the type must be a thunk () => T (for example () => String), got undefined`, а с `@Prop(String)` — `…got String`.
+
+Во время компиляции те же случаи отвергаются типами: у статических и `#private` полей и у `private`/`protected` членов декоратор не проходит проверку, компилятор сообщает `TS1240`, а в тексте названа причина, например `@Prop "#x": #private fields cannot be schema fields`, `@Prop "label": static fields are not schema fields`, `@Prop "secret": not a public field (private and protected fields cannot be schema fields)`.
+
+<FullType>
+
+```ts
+const Prop: <const S extends TypeSpec, const O extends PropOptions<S>>(
+  type: () => S,
+  options?: O & NoExtraOptions<O, PropOptions<S>>,
+) => Tc39PropDecorator<S, O>;
+```
+
+</FullType>
+
+---
+
+## @Tenant
+
+`@Tenant()` помечает поле тенанта: декоратор ставится рядом с `@Prop` на поле типа `TenantField<T>`, как [`@Tenant` ядра](../schemas/field-markers.mdx#tenant). Схема с опцией `tenant` не собирается без такой пометки, поэтому декоратор нужен в каждой схеме, разделённой по тенантам (зачем, рассказывает руководство [Тенанты](../../policies/tenants.mdx#описать-поле-тенанта)).
+
+```ts
+@Schema({ collection: "notes", tenant: true })
+class Note extends Entity {
+  @Prop(() => String)
+  @Tenant()
+  tenantId!: TenantField<string>;
+}
+```
+
+Принимает ничего. Возвращает декоратор поля.
+
+Правила сборки схемы общие с ядром, и ошибки те же. Запуск дал `ConfigurationError` при первом `model()`: `Note: the tenant field "tenantId" must be marked @Tenant() (declare it @Prop(...) @Tenant() tenantId!: TenantField<T>)` (опция `tenant` есть, пометки нет), `Note: @Tenant() on "tenantId", but the schema has no tenant policy — add tenant: true (or { field }) to @Schema` (пометка есть, опции нет), `Note: @Tenant() marks "tenantId", "other"; only the tenant field "tenantId" may be marked` (две пометки). Поле другого типа компилятор отвергает сообщением `@Tenant "other": declare the field as TenantField<T>` (`TS1240`). На `#private` и статическом члене декоратор бросает `ConfigurationError` с тем же текстом, что у `@Prop`: `@Tenant on private field "#x" (#private fields cannot be schema members)`.
+
+<FullType>
+
+```ts
+const Tenant: () => Tc39TenantDecorator;
+```
+
+</FullType>
+
+---
+
+## @Virtual
+
+`@Virtual` объявляет виртуальное поле подгрузки связей на поле типа `VirtualRef` и принимает опции [`@Virtual` ядра](../schemas/virtual.mdx#virtual): `ref`, `localField`, `foreignField`, `justOne`, `count`, `match`, `options`, `perDocumentLimit`.
+
+```ts
+@Virtual({ ref: () => Post, localField: "_id", foreignField: "author" })
+posts!: VirtualRef<Post>;
+```
+
+<Params>
+<Param name="options" type="VirtualOptions" required>
+
+Опции связи. Описаны в справочнике [`@Virtual`](../schemas/virtual.mdx#virtual).
+
+</Param>
+</Params>
+
+Не к полю, статическому, `#private` и с символьным именем применить нельзя: `ConfigurationError`.
+
+---
+
+## @Discriminator
+
+`@Discriminator` объявляет класс наследником базового класса по ключу дискриминатора; значение по умолчанию — имя класса. Контракт тот же, что у [`@Discriminator` ядра](../schemas/discriminator.mdx#discriminator).
+
+```ts
+@Discriminator("savings")
+class SavingsAccount extends Account {}
+```
+
+<Params>
+<Param name="value" type="string">
+
+Значение ключа дискриминатора; по умолчанию имя класса.
+
+</Param>
+</Params>
+
+---
+
+## @Index
+
+`@Index` объявляет составной или любой другой индекс на классе; поля и опции проверяются по классу, как у [`@Index` ядра](../schemas/index-decorators.mdx#index).
+
+```ts
+@Index({ title: 1, balance: -1 }, { unique: true })
+class Account extends Entity {}
+```
+
+<Params>
+<Param name="fields" type="IndexFields" required>
+
+Поля индекса с направлениями.
+
+</Param>
+<Param name="options" type="IndexOptions" default="{}">
+
+Опции индекса: `unique`, `sparse`, `expireAfterSeconds` и другие; см. [`@Index`](../schemas/index-decorators.mdx#index).
+
+</Param>
+</Params>
+
+---
+
+## @SearchIndex
+
+`@SearchIndex` описывает индекс Atlas Search или Vector Search; опции те же, что у [`@SearchIndex` ядра](../schemas/index-decorators.mdx#searchindex). Индексы поиска работают только с Atlas или поддерживающей их конфигурацией; в этом пакете декоратор только записывает описание.
+
+<Params>
+<Param name="options" type="SearchIndexOptions" required>
+
+Определение индекса поиска.
+
+</Param>
+</Params>
+
+---
+
+## @Plugin
+
+`@Plugin` подключает плагин схемы к классу при компиляции схемы, как [`Typemo.plugin`](../connection/typemo.mdx#typemoplugin), но на уровне одной модели. Если тип настроек плагина не допускает `undefined`, настройки обязательны.
+
+<Params>
+<Param name="plugin" type="SchemaPlugin<O>" required>
+
+Плагин схемы.
+
+</Param>
+<Param name="options" type="O">
+
+Настройки плагина.
+
+</Param>
+</Params>
+
+Руководство: [Плагины](../../hooks/plugins.mdx).
+
+---
+
+## @Pre
+
+`@Pre` помечает метод класса хуком «до события». События и `this` те же, что у [`@Pre` ядра](../hooks/pre-post.mdx#pre): в хуках документа `this` — документ (пишите `touch(this: Account)`), в хуках операций — контекст операции.
+
+```ts
+@Pre("document.save")
+touch(this: Account): void {}
+```
+
+<Params>
+<Param name="events" type="HookEvent | [HookEvent, ...HookEvent[]]" required>
+
+Событие или несколько событий.
+
+</Param>
+</Params>
+
+Хук может быть только методом экземпляра со строковым именем: на поле, геттере или методе с символьным именем декоратор бросает `ConfigurationError: @Pre: a hook must be a string-named instance method, got field` (вместо `field` стоит вид члена, например `getter`). Статический хук компилятор не принимает, а во время работы `@Pre` называет причину так же, как `@Prop`: `@Pre on static member "m" (static members are not schema members)`.
+
+В хуках документа `this` объявляется так же, как у декораторов ядра: `touch(this: Account)` для работы с полями или `touch(this: HookThis<"document.save", Account>)` для методов документа. Хук класса запускается и на поддокументе, если класс встроен в другую модель, поэтому методы корня (`$getChanges()`, `$save()`) доступны после проверки [`this.$isRoot()`](../documents/document-api.mdx#isroot), а `touch(this: HydratedDoc<Account>)` не компилируется. Подробно — в справочнике [`@Pre`](../hooks/pre-post.mdx#this-зависит-от-области-события).
+
+---
+
+## @Post
+
+`@Post` помечает метод хуком «после успешного события»; получает результат. Остальное как у [`@Post` ядра](../hooks/pre-post.mdx#post).
+
+<Params>
+<Param name="events" type="HookEvent | [HookEvent, ...HookEvent[]]" required>
+
+Событие или несколько событий.
+
+</Param>
+</Params>
+
+---
+
+## @PostError
+
+`@PostError` помечает метод хуком «после ошибки события»: он вызывается вместо `@Post` и получает ошибку. Остальное как у [`@PostError` ядра](../hooks/pre-post.mdx#posterror).
+
+<Params>
+<Param name="events" type="HookEvent | [HookEvent, ...HookEvent[]]" required>
+
+Событие или несколько событий.
+
+</Param>
+</Params>
+
+---
+
+## Типы пакета
+
+Пакет экспортирует и типы возвращаемых декораторов: `Tc39PropDecorator`, `Tc39TenantDecorator`, `Tc39VirtualDecorator`, `Tc39HookDecorator` и `Tc39PropCheck` (проверка опций против типа поля). Они нужны, только если вы пишете обёртку над декоратором и должны назвать его тип.
+
+## Когда пакет не подходит
+
+Если в проекте включён `experimentalDecorators` (другая библиотека требует legacy-режима), используйте декораторы ядра `@venloc/typemo`: флаг действует на весь проект, и TC39-декораторы в нём работать не будут. Как выбрать, — в руководстве [Использовать TC39-декораторы](../../decorators-tc39/tc39.mdx#выбрать-пакет).
+
+## Что дальше
+
+<Cards>
+<Card title="Использовать TC39-декораторы" href="../../decorators-tc39/tc39.mdx">
+  Установка, tsconfig и переход с legacy.
+</Card>
+<Card title="@Prop" href="../schemas/prop.mdx#prop">
+  Полный список опций поля.
+</Card>
+<Card title="@Schema" href="../schemas/schema.mdx#schema">
+  Полный список опций схемы.
+</Card>
+</Cards>

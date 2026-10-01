@@ -1,0 +1,318 @@
+---
+title: Хранить списки значений и поддокументов
+description: "Как объявить массив значений, массив поддокументов и вложенные массивы, как проверяются элементы и как искать по элементам"
+icon: List
+---
+
+Массив в схеме объявляется квадратными скобками вокруг типа элемента: `[String]` — список строк, `[Line]` — список поддокументов, `[[Number]]` — список списков чисел. Опции типа элемента (`enum`, `min`, `match`) относятся к каждому элементу, а сами массивы Typemo проверяет целиком: значение обязано быть массивом, и каждый элемент проходит своё приведение и правила. Путь к неверному элементу в ошибке содержит его позицию, поэтому видно, какой именно элемент подвёл.
+
+Как менять массив в загруженном документе (`push`, `pull`, `set`), описывает руководство [Массивы и Map в документе](../documents/typed-collections.mdx). На этой странице мы объявляем схему и разбираем, что при записи и поиске делает сама библиотека.
+
+## Что предполагается
+
+Модель описана по руководству [Описать модель](./define-model.mdx), а поддокументы известны из руководства [Вложенные объекты и поддокументы](./nested-and-subdocuments.mdx). Примеры строят заказ магазина с метками и строками.
+
+## Быстрый путь
+
+Массив значений — `[String]`, массив поддокументов — `[Line]`, где `Line` — класс с `@Schema`:
+
+```ts twoslash title="orders/order.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 1 }) qty!: number;
+}
+
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => [Line])
+  lines!: Line[];
+}
+
+const Orders = client.connection.model(Order);
+const order = await Orders.create({
+  customer: "ann",
+  tags: ["gift"],
+  lines: [{ sku: "A1", qty: 2 }],
+});
+console.log(order.$toPlain().lines.length, order.tags.length);
+// → 1 1
+```
+
+Каждой строке заказа Typemo дал собственный `_id`, потому что `Line` наследует `Entity`. Остальная страница разбирает правила для элементов, пустые массивы и поиск.
+
+## Проверить элементы
+
+Каждый элемент приводится к типу элемента, и ошибка называет позицию. Если вместо массива пришло другое значение, ошибка говорит, что нужен массив, а не пытается превратить строку в список из одного элемента: такая «помощь» скрыла бы ошибку в данных.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 1 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+}
+const Orders = client.connection.model(Order);
+// ---cut---
+try {
+  await Orders.create({ customer: "ann", tags: ["a", 5 as never], lines: [] });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to string failed at path "tags.1" for 5 (number): expected a string [type]
+try {
+  await Orders.create({ customer: "ann", tags: "a" as never, lines: [] });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to Array<string> failed at path "tags" for "a" (string): expected an array [type]
+try {
+  await Orders.create({ customer: "ann", tags: [], lines: [{ sku: "A", qty: 0 }, { qty: 1 } as never] });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "lines.0.qty": must be at least 1 [min]; "lines.1.sku": the field is required [required]
+```
+
+Пути `tags.1` и `lines.0.qty` содержат индекс элемента, а для поддокументов — ещё и имя поля внутри. Элемент `null` в массиве строк тоже ошибка: `Cast to string failed at path "tags.1" for null: null is not allowed on a path that is not nullable [null]`.
+
+## Ограничить значения элементов
+
+Опции элемента ставятся на массив и действуют на каждый элемент. Для `enum` элементы объявляются объединением значений, а для чисел работают `min` и `max`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => [String], { enum: ["new", "sale"] as const }) // [!code highlight]
+  labels?: ("new" | "sale")[];
+
+  @Prop(() => [Number], { min: 1 }) // [!code highlight]
+  ratings?: number[];
+}
+const Products = client.connection.model(Product);
+try {
+  await Products.create({ labels: ["new", "hot" as never], ratings: [5, 0] });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "labels.1": must be one of "new", "sale" [enum]; "ratings.1": must be at least 1 [min]
+```
+
+Ограничения на сам массив (число элементов, непустота) опциями не задаются. Если нужно потребовать хотя бы один элемент, напишите проверку через [`validate`](./validation.mdx) на поле-массиве.
+
+## Вложить массив в массив
+
+Массив внутри массива объявляется вложенными скобками: `[[Number]]`. Глубина не ограничена, и каждый уровень проверяется отдельно, а ошибка указывает позицию на нужном уровне.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "boards" })
+class Board extends Entity {
+  @Prop(() => [[Number]]) // [!code highlight]
+  cells?: number[][];
+}
+const Boards = client.connection.model(Board);
+const board = await Boards.create({ cells: [[1, 2], [3]] });
+console.log(board.$toPlain().cells);
+// → [[1, 2], [3]]
+try {
+  await Boards.create({ cells: [[1], "x"] as never });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to Array<number> failed at path "cells.1" for "x" (string): expected an array [type]
+```
+
+## Пустой массив по умолчанию
+
+Поле-массив без `required` и без `default` **само становится пустым**: `create`, `Model.new`, вставка через upsert и новый поддокумент кладут `[]`, если вы не передали значение. Так тип в классе (`tags!: string[]`) говорит правду, что список всегда есть, и объявлять `default: () => []` или `Defaulted<string[]>` не нужно. Ни `default`, ни `Defaulted` не запрещены: свой `default` просто переопределит пустой массив.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) // [!code highlight]
+  tags!: string[];
+}
+const Orders = client.connection.model(Order);
+const order = await Orders.create({ customer: "ann" });
+console.log(order.tags.length);
+// → 0
+const plain = await Orders.findById(order._id).orFail().lean();
+console.log(plain.tags);
+// → []
+```
+
+В базе `[]` тоже лежит: значение записывается вместе с документом, а не подставляется при чтении. Массив в `CreateInput` необязателен, поэтому `Orders.create({ customer: "ann" })` компилируется без `tags`.
+
+**Старые документы**, у которых в базе нет ключа массива, читаются по-разному. Гидратированный документ даёт пустой массив, и следующий `$save` запишет его в базу. `lean()` отдаёт документ как он хранится, то есть без ключа.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "legacy_orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const Orders = client.connection.model(Order);
+// ---cut---
+await client.unsafeDriver().db("shop").collection("legacy_orders").insertOne({ customer: "old" });
+
+const doc = await Orders.findOne({ customer: "old" }).orFail();
+console.log(doc.tags.length);
+// → 0
+const lean = await Orders.findOne({ customer: "old" }).orFail().lean();
+console.log("tags" in lean);
+// → false
+```
+
+Если массив должен быть передан всегда, объявите его `required: true`. Такое поле умолчания не получает: `create` без него бросает `ValidationError` (`Validation failed: "tags": the field is required [required]`). Пустой массив считается переданным значением, а вот непустоту `required` не проверяет: для неё нужна своя проверка [`validate`](./validation.mdx).
+
+## Искать по элементам
+
+Путь через массив пишется как для вложенного объекта: `"lines.sku"` находит заказы, у которых хотя бы одна строка имеет такой `sku`. Значение по этому пути приводится по типу элемента. Добавить элемент в массив можно и оператором обновления `$push`: новый элемент проверяется по тем же правилам, а в пути ошибки перед индексом стоит `+`, потому что элемента в базе ещё нет.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 1 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+}
+const Orders = client.connection.model(Order);
+await Orders.create({ customer: "bob", tags: [], lines: [{ sku: "B", qty: 2 }] });
+// ---cut---
+const found = await Orders.find({ "lines.sku": "B" }).plain();
+console.log(found.length);
+// → 1
+await Orders.updateOne({ customer: "bob" }, { $push: { tags: "vip" } });
+console.log((await Orders.findOne({ customer: "bob" }).plain())?.tags);
+// → ["vip"]
+try {
+  await Orders.updateOne({ customer: "bob" }, { $push: { lines: { sku: "Z", qty: 0 } } } as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "lines.+0.qty": must be at least 1 [min]
+```
+
+## Как выбрать
+
+Задайте себе один вопрос: **нужно ли находить и менять отдельный элемент по идентификатору?** Если нет (метки, оценки, адреса электронной почты), берите массив значений: `[String]`, `[Number]`. Если да (строка заказа, комментарий), берите массив поддокументов с `Entity`: у каждого элемента будет `_id`. Если элементов может стать очень много или они живут своей жизнью, вынесите их в отдельную коллекцию со ссылкой: [Ссылки на другие модели](./references.mdx).
+
+## Когда это не нужно
+
+Набор значений, где важна уникальность и не важен порядок, тоже хранят массивом, а добавлять в него удобнее методом `addToSet` при работе с [документом](../documents/typed-collections.mdx): отдельного типа «множество» нет, а `Set` как тип поля не поддерживается. Словарь с заранее неизвестными ключами — не массив, а [`Spec.map`](./maps.mdx). Кортеж фиксированной длины лучше описать вложенным объектом с именованными полями.
+
+## Частые ошибки
+
+### Присваивание по индексу не компилируется
+
+`order.tags[0] = "x"` на загруженном документе остановит компилятор: индекс не сообщает, что вы хотели сделать, и запись целиком перезаписала бы чужие правки. Используйте методы коллекции, см. [Массивы и Map в документе](../documents/typed-collections.mdx).
+
+### Строка вместо массива
+
+`tags: "gift"` — `CastError`, а не список из одного элемента. Причина в том, что библиотека не угадывает намерение. Оберните значение сами: `tags: ["gift"]`.
+
+### Ждали ошибку за отсутствующий массив
+
+Документ создан без `tags`, и ошибки нет: Typemo положил `[]`. Причина в том, что поле-массив без `required` считается необязательным, а пустой список — обычное начальное значение. Если список обязан прийти от вызывающего, объявите поле с `required: true`, а если он обязан быть непустым, добавьте проверку [`validate`](./validation.mdx).
+
+## Полный пример
+
+Один файл собирает заказ с метками, строками и вложенным массивом. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="orders/orders.service.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+// поддокумент: строка заказа со своим _id
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 1 }) qty!: number;
+}
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String], { enum: ["gift", "urgent"] as const })
+  tags!: ("gift" | "urgent")[];
+  @Prop(() => [Line]) lines!: Line[];
+}
+
+// код читателя: ошибка на границе приложения
+class __BadRequest__ extends Error {}
+
+// создание заказа со строками
+export const placeOrder = async (customer: string, lines: { sku: string; qty: number }[]) => {
+  const Orders = client.connection.model(Order);
+  try {
+    return await Orders.create({ customer, lines });
+  } catch (error) {
+    throw new __BadRequest__((error as Error).message);
+  }
+};
+
+// поиск заказов, где есть строка с товаром
+export const ordersWith = async (sku: string) => {
+  const Orders = client.connection.model(Order);
+  return Orders.find({ "lines.sku": sku }).plain();
+};
+
+await placeOrder("cid", [{ sku: "F1", qty: 2 }]);
+console.log((await ordersWith("F1")).length);
+// → 1
+```
+
+<Callout type="migration">
+
+В Mongoose массив по умолчанию становится пустым `[]`, если его не передали, и в Typemo так же: отдельный `default: () => []` не нужен. Обязательным массив делается опцией `required: true`. Присваивание по индексу и запись в `length` у загруженного документа закрыты типами: изменять массив нужно методами, чтобы в базу уходила точная операция.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Map" href="./maps.mdx">
+  Словарь с заранее неизвестными ключами и его ограничения.
+</Card>
+<Card title="Массивы и Map в документе" href="../documents/typed-collections.mdx">
+  Как менять массив загруженного документа методами `push`, `pull`, `set`.
+</Card>
+<Card title="Справочник: типизированные коллекции" href="../reference/documents/typed-collections.mdx">
+  Все методы `StrictArray` и `SubdocumentArray`.
+</Card>
+</Cards>

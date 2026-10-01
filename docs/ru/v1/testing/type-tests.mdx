@@ -1,0 +1,128 @@
+---
+title: Тесты типов своих моделей
+description: "Как проверить компилятором, что типы модели, запросов и ответов такие, как вы задумали, и что неверный код не компилируется"
+icon: ShieldCheck
+---
+
+Половина ценности Typemo в типах: опечатка в имени поля, неверное значение в фильтре, лишнее поле в ответе останавливаются компилятором. Тест типов фиксирует это обещание: он падает не во время работы, а при проверке `tsc`, когда тип модели или запроса изменился не так, как вы ожидали. Такие тесты стоит писать для моделей, на которые опирается много кода, и для типов ответов, которые отдаёте наружу.
+
+Тесты типов ничего не запускают и не обращаются к базе. Их проверяет только компилятор, поэтому они быстрые и не требуют тестовой базы.
+
+## Что предполагается
+
+Примеры используют модель счёта и запуск `tsc --noEmit` для файлов с тестами. В отличие от [тестов приложения](./testing-apps.mdx) здесь не нужен сервер.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true })
+  balance!: number;
+
+  @Prop(() => String, { hidden: true })
+  pin?: Hidden<string>;
+}
+```
+
+## Быстрый путь
+
+Нужен способ сказать «тип A равен типу B» так, чтобы несовпадение не компилировалось. Достаточно двух строк без библиотек:
+
+```ts twoslash
+type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+const assertType = <_T extends true>(): void => {};
+// ---cut---
+assertType<Equal<{ a: number }, { a: number }>>(); // компилируется
+
+// @errors: 2344
+assertType<Equal<{ a: number }, { a: string }>>();
+```
+
+Так же устроены `expectTypeOf` из `bun:test` и `vitest`, `tsd` и подобные: если в проекте они есть, используйте их. Остальная страница показывает, что проверять.
+
+## Проверить тип ответа
+
+Ситуация: вы отдаёте счета наружу и хотите закрепить форму ответа. Тип берётся из самого запроса, поэтому проверять нужно то, что получит вызывающий код.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+
+type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+const assertType = <_T extends true>(): void => {};
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank-test" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const rows = await Accounts.find().select({ title: 1, balance: 1 }).plain();
+//    ^?
+
+assertType<Equal<(typeof rows)[number]["title"], string>>();
+```
+
+Подсказка `^?` показывает выведенный тип прямо в документации; в вашем тесте вместо неё стоит утверждение. Проверяйте то, что для вас важно: что `select` сузил ответ, что скрытое поле `pin` не попало в plain-вид, что `.orFail()` убрал `null`. Другие проверки повторяются тем же приёмом.
+
+## Проверить, что неверный код не компилируется
+
+Ситуация: вы хотите закрепить, что опечатка в поле — ошибка. В обычных тестах для этого пишут `// @ts-expect-error`: компилятор требует, чтобы на следующей строке была ошибка, и сам падает, если её нет.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank-test" });
+const Accounts = client.db().model(Account);
+// ---cut---
+// @errors: 2561
+Accounts.find({ balanse: { $gt: 5 } });
+```
+
+Что именно упало, комментарий не проверяет: любая ошибка на строке его устраивает. Поэтому пишите рядом, чего вы ожидаете («опечатка в имени поля»), и не оставляйте `@ts-expect-error` на широком выражении, где могла упасть другая часть.
+
+## Как проверять во время сборки
+
+Файлы тестов типов кладите рядом с обычными и включите их в `tsconfig` (или отдельный `tsconfig.types.json`), а в `package.json` добавьте `"typecheck": "tsc --noEmit"`. Запускайте его в CI вместе с тестами. Раннер тестов типы не проверяет: `bun test` выполняет код, а типы игнорирует, поэтому без `tsc` тест типов ничего не проверит.
+
+## Как выбрать
+
+Один вопрос: **какое обещание должно сломать сборку?** Если форма ответа, которую вы отдаёте клиентам, — фиксируйте её `Equal`. Если запрещённый вызов, — `@ts-expect-error`. Если просто «работает», обычных тестов достаточно.
+
+## Когда это не нужно
+
+Не тестируйте типы самого Typemo и очевидные вещи (что `string` — это `string`): за это отвечает библиотека. Тесты типов имеют смысл для ваших моделей, ваших публичных ответов и ваших обёрток над запросами.
+
+## Частые ошибки
+
+### Тест типов «проходит», но `tsc` его не видит
+
+Файл не входит в `include` вашего `tsconfig`, либо вы запускаете только `bun test`. Проверка типов — отдельный запуск `tsc --noEmit`.
+
+### `@ts-expect-error` больше не нужен
+
+`Unused '@ts-expect-error' directive`: строка перестала быть ошибкой. Это значит, что тип стал мягче, чем вы задумывали, и обещание нарушено. Разберитесь, а не удаляйте директиву.
+
+## Что дальше
+
+<Cards>
+<Card title="Тестировать приложение" href="./testing-apps.mdx">
+  Тесты с настоящей базой: фабрики и проверка индексов.
+</Card>
+<Card title="Типы чтения" href="../concepts/reading-types.mdx">
+  Чем отличаются документ, lean и plain.
+</Card>
+</Cards>

@@ -1,0 +1,528 @@
+---
+title: Курсор
+description: "Курсор запроса: next, toArray, map, eachAsync, close, for await, типы QueryCursor и CursorSource, ошибка EachAsyncError"
+icon: Rows3
+---
+
+**Курсор** отдаёт документы запроса по одному, по мере чтения из базы, а не массивом целиком. Его получают из [`.cursor()`](./reading.mdx#cursor) у запроса [`find`](./reading.mdx#modelfind), когда документов так много, что держать их все в памяти неудобно: выгрузка в другую систему, миграция данных, ночной отчёт. На этой странице описаны все методы курсора и ошибка, которую он бросает при обработке.
+
+Если вы только начинаете, сначала прочитайте руководство [Большие выборки](../../queries/large-results.mdx). Эта страница — справочник.
+
+Все примеры используют одну модель заказа. Сначала в ней два поля, остальное не нужно:
+
+```ts twoslash title="models/order.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => Number, { required: true })
+  number!: number;
+
+  @Prop(() => String, { required: true })
+  status!: string;
+}
+```
+
+В коллекции пять заказов с номерами от 1 до 5. Нечётные заказы оплачены (`paid`), чётные новые (`new`). Во всех примерах они читаются по возрастанию номера, поэтому порядок в результатах понятен.
+
+Курсор возвращает те же строки, что вернул бы `await`: документы, [`.lean()`](./reading.mdx#lean)-строки или [`.plain()`](./reading.mdx#plain)-строки, в зависимости от цепочки. [`.skip`](./reading.mdx#skip), [`.limit`](./reading.mdx#limit) и [`.batchSize`](./options.mdx#batchsize) работают и с курсором.
+
+Тип курсора называется [`QueryCursor<T>`](#querycursor), где `T` — тип строки. Его можно назвать в своей сигнатуре, импортировав из пакета: функция, которая принимает курсор заказов, не зависит от того, документы это, lean- или plain-строки.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, type QueryCursor } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => Number, { required: true }) number!: number;
+  @Prop(() => String, { required: true }) status!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Orders = client.db().model(Order);
+// ---cut---
+export const countRows = async (rows: QueryCursor<{ number: number }>): Promise<number> => {
+  let total = 0;
+  for await (const _row of rows) total += 1;
+  return total;
+};
+
+const cursor = Orders.find().plain().cursor();
+//    ^?
+console.log(await countRows(cursor));
+// → 5
+```
+
+---
+
+## for await
+
+Самый частый способ читать курсор — цикл `for await ... of`. Курсор асинхронно итерируется: цикл получает следующий документ, когда закончил с предыдущим, так что в памяти одновременно живёт только текущая порция.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => Number, { required: true }) number!: number;
+  @Prop(() => String, { required: true }) status!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Orders = client.db().model(Order);
+declare const __sendToWarehouse__: (order: { number: number }) => Promise<void>;
+// ---cut---
+for await (const order of Orders.find().sort({ number: 1 }).plain().cursor()) {
+  await __sendToWarehouse__(order);
+}
+```
+
+Когда документы кончились, цикл заканчивается и курсор закрывается сам. Он закрывается и когда вы выходите из цикла раньше: `break` или ошибка внутри цикла освобождают курсор на сервере. Это важно, потому что незакрытый курсор держит ресурсы сервера. Но это накладывает правило: после раннего выхода тот же курсор больше читать нельзя, иначе `QueryError`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => Number, { required: true }) number!: number;
+  @Prop(() => String, { required: true }) status!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Orders = client.db().model(Order);
+// ---cut---
+const cursor = Orders.find().sort({ number: 1 }).plain().cursor();
+for await (const order of cursor) {
+  if (order.number === 2) break;
+}
+await cursor.next(); // [!code error]
+// QueryError: the cursor is closed (close() or a left for-await); open a new one
+```
+
+Так сделано намеренно: чтение курсора, который вы сами закрыли, означало бы, что код читает не те данные, которые думает, а «молчаливый» пустой результат скрыл бы ошибку. Чтобы прочитать данные снова, откройте новый курсор. Курсор, который вы дочитали до конца, ошибкой не отвечает: он исчерпан, и `.next` на нём возвращает `null`.
+
+---
+
+## .next
+
+`.next` возвращает следующий документ или `null`, когда документы закончились. Пригодится, когда цикл не подходит: вы читаете документы по одному в разных местах кода или забираете только первые несколько.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => Number, { required: true }) number!: number;
+  @Prop(() => String, { required: true }) status!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Orders = client.db().model(Order);
+// ---cut---
+const cursor = Orders.find().sort({ number: 1 }).plain().cursor();
+
+const first = await cursor.next();
+const second = await cursor.next();
+console.log(first?.number, second?.number);
+// → 1 2
+```
+
+<Returns type="Promise<T | null>">
+
+Следующая строка или `null`, если курсор исчерпан. На исчерпанном курсоре `.next` продолжает возвращать `null`: повторный вызов не ошибка. Если курсор закрыли вы сами ([`.close`](#close), выход из `for await`, [`.eachAsync`](#eachasync)), бросается `QueryError` с текстом `the cursor is closed (close() or a left for-await); open a new one`.
+
+</Returns>
+
+Принимает ничего.
+
+<FullType>
+
+```ts
+next(): Promise<T | null>
+```
+
+</FullType>
+
+---
+
+## .toArray
+
+`.toArray` дочитывает курсор до конца и возвращает оставшиеся документы массивом. Используйте его, когда сначала нужно снять с курсора несколько документов через [`.next`](#next), а остальное взять целиком, или когда вы получили курсор от чужого кода.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => Number, { required: true }) number!: number;
+  @Prop(() => String, { required: true }) status!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Orders = client.db().model(Order);
+// ---cut---
+const cursor = Orders.find().sort({ number: 1 }).plain().cursor();
+await cursor.next();
+
+const rest = await cursor.toArray();
+console.log(rest.map((order) => order.number));
+// → [2, 3, 4, 5]
+```
+
+<Returns type="Promise<T[]>">
+
+Все ещё не прочитанные документы. Курсор при этом исчерпывается и закрывается сам. У закрытого вами курсора `.toArray` бросает `QueryError`, как и [`.next`](#next).
+
+</Returns>
+
+Принимает ничего.
+
+<FullType>
+
+```ts
+toArray(): Promise<T[]>
+```
+
+</FullType>
+
+### Когда `.toArray` не подходит
+
+`.toArray` собирает всё в память, то есть возвращает то же, что обычный `await`. Если документов много и нужна экономия, обрабатывайте их по одному в [`for await`](#for-await) или через [`.eachAsync`](#eachasync).
+
+---
+
+## .map
+
+`.map` превращает документы курсора: возвращает **новый** курсор, документы которого получаются вызовом вашей функции над каждой исходной строкой. Так можно привести строки к нужной форме до того, как код дальше начнёт их читать.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => Number, { required: true }) number!: number;
+  @Prop(() => String, { required: true }) status!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Orders = client.db().model(Order);
+// ---cut---
+const numbers = Orders.find().sort({ number: 1 }).plain().cursor().map((order) => order.number * 10);
+console.log(await numbers.toArray());
+// → [10, 20, 30, 40, 50]
+```
+
+<Returns type="QueryCursor<U>">
+
+Новый курсор с преобразованными документами. Исходный курсор не изменяется, но **поток данных у них общий**: они читают одни и те же документы, и документ, прочитанный через один курсор, другой уже не увидит.
+
+</Returns>
+
+<Params>
+<Param name="fn" type="(doc: T) => U" required>
+
+Функция преобразования. Вызывается на каждой строке, которую читает новый курсор. Результат функции — строка нового курсора, и `U` выводится из него.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+map<U>(fn: (doc: T) => U): QueryCursor<U>
+```
+
+</FullType>
+
+### Общий поток с исходным курсором
+
+Драйвер MongoDB в такой ситуации изменил бы сам курсор и вернул его же. Здесь `.map` возвращает новый курсор, но читать из обоих сразу не получится: каждая строка достаётся только одному из них.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => Number, { required: true }) number!: number;
+  @Prop(() => String, { required: true }) status!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Orders = client.db().model(Order);
+// ---cut---
+const cursor = Orders.find().sort({ number: 1 }).plain().cursor();
+const mapped = cursor.map((order) => order.number);
+
+const viaMapped = await mapped.next();
+const viaOriginal = await cursor.next();
+console.log(viaMapped, viaOriginal?.number);
+// → 1 2
+```
+
+Если вам нужны оба вида строк, преобразуйте строку внутри одного цикла, а не заводите два курсора.
+
+---
+
+## .eachAsync
+
+`.eachAsync` вызывает вашу функцию для каждого документа и ждёт её завершения. Это способ обработать все документы курсора без цикла, с настраиваемой параллельностью, порциями и сбором ошибок. Курсор закрывается в конце сам, даже если функция бросила ошибку.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => Number, { required: true }) number!: number;
+  @Prop(() => String, { required: true }) status!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Orders = client.db().model(Order);
+declare const __sendToWarehouse__: (order: { number: number }) => Promise<void>;
+// ---cut---
+await Orders.find().sort({ number: 1 }).plain().cursor().eachAsync(async (order, index) => {
+  await __sendToWarehouse__(order);
+  console.log(index, order.number);
+});
+// → 0 1
+//   1 2
+//   2 3
+//   3 4
+//   4 5
+```
+
+<Returns type="Promise<void>">
+
+Промис, который завершается, когда обработаны все документы. Курсор к этому моменту закрыт: читать его дальше нельзя (`QueryError`, как после выхода из `for await`). Если функция бросила ошибку, промис завершается ошибкой, о которой подробнее ниже.
+
+</Returns>
+
+<Params>
+<Param name="fn" type="(doc: T, index: number) => unknown" required>
+
+Функция обработки. Получает документ и его порядковый номер с нуля. Может быть асинхронной: `.eachAsync` дожидается её результата. С опцией `batchSize` вместо документа приходит массив документов, а вместо номера документа — номер порции.
+
+</Param>
+<Param name="options.parallel" type="number" default="1">
+
+Сколько вызовов `fn` могут выполняться одновременно. Документы при этом читаются по-прежнему по одному, а параллельно выполняется только ваша функция. Значение должно быть положительным целым: иначе `QueryError` с текстом `eachAsync: parallel must be a positive integer, got 0 (number)`. В тексте значение печатается вместе с типом: строка `"2"` даёт `got "2" (string)`, а не молчаливое приведение к числу.
+
+</Param>
+<Param name="options.continueOnError" type="boolean" default="false">
+
+Продолжать после ошибки в `fn`. Ошибки собираются и бросаются вместе в конце как [`EachAsyncError`](#eachasyncerror). Без этой опции первая ошибка останавливает обработку и бросается как есть.
+
+</Param>
+<Param name="options.batchSize" type="number">
+
+Передавать `fn` порции до `batchSize` документов вместо одного документа. Значение должно быть положительным целым, иначе `QueryError` с текстом `eachAsync: batchSize must be a positive integer, got 0 (number)`. Не путайте с [`.batchSize`](./options.mdx#batchsize) запроса: та опция управляет размером порции при чтении из сети, а эта — размером порции, которую получает ваша функция.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+eachAsync(fn: (docs: T[], batchIndex: number) => unknown, options: EachAsyncBatchOptions): Promise<void>
+eachAsync(fn: (doc: T, index: number) => unknown, options?: EachAsyncOptions): Promise<void>
+```
+
+</FullType>
+
+### Параллельная обработка
+
+По умолчанию `.eachAsync` вызывает `fn` для каждого документа по очереди: следующий вызов начинается после завершения предыдущего. Если функция ждёт сеть (отправка в другую систему), это простаивающее время. `parallel` позволяет держать несколько вызовов одновременно:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => Number, { required: true }) number!: number;
+  @Prop(() => String, { required: true }) status!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Orders = client.db().model(Order);
+declare const __sendToWarehouse__: (order: { number: number }) => Promise<void>;
+// ---cut---
+await Orders.find().sort({ number: 1 }).plain().cursor().eachAsync(
+  (order) => __sendToWarehouse__(order),
+  { parallel: 3 },
+);
+```
+
+В этом запуске одновременно выполнялось не более трёх вызовов. Порядок завершения вызовов при этом не гарантируется: заказ 3 может закончиться раньше заказа 2. Если порядок важен, оставьте `parallel` равным единице.
+
+### Порции
+
+Когда получателю удобнее принимать пачками, например при вставке в другую базу, `batchSize` собирает документы в массивы:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => Number, { required: true }) number!: number;
+  @Prop(() => String, { required: true }) status!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Orders = client.db().model(Order);
+// ---cut---
+await Orders.find().sort({ number: 1 }).plain().cursor().eachAsync(
+  (orders, batchIndex) => {
+    console.log(batchIndex, orders.map((order) => order.number));
+  },
+  { batchSize: 2 },
+);
+// → 0 [1, 2]
+//   1 [3, 4]
+//   2 [5]
+```
+
+Последняя порция может быть короче остальных, в примере она содержит один заказ.
+
+### Ошибки в обработчике
+
+Без `continueOnError` первая ошибка функции останавливает обработку: новые документы больше не запускаются, уже запущенные при `parallel` вызовы дожидаются, а сама ошибка бросается без обёртки. Курсор к этому моменту закрыт.
+
+С `continueOnError: true` обработка доходит до конца, а ошибки собираются и бросаются вместе как `EachAsyncError`:
+
+```ts twoslash
+import { EachAsyncError } from "@venloc/typemo";
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => Number, { required: true }) number!: number;
+  @Prop(() => String, { required: true }) status!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Orders = client.db().model(Order);
+// ---cut---
+try {
+  await Orders.find().sort({ number: 1 }).plain().cursor().eachAsync(
+    (order) => {
+      if (order.number % 2 === 0) throw new Error(`order ${order.number} rejected`);
+    },
+    { continueOnError: true },
+  );
+} catch (error) {
+  if (error instanceof EachAsyncError) {
+    console.log(error.message);
+    // → "eachAsync: 2 call(s) of the callback failed (continueOnError)"
+    console.log(error.errors.map(String));
+    // → ["Error: order 2 rejected", "Error: order 4 rejected"]
+  }
+}
+```
+
+### Когда `.eachAsync` не подходит
+
+Если нужно остановить чтение по условию, например «взять документы, пока не встретится определённый», используйте [`for await`](#for-await) с `break`: `.eachAsync` читает курсор до конца. Если вам нужны все документы сразу и в памяти, используйте [`.toArray`](#toarray) или обычный `await`.
+
+---
+
+## .close
+
+`.close` закрывает курсор и освобождает ресурсы на сервере. Закрывать вручную нужно, только когда вы не дочитали курсор до конца и не вышли через `for await` или `.eachAsync`: например, взяли несколько документов через [`.next`](#next) и остановились.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => Number, { required: true }) number!: number;
+  @Prop(() => String, { required: true }) status!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Orders = client.db().model(Order);
+// ---cut---
+const cursor = Orders.find().sort({ number: 1 }).plain().cursor();
+const first = await cursor.next();
+await cursor.close();
+console.log(first?.number);
+// → 1
+```
+
+<Returns type="Promise<void>">
+
+Промис без значения. Закрытие идемпотентно: повторный `.close` не ошибка. Оно никогда не бросает ошибку, даже если сервер не смог закрыть курсор. После закрытия любое чтение (`.next`, `.toArray`, `for await`) бросает `QueryError` с текстом `the cursor is closed (close() or a left for-await); open a new one`.
+
+</Returns>
+
+Принимает ничего.
+
+<FullType>
+
+```ts
+close(): Promise<void>
+```
+
+</FullType>
+
+---
+
+## EachAsyncError
+
+`EachAsyncError` — ошибка, которую бросает [`.eachAsync`](#eachasync) с `continueOnError: true`, когда хотя бы один вызов функции завершился ошибкой. Она наследует общий класс ошибок Typemo. Все ошибки функции сохраняются в поле `errors` в порядке документов, а первая из них доступна и как `cause`.
+
+<TypeTable
+  type={{
+    errors: { description: "Все ошибки, которые бросила функция, в порядке документов. Массив заморожен.", type: "readonly unknown[]" },
+    cause: { description: "Первая из ошибок функции.", type: "unknown" },
+    message: { description: "Текст `eachAsync: N call(s) of the callback failed (continueOnError)`, где `N` — число ошибок.", type: "string" },
+  }}
+/>
+
+Без `continueOnError` `EachAsyncError` не бросается: вы получаете первую ошибку функции как есть. Класс описан также в справочнике ошибок: [`EachAsyncError`](../errors/query-errors.mdx#eachasyncerror).
+
+---
+
+## QueryCursor
+
+`QueryCursor<T>` — тип курсора: интерфейс с методами `next`, `toArray`, `map`, `eachAsync` и `close`, а также асинхронным обходом. Его возвращает [`.cursor()`](./reading.mdx#cursor), и им удобно описывать параметры функций, которые читают курсор: функции не важно, какие строки внутри, главное — тип `T`.
+
+Класс, который стоит за интерфейсом, называется `TypedCursor`. Он нужен, когда курсор надо собрать самому, например в тесте, чтобы подменить чтение из базы своими данными. Его источник описывает тип `CursorSource<T>` — асинхронно итерируемый объект с необязательным методом `close`:
+
+```ts twoslash
+import { type CursorSource, type QueryCursor, TypedCursor } from "@venloc/typemo";
+// ---cut---
+const source: CursorSource<number> = {
+  async *[Symbol.asyncIterator]() {
+    yield 1;
+    yield 2;
+    yield 3;
+  },
+  close: async () => {},
+};
+
+const cursor: QueryCursor<number> = new TypedCursor(source);
+const doubled = await cursor.map((n) => n * 2).toArray();
+console.log(doubled);
+// → [2, 4, 6]
+```
+
+Метод `close` источника вызывается один раз, когда курсор закрывается; он не должен бросать ошибок, потому что закрытие курсора ошибок не бросает: исключение из `close` проглатывается.
+
+Параметры [`.eachAsync`](#eachasync) описывают два типа: `EachAsyncOptions` (`parallel`, `continueOnError`) и `EachAsyncBatchOptions`, который добавляет обязательный `batchSize`. Первый подходит, когда функция получает документ, второй — когда порцию. Так TypeScript сам выбирает нужную форму `fn`: с `batchSize` первым аргументом приходит массив.
+
+<FullType>
+
+```ts
+interface CursorSource<T> extends AsyncIterable<T, void, undefined> {
+  readonly close?: () => Promise<void>;
+}
+
+interface EachAsyncOptions {
+  readonly parallel?: number;
+  readonly continueOnError?: boolean;
+}
+
+interface EachAsyncBatchOptions extends EachAsyncOptions {
+  readonly batchSize: number;
+}
+
+interface QueryCursor<T> extends AsyncIterable<T, void, undefined> {
+  next(): Promise<T | null>;
+  toArray(): Promise<T[]>;
+  close(): Promise<void>;
+  eachAsync(fn: (docs: T[], batchIndex: number) => unknown, options: EachAsyncBatchOptions): Promise<void>;
+  eachAsync(fn: (doc: T, index: number) => unknown, options?: EachAsyncOptions): Promise<void>;
+  map<U>(fn: (doc: T) => U): QueryCursor<U>;
+}
+```
+
+</FullType>
+
+---
+
+## Что почитать дальше
+
+<Cards>
+<Card title="Чтение" href="./reading.mdx">
+  `.cursor()`: как получить курсор из запроса, и `.batchSize`, `.skip`, `.limit`, которые с ним работают.
+</Card>
+<Card title="Опции запроса" href="./options.mdx">
+  `.batchSize`, `.timeoutMS` и другие опции, влияющие на чтение курсором.
+</Card>
+</Cards>

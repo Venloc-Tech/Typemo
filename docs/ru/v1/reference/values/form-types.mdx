@@ -1,0 +1,421 @@
+---
+title: Типы форм
+description: "Типы TypeScript, которыми описаны формы значений: Lean, Plain, ObjectForm, PlainJson, их варианты для одного значения и типы входа CreateInput и UpdateInput"
+icon: Braces
+---
+
+Форма документа — это не только данные во время работы, но и тип, который компилятор выводит для результата запроса или метода документа. На этой странице описаны публичные типы, из которых эти результаты составлены: `Lean` для `.lean()`, `Plain` для `.plain()` и `$toPlain()`, `ObjectForm` для `$toObject()`, `PlainJson` для `$toJSON()`, а также типы входа `CreateInput` и `UpdateInput`. Каждому типу формы соответствует вариант для одного значения: `LeanOf`, `PlainOf`, `ObjectFormOf`, `JsonOf`.
+
+Если вам нужно только понять, чем формы отличаются, прочитайте [Формы значений](./value-forms.mdx): там таблица по типам MongoDB. Эта страница — справочник по типам. Обычно писать эти типы руками не приходится: результат запроса выводится сам, а нужный тип можно взять из него (`Awaited<ReturnType<typeof f>>`). Прямая запись нужна, когда вы объявляете параметр или тип возврата своей функции.
+
+Примеры используют модель с полями разных типов (см. страницу [Формы значений](./value-forms.mdx)) и скрытым полем `secret`.
+
+Типы на странице: [`HydratedDoc`](#hydrateddoc), [`Lean`](#lean), [`Plain`](#plain), [`ObjectForm`](#objectform), [`PlainJson`](#plainjson), [варианты для одного значения](#типы-одного-значения), [`Int64String`](#int64string), [`CreateInput` и `UpdateInput`](#createinput-и-updateinput) и [вспомогательные типы](#вспомогательные-типы).
+
+---
+
+## HydratedDoc
+
+`HydratedDoc<T>` — тип документа, который вы получаете после обычного чтения: экземпляр модели `T` с типизированными коллекциями (массивы, поддокументы, карты) и методами с префиксом `$` (`$save`, `$set`, `$toPlain`). Скрытых полей в нём нет, как нет их и в ответе обычного чтения. Тот же тип возвращают `new()` и `create()`, поэтому параметр `HydratedDoc<T>` принимает документ из любого из этих мест. Это единственная форма, у которой есть методы и которая знает, что изменено. Все остальные формы — данные без методов. Тип `Output<T>` — то же самое под другим именем.
+
+```ts twoslash
+import { Binary, Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, type Hidden, type Vector } from "@venloc/typemo";
+@Schema({ collection: "readings" })
+class Reading extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+  @Prop(() => Types.Double) ratio?: number;
+  @Prop(() => Types.Int32) count?: number;
+  @Prop(() => BigInt) total?: bigint;
+  @Prop(() => Types.Decimal128) price?: Decimal128;
+  @Prop(() => Boolean) ok?: boolean;
+  @Prop(() => Date) at?: Date;
+  @Prop(() => Spec.binary({ subtype: 0 })) blob?: Binary;
+  @Prop(() => Types.UUID) uid?: UUID;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) vec?: Vector;
+  @Prop(() => RegExp) re?: RegExp;
+  @Prop(() => Types.Timestamp) ts?: InstanceType<typeof Types.Timestamp>;
+  @Prop(() => Spec.map(BigInt)) scores?: Map<string, bigint>;
+  @Prop(() => String, { hidden: true }) secret?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "sensors" });
+const Readings = client.db().model(Reading);
+// ---cut---
+import type { HydratedDoc } from "@venloc/typemo";
+const save = async (doc: HydratedDoc<Reading>) => {
+  doc.label = "renamed";
+  await doc.$save();
+};
+const doc = await Readings.findOne({ label: "r1" }).orFail();
+await save(doc);
+```
+
+Документ, у которого поля отличаются от обычного чтения, — другой тип, [`HydratedDocWith`](#hydrateddocwith): он не присваивается параметру `HydratedDoc<Reading>`. Функции, которой всё равно, загружена ли связь, нужен [`AnyPopulationDoc<T>`](../populate/populate-types.mdx#anypopulationdoc); подробнее — в руководстве [Убедиться, что связь загружена](../../populate/type-checks.mdx).
+
+## HydratedDocWith
+
+`HydratedDocWith<T, P>` — документ модели `T`, у которого часть полей отличается от обычного чтения. Второй аргумент `P` перечисляет только эти поля в том виде, в каком они читаются, остальные поля такие же, как у `HydratedDoc<T>`. Так редактор показывает три случая: скрытое поле, запрошенное знаком `+` (`HydratedDocWith<Reading, { secret?: string }>`), связь, загруженную через populate (`HydratedDocWith<Post, { author: HydratedDoc<User> | null }>`), и поле, суженное условием `.where(…).in(…)`. Методы такого документа работают с полями из `P`: `$set` загруженного поля принимает идентификатор, `$toPlain()` убирает скрытое поле, пока вы не передали `{ hidden: true }`, а `$depopulate()` возвращает документ к `HydratedDoc<T>`.
+
+При выборе части полей первым аргументом становится сама проекция класса: `Projected<Reading, "_id" | "label">` для списка полей, `Omit<Reading, "blob">` для исключения и `Partial<Reading>` для проекции, состав которой компилятору неизвестен.
+
+```ts twoslash
+import { Binary, Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, type Hidden, type Vector } from "@venloc/typemo";
+@Schema({ collection: "readings" })
+class Reading extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+  @Prop(() => Types.Double) ratio?: number;
+  @Prop(() => Types.Int32) count?: number;
+  @Prop(() => BigInt) total?: bigint;
+  @Prop(() => Types.Decimal128) price?: Decimal128;
+  @Prop(() => Boolean) ok?: boolean;
+  @Prop(() => Date) at?: Date;
+  @Prop(() => Spec.binary({ subtype: 0 })) blob?: Binary;
+  @Prop(() => Types.UUID) uid?: UUID;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) vec?: Vector;
+  @Prop(() => RegExp) re?: RegExp;
+  @Prop(() => Types.Timestamp) ts?: InstanceType<typeof Types.Timestamp>;
+  @Prop(() => Spec.map(BigInt)) scores?: Map<string, bigint>;
+  @Prop(() => String, { hidden: true }) secret?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "sensors" });
+const Readings = client.db().model(Reading);
+// ---cut---
+const withSecret = await Readings.findOne({ label: "r1" }).select({ "+secret": true }).orFail();
+//    ^?
+const labels = await Readings.findOne({ label: "r1" }).select({ label: 1 }).orFail();
+//    ^?
+declare const fields: Record<string, 0 | 1>;
+const dynamic = await Readings.findOne({ label: "r1" }).select(fields).orFail();
+//    ^?
+```
+
+Тип пишут в сигнатуре так же, как он показан в подсказке, но чаще его выводят из запроса: `Awaited<ReturnType<typeof read>>`.
+
+## Lean
+
+`Lean<T>` — форма `.lean()`: только данные (виртуальные поля и методы убраны), без изменений типов значений: `ObjectId`, `bigint`, `Binary`, а карта — обычный объект `{ [key: string]: V }`. Необязательные поля остаются необязательными, маркеры (`Hidden`, `Ref`, `Immutable`) убираются, а `_id` — `ObjectId`. Скрытые поля в lean присутствуют, если запрос их выбрал.
+
+```ts twoslash
+import { Binary, Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, type Hidden, type Vector } from "@venloc/typemo";
+@Schema({ collection: "readings" })
+class Reading extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+  @Prop(() => Types.Double) ratio?: number;
+  @Prop(() => Types.Int32) count?: number;
+  @Prop(() => BigInt) total?: bigint;
+  @Prop(() => Types.Decimal128) price?: Decimal128;
+  @Prop(() => Boolean) ok?: boolean;
+  @Prop(() => Date) at?: Date;
+  @Prop(() => Spec.binary({ subtype: 0 })) blob?: Binary;
+  @Prop(() => Types.UUID) uid?: UUID;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) vec?: Vector;
+  @Prop(() => RegExp) re?: RegExp;
+  @Prop(() => Types.Timestamp) ts?: InstanceType<typeof Types.Timestamp>;
+  @Prop(() => Spec.map(BigInt)) scores?: Map<string, bigint>;
+  @Prop(() => String, { hidden: true }) secret?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "sensors" });
+const Readings = client.db().model(Reading);
+// ---cut---
+import type { Lean } from "@venloc/typemo";
+const row: Lean<Reading> = await Readings.findOne({ label: "r1" }).orFail().lean();
+//    ^?
+```
+
+`LeanOf<V>` — та же форма для одного значения: `LeanOf<Map<string, number>>` — `{ [key: string]: number }`. Тип вы увидите в подсказке результата `.lean()`.
+
+## Plain
+
+`Plain<T, H>` — форма `.plain()` и `$toPlain()`: идентификаторы, `bigint`, `Decimal128` и `UUID` — строки, `Date` и `RegExp` остаются как есть, `Binary` — `Uint8Array`, вектор — `number[]`, карта — `Map` со значениями в plain-форме. Второй параметр `H` говорит, оставлять ли скрытые поля: `true` по умолчанию в самом типе, а `$toPlain()` и `.plain()` вычисляют его сами (скрытые поля выпадают, пока вы не передали `{ hidden: true }`).
+
+```ts twoslash
+import { Binary, Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, type Hidden, type Vector } from "@venloc/typemo";
+@Schema({ collection: "readings" })
+class Reading extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+  @Prop(() => Types.Double) ratio?: number;
+  @Prop(() => Types.Int32) count?: number;
+  @Prop(() => BigInt) total?: bigint;
+  @Prop(() => Types.Decimal128) price?: Decimal128;
+  @Prop(() => Boolean) ok?: boolean;
+  @Prop(() => Date) at?: Date;
+  @Prop(() => Spec.binary({ subtype: 0 })) blob?: Binary;
+  @Prop(() => Types.UUID) uid?: UUID;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) vec?: Vector;
+  @Prop(() => RegExp) re?: RegExp;
+  @Prop(() => Types.Timestamp) ts?: InstanceType<typeof Types.Timestamp>;
+  @Prop(() => Spec.map(BigInt)) scores?: Map<string, bigint>;
+  @Prop(() => String, { hidden: true }) secret?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "sensors" });
+const Readings = client.db().model(Reading);
+// ---cut---
+import type { Plain } from "@venloc/typemo";
+const row: Plain<Reading, false> = await Readings.findOne({ label: "r1" }).orFail().plain();
+//    ^?
+type WithoutHidden = "secret" extends keyof Plain<Reading, false> ? true : false;
+//   ^?
+type WithHidden = "secret" extends keyof Plain<Reading, true> ? true : false;
+//   ^?
+```
+
+`PlainOf<V, H>` — то же для одного значения: `PlainOf<ObjectId>` — `string`, `PlainOf<Date[]>` — `Date[]`. Опция `hidden` действует на любой глубине: в поддокументах, массивах, картах и загруженных связях. У `.plain()` скрытые поля не попадают в результат, даже если запрос выбрал их через `select`: их показывают `.plain({ hidden: true })` и `.lean()`.
+
+## ObjectForm
+
+`ObjectForm<T, H>` — форма `$toObject()`: данные как у `Lean`, но карты остаются `Map`, а BSON-значения — как есть. Скрытые поля здесь по умолчанию включены (`H` равно `true`), потому что `$toObject()` — данные для самого приложения. `ObjectFormOf<V, H>` — вариант для одного значения.
+
+```ts twoslash
+import { Binary, Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, type Hidden, type Vector } from "@venloc/typemo";
+@Schema({ collection: "readings" })
+class Reading extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+  @Prop(() => Types.Double) ratio?: number;
+  @Prop(() => Types.Int32) count?: number;
+  @Prop(() => BigInt) total?: bigint;
+  @Prop(() => Types.Decimal128) price?: Decimal128;
+  @Prop(() => Boolean) ok?: boolean;
+  @Prop(() => Date) at?: Date;
+  @Prop(() => Spec.binary({ subtype: 0 })) blob?: Binary;
+  @Prop(() => Types.UUID) uid?: UUID;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) vec?: Vector;
+  @Prop(() => RegExp) re?: RegExp;
+  @Prop(() => Types.Timestamp) ts?: InstanceType<typeof Types.Timestamp>;
+  @Prop(() => Spec.map(BigInt)) scores?: Map<string, bigint>;
+  @Prop(() => String, { hidden: true }) secret?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "sensors" });
+const Readings = client.db().model(Reading);
+// ---cut---
+import type { ObjectForm } from "@venloc/typemo";
+const row: ObjectForm<Reading, true> = (await Readings.findOne({ label: "r1" }).orFail()).$toObject();
+//    ^?
+```
+
+## PlainJson
+
+`PlainJson<T, H>` — форма `$toJSON()` (её же вызывает `JSON.stringify(doc)`): все значения — то, что JSON выдерживает без потерь. `Date` — строка, `int64` — десятичная строка, `Binary` — base64, карта — объект. `JsonOf<V, H>` — вариант для одного значения: `JsonOf<Date>` — `string`, `JsonOf<Map<string, ObjectId>>` — `{ [key: string]: string }`.
+
+```ts twoslash
+import { Binary, Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, type Hidden, type Vector } from "@venloc/typemo";
+@Schema({ collection: "readings" })
+class Reading extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+  @Prop(() => Types.Double) ratio?: number;
+  @Prop(() => Types.Int32) count?: number;
+  @Prop(() => BigInt) total?: bigint;
+  @Prop(() => Types.Decimal128) price?: Decimal128;
+  @Prop(() => Boolean) ok?: boolean;
+  @Prop(() => Date) at?: Date;
+  @Prop(() => Spec.binary({ subtype: 0 })) blob?: Binary;
+  @Prop(() => Types.UUID) uid?: UUID;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) vec?: Vector;
+  @Prop(() => RegExp) re?: RegExp;
+  @Prop(() => Types.Timestamp) ts?: InstanceType<typeof Types.Timestamp>;
+  @Prop(() => Spec.map(BigInt)) scores?: Map<string, bigint>;
+  @Prop(() => String, { hidden: true }) secret?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "sensors" });
+const Readings = client.db().model(Reading);
+// ---cut---
+import type { PlainJson } from "@venloc/typemo";
+const row: PlainJson<Reading, false> = (await Readings.findOne({ label: "r1" }).orFail()).$toJSON();
+//    ^?
+```
+
+## Типы одного значения
+
+`LeanOf<V>`, `PlainOf<V, H>`, `ObjectFormOf<V, H>` и `JsonOf<V, H>` принимают тип поля (а не документа) и возвращают его в нужной форме. Они нужны там, где вы пишете код над значением поля: например, функцию, которая принимает поле идентификатора в plain-форме.
+
+```ts twoslash
+import { Binary, Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, type Hidden, type Vector } from "@venloc/typemo";
+@Schema({ collection: "readings" })
+class Reading extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+  @Prop(() => Types.Double) ratio?: number;
+  @Prop(() => Types.Int32) count?: number;
+  @Prop(() => BigInt) total?: bigint;
+  @Prop(() => Types.Decimal128) price?: Decimal128;
+  @Prop(() => Boolean) ok?: boolean;
+  @Prop(() => Date) at?: Date;
+  @Prop(() => Spec.binary({ subtype: 0 })) blob?: Binary;
+  @Prop(() => Types.UUID) uid?: UUID;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) vec?: Vector;
+  @Prop(() => RegExp) re?: RegExp;
+  @Prop(() => Types.Timestamp) ts?: InstanceType<typeof Types.Timestamp>;
+  @Prop(() => Spec.map(BigInt)) scores?: Map<string, bigint>;
+  @Prop(() => String, { hidden: true }) secret?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "sensors" });
+const Readings = client.db().model(Reading);
+// ---cut---
+import type { JsonOf, LeanOf, ObjectFormOf, PlainOf } from "@venloc/typemo";
+import type { ObjectId } from "mongodb";
+type Scores = Map<string, bigint>;
+type L = LeanOf<Scores>;
+//   ^?
+type O = ObjectFormOf<Scores>;
+//   ^?
+type P = PlainOf<ObjectId>;
+//   ^?
+type J = JsonOf<Date>;
+//   ^?
+```
+
+## Int64String
+
+`Int64String` — тип `` `${bigint}` ``: десятичная запись целого. Он нужен потому, что plain- и JSON-формы отдают `int64` строкой, а записи принимают её обратно. Значение из plain-формы можно передать в `create` и `updateOne` без приведений: строка проверяется по формату во время работы, а не компилятором.
+
+```ts twoslash
+import { Binary, Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, type Hidden, type Vector } from "@venloc/typemo";
+@Schema({ collection: "readings" })
+class Reading extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+  @Prop(() => Types.Double) ratio?: number;
+  @Prop(() => Types.Int32) count?: number;
+  @Prop(() => BigInt) total?: bigint;
+  @Prop(() => Types.Decimal128) price?: Decimal128;
+  @Prop(() => Boolean) ok?: boolean;
+  @Prop(() => Date) at?: Date;
+  @Prop(() => Spec.binary({ subtype: 0 })) blob?: Binary;
+  @Prop(() => Types.UUID) uid?: UUID;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) vec?: Vector;
+  @Prop(() => RegExp) re?: RegExp;
+  @Prop(() => Types.Timestamp) ts?: InstanceType<typeof Types.Timestamp>;
+  @Prop(() => Spec.map(BigInt)) scores?: Map<string, bigint>;
+  @Prop(() => String, { hidden: true }) secret?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "sensors" });
+const Readings = client.db().model(Reading);
+// ---cut---
+const doc = await Readings.findOne({ label: "r1" }).orFail();
+const total = doc.$toPlain().total;
+if (total !== undefined) await Readings.updateOne({ label: "r1" }, { $set: { total } });
+```
+
+Строка, которая не является десятичным целым в диапазоне int64, приводит к `CastError` при выполнении. Подробнее о разрешённых записях — на странице [Формы значений](./value-forms.mdx#числа-double-int32-и-int64).
+
+## CreateInput и UpdateInput
+
+`CreateInput<T>` — то, что принимают `create`, `insertOne` и `insertMany`: обязательные поля обязательны, поля с `?`, поля со значением по умолчанию (`Defaulted`), поле тенанта и поля-массивы необязательны (массив без `required` и без `default` при создании становится `[]`), виртуальных полей нет. Значения принимаются во «входной» форме: вместо `ObjectId` можно строка, вместо `bigint` — `Int64String`, вместо `Ref<M>` — идентификатор или сам документ, вместо `Map` — и `Map`, и объект. `undefined` значением не является: отсутствующее поле пишется как отсутствующее.
+
+`UpdateInput<T>` — поля, которые может присвоить запись: все необязательные, без `_id` и без неизменяемых (`Immutable`). `Replacement<T>` — то, что принимают `replaceOne` и `findOneAndReplace`: `CreateInput` без `_id` и без служебных полей `createdAt`, `updatedAt` и `__v` (их ведёт ядро, [`ServiceKeys`](#вспомогательные-типы)).
+
+```ts twoslash
+import { Binary, Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, type Hidden, type Vector } from "@venloc/typemo";
+@Schema({ collection: "readings" })
+class Reading extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+  @Prop(() => Types.Double) ratio?: number;
+  @Prop(() => Types.Int32) count?: number;
+  @Prop(() => BigInt) total?: bigint;
+  @Prop(() => Types.Decimal128) price?: Decimal128;
+  @Prop(() => Boolean) ok?: boolean;
+  @Prop(() => Date) at?: Date;
+  @Prop(() => Spec.binary({ subtype: 0 })) blob?: Binary;
+  @Prop(() => Types.UUID) uid?: UUID;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) vec?: Vector;
+  @Prop(() => RegExp) re?: RegExp;
+  @Prop(() => Types.Timestamp) ts?: InstanceType<typeof Types.Timestamp>;
+  @Prop(() => Spec.map(BigInt)) scores?: Map<string, bigint>;
+  @Prop(() => String, { hidden: true }) secret?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "sensors" });
+const Readings = client.db().model(Reading);
+// ---cut---
+import type { CreateInput, Replacement, UpdateInput } from "@venloc/typemo";
+const created: CreateInput<Reading> = { label: "r2", total: "9007199254740993" };
+//    ^?
+const patch: UpdateInput<Reading> = { count: 3 };
+//    ^?
+const replacement: Replacement<Reading> = { label: "r3" };
+//    ^?
+void created;
+void patch;
+void replacement;
+```
+
+Обратите внимание: `total` принимает строку `"9007199254740993"` вместо `bigint`. В `CreateInput` есть необязательный `_id`, в `UpdateInput` и `Replacement` `_id` нет: записью идентификатор не изменить. А `label` — единственное обязательное поле входа, потому что только оно объявлено с `required: true`; без него компилятор остановит присваивание:
+
+```ts twoslash
+// @errors: 2741
+import { Binary, Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, type Hidden, type Vector } from "@venloc/typemo";
+@Schema({ collection: "readings" })
+class Reading extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+  @Prop(() => Types.Double) ratio?: number;
+  @Prop(() => Types.Int32) count?: number;
+  @Prop(() => BigInt) total?: bigint;
+  @Prop(() => Types.Decimal128) price?: Decimal128;
+  @Prop(() => Boolean) ok?: boolean;
+  @Prop(() => Date) at?: Date;
+  @Prop(() => Spec.binary({ subtype: 0 })) blob?: Binary;
+  @Prop(() => Types.UUID) uid?: UUID;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) vec?: Vector;
+  @Prop(() => RegExp) re?: RegExp;
+  @Prop(() => Types.Timestamp) ts?: InstanceType<typeof Types.Timestamp>;
+  @Prop(() => Spec.map(BigInt)) scores?: Map<string, bigint>;
+  @Prop(() => String, { hidden: true }) secret?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "sensors" });
+const Readings = client.db().model(Reading);
+// ---cut---
+import type { CreateInput } from "@venloc/typemo";
+const missing: CreateInput<Reading> = { count: 1 };
+```
+
+Компилятор: `TS2741: Property 'label' is missing in type '{ count: number; }' but required in type …`, и дальше перечислены поля входа.
+
+## Вспомогательные типы
+
+<TypeTable
+  type={{
+    "Output<T>": { description: "То же, что `HydratedDoc<T>`.", type: "type" },
+    "DataFields<T>": { description: "Данные модели `T`: её поля без методов и виртуальных полей, с объявленными типами и маркерами.", type: "type" },
+    "IdOf<T>": { description: "Тип `_id` модели без маркеров (`ObjectId` для `extends Entity`); `never`, если `_id` нет.", type: "type" },
+    "InputOf<V>": { description: "Входная форма одного значения: идентификатор вместо `Ref`, строка вместо `bigint`, `ObjectId` и `UUID`, массивы могут быть только для чтения.", type: "type" },
+    "StringInputOf<V>": { description: "Строка, которую значение принимает вместо себя: `Int64String` для `bigint`, `string` для `ObjectId` и `UUID`, для остальных `never`.", type: "type" },
+    "IdInputOf<T>": { description: "Что принимают `findById` и его родственники: тип `_id` и его строковая форма.", type: "type" },
+    "Int64String": { description: "Десятичная запись целого: `` `${bigint}` ``.", type: "type" },
+    "ServiceKeys": { description: "Служебные поля, которые ведёт ядро: `\"createdAt\" | \"updatedAt\" | \"__v\"`.", type: "type" },
+  }}
+/>
+
+`DocOf` в публичном API есть, но он относится к агрегациям: это тип документа источника конвейера без скрытых полей (`DocOf<typeof User>`), а не общее имя формы документа. Он описан в разделе [агрегаций](../aggregation/index.mdx).
+
+## Когда эти типы не нужны
+
+Если результат запроса используется в том же месте, где выполнен запрос, называть его тип не нужно: он выводится. Если функции нужно принять результат чужого запроса, выведите тип из запроса (`Awaited<ReturnType<typeof f>>`), а не пишите его вручную: так тип не разойдётся с данными. Для проверки формы ответа при компиляции и во время работы есть [контракты](../query/contracts.mdx).
+
+## Частые ошибки
+
+### Тип plain не подходит там, где ждут JSON
+
+`Plain<T>` — не JSON: в нём остаются `Date`, `Uint8Array` и `Map`. Для значения, которое вы отдадите в `JSON.stringify`, используйте `PlainJson<T>` и `$toJSON()`.
+
+### Скрытое поле пропало из типа
+
+`Plain<T>` без второго аргумента включает скрытые поля, а `$toPlain()` их убирает. Тип вашей переменной должен быть выведен из вызова, а не записан вручную как `Plain<T>`: тогда компилятор сам учтёт `{ hidden: true }`.
+
+## Что дальше
+
+<Cards>
+<Card title="Формы значений" href="./value-forms.mdx">
+  Как выглядит каждый тип MongoDB в каждой форме.
+</Card>
+<Card title="Типы запросов" href="./query-types.mdx">
+  `Filter`, `Update`, `Projection`, `Sort`, `Paths` и результаты операций.
+</Card>
+<Card title="Контракты" href="../query/contracts.mdx">
+  Проверка формы ответа при компиляции и во время работы.
+</Card>
+</Cards>

@@ -1,0 +1,360 @@
+---
+title: REST API на NestJS
+description: "Полный CRUD счетов на NestJS и Typemo: модуль, сервис с транзакцией, контроллер с пайпами, ответы на ошибки, тенант из запроса и e2e-тест"
+icon: Server
+---
+
+Этот рецепт собирает REST API счетов организации на NestJS из возможностей `@venloc/typemo-nestjs`: модели по классу, проверка тела схемой, разбор id из адреса, перевод денег в транзакции, тенант из заголовка запроса и ответы на ошибки базы. В конце — e2e-тест, который проверяет каждый ответ, показанный на странице. Тот же API на обычных функциях без фреймворка разобран в рецепте [REST API для счетов](./rest-api.mdx).
+
+## Что предполагается
+
+Приложение на NestJS 12 с Express и пакеты из руководства [Подключить Typemo к NestJS](../integrations/nestjs/setup.mdx). MongoDB запущена как реплика-сет: на нём работают транзакции. Организация приходит в заголовке `x-org`; в настоящем приложении её кладёт аутентификация.
+
+## Быстрый путь
+
+Пять маршрутов и перевод:
+
+```text
+GET    /accounts?status=open&limit=20   список
+GET    /accounts/:id                    один счёт
+POST   /accounts                        открыть
+PATCH  /accounts/:id                    переименовать
+DELETE /accounts/:id                    закрыть
+POST   /accounts/transfer               перевести деньги
+```
+
+Ниже каждый файл приложения по очереди, затем запросы с ответами и тест.
+
+## Описать счёт
+
+Счёт принадлежит организации: поле `tenantId` помечено тенантом, и политика сама фильтрует и заполняет его по контексту запроса. Статус по умолчанию `open`; закрытый счёт не удаляется, чтобы история переводов не теряла концы.
+
+```ts twoslash title="accounts/account.ts"
+import { type Defaulted, Entity, Prop, Schema, Tenant, type TenantField } from "@venloc/typemo";
+
+@Schema({ collection: "accounts", tenant: true })
+export class Account extends Entity {
+  @Prop(() => String)
+  @Tenant()
+  tenantId!: TenantField<string>;
+
+  @Prop(() => String, { required: true, minLength: 1 })
+  title!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  balance!: number;
+
+  @Prop(() => String, { enum: ["open", "closed"] as const, default: "open" })
+  status!: Defaulted<"open" | "closed">;
+}
+```
+
+## Написать сервис
+
+Сервис работает с моделью и ничего не знает о HTTP. Перевод помечен [`@Transactional()`](../reference/integrations/nestjs.mdx#transactional): списание и зачисление случаются вместе или никак. Обе операции — атомарные `$inc` с условием «счёт открыт», и `.orFail()` превращает закрытый или чужой счёт в ошибку, которая откатывает транзакцию.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { Injectable } from "@nestjs/common";
+import { type CreateInput, type Defaulted, Entity, type IdOf, type Model, Prop, Schema, Tenant, type TenantField, type UpdateInput } from "@venloc/typemo";
+import { InjectModel, Transactional } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts", tenant: true })
+class Account extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true, minLength: 1 }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+  @Prop(() => String, { enum: ["open", "closed"] as const, default: "open" }) status!: Defaulted<"open" | "closed">;
+}
+// ---cut---
+@Injectable()
+export class AccountsService {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+
+  list(status: "open" | "closed" | undefined, limit: number) {
+    return this.accounts
+      .find(status === undefined ? {} : { status })
+      .sort({ title: 1 })
+      .limit(limit)
+      .select({ title: 1, balance: 1, status: 1 })
+      .plain();
+  }
+
+  get(id: IdOf<Account>) {
+    return this.accounts.findById(id).orFail().plain();
+  }
+
+  async open(body: CreateInput<Account>) {
+    return (await this.accounts.create(body)).$toPlain();
+  }
+
+  update(id: IdOf<Account>, body: UpdateInput<Account>) {
+    return this.accounts.findByIdAndUpdate(id, { $set: body }).orFail().plain();
+  }
+
+  async close(id: IdOf<Account>): Promise<void> {
+    await this.accounts.updateOne({ _id: id }, { $set: { status: "closed" } });
+  }
+
+  @Transactional()
+  async transfer(from: IdOf<Account>, to: IdOf<Account>, amount: number): Promise<void> {
+    await this.accounts.findOneAndUpdate({ _id: from, status: "open" }, { $inc: { balance: -amount } }).orFail();
+    await this.accounts.findOneAndUpdate({ _id: to, status: "open" }, { $inc: { balance: amount } }).orFail();
+  }
+}
+```
+
+Фильтра организации в сервисе нет: его добавляет политика тенанта для каждой операции, построенной внутри запроса.
+
+## Написать контроллер
+
+Контроллер разбирает ввод и зовёт сервис. [`ValidateBodyPipe`](../reference/integrations/nestjs.mdx#validatebodypipe) проверяет тело схемой счёта, а `pick` оставляет клиенту только `title` и `balance`: организацию и статус задаёт сервер. [`ParseIdPipe`](../reference/integrations/nestjs.mdx#parseidpipe) разбирает id из адреса. Строку запроса проверяем руками: статус — одно из двух значений, `limit` — от 1 до 100.
+
+```ts twoslash title="accounts/accounts.controller.ts"
+import { BadRequestException, Body, Controller, Delete, Get, HttpCode, Injectable, Param, Patch, Post, Query } from "@nestjs/common";
+import { type CreateInput, type Defaulted, Entity, type IdOf, type Model, Prop, Schema, Tenant, type TenantField, type UpdateInput } from "@venloc/typemo";
+import { InjectModel, ParseIdPipe, ValidateBodyPipe } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts", tenant: true })
+class Account extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true, minLength: 1 }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+  @Prop(() => String, { enum: ["open", "closed"] as const, default: "open" }) status!: Defaulted<"open" | "closed">;
+}
+@Injectable()
+class AccountsService {
+  list(_status: "open" | "closed" | undefined, _limit: number) { return []; }
+  get(_id: IdOf<Account>) { return {}; }
+  open(_body: CreateInput<Account>) { return {}; }
+  update(_id: IdOf<Account>, _body: UpdateInput<Account>) { return {}; }
+  async close(_id: IdOf<Account>) {}
+  async transfer(_from: IdOf<Account>, _to: IdOf<Account>, _amount: number) {}
+}
+// ---cut---
+const STATUSES = ["open", "closed"] as const;
+
+@Controller("accounts")
+export class AccountsController {
+  constructor(
+    private readonly service: AccountsService,
+    @InjectModel(Account) private readonly accounts: Model<Account>,
+  ) {}
+
+  @Get()
+  list(@Query("status") status?: string, @Query("limit") limit = "20") {
+    if (status !== undefined && !(STATUSES as readonly string[]).includes(status)) {
+      throw new BadRequestException(`status is one of ${STATUSES.join(", ")}`);
+    }
+    const count = Number(limit);
+    if (!Number.isInteger(count) || count < 1 || count > 100) throw new BadRequestException("limit is 1 to 100");
+    return this.service.list(status as "open" | "closed" | undefined, count);
+  }
+
+  @Get(":id")
+  get(@Param("id", ParseIdPipe.for(Account)) id: IdOf<Account>) {
+    return this.service.get(id);
+  }
+
+  @Post()
+  open(@Body(ValidateBodyPipe.for(Account, { pick: ["title", "balance"] })) body: CreateInput<Account>) {
+    return this.service.open(body);
+  }
+
+  @Patch(":id")
+  update(
+    @Param("id", ParseIdPipe.for(Account)) id: IdOf<Account>,
+    @Body(ValidateBodyPipe.for(Account, { pick: ["title"], partial: true })) body: UpdateInput<Account>,
+  ) {
+    return this.service.update(id, body);
+  }
+
+  @Delete(":id")
+  @HttpCode(204)
+  close(@Param("id", ParseIdPipe.for(Account)) id: IdOf<Account>) {
+    return this.service.close(id);
+  }
+
+  @Post("transfer")
+  @HttpCode(204)
+  transfer(@Body() body: { readonly from: string; readonly to: string; readonly amount: number }) {
+    if (typeof body.amount !== "number" || !(body.amount > 0)) throw new BadRequestException("amount is positive");
+    const ids = new ParseIdPipe(this.accounts);
+    return this.service.transfer(ids.transform(body.from), ids.transform(body.to), body.amount);
+  }
+}
+```
+
+У перевода тело — команда, а не документ, поэтому `ValidateBodyPipe` здесь не подходит: id разбирает `ParseIdPipe`, созданный напрямую на модели, а сумму проверяем сами.
+
+## Собрать приложение
+
+Модуль счетов регистрирует модель; корневой модуль подключает клиента и создаёт коллекцию при старте; в `main.ts` подключены фильтр ошибок и перехватчик тенанта.
+
+```ts twoslash title="main.ts"
+import { Module } from "@nestjs/common";
+import { NestFactory } from "@nestjs/core";
+import { Entity, Prop, Schema } from "@venloc/typemo";
+import { PolicyInterceptor, TypemoExceptionFilter, TypemoModule } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+class AccountsController {}
+class AccountsService {}
+// ---cut---
+@Module({ imports: [TypemoModule.forFeature([Account])], controllers: [AccountsController], providers: [AccountsService] })
+export class AccountsModule {}
+
+@Module({ imports: [TypemoModule.forRoot("mongodb://localhost:27017", { dbName: "bank", sync: "init" }), AccountsModule] })
+export class AppModule {}
+
+const app = await NestFactory.create(AppModule);
+app.useGlobalFilters(new TypemoExceptionFilter());
+app.useGlobalInterceptors(new PolicyInterceptor({ tenant: (request) => request.headers["x-org"] }));
+app.enableShutdownHooks();
+await app.listen(3000);
+```
+
+## Запросы и ответы
+
+Все ответы ниже получены запуском приложения рецепта (организация `acme` в заголовке `x-org`, если не сказано иное).
+
+Открыть счёт. Ответ — созданный документ: организацию поставила политика, статус — умолчание.
+
+```text
+POST /accounts { "title": "Main", "balance": 100 }
+→ 201 { "_id": "…", "tenantId": "acme", "title": "Main", "balance": 100, "status": "open" }
+```
+
+Попытка задать организацию самому отвергается: `tenantId` нет в `pick`.
+
+```text
+POST /accounts { "title": "Hack", "balance": 1, "tenantId": "globex" }
+→ 422 { "message": "Validation failed", "errors": { "tenantId": "not allowed here" } }
+```
+
+Перевод 30 с `Main` на `Savings` (открыт с балансом 0) и список после него:
+
+```text
+POST /accounts/transfer { "from": "<Main>", "to": "<Savings>", "amount": 30 }
+→ 204
+GET /accounts
+→ 200 [{ "_id": "…", "title": "Main", "balance": 70, "status": "open" },
+       { "_id": "…", "title": "Savings", "balance": 30, "status": "open" }]
+```
+
+Перевод 500 с `Savings` нарушает `min: 0`: ядро отвергает обновление, транзакция откатывается, и баланс `Savings` остаётся 30.
+
+```text
+POST /accounts/transfer { "from": "<Savings>", "to": "<Main>", "amount": 500 }
+→ 422 { "message": "Validation failed", "errors": { "balance": "$inc -500 on 30 gives -470, below the minimum 0; nothing was written" } }
+```
+
+Переименовать можно, изменить баланс через `PATCH` нельзя:
+
+```text
+PATCH /accounts/<Main> { "title": "Everyday" }        → 200 { …, "title": "Everyday" }
+PATCH /accounts/<Main> { "balance": 1000000 }          → 422 { "errors": { "balance": "not allowed here" } }
+```
+
+Закрыть `Savings` и перевести на него: `.orFail()` не нашёл открытый счёт, и списание с `Main` откатилось.
+
+```text
+DELETE /accounts/<Savings>                                        → 204
+GET /accounts?status=closed                                        → 200 [{ …, "title": "Savings", "status": "closed" }]
+POST /accounts/transfer { "from": "<Main>", "to": "<Savings>", "amount": 1 } → 404 { "message": "Not found" }
+GET /accounts/<Main>                                               → 200 { …, "balance": 70 }
+```
+
+Другая организация не видит чужих счетов, неверный id и неверный статус — 400:
+
+```text
+GET /accounts            (x-org: globex)   → 200 []
+GET /accounts/<Main>     (x-org: globex)   → 404 { "message": "Not found" }
+GET /accounts/12                           → 400 { "message": "Invalid id: expected ObjectId (not a 24-character hex string)" }
+GET /accounts?status=frozen                → 400 { "message": "status is one of open, closed" }
+```
+
+## Проверить тестом
+
+e2e-тест поднимает приложение на тестовой базе ([`TypemoTestingModule`](../reference/integrations/nestjs.mdx#typemotestingmoduleforroot)) и повторяет запросы выше:
+
+```ts twoslash title="test/accounts.e2e-spec.ts"
+import { afterAll, beforeAll, expect, test } from "bun:test";
+import { type INestApplication, Module } from "@nestjs/common";
+import { Test } from "@nestjs/testing";
+import { PolicyInterceptor, TypemoExceptionFilter } from "@venloc/typemo-nestjs";
+import { TypemoTestingModule } from "@venloc/typemo-nestjs/testing";
+@Module({})
+class AccountsModule {}
+// ---cut---
+let app: INestApplication;
+let url = "";
+const call = (method: string, path: string, body?: unknown, org = "acme") =>
+  fetch(`${url}${path}`, {
+    method,
+    headers: { "content-type": "application/json", "x-org": org },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+
+beforeAll(async () => {
+  const moduleRef = await Test.createTestingModule({
+    imports: [TypemoTestingModule.forRoot(process.env.MONGO_URI ?? ""), AccountsModule],
+  }).compile();
+  app = moduleRef.createNestApplication();
+  app.useGlobalFilters(new TypemoExceptionFilter());
+  app.useGlobalInterceptors(new PolicyInterceptor({ tenant: (request) => request.headers["x-org"] }));
+  await app.listen(0, "127.0.0.1");
+  url = `http://127.0.0.1:${(app.getHttpServer().address() as { port: number }).port}`;
+});
+afterAll(() => app.close());
+
+test("an organization sees only its accounts", async () => {
+  await call("POST", "/accounts", { title: "Main", balance: 100 });
+  expect(await (await call("GET", "/accounts", undefined, "globex")).json()).toEqual([]);
+});
+```
+
+## Как выбрать: проверка пайпом или руками
+
+Тело, которое является документом (открыть счёт, переименовать), проверяет `ValidateBodyPipe` — той же схемой, что и запись, и правила не разойдутся. Тело-команда (перевод) и строка запроса — не документы: их проверяйте сами или своим валидатором. Признак простой: если поля тела — это поля сущности, это документ.
+
+## Когда это не нужно
+
+Если API только читает (отчёты, витрина), транзакция и `ValidateBodyPipe` не нужны, а список удобнее отдавать страницами по ключу ([`keysetPage`](../reference/query/keyset.mdx#modelkeysetpage)), как в рецепте [REST API для счетов](./rest-api.mdx).
+
+## Частые ошибки
+
+### Организация из тела запроса
+
+Без `pick` (или `omit: ["tenantId"]`) клиент может прислать `tenantId`. Чужую организацию политика тенанта всё равно не запишет — запрос получит 400 `{ "message": "Not allowed", "reason": "tenant", "path": "tenantId" }`, — но ответ 422 от пайпа говорит клиенту прямо, что поле ему не принадлежит.
+
+### Перевод на закрытый счёт списал деньги
+
+Условие `status: "open"` и `.orFail()` должны быть в обеих операциях перевода, а сам перевод — в `@Transactional()`: иначе списание успеет случиться до того, как зачисление не найдёт счёт.
+
+### Список без ограничения
+
+`limit` из строки запроса без проверки превращается в `NaN` или ноль. Проверяйте диапазон до запроса, как в контроллере.
+
+## Полный пример
+
+Весь код собран выше по файлам: [модель](#описать-счёт), [сервис](#написать-сервис), [контроллер](#написать-контроллер), [модули и `main.ts`](#собрать-приложение), [тест](#проверить-тестом). Этот же код с проверкой каждого ответа лежит в тестах пакета `@venloc/typemo-nestjs` (`test/e2e/recipe.test.ts`).
+
+<Callout type="migration" title="Если вы пришли из @nestjs/mongoose">
+
+Фильтр организации, проверка DTO и перевод ошибки уникальности в 409 в приложении на `@nestjs/mongoose` пишутся руками в каждом месте. Здесь они — политика, пайп и фильтр, а сервис содержит только работу с данными.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Ошибки, id и тело запроса" href="../integrations/nestjs/http.mdx">
+  Подробно о фильтре и пайпах.
+</Card>
+<Card title="Транзакции и политики в запросе" href="../integrations/nestjs/transactions-and-policies.mdx">
+  Как устроены `@Transactional` и тенант из запроса.
+</Card>
+<Card title="Многотенантное приложение" href="./multi-tenant.mdx">
+  Тенант, мягкое удаление и аудит без фреймворка.
+</Card>
+</Cards>

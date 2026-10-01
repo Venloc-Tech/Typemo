@@ -1,0 +1,167 @@
+---
+title: Метки времени и версии
+description: "Как получить createdAt, updatedAt и номер версии документа и что происходит с ними при каждой записи"
+icon: Clock
+---
+
+Почти каждой сущности нужно знать, когда её создали, когда последний раз меняли и не изменил ли её кто-то другой, пока вы её редактировали. В Typemo эти поля не добавляются скрытно: вы получаете их, наследуя базовый класс. [`Timestamped`](../reference/schemas/base-classes.mdx#timestamped) добавляет `createdAt` и `updatedAt`, [`Versioned`](../reference/schemas/base-classes.mdx#versioned) — числовую версию `__v`. Поля видны компилятору, подсказкам редактора и типам результатов, а значения проставляет само ядро.
+
+Если вы пришли из Mongoose, где то же делают опции `timestamps` и `versionKey`, разница в том, что здесь это обычные поля класса: тип результата содержит их всегда, и передавать их при создании не нужно.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель поста из файла `posts/post.ts`.
+
+## Быстрый путь
+
+Оберните базовый класс: `Timestamped(Entity)`. Даты появятся при создании, а `updatedAt` вырастет при первом же изменении.
+
+```ts twoslash title="posts/post.ts"
+import { Entity, Prop, Schema, Timestamped, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Timestamped(Entity) {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Posts = client.db().model(Post);
+// ---cut---
+const post = await Posts.create({ title: "Hello" });
+console.log(post.createdAt.getTime() === post.updatedAt.getTime());
+// → true
+
+post.title = "Hello, world";
+await post.$save();
+console.log(post.updatedAt.getTime() > post.createdAt.getTime());
+// → true
+```
+
+Остальная страница разбирает, когда именно меняются метки, и добавляет версию.
+
+## Как меняются метки
+
+`createdAt` записывается один раз, при создании, и после этого не меняется: у поля тип `Immutable`, и обновление, которое пытается его изменить, отвергается. `updatedAt` обновляется каждой операцией записи, которая дошла до документа: и при [`$save`](../reference/documents/document-api.mdx#save) с изменениями, и при [`updateOne`](../reference/writes/writes.mdx#updateone), и при `updateMany`, `findOneAndUpdate`, замене и upsert. Вам не нужно ставить его самому. Запись, которая ничего не меняет по значению, тоже обновляет `updatedAt`: например, `$set` того же заголовка или `$addToSet` значения, которое уже есть в массиве (сервер при этом сообщает `modifiedCount: 1`). Причина в том, что ядро до записи не знает, изменит ли что-нибудь сервер.
+
+```ts twoslash title="posts/posts.service.ts"
+import { Entity, Prop, Schema, Timestamped, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Timestamped(Entity) {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Posts = client.db().model(Post);
+// ---cut---
+const post = await Posts.create({ title: "a" });
+await Posts.updateOne({ _id: post._id }, { $set: { title: "b" } });
+const reread = await Posts.findById(post._id).orFail();
+console.log(reread.createdAt.getTime() === post.createdAt.getTime(), reread.updatedAt.getTime() >= post.updatedAt.getTime());
+// → true true
+```
+
+Попытка изменить `createdAt` обновлением останавливается ошибкой [`StrictModeError`](../reference/errors/data-errors.mdx#strictmodeerror) с причиной `immutable`: `$set.createdAt: "createdAt" is immutable; it is written only when the document is created ($setOnInsert on upsert) [immutable]`. В типах такое обновление не компилируется. При upsert, когда документ создаётся обновлением, обе метки ставятся равными.
+
+Метки можно задать осознанно, и типы это разрешают: при создании необязательны обе (`create({ title, createdAt, updatedAt })`), а в обновлении можно записать `updatedAt`. Заданную дату ядро оставляет как есть, а присвоенный в документе `updatedAt` `$save` не затирает. Так переносят старые данные вместе с историей. В обычном коде метки сами не передавайте: `createdAt` после создания всё равно не изменить.
+
+## Добавить версию
+
+`Versioned(Entity)` добавляет `__v` — счётчик, который ядро увеличивает, когда изменение зависит от позиции элементов массива: два процесса, меняющие один массив по индексу, иначе затёрли бы друг друга. Миксины комбинируются в любом порядке: `Timestamped(Versioned(Entity))`.
+
+```ts twoslash title="posts/post.ts"
+import { Entity, Prop, Schema, Timestamped, TypemoClient, Versioned } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ collection: "posts" })
+class Post extends Timestamped(Versioned(Entity)) { // [!code highlight]
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+
+const Posts = client.db().model(Post);
+const post = await Posts.create({ title: "a", tags: [] });
+console.log(post.__v);
+// → 0
+
+post.tags.push("news");
+await post.$save();
+console.log(post.__v);
+// → 1
+```
+
+Изменение обычного поля версию не увеличивает, а замена документа целиком через `replaceOne` сохраняет `createdAt` и текущее значение `__v`.
+
+Метки пригодны как ключи постраничного чтения: [`keysetPage`](../reference/query/keyset.mdx#modelkeysetpage) сортирует по `createdAt` и `updatedAt` (`sort: [["createdAt", "desc"]]`), потому что эти поля всегда заполнены и не `null`.
+
+## Защититься от одновременных правок
+
+Чтобы сохранение не затирало чужое изменение, добавьте в схему `optimisticConcurrency: true`. Тогда [`$save`](../reference/documents/document-api.mdx#save) сработает, только если документ в базе не менялся с момента чтения, а иначе бросит [`VersionError`](../reference/errors/query-errors.mdx#versionerror). Опция требует `Versioned`: без него модель не соберётся. Эта тема разобрана в руководстве [Версии документа и конфликты](../documents/versions.mdx), а опция описана в [`@Schema`](../reference/schemas/schema.mdx#optimisticconcurrency).
+
+## Как выбрать
+
+Задайте себе один вопрос: **что мне нужно знать о документе?** Когда он создан и когда менялся — `Timestamped`. Защита от одновременного редактирования и от гонок по массивам — `Versioned` с `optimisticConcurrency`. Если нужны оба свойства, подмешивайте оба. Собственные поля вроде `publishedAt` обычными полями и остаются: `Timestamped` отвечает только за создание и изменение записи.
+
+## Когда это не нужно
+
+Для справочников, которые меняются раз в год, метки времени не нужны, и каждое лишнее поле — лишний вес. Для журналов и событий, которые только пишутся, `updatedAt` не имеет смысла: достаточно `createdAt`, который вы объявите обычным полем с `default`. Версия нужна не всякой модели: если сущность меняет один процесс, конфликтов не будет.
+
+## Частые ошибки
+
+### Обновление `createdAt`
+
+Обновление, которое пытается изменить `createdAt`, не сохранится. Поле создаётся один раз, и чтобы записать его вручную, нужно создавать документ заново.
+
+### Модель без `Versioned` с `optimisticConcurrency`
+
+```text
+ConfigurationError: optimisticConcurrency needs the version field — extend Versioned(...)
+```
+
+Добавьте `Versioned` в цепочку наследования: `class Account extends Versioned(Entity)`.
+
+### Метки не попадают в ответ
+
+`createdAt` и `updatedAt` есть в plain-виде и в lean, но при выборе полей через `select({ title: 1 })` в результате будут только выбранные поля. Добавьте нужные метки в выбор.
+
+## Полный пример
+
+```ts twoslash title="posts/posts.service.ts"
+import { Entity, Prop, Schema, Timestamped, TypemoClient, Versioned } from "@venloc/typemo";
+
+@Schema({ collection: "posts", optimisticConcurrency: true })
+class Post extends Timestamped(Versioned(Entity)) {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Posts = client.db().model(Post);
+
+// создание: метки и версия проставляются сами
+export const publish = async (title: string) => Posts.create({ title, tags: [] });
+
+// изменение: updatedAt растёт, а при чужой правке $save бросит VersionError
+export const rename = async (id: Post["_id"], title: string) => {
+  const post = await Posts.findById(id).orFail();
+  post.title = title;
+  await post.$save();
+  return post.updatedAt;
+};
+```
+
+<Callout type="migration">
+
+В Mongoose метки включаются опцией схемы `timestamps: true`, а версия `__v` есть всегда. В Typemo это наследование: `Timestamped` и `Versioned` подключаются отдельно, поля видны в типах, а проверка версии при сохранении включается опцией `optimisticConcurrency`.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Версии документа и конфликты" href="../documents/versions.mdx">
+  Как поймать `VersionError`, повторить операцию и защитить массивы.
+</Card>
+<Card title="Справочник: базовые классы" href="../reference/schemas/base-classes.mdx">
+  `Entity`, `Timestamped` и `Versioned` с точными типами.
+</Card>
+<Card title="Неизменяемые поля" href="./immutable.mdx">
+  Как запретить менять поле после создания, как это делает `createdAt`.
+</Card>
+</Cards>

@@ -1,0 +1,948 @@
+---
+title: "@Prop"
+description: "Декоратор поля модели и каждая его опция: что она делает, к каким типам применима и какую ошибку даёт при неверном использовании"
+icon: Tag
+---
+
+`@Prop` объявляет поле модели: какого типа значение лежит в базе и по каким правилам Typemo его принимает, проверяет и отдаёт. На этой странице собраны сам декоратор и **все** его опции, каждая в своём разделе. Сюда приходят, когда нужно уточнить, что именно делает опция, к каким типам она применима и что произойдёт при ошибке.
+
+Если вы описываете первую модель, начните с руководства [Описать модель](../../schemas/define-model.mdx): оно объясняет, откуда берётся тип поля и как модель связана с коллекцией. Эта страница — справочник.
+
+Примеры используют небольшие модели по одной-две опции. Результаты в комментариях `// →` получены запуском на настоящей MongoDB. Примеры `hidden`, `ref`, `refPath` и `refModel` читают документы, созданные заранее: пользователя `gina` с хешем `h`, автора `Ann` и бота `R2`.
+
+---
+
+## @Prop
+
+`@Prop(() => Тип, опции)` записывает поле в описание класса. Первый аргумент — **функция, возвращающая рантайм-тип**: `() => String`, `() => [Address]`, `() => Types.ObjectId`. Тип задаётся явно на каждом поле, потому что Typemo не читает метаданные `design:type`: они не различают `int32` и `double`, не знают элемента массива и путают `null` с отсутствием. Функция, а не значение, нужна, чтобы класс, объявленный ниже в файле или в другом модуле, успел появиться к моменту сборки схемы.
+
+Опции и тип поля проверяются дважды. Компилятор сверяет опции с типом, который вы написали в классе: `hidden: true` требует `Hidden<T>`, `default` требует `Defaulted<T>`, `nullable: true` требует `| null` (в обе стороны). Вторая проверка происходит, когда модель собирается в [`client.db().model(...)`](../connection/connection.mdx): она ловит то же самое для кода без типов, а также правила, которые компилятору не под силу, — например `min` больше `max`. Она бросает [`ConfigurationError`](../errors/configuration-errors.mdx#configurationerror) с именем класса и поля.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Signup extends Entity {
+  @Prop(() => String, { required: true, trim: true }) // [!code highlight]
+  login!: string;
+}
+const Signups = client.db().model(Signup);
+const signup = await Signups.create({ login: "  alice " });
+console.log(signup.login);
+// → alice
+```
+
+<Returns type="PropDecorator<S, O>">
+
+Декоратор свойства. Во время работы он только записывает поле в описание класса; схему собирает [`model`](../connection/connection.mdx). Применённый к статическому члену, методу или аксессору, он бросает `ConfigurationError` сразу.
+
+</Returns>
+
+<Params>
+<Param name="type" type="() => TypeSpec" required>
+
+Функция, возвращающая рантайм-тип поля: конструктор (`String`, `Number`, `Boolean`, `Date`, `BigInt`, `RegExp`), класс из [`Types`](./types-and-spec.mdx#types), класс с [`@Schema`](./schema.mdx#schema), массив `[X]` или результат [`Spec`](./types-and-spec.mdx#spec). `Set`, `Map`, `Array` и `Object` не поддерживаются: для них есть `[X]` и `Spec.map(X)`.
+
+</Param>
+<Param name="options" type="PropOptions<S>">
+
+Опции поля. Набор допустимых опций зависит от типа: таблица ниже. Опция, которой у типа нет, — ошибка компиляции на ключе, а в коде без типов — `ConfigurationError`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+const Prop: <const S extends TypeSpec, const O extends PropOptions<S>>(
+  type: () => S,
+  options?: O & NoExtraOptions<O, PropOptions<S>>,
+) => PropDecorator<S, O>
+```
+
+</FullType>
+
+### Какие опции к каким типам применимы
+
+Общие опции принимает любое поле. Остальные зависят от типа значения. У массива опции типа элемента относятся к элементам, а `text` и `expires` остаются на самом массиве.
+
+| Тип поля | Общие | Дополнительно |
+|---|---|---|
+| все типы | `required`, `nullable`, `default`, `immutable`, `hidden`, `sensitive`, `dbName`, `index`, `unique`, `sparse`, `validate`, `get`, `set`, `ext` | — |
+| `String` | общие | `enum`, `lowercase`, `uppercase`, `trim`, `match`, `minLength`, `maxLength`, `text`, `ref`, `refPath`, `refModel` |
+| `Number`, `Types.Double`, `Types.Int32` | общие | `enum`, `min`, `max`, `ref`, `refPath`, `refModel` |
+| `BigInt` | общие | `min`, `max` |
+| `Date` | общие | `min`, `max`, `expires` |
+| `Types.ObjectId`, `Types.UUID` | общие | `ref`, `refPath`, `refModel` |
+| класс с `@Schema` | общие | `excludeIndexes` |
+| `Spec.map(X)` из строк, чисел, `ObjectId`, `UUID` | общие | `ref`, `refPath`, `refModel` (относятся к значениям) |
+| остальные (`Boolean`, `Types.Decimal128`, `Types.Binary`, `Types.Timestamp`, `Spec.vector`, `RegExp`, `Spec.union`) | общие | — |
+
+Проверим на примере: `min` — опция чисел и дат, для строки её нет.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+// @errors: 2353
+@Schema()
+class Wrong extends Entity {
+  @Prop(() => String, { min: 1 })
+  title!: string;
+}
+```
+
+Компилятор подчёркивает ключ `min` и пишет, что такого свойства в типе опций строки нет. В коде без типов то же самое случится при сборке модели: `Wrong.title: "min" is not an option of this field type`.
+
+---
+
+## required
+
+`required: true` требует, чтобы поле было в документе. Без `nullable` оно при этом не бывает и `null`, а вместе с [`nullable: true`](#nullable) ключ обязателен, но `null` допустим. Опция всегда явная: Typemo не выводит её из `?` или `!` в объявлении, потому что `?` описывает тип в TypeScript, а обязательность — правило для данных, и это разные решения. Применима ко всем типам.
+
+Проверка срабатывает при создании и замене документа, в [`$validate`](../documents/document-api.mdx#validate) и при сохранении.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Signup extends Entity {
+  @Prop(() => String, { required: true }) // [!code highlight]
+  login!: string;
+}
+const Signups = client.db().model(Signup);
+try {
+  await Signups.create({} as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "login": the field is required [required]
+```
+
+Ошибка — [`ValidationError`](../errors/data-errors.mdx#validationerror) с причиной `required`. Подробнее о том, чем отсутствие поля отличается от `null`, — в руководстве [Обязательность, `null` и отсутствие](../../schemas/required-and-null.mdx).
+
+---
+
+## nullable
+
+`nullable: true` объявляет, что `null` — допустимое значение поля. Без неё `null` на поле не проходит: отсутствие поля и явный `null` в MongoDB разные состояния, и Typemo не смешивает их молча. Применима ко всем типам. Тип поля при этом должен содержать `| null`, и компилятор проверяет это в обе стороны.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Profile extends Entity {
+  @Prop(() => String, { nullable: true }) // [!code highlight]
+  nickname?: string | null;
+}
+const Profiles = client.db().model(Profile);
+const profile = await Profiles.create({ nickname: null });
+console.log(profile.nickname);
+// → null
+```
+
+Если вы забыли `| null` в типе, компилятор скажет, что опция требует его:
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+// @errors: 1240
+@Schema()
+class Wrong extends Entity {
+  @Prop(() => String, { nullable: true })
+  nickname?: string;
+}
+```
+
+Текст ошибки внутри сообщения: `@Prop "nickname": "nullable" is set, but the field type has no "| null"`. Обратный случай — `| null` в типе без `nullable: true` — даёт `@Prop "nickname": the field type has "| null", add nullable: true`.
+
+Если `null` пришёл на поле без `nullable`, приведение типа бросает [`CastError`](../errors/data-errors.mdx#casterror): `Cast to string failed at path "role" for null: null is not allowed on a path that is not nullable [null]`.
+
+С [`required: true`](#required) `nullable` образует пару «ключ обязателен, значение может быть `null`»: документ без ключа не сохранится (`Validation failed: "phone": the field is required [required]`), `null` проходит, а `$unset` такого поля запрещён (`Validation failed: "phone": the field is required; $unset would remove it [required]`). Тип поля при этом `T | null` без `?`. Разбор с примерами — в руководстве [Обязательность, `null` и отсутствие](../../schemas/required-and-null.mdx).
+
+---
+
+## default
+
+`default` задаёт значение, которое подставляется, когда поля нет во входных данных. Принимает значение или функцию без аргументов; функция вызывается заново для каждого документа, поэтому `() => new Date()` даёт свежую дату, а массив-литерал копируется. Применима ко всем типам. Поле должно быть объявлено как `Defaulted<T>`: этот [маркер](./field-markers.mdx#defaulted) сообщает типу, что при создании поле можно не передавать, а при чтении оно всегда есть. Для поля-массива маркер не нужен: массив без значения и без `default` сам становится пустым (`[]`), поэтому `tags!: string[]` с `default: () => ["new"]` компилируется, а `Defaulted<string[]>` разрешён, но не обязателен.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Member extends Entity {
+  @Prop(() => String, { enum: ["user", "admin"] as const, default: "user" }) // [!code highlight]
+  role!: Defaulted<"user" | "admin">;
+}
+const Members = client.db().model(Member);
+const member = await Members.create({});
+console.log(member.role);
+// → user
+```
+
+Значение по умолчанию проверяется при сборке модели. `default: "x"` на числовом поле — `ConfigurationError`: `D1.a: the "default" value is not a value of the field (got "x" (string)): expected a number [type]`. `default: null` разрешён только вместе с `nullable: true`, иначе: `D2.a: "default: null" on a field that is not nullable`.
+
+Компилятор следит за парой `default` и `Defaulted<T>`:
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+// @errors: 1240
+@Schema()
+class Wrong extends Entity {
+  @Prop(() => Number, { default: 5 })
+  score!: number;
+}
+```
+
+Сообщение: `@Prop "score": "default" is set, declare the field as Defaulted<T>`. Наоборот, `Defaulted<T>` без `default` — `the field is Defaulted<T>, but "default" is missing`.
+
+---
+
+## immutable
+
+`immutable: true` запрещает менять значение после создания документа. Применима ко всем типам, поле объявляется как `Immutable<T>`. Подходит для того, что не должно меняться никогда: страна регистрации, идентификатор во внешней системе, дата создания.
+
+Оператор обновления на таком поле останавливает уже компилятор: неизменяемое поле не входит в допустимые пути `$set`.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+// @errors: 2769
+@Schema()
+class Account extends Entity {
+  @Prop(() => String, { immutable: true }) // [!code highlight]
+  country?: Immutable<string>;
+}
+const Accounts = client.db().model(Account);
+await Accounts.updateOne({ country: "PL" }, { $set: { country: "DE" } });
+```
+
+Если обновление собрано в коде без типов, то же самое поймает Typemo во время работы:
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Account extends Entity {
+  @Prop(() => String, { immutable: true })
+  country?: Immutable<string>;
+}
+const Accounts = client.db().model(Account);
+try {
+  await Accounts.updateOne({ country: "PL" }, { $set: { country: "DE" } } as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → $set.country: "country" is immutable; it is written only when the document is created ($setOnInsert on upsert) [immutable]
+```
+
+Присваивание в загруженном документе не бросает ошибку сразу, но сохранить такое изменение нельзя. Во всех случаях ошибка — [`StrictModeError`](../errors/data-errors.mdx#strictmodeerror) с причиной `immutable`; `$save` после изменения поля бросает ту же ошибку с тем же текстом. При upsert значение поля записывается только через `$setOnInsert`. Замена документа целиком ([`replaceOne`](../writes/writes.mdx#replaceone)) должна нести сохранённое значение поля, а если поля в документе нет, не передавать его: расхождение сравнивает сервер, и замена с ним не записывается. Подробнее — в руководстве [Неизменяемые поля](../../schemas/immutable.mdx).
+
+---
+
+## hidden
+
+`hidden: true` убирает поле из результатов запросов, если вы не выбрали его явно. Так хеш пароля или служебный токен не уходят в ответ по ошибке. Применима ко всем типам, поле объявляется как `Hidden<T>`, и тип результата тоже не содержит его. Опция заменяет `select: false` из Mongoose.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { hidden: true }) // [!code highlight]
+  passwordHash?: Hidden<string>;
+}
+const Users = client.db().model(User);
+const visible = await Users.find({ name: "gina" }).plain();
+// → [{ _id: "…", name: "gina" }]
+const selected = await Users.find({ name: "gina" }).select({ passwordHash: 1 }).lean();
+// → [{ _id: ObjectId("…"), passwordHash: "h" }]
+const all = await Users.find({ name: "gina" }).select({ "+passwordHash": true }).plain({ hidden: true });
+// → [{ _id: "…", name: "gina", passwordHash: "h" }]
+```
+
+Поле читается, если выбрать его явно: `select({ passwordHash: 1 })` даёт только его и `_id`, а `select({ "+passwordHash": true })` добавляет его к обычным полям. Но виды, которые уходят за пределы приложения, скрытое поле не отдают даже после такого выбора: `.plain()` и `$toPlain()` всегда убирают его, и показывают его только `.plain({ hidden: true })` и `.lean()`.
+
+Пара `hidden: true` и `Hidden<T>` проверяется компилятором: `@Prop "passwordHash": "hidden" is set, declare the field as Hidden<T>` и наоборот `the field is Hidden<T>, add hidden: true`. Руководство: [Скрытые и чувствительные поля](../../schemas/hidden-and-sensitive.mdx).
+
+---
+
+## sensitive
+
+`sensitive` определяет, как значение выглядит **за пределами базы**: в журнале аудита, в событиях наблюдения (а значит, в трассировках) и в текстах ошибок. Применима ко всем типам. Значения:
+
+- `"show"` — показывать настоящее значение;
+- `"mask"` — показывать `?`;
+- `"hide"` — заменить значение (а у условия вроде `$gt` — всё условие) на `[hidden]`: ключ остаётся, поэтому видно, что поле было;
+- `{ mask: (value) => json }` — своя функция маски, типизированная по значению поля.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Payment extends Entity {
+  @Prop(() => String, { sensitive: "mask" }) // [!code highlight]
+  card?: string;
+  @Prop(() => Number, { sensitive: "hide" }) // [!code highlight]
+  cvv?: number;
+}
+const Payments = client.db().model(Payment);
+try {
+  await Payments.create({ card: 5 as never });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to string failed at path "card" for "?" (string): expected a string [type]
+try {
+  await Payments.create({ cvv: "x" as never });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to number failed at path "cvv" for "[hidden]" (string): expected a number [type]
+```
+
+Отметка на поле сильнее настройки подписчика наблюдения. Функция маски вызывается только для значения объявленного типа: значение, которое не удалось привести (число в строковом поле), элемент массива или операнд другого типа показываются как `?` без вызова функции. Если функция бросает ошибку при подготовке события или текста ошибки, операция продолжается и показывается `?`, а сбой доходит до подписчиков событием `instrumentation.error` (без подписчиков — в `console.error`). В журнале аудита такой сбой — [`AuditError`](../errors/configuration-errors.mdx#auditerror): запись журнала не создана, транзакция откатывается вместе с самой записью. Подробнее о том, где маскировка действует, — в руководстве [Скрытые и чувствительные поля](../../schemas/hidden-and-sensitive.mdx).
+
+---
+
+## dbName
+
+`dbName` задаёт имя поля в базе, если оно отличается от имени свойства класса. Применима ко всем типам. Значение — непустая строка без точки и без `$` в начале. В коде, фильтрах и результатах вы работаете с именем свойства; имя из `dbName` видно только в самой базе.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Contact extends Entity {
+  @Prop(() => String, { dbName: "e" }) // [!code highlight]
+  email?: string;
+}
+const Contacts = client.db().model(Contact);
+await Contacts.create({ email: "a@b.c" });
+const rows = await Contacts.find({ email: "a@b.c" }).plain();
+console.log(rows[0]?.email);
+// → a@b.c
+console.log(Contacts.schema.toDbPath("email"));
+// → e
+```
+
+Через драйвер тот же документ выглядит как `{ e: "a@b.c" }`. Два поля с одним `dbName`, а также `dbName`, совпадающий с именем другого поля, — `ConfigurationError` (`fields "a" and "b" are both stored as "x" (dbName conflict)`). У `_id` `dbName` быть не может.
+
+---
+
+## enum
+
+`enum` ограничивает значения строки или числа заданным списком. Принимает массив или объект (подойдёт TypeScript `enum`: берутся его значения). У массива опция применяется к каждому элементу. Поле с типом-объединением литералов (`"user" | "admin"`) обязано иметь `enum` с теми же значениями, а поле с `enum` обязано иметь такой тип: компилятор проверяет совпадение.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Member extends Entity {
+  @Prop(() => String, { enum: ["user", "admin"] as const, default: "user" }) // [!code highlight]
+  role!: Defaulted<"user" | "admin">;
+}
+const Members = client.db().model(Member);
+try {
+  await Members.create({ role: "root" as never });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "role": must be one of "user", "admin" [enum]
+```
+
+Компилятор ловит расхождения: без `enum` у поля с литералами — `@Prop "role": the field is a literal union, list its members in "enum"`, а если список не совпадает с типом — `"enum" values differ from the field's literal union`. При сборке пустой список — `"enum" is empty`, а значение, которое не годится для типа поля, — `the enum value 1 is not a value of the field`.
+
+---
+
+## min
+
+`min` — нижняя граница значения. Применима к `Number`, `Types.Double`, `Types.Int32` (число), `BigInt` (`bigint`) и `Date` (дата). Значение границы должно быть значением того же типа, что поле.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Person extends Entity {
+  @Prop(() => Date, { min: new Date("2020-01-01") }) // [!code highlight]
+  born?: Date;
+}
+const People = client.db().model(Person);
+try {
+  await People.create({ born: new Date("2019-01-01") });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "born": must be at least 2020-01-01T00:00:00.000Z [min]
+```
+
+Граница не того типа или `min` больше `max` — `ConfigurationError`: `"min" is greater than "max"`.
+
+---
+
+## max
+
+`max` — верхняя граница; те же типы и правила, что у [`min`](#min).
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Person extends Entity {
+  @Prop(() => Number, { min: 0, max: 150 }) // [!code highlight]
+  age?: number;
+}
+const People = client.db().model(Person);
+try {
+  await People.create({ age: 200 });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "age": must be at most 150 [max]
+```
+
+---
+
+## minLength
+
+`minLength` — минимальная длина строки, неотрицательное целое. Применима к `String`. Проверка идёт после `trim` и смены регистра, поэтому пробелы по краям не считаются.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Signup extends Entity {
+  @Prop(() => String, { minLength: 3 }) // [!code highlight]
+  login?: string;
+}
+const Signups = client.db().model(Signup);
+try {
+  await Signups.create({ login: "ab" });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "login": must be at least 3 characters long [minLength]
+```
+
+Нецелое или отрицательное число, а также `minLength` больше `maxLength` — `ConfigurationError` (`"minLength"/"maxLength" must be non-negative integers`, `"minLength" is greater than "maxLength"`).
+
+---
+
+## maxLength
+
+`maxLength` — максимальная длина строки; правила те же, что у [`minLength`](#minlength).
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Signup extends Entity {
+  @Prop(() => String, { maxLength: 20 }) // [!code highlight]
+  login?: string;
+}
+const Signups = client.db().model(Signup);
+try {
+  await Signups.create({ login: "x".repeat(30) });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "login": must be at most 20 characters long [maxLength]
+```
+
+---
+
+## match
+
+`match` — регулярное выражение, которому должна соответствовать строка. Применима к `String`. Флаги `g` и `y` запрещены: у такого выражения есть состояние (`lastIndex`), и одна и та же проверка давала бы разные ответы на одно значение.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Signup extends Entity {
+  @Prop(() => String, { match: /^[a-z0-9_]+$/ }) // [!code highlight]
+  login?: string;
+}
+const Signups = client.db().model(Signup);
+try {
+  await Signups.create({ login: "a b c" });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "login": must match /^[a-z0-9_]+$/ [match]
+```
+
+С флагом `g` при сборке модели: `"match" with the g or y flag is stateful (lastIndex); remove the flag`.
+
+---
+
+## trim
+
+`trim: true` обрезает пробелы по краям строки при присваивании. Применима к `String`. Обрезка идёт до `lowercase`, `uppercase` и до проверок длины и `match`.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Signup extends Entity {
+  @Prop(() => String, { trim: true }) // [!code highlight]
+  login?: string;
+}
+const Signups = client.db().model(Signup);
+const signup = await Signups.create({ login: "  alice  " });
+console.log(signup.login);
+// → alice
+```
+
+---
+
+## lowercase
+
+`lowercase: true` приводит строку к нижнему регистру при присваивании. Применима к `String`. Вместе с `uppercase` не работает.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Signup extends Entity {
+  @Prop(() => String, { trim: true, lowercase: true }) // [!code highlight]
+  login?: string;
+}
+const Signups = client.db().model(Signup);
+const signup = await Signups.create({ login: "  Alice_1 " });
+console.log(signup.login);
+// → alice_1
+```
+
+Обе опции сразу — `ConfigurationError`: `"lowercase" and "uppercase" together`.
+
+---
+
+## uppercase
+
+`uppercase: true` приводит строку к верхнему регистру при присваивании; те же типы и ограничения, что у [`lowercase`](#lowercase). Удобна для кодов вроде страны или валюты.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Price extends Entity {
+  @Prop(() => String, { uppercase: true, minLength: 3, maxLength: 3 }) // [!code highlight]
+  currency?: string;
+}
+const Prices = client.db().model(Price);
+const price = await Prices.create({ currency: "eur" });
+console.log(price.currency);
+// → EUR
+```
+
+---
+
+## validate
+
+`validate` — своя проверка значения: функция или список функций. Функция получает значение и контекст и возвращает `true`, если всё хорошо, или строку с текстом ошибки. Она может быть асинхронной. Применима ко всем типам; запускается после приведения типа и только для значений, не равных `null` (отсутствие и `null` — дело [`required`](#required) и [`nullable`](#nullable)). Из списка выполняются все проверки, и в ошибке будут все сообщения.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Contact extends Entity {
+  @Prop(() => String, { validate: (value) => value.includes("@") || "must contain @" }) // [!code highlight]
+  email?: string;
+}
+const Contacts = client.db().model(Contact);
+try {
+  await Contacts.create({ email: "nope" });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "email": must contain @ [validator]
+```
+
+Второй аргумент — контекст проверки (см. ниже): по нему проверка узнаёт, где она запущена. Для целого документа это `{ kind: "document", operation, path }`, для значения, записанного оператором обновления, — `{ kind: "update", operation, operator, path, upsert, filter }`. Проверка выполняется и при обновлении: `updateOne` со `$set` вызвал ту же функцию с контекстом `update:updateOne`. Не-функция в `validate` — `ConfigurationError`.
+
+### Контекст проверки
+
+Контекст — объект одного из двух видов, которые различаются полем `kind`: `"document"` или `"update"`. Типы экспортируются из `@venloc/typemo`: `DocumentValidationContext`, `UpdateValidationContext`, их объединение `ValidationContext` и тип самой функции `FieldValidator<V>`, так что общий валидатор можно вынести в отдельную функцию с точными типами.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Contact extends Entity {
+  @Prop(() => String, {
+    validate: async (value, context) =>
+      value !== "bad" || `rejected in ${context.kind}:${context.operation}`,
+  })
+  email?: string;
+}
+const Contacts = client.db().model(Contact);
+try {
+  await Contacts.create({ email: "bad" });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "email": rejected in document:save [validator]
+try {
+  await Contacts.updateOne({ email: "a@b.c" }, { $set: { email: "bad" } });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "email": rejected in update:updateOne [validator]
+```
+
+---
+
+## get
+
+`get` — функция, которая преобразует значение при **чтении через `$get`** и при сериализации с параметром `getters: true` (`$toObject`, `$toJSON`, `$toPlain`). Применима ко всем типам, принимает значение и возвращает значение того же типа.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Label extends Entity {
+  @Prop(() => String, { get: (value) => `${value}!`, set: (value) => value.toUpperCase() })
+  tag?: string;
+}
+const Labels = client.db().model(Label);
+const label = Labels.new({ tag: "abc" });
+console.log(label.tag);
+// → ABC
+console.log(label.$get("tag"));
+// → ABC!
+```
+
+Обратите внимание: обычное чтение свойства (`label.tag`) `get` не вызывает: он срабатывает только через `$get` и при сериализации с `getters: true`. Результат `lean()` и значения, которые уходят в базу, через него тоже не проходят.
+
+---
+
+## set
+
+`set` — функция, которая преобразует значение при присваивании, **после** приведения типа и встроенных преобразований (`trim`, `lowercase`, `uppercase`). Применима ко всем типам. В примере выше `set` перевёл `"abc"` в `"ABC"` уже при `Labels.new`.
+
+---
+
+## index
+
+`index` создаёт одиночный индекс по полю. Значения: `true` и `1` — по возрастанию, `-1` — по убыванию, `"hashed"` — хешированный. Применима ко всем типам. Составные индексы описываются декоратором [`@Index`](./index-decorators.mdx#index).
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Event extends Entity {
+  @Prop(() => String, { index: -1 }) // [!code highlight]
+  kind?: string;
+}
+const Events = client.db().model(Event);
+console.log(Events.schema.describe().indexes);
+// → [{ keys: { kind: -1 }, options: {} }]
+```
+
+Другое значение — `ConfigurationError`: `"index" must be true, 1, -1 or "hashed"`. Индекс по `_id` запрещён: сервер и так строит его уникальным.
+
+---
+
+## unique
+
+`unique: true` создаёт уникальный индекс: сервер не даст записать второй документ с тем же значением. Применима ко всем типам. Опция требует одного из трёх условий: `required: true`, `sparse: true` или частичного `@Index`. Причина в MongoDB: документы без поля индексируются как `null`, и второй такой документ упал бы с ошибкой дубликата.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Account extends Entity {
+  @Prop(() => String, { unique: true, required: true }) // [!code highlight]
+  code!: string;
+}
+const Accounts = client.db().model(Account);
+console.log(Accounts.schema.describe().indexes);
+// → [{ keys: { code: 1 }, options: { unique: true } }]
+```
+
+Без `required` и `sparse` при сборке модели:
+
+```text
+ConfigurationError: Account.nickname: "unique" on a field that is not required — every document without it is indexed as null and the second one fails (E11000); add required: true, sparse: true or use a partial @Index
+```
+
+`unique` на поле с `nullable: true` тоже запрещён: значения `null` конфликтуют даже в разреженном индексе (`"unique" on a nullable field — null values collide even in a sparse index; use a partial @Index`). Нарушение уникальности во время записи — [`DuplicateKeyError`](../errors/server-errors.mdx#duplicatekeyerror).
+
+---
+
+## sparse
+
+`sparse: true` делает индекс поля разреженным: в него попадают только документы, у которых поле есть. Применима ко всем типам, но только вместе с `index` или `unique`: сама по себе она не создаёт индекс, и `sparse` без них — `ConfigurationError` (`"sparse" needs "index" or "unique"`).
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Account extends Entity {
+  @Prop(() => String, { unique: true, sparse: true }) // [!code highlight]
+  nickname?: string;
+}
+const Accounts = client.db().model(Account);
+console.log(Accounts.schema.describe().indexes);
+// → [{ keys: { nickname: 1 }, options: { unique: true, sparse: true } }]
+```
+
+---
+
+## expires
+
+`expires` — время жизни документа в секундах после значения даты. Применима к `Date` и к массивам дат. Под неё строится TTL-индекс: MongoDB сама удаляет документ, когда указанное время прошло. Значение — неотрицательное целое число; иначе `ConfigurationError` (`"expires" is a non-negative whole number of seconds`).
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Session extends Entity {
+  @Prop(() => Date, { expires: 3600 }) // [!code highlight]
+  lastSeen?: Date;
+}
+const Sessions = client.db().model(Session);
+console.log(Sessions.schema.describe().indexes);
+// → [{ keys: { lastSeen: 1 }, options: { expireAfterSeconds: 3600 } }]
+```
+
+Сервер проверяет TTL примерно раз в минуту, поэтому документ исчезает не мгновенно.
+
+---
+
+## text
+
+`text: true` включает поле в текстовый индекс коллекции. Применима к `String` и к массивам строк. В коллекции может быть только один текстовый индекс, поэтому поля с `text: true` объединяются в один индекс; отдельный текстовый `@Index` рядом с ними — `ConfigurationError` (`a collection has at most one text index; "text: true" fields are merged into one, ...`).
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Article extends Entity {
+  @Prop(() => String, { text: true }) // [!code highlight]
+  title?: string;
+  @Prop(() => String, { text: true }) // [!code highlight]
+  body?: string;
+}
+const Articles = client.db().model(Article);
+console.log(Articles.schema.describe().indexes);
+// → [{ keys: { title: "text", body: "text" }, options: {} }]
+```
+
+Веса и язык текстового индекса задаются в [`@Index`](./index-decorators.mdx#index) через `weights`, `default_language` и `language_override`, но тогда `text: true` на полях не используется.
+
+---
+
+## excludeIndexes
+
+`excludeIndexes: true` отключает индексы, объявленные внутри класса поддокумента, для этого поля. Применима к полю, тип которого — класс с `@Schema`. Она нужна, когда один и тот же поддокумент встроен в несколько коллекций и индексы нужны не везде.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Address {
+  @Prop(() => String, { index: true })
+  city?: string;
+}
+@Schema()
+class Shop extends Entity {
+  @Prop(() => Address)
+  address?: Address;
+}
+@Schema()
+class Draft extends Entity {
+  @Prop(() => Address, { excludeIndexes: true }) // [!code highlight]
+  address?: Address;
+}
+const Shops = client.db().model(Shop);
+const Drafts = client.db().model(Draft);
+console.log(Shops.schema.describe().indexes);
+// → [{ keys: { "address.city": 1 }, options: {} }]
+console.log(Drafts.schema.describe().indexes);
+// → []
+```
+
+---
+
+## ref
+
+`ref` связывает поле со ссылкой на документ другой модели: `ref: () => User`. Применима к `String`, числам, `Types.ObjectId`, `Types.UUID` (тип `_id` целевой модели), к массивам таких значений и к значениям `Spec.map`. Поле объявляется как [`Ref<M>`](./field-markers.mdx#ref), и компилятор сверяет, что модель в `ref` та же, что в типе поля. Функция, а не класс, нужна из-за порядка объявления.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Author extends Entity {
+  @Prop(() => String) name?: string;
+}
+@Schema()
+class Post extends Entity {
+  @Prop(() => Types.ObjectId, { ref: () => Author }) // [!code highlight]
+  author?: Ref<Author>;
+}
+const Authors = client.db().model(Author);
+const Posts = client.db().model(Post);
+const post = await Posts.findOne({}).populate("author").orFail();
+console.log((post.author as { name?: string }).name);
+// → Ann
+```
+
+Ошибки компиляции: `ref` без `Ref<M>` в типе — `@Prop "author": "ref" is set, but the field type is not Ref<Model>`; `Ref<M>` без `ref` — `the field is Ref<Model>, add ref: () => Model`; другая модель — `"ref" points to another model than the field's Ref<Model>`. Руководство: [Ссылки на другие модели](../../schemas/references.mdx).
+
+---
+
+## refPath
+
+`refPath` нужна, когда поле может ссылаться на модели разных классов. Значение — путь к полю **того же документа** (или поддокумента), в котором лежит имя класса целевой модели: `"User"` или `"Bot"`. Поле объявляется как `Ref<A | B>`, обе модели должны быть зарегистрированы на соединении.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Comment extends Entity {
+  @Prop(() => String) kind?: string;
+  @Prop(() => Types.ObjectId, { refPath: "kind" }) // [!code highlight]
+  target?: Ref<Author | Bot>;
+}
+@Schema()
+class Author extends Entity {
+  @Prop(() => String) name?: string;
+}
+@Schema()
+class Bot extends Entity {
+  @Prop(() => String) name?: string;
+}
+const Comments = client.db().model(Comment);
+const comment = await Comments.findOne({ kind: "Bot" }).populate("target").orFail();
+console.log((comment.target as { name?: string }).name);
+// → R2
+```
+
+`ref`, `refPath` и `refModel` взаимоисключающие: две сразу — `ConfigurationError` (`"ref", "refPath" and "refModel" are exclusive (one form of reference)`).
+
+---
+
+## refModel
+
+`refModel` — то же, что [`refPath`](#refpath), но модель выбирает ваша функция. Она получает документ (или поддокумент), в котором лежит ссылка, и идентификатор, и возвращает класс модели. Так удобно, когда правило выбора сложнее, чем «имя класса в поле».
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema()
+class Author extends Entity {
+  @Prop(() => String) name?: string;
+}
+@Schema()
+class Bot extends Entity {
+  @Prop(() => String) name?: string;
+}
+@Schema()
+class Action extends Entity {
+  @Prop(() => String) kind?: string;
+  @Prop(() => Types.ObjectId, { refModel: (owner) => ((owner as Action).kind === "Bot" ? Bot : Author) }) // [!code highlight]
+  actor?: Ref<Author | Bot>;
+}
+const Actions = client.db().model(Action);
+const action = await Actions.findOne({ kind: "Bot" }).populate("actor").orFail();
+console.log((action.actor as { name?: string }).name);
+// → R2
+```
+
+---
+
+## ext
+
+`ext` хранит опции зарегистрированных расширений: метаданные для интеграций, проверенные самим расширением и замороженные после сборки. Ключ — имя расширения. Опция не может изменить операцию или политику ядра: расширение читает её через [`SchemaInfo.extOf`](./schema-info.mdx#extof). Незарегистрированный ключ — ошибка компиляции на этом ключе.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+// @errors: 2322
+@Schema()
+class Wrong extends Entity {
+  @Prop(() => String, { ext: { nope: 1 } })
+  title?: string;
+}
+```
+
+О том, как объявить расширение и его опции, — в руководстве [Свои опции полей и схем](../../extensions/custom-options.mdx).
+
+---
+
+## Ошибки, общие для всех опций
+
+Тип, которого нет в списке поддерживаемых, — ошибка компиляции с готовым советом:
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type TenantField, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+// @errors: 1240
+@Schema()
+class Wrong extends Entity {
+  @Prop(() => Set)
+  tags!: Set<string>;
+}
+```
+
+Внутри сообщения: `@Prop "tags": this type is not supported (no Set/Map/Array/Object: use [X], Spec.map(X) or a @Schema class)`. Похожие проверки: `the runtime type () => X does not match the field type` (тип из функции не совпадает с типом поля), `a VirtualRef field is declared with @Virtual, not @Prop`, `not a public field (private and protected fields cannot be schema fields)`.
+
+`@Prop` на методе или аксессоре — `ConfigurationError` при объявлении класса: `Account: @Prop on "m", which is a method or an accessor (getters are virtuals and need no decorator)`. Значение сразу при объявлении (`a: number = 5`) — при сборке модели: `Account: field(s) "a" get a value from an initializer or the constructor; use the "default" option — service fields are filled by Typemo`. `Set` как тип поля в коде без типов — `Account.a: Set is not supported: use an array [X] (with a unique validator if needed)`.
+
+Обратное нарушение: собственное свойство данных **без** `@Prop` (например, `note = "x"` или поле без инициализатора при `useDefineForClassFields: true`) — `ConfigurationError` при сборке: `Account: property "note" has no @Prop, so it is not a field of the schema (never stored, cast or loaded); decorate it with @Prop, declare it with "declare", or make it a getter or a method`. Методы, геттеры и неперечисляемые свойства не считаются.
+
+## Когда не подходит
+
+`@Prop` описывает поле, которое хранится в базе. Значение, вычисляемое из других полей, — это геттер класса с типом [`Computed<T>`](./field-markers.mdx#computed) без декоратора. Ссылка, которая подтягивает документы по обратной связи и ничего не хранит, — [`@Virtual`](./virtual.mdx#virtual). Составной или частичный индекс — [`@Index`](./index-decorators.mdx#index). Настройки всей коллекции — [`@Schema`](./schema.mdx#schema).
+
+## Что дальше
+
+<Cards>
+<Card title="Описать модель" href="../../schemas/define-model.mdx">
+  `@Schema`, `@Prop`, `Entity` и то, откуда берётся тип поля.
+</Card>
+<Card title="Валидация полей" href="../../schemas/validation.mdx">
+  `min`, `max`, `enum`, `match` и свой `validate` на реальных задачах.
+</Card>
+<Card title="Маркерные типы полей" href="./field-markers.mdx">
+  `Defaulted`, `Hidden`, `Immutable`, `Ref` и остальные маркеры, которые идут в паре с опциями.
+</Card>
+</Cards>

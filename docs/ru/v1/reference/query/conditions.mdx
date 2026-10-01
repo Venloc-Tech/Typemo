@@ -1,0 +1,907 @@
+---
+title: Условия цепочкой
+description: "where, and, or, nor, merge и методы цепочки where(path): как собирать фильтр по частям и как при этом сужается тип результата"
+icon: ListFilter
+---
+
+Фильтр не обязан быть одним объектом. К запросу, который вернул [`find`](./reading.mdx#modelfind), можно добавлять условия по одному: [`.where`](#where), [`.and`](#and), [`.or`](#or), [`.nor`](#nor), [`.merge`](#merge). Так удобно, когда условия появляются в разных местах кода: одна функция добавляет ограничение по правам пользователя, другая — фильтр из параметров URL. Дополнительно у `.where("поле")` есть цепочка методов вроде `.gte(18).lt(65)`, которая записывает условия на одно поле.
+
+Если вы только начинаете, сначала прочитайте руководство [Фильтры](../../queries/filters.mdx). Эта страница — справочник. Сами операторы (`$gte`, `$in` и другие) описаны в справочнике [Операторы фильтра](./filter-operators.mdx).
+
+Все примеры используют одну модель участника. В ней есть поле с конечным набором значений (`role`), необязательная строка, необязательное число и массив:
+
+```ts twoslash title="models/member.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "members" })
+export class Member extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true })
+  role!: "user" | "editor" | "admin";
+
+  @Prop(() => String)
+  nickname?: string;
+
+  @Prop(() => Number)
+  age?: number;
+
+  @Prop(() => [String])
+  tags!: string[];
+}
+```
+
+В коллекции три участника: Alice (роль `admin`, ник `al`, 30 лет, теги `admin` и `dev`), Bob (роль `user`, без ника, 17 лет, тег `dev`) и Carol (роль `editor`, ник `cc`, 30 лет, без тегов). Результаты в комментариях `// →` — имена найденных участников по алфавиту.
+
+Все методы этой страницы есть у строителя запроса, а не у модели, и ни один из них не меняет строитель, у которого вызван: каждый возвращает новый. Условия, добавленные разными методами, объединяются через «и». Готовый объединённый фильтр строителя возвращает метод `filter()`, и в примерах ниже он показывает, что получилось.
+
+---
+
+## .where
+
+`.where` добавляет условия к запросу. Он умеет две вещи, которые различает по аргументу: принять целый фильтр (объект) или начать цепочку условий на одном поле (строка с путём).
+
+### .where(filter)
+
+С объектом `.where` работает как фильтр в [`find`](./reading.mdx#modelfind): условия добавляются к уже заданным и объединяются через «и». Если у обоих фильтров есть один и тот же ключ, условия не заменяют друг друга, а выполняются оба.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const found = await Members.find({ role: "admin" }).where({ age: 30 }).plain();
+console.log(found.map((member) => member.name));
+// → ["Alice"]
+
+const none = await Members.find({ age: 17 }).where({ age: 30 }).plain();
+console.log(none.length);
+// → 0
+```
+
+Во втором запросе ни один участник не может быть одновременно моложе 18 и ровно в 30 лет, и ответ пустой, а не «последнее слово побеждает».
+
+<Returns type="QueryBuilder">
+
+Новый строитель с объединённым фильтром. Тип результата не меняется.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+Условия, такие же, как в [`find`](./reading.mdx#modelfind), и проверяются они так же: неизвестное поле, значение не того типа, `undefined` и оператор вместо значения не допускаются. Не объект приводит к `QueryError` с текстом `filter: an object`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+where<F extends Filter<T, true>>(
+  filter: F & NoInfer<FilterCheck<T, F>>,
+): QueryBuilder<T, Op, S, E, Form, Found, N, X>
+```
+
+</FullType>
+
+### .where(path)
+
+С путём `.where` начинает цепочку условий на одном поле. Методы цепочки (`equals`, `gte`, `in` и другие, они описаны ниже) добавляют операторы к этому полю. Это удобно, когда границы диапазона приходят из разных источников или когда запись `.where("age").gte(18).lt(65)` читается лучше, чем `{ age: { $gte: 18, $lt: 65 } }`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const query = Members.find().where("age").gte(17).lt(30);
+console.log(query.filter());
+// → { age: { $gte: 17, $lt: 30 } }
+
+const found = await query.plain();
+console.log(found.map((member) => member.name));
+// → ["Bob"]
+```
+
+Операторы одного поля накапливаются в одном объекте: обратите внимание, что `$gte` и `$lt` оказались вместе в `age`. Если оператор для этого поля повторяется, второй раз он не заменяет первый, а добавляется отдельным условием через «и»:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const query = Members.find().where("age").gte(17).gte(20);
+console.log(query.filter());
+// → { $and: [{ age: { $gte: 17 } }, { age: { $gte: 20 } }] }
+```
+
+Цепочка заканчивается, как только вы вызываете любой другой метод строителя: `.sort`, `.limit`, `.plain` и так далее возвращают обычный строитель. Новый `.where(path)` начинает цепочку на другом поле:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const query = Members.find().where("age").gte(17).where("name").equals("Bob");
+console.log(query.filter());
+// → { age: { $gte: 17 }, name: { $eq: "Bob" } }
+```
+
+<Returns type="WhereBuilder">
+
+Строитель с теми же методами, что у обычного, и с методами цепочки поля: [`equals`](#equals), [`ne`](#ne), [`in`](#in), [`nin`](#nin), [`gt`, `gte`, `lt`, `lte`](#gt-gte-lt-lte), [`exists`](#exists), [`regex`](#regex), [`mod`](#mod), [`size`](#size), [`all`](#all), [`elemMatch`](#elemmatch).
+
+</Returns>
+
+<Params>
+<Param name="path" type="путь к полю модели" required>
+
+Поле, на которое пишутся условия. Компилятор подскажет доступные пути, включая вложенные через точку. Пустая строка приводит к `QueryError` с текстом `where: an empty path`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+where<const P extends FilterPaths<T>>(
+  path: P,
+): WhereBuilder<T, Op, S, E, Form, Found, N, X, P, FilterValue<T, P>>
+```
+
+</FullType>
+
+### Когда `.where` не подходит
+
+Для гео-операторов (`$near`, `$geoWithin` и других) у цепочки методов нет: используйте `.where(filter)` с объектом, например `.where({ place: { $near: … } })`. Операторы, которых нет в цепочке (`$type`, `$not`, `$expr`, `$jsonSchema`, битовые), тоже пишутся объектом: их описание — в справочнике [Операторы фильтра](./filter-operators.mdx).
+
+---
+
+## .and
+
+`.and` требует, чтобы выполнились все условия списка. Список не может быть пустым. Для условий на разные поля он не нужен: `.where` с объектом объединяет их через «и» сам. Он полезен, когда список условий собирается в коде из частей.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const found = await Members.find().and([{ age: 30 }, { role: "editor" }]).plain();
+console.log(found.map((member) => member.name));
+// → ["Carol"]
+```
+
+<Returns type="QueryBuilder">
+
+Новый строитель. Условие добавляется к уже заданным и объединяется с ними через «и».
+
+</Returns>
+
+<Params>
+<Param name="clauses" type="NonEmptyArray<Filter<T>>" required>
+
+Список фильтров, каждый из которых проверяется как фильтр в [`find`](./reading.mdx#modelfind). Пустой список приводит к `QueryError` с текстом `and: $and must be a non-empty array (at "$and")`: сервер отвергает пустой `$and`, а собранный из данных список легко оказывается пустым.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+and<C extends NonEmptyArray<Filter<T, true>>>(
+  clauses: C & NoInfer<FilterCheck<T, { $and: C }>>,
+): QueryBuilder<T, Op, S, E, Form, Found, N, X>
+```
+
+</FullType>
+
+---
+
+## .or
+
+`.or` требует, чтобы выполнилось хотя бы одно условие списка. Он объединяется с остальными условиями запроса через «и», то есть ограничивает результат, а не расширяет его.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const found = await Members.find().or([{ role: "admin" }, { age: { $lt: 18 } }]).sort({ name: 1 }).plain();
+console.log(found.map((member) => member.name));
+// → ["Alice", "Bob"]
+
+const narrowed = await Members.find({ age: 30 }).or([{ role: "admin" }, { role: "user" }]).plain();
+console.log(narrowed.map((member) => member.name));
+// → ["Alice"]
+```
+
+Во втором запросе условие `age: 30` осталось в силе: `.or` не заменил его, а добавился к нему. Bob подходит под `.or`, но ему не 30, поэтому в результат он не попал.
+
+Два вызова `.or` подряд не объединяются в один список, а работают вместе через «и»: участник должен подойти под оба.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const query = Members.find().or([{ role: "admin" }]).or([{ age: 30 }]);
+console.log(query.filter());
+// → { $and: [{ $or: [{ role: "admin" }] }, { $or: [{ age: 30 }] }] }
+```
+
+<Returns type="QueryBuilder">
+
+Новый строитель.
+
+</Returns>
+
+<Params>
+<Param name="clauses" type="NonEmptyArray<Filter<T>>" required>
+
+Список фильтров. Пустой список приводит к `QueryError` с текстом `or: $or must be a non-empty array (at "$or")`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+or<C extends NonEmptyArray<Filter<T, true>>>(
+  clauses: C & NoInfer<FilterCheck<T, { $or: C }>>,
+): QueryBuilder<T, Op, S, E, Form, Found, N, X>
+```
+
+</FullType>
+
+---
+
+## .nor
+
+`.nor` требует, чтобы не выполнилось ни одно условие списка.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const found = await Members.find().nor([{ role: "admin" }, { role: "user" }]).plain();
+console.log(found.map((member) => member.name));
+// → ["Carol"]
+```
+
+<Returns type="QueryBuilder">
+
+Новый строитель. Условие объединяется с остальными через «и».
+
+</Returns>
+
+<Params>
+<Param name="clauses" type="NonEmptyArray<Filter<T>>" required>
+
+Список фильтров. Пустой список приводит к `QueryError`, как у [`.and`](#and).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+nor<C extends NonEmptyArray<Filter<T, true>>>(
+  clauses: C & NoInfer<FilterCheck<T, { $nor: C }>>,
+): QueryBuilder<T, Op, S, E, Form, Found, N, X>
+```
+
+</FullType>
+
+---
+
+## .merge
+
+`.merge` берёт условия другого запроса или фильтра и добавляет их к текущему. Так можно собрать готовые «куски» запросов, например общий запрос «только активные», и применить его к разным запросам.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const admins = Members.find({ role: "admin" });
+const found = await Members.find({ age: 30 }).merge(admins).plain();
+console.log(found.map((member) => member.name));
+// → ["Alice"]
+
+const sameWithFilter = await Members.find({ age: 30 }).merge({ role: "admin" }).plain();
+console.log(sameWithFilter.map((member) => member.name));
+// → ["Alice"]
+```
+
+Переносятся только условия: сортировка, ограничения и выбор полей другого запроса не копируются.
+
+<Returns type="QueryBuilder">
+
+Новый строитель с объединёнными условиями.
+
+</Returns>
+
+<Params>
+<Param name="source" type="QueryOf<T> | Filter<T>" required>
+
+Запрос **той же модели** или фильтр. Запрос другой модели не принимается ни компилятором, ни во время работы: условия по полям одной модели не имеют смысла для другой.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+merge(source: QueryOf<T>): QueryBuilder<T, Op, S, E, Form, Found, N, X>
+merge<F extends Filter<T, true>>(
+  source: F & NoInfer<FilterCheck<T, F>>,
+): QueryBuilder<T, Op, S, E, Form, Found, N, X>
+```
+
+</FullType>
+
+### Запрос другой модели
+
+Если запрос принадлежит другой модели, компилятор откажет, а во время работы Typemo бросит `QueryError`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+// @errors: 2769
+Members.find().merge(Posts.find({ title: "x" }));
+```
+
+```text
+QueryError: merge: a query of Post cannot be merged into a query of Member
+```
+
+---
+
+## .filter
+
+`.filter` возвращает все условия запроса одним фильтром: то, что вы передали в [`find`](./reading.mdx#modelfind), и то, что добавили через [`.where`](#where), [`.and`](#and), [`.or`](#or), [`.nor`](#nor) и [`.merge`](#merge). Он ничего не отправляет в базу, поэтому пригодится, чтобы посмотреть, что именно собралось, или передать готовый фильтр в другой запрос, например в [`.merge`](#merge).
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+// ---cut---
+const query = Members.find({ role: "admin" }).where("age").gte(17).lt(30);
+console.log(query.filter());
+// → { role: "admin", age: { $gte: 17, $lt: 30 } }
+```
+
+<Returns type="PlanDocument">
+
+Объект-фильтр в том виде, в каком условия были заданы: до приведения значений к типам модели и до условий политик (тенанта, мягкого удаления). Если условий не было, это пустой объект `{}`. Объект заморожен, изменить его нельзя.
+
+</Returns>
+
+Принимает ничего.
+
+<FullType>
+
+```ts
+filter(): PlanDocument
+```
+
+</FullType>
+
+### Фильтр до приведения типов
+
+`.filter` не приводит значения к типам модели, поэтому строка остаётся строкой: у `Members.findById("6abd…")` в фильтре будет `{ _id: "6abd…" }` со строкой, а не с `ObjectId`. Приведение и проверка путей происходят позже, когда запрос выполняется. Поэтому успешный `.filter()` ещё не значит, что запрос пройдёт проверку: опечатка в имени поля обнаружится на `await`.
+
+---
+
+## Цепочка where(path)
+
+После `.where("поле")` доступны методы цепочки. Каждый добавляет один оператор к этому полю и возвращает цепочку, поэтому их можно вызывать подряд. Типы операндов выводятся из типа поля: числовое поле принимает числа, а на строковое `.gte` или `.mod` не подходит.
+
+### .equals
+
+Поле равно значению, как [`$eq`](./filter-operators.mdx#eq). Для поля с конечным набором значений сужает тип результата: см. [Как сужается тип](#как-сужается-тип).
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const admins = await Members.find().where("role").equals("admin").plain();
+console.log(admins.map((member) => member.name));
+// → ["Alice"]
+```
+
+### .ne
+
+Поле не равно значению, как [`$ne`](./filter-operators.mdx#ne). Документы без этого поля тоже подходят. Сужает тип у полей с конечным набором значений.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const notAdmins = await Members.find().where("role").ne("admin").sort({ name: 1 }).plain();
+console.log(notAdmins.map((member) => member.name));
+// → ["Bob", "Carol"]
+```
+
+### .in
+
+Поле равно одному из значений списка, как [`$in`](./filter-operators.mdx#in). Сужает тип: после `.in(["admin", "editor"])` поле `role` в результате имеет тип `"admin" | "editor"`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const staff = await Members.find().where("role").in(["admin", "editor"]).sort({ name: 1 }).plain();
+//    ^?
+console.log(staff.map((member) => member.name));
+// → ["Alice", "Carol"]
+```
+
+### .nin
+
+Поле не равно ни одному значению списка, как [`$nin`](./filter-operators.mdx#nin). Сужает тип: убирает перечисленные значения.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const notAdmins = await Members.find().where("role").nin(["admin"]).sort({ name: 1 }).plain();
+console.log(notAdmins.map((member) => member.name));
+// → ["Bob", "Carol"]
+```
+
+### .gt, .gte, .lt, .lte
+
+Больше, больше или равно, меньше, меньше или равно: [`$gt`](./filter-operators.mdx#gt-gte-lt-lte) и три остальных. Принимают значение с порядком: число, строку, дату, идентификатор. У поля без порядка, например у логического, они не компилируются. Типы результата не меняют.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const adults = await Members.find().where("age").gt(17).sort({ name: 1 }).plain();
+console.log(adults.map((member) => member.name));
+// → ["Alice", "Carol"]
+```
+
+### .exists
+
+Поле есть в документе (`exists()` и `exists(true)`) или его нет (`exists(false)`), как [`$exists`](./filter-operators.mdx#exists). После `exists()` необязательное поле в типе результата становится обязательным.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const withNick = await Members.find().where("nickname").exists().sort({ name: 1 }).plain();
+//    ^?
+console.log(withNick.map((member) => member.name));
+// → ["Alice", "Carol"]
+
+const withoutNick = await Members.find().where("nickname").exists(false).plain();
+console.log(withoutNick.map((member) => member.name));
+// → ["Bob"]
+```
+
+Тип сужается только для необязательных полей верхнего уровня и убирает только `undefined`. Поле, которое может быть `null`, остаётся таким: `{ $exists: true }` находит и документы, в которых поле равно `null`.
+
+### .regex
+
+Строка подходит под регулярное выражение, как [`$regex`](./filter-operators.mdx#regex). Принимает `RegExp` или строку-шаблон; только для строковых полей.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const ab = await Members.find().where("name").regex(/^[AB]/).sort({ name: 1 }).plain();
+console.log(ab.map((member) => member.name));
+// → ["Alice", "Bob"]
+```
+
+Для числового поля метод не компилируется. Если такой вызов пришёл из кода без типов, во время работы Typemo бросает `StrictModeError` с текстом `$regex applies to strings only (at "age.$regex") [sanitize]`.
+
+### .mod
+
+Остаток от деления числа на `divisor` равен `remainder`, как [`$mod`](./filter-operators.mdx#mod). Только для числовых полей.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const roundAges = await Members.find().where("age").mod(10, 0).sort({ name: 1 }).plain();
+console.log(roundAges.map((member) => member.name));
+// → ["Alice", "Carol"]
+```
+
+### .size
+
+В массиве ровно `n` элементов, как [`$size`](./filter-operators.mdx#size). Только для массивов.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const noTags = await Members.find().where("tags").size(0).plain();
+console.log(noTags.map((member) => member.name));
+// → ["Carol"]
+```
+
+### .all
+
+Массив содержит все значения списка, как [`$all`](./filter-operators.mdx#all). Только для массивов.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const both = await Members.find().where("tags").all(["admin", "dev"]).plain();
+console.log(both.map((member) => member.name));
+// → ["Alice"]
+```
+
+### .elemMatch
+
+Один элемент массива подходит под все условия сразу, как [`$elemMatch`](./filter-operators.mdx#elemmatch). Только для массивов: операнд — фильтр вложенного документа или объект операторов над скалярным элементом.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const query = Members.find().where("tags").elemMatch({ $regex: "^d" });
+console.log(query.filter());
+// → { tags: { $elemMatch: { $regex: "^d" } } }
+```
+
+<FullType label="Полные типы методов цепочки">
+
+```ts
+equals<const Y extends WhereOperand<V>>(value: Y): WhereBuilder<…, NarrowIn<N, T, P, Y>, X, P, V>
+ne<const Y extends WhereOperand<V>>(value: Y): WhereBuilder<…, NarrowNotIn<N, T, P, Y>, X, P, V>
+in<const Y extends readonly WhereOperand<V>[]>(values: Y): WhereBuilder<…, NarrowIn<N, T, P, Y[number]>, X, P, V>
+nin<const Y extends readonly WhereOperand<V>[]>(values: Y): WhereBuilder<…, NarrowNotIn<N, T, P, Y[number]>, X, P, V>
+gt(value: OrderOperand<V>): WhereBuilder<…>
+gte(value: OrderOperand<V>): WhereBuilder<…>
+lt(value: OrderOperand<V>): WhereBuilder<…>
+lte(value: OrderOperand<V>): WhereBuilder<…>
+exists(): WhereBuilder<…, NarrowExists<X, P>, P, V>
+exists<const B extends boolean>(present: B): WhereBuilder<…>
+regex(pattern: StringOperand<V>): WhereBuilder<…>
+mod(divisor: ModOperand<V>, remainder: ModOperand<V>): WhereBuilder<…>
+size(n: ArrayOperand<V, number>): WhereBuilder<…>
+all(values: ArrayOperand<V, readonly CompareOf<ElementOf<NonNullable<V>>>[]>): WhereBuilder<…>
+elemMatch(condition: ArrayOperand<V, ElemMatchOperand<ElementOf<NonNullable<V>>>>): WhereBuilder<…>
+```
+
+</FullType>
+
+---
+
+## Как сужается тип
+
+Условие не только отбирает документы, но и говорит компилятору, какими значениями поле может обладать в результате. Поэтому после `.where("role").in(["admin", "editor"])` тип `role` в каждой строке результата — `"admin" | "editor"`, а не все три роли, и код, который проверяет `role === "user"`, компилятор сочтёт ошибочным.
+
+Сужаются методы [`equals`](#equals), [`ne`](#ne), [`in`](#in), [`nin`](#nin) и [`exists`](#exists). Правила у них общие: сужается только поле верхнего уровня, значения которого образуют конечный набор (объединение литералов, `boolean`, значения `enum`). Поле `string` или `number` не сужается: после `.equals("Bob")` тип `name` остался бы литералом `"Bob"`, а это шум без информации. Поле-массив сравнивается по элементам и не сужается.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const notUsers = await Members.find().where("role").ne("user").plain();
+//    ^?
+```
+
+Сужение хранится в запросе и применяется к итоговому типу результата, поэтому порядок вызовов не важен: `.select` после `.where` не теряет сужения.
+
+Условия, заданные не цепочкой, а объектом фильтра (`find({ role: "admin" })`, [`.where(filter)`](#wherefilter)), тип не сужают.
+
+## Когда цепочка не подходит
+
+Если условие пришло готовым объектом (из параметров запроса, из конфигурации), нет смысла разбирать его на цепочку: передайте его в [`.where(filter)`](#wherefilter) или прямо в [`find`](./reading.mdx#modelfind). Цепочка нужна, когда вы записываете условия в коде и хотите сужения типа или более читаемой записи диапазона.

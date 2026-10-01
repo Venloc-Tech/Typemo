@@ -1,0 +1,138 @@
+---
+title: OpenTelemetry
+description: "Как получить спаны и метрики операций Typemo в OpenTelemetry и не отправить данные пользователей"
+icon: Radar
+---
+
+Пакет `@venloc/typemo-opentelemetry` превращает каждую операцию Typemo в **спан** (отрезок трассы с именем, длительностью и атрибутами) и считает метрики длительности и пула соединений. В трассе запроса вы видите, какая операция какой модели заняла время и чем закончилась, без ручных обёрток. Пакет отдельный: ядро ничего не знает про OpenTelemetry.
+
+Если вы впервые работаете с OpenTelemetry, знайте главное: приложение само выбирает SDK, экспортёр и менеджер контекста, а адаптер только создаёт спаны через `@opentelemetry/api`. Подробности API — в [справочнике](../reference/observability/opentelemetry.mdx).
+
+## Что предполагается
+
+В приложении уже настроен SDK OpenTelemetry (провайдер трасс и, для метрик, провайдер метрик), а клиент создан как в [быстром старте](../getting-started/quick-start.mdx). Примеры используют модель счёта из банковского приложения. Блоки кода на этой странице не компилируются сборкой документации, потому что она не подключает пакеты OpenTelemetry; их работа проверена запуском.
+
+## Быстрый путь
+
+```package-install
+@venloc/typemo-opentelemetry @opentelemetry/api
+```
+
+```ts title="telemetry.ts"
+import { TypemoClient } from "@venloc/typemo";
+import { TypemoOpenTelemetry } from "@venloc/typemo-opentelemetry";
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank" });
+const subscription = TypemoOpenTelemetry.instrument(client);
+```
+
+Каждая операция теперь даёт спан `Typemo.find (Account)`, `Typemo.insertOne (Account)` и так далее. Остальная страница разбирает задачи по порядку.
+
+## Чтобы спаны вкладывались друг в друга
+
+Ситуация: спаны есть, но у каждого нет родителя. Так бывает, когда в процессе нет **менеджера контекста**: объекта, который переносит «текущий спан» через `await`. Адаптер делает спан операции активным на время операции, поэтому спаны ваших хуков и подзапросов подгрузки связей вкладываются в него, но только если менеджер зарегистрирован.
+
+```ts title="telemetry.ts"
+import { context, trace } from "@opentelemetry/api";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
+import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
+
+context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
+trace.setGlobalTracerProvider(new BasicTracerProvider({ spanProcessors: [new BatchSpanProcessor(exporter)] }));
+```
+
+Здесь `exporter` — ваш экспортёр. Этот менеджер сохранил контекст на Bun через `await`, внутри транзакции и при её повторе.
+
+Запрос ленив: он берёт активный контекст в момент выполнения, то есть при `await`. Поэтому `context.with(ctx, () => Accounts.find())` без `await` выполнит запрос уже вне `ctx`. Пишите `context.with(ctx, async () => await Accounts.find())`.
+
+## Что вы увидите в трассе
+
+Запуск `create`, `find`, повторной вставки и транзакции с `stepSpans: true` и `commandSpans: true` дал такие спаны:
+
+```ts
+// Typemo.transaction                      (INTERNAL, typemo.transaction.attempts: 1)
+//   └─ Typemo.updateOne (Account)         (CLIENT, typemo.transaction: true)
+//        ├─ Typemo.step cast              (INTERNAL)
+//        ├─ Typemo.step validate          (INTERNAL)
+//        ├─ update                        (CLIENT, команда драйвера)
+//        └─ Typemo.step populate          (INTERNAL)
+// Typemo.find (Account)                   (CLIENT, db.query.summary: "find accounts")
+// Typemo.find.cursor (Account)            (курсор; событие cursor.batch)
+// Typemo.insertOne (Account)              (CLIENT, статус ERROR, error.type: "DuplicateKeyError")
+// Typemo.aggregate (database bank)        (CLIENT, connection.aggregate: без модели и коллекции)
+```
+
+Имя спана — не `find accounts`, как советует конвенция OpenTelemetry, а `Typemo.find (Account)`: сразу видно, что спан от ODM и какая модель. Коллекция лежит в `db.collection.name`. Полные таблицы атрибутов и метрик — в [справочнике](../reference/observability/opentelemetry.mdx#атрибуты).
+
+## Найти шаг, на который ушло время
+
+Спаны шагов выключены: для них ядро строит дополнительные события. Включите `stepSpans`, когда нужно понять, что заняло время внутри операции: приведение типов, проверка, ваши хуки или подгрузка связей.
+
+```ts
+TypemoOpenTelemetry.instrument(client, { stepSpans: true });
+```
+
+Появятся дочерние спаны `Typemo.step cast`, `Typemo.step validate`, `Typemo.step populate`. Спан шага создаётся уже после него, с началом, сдвинутым назад на длительность шага.
+
+## Спаны команд драйвера
+
+Ситуация: нужно знать, какой сервер выполнил команду и сколько она заняла. Клиент должен быть создан с `monitorCommands: true`, иначе регистрация бросит `ConfigurationError: TypemoClient "default": driver command events need the client option monitorCommands: true`.
+
+```ts
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank", monitorCommands: true });
+TypemoOpenTelemetry.instrument(client, { commandSpans: true });
+```
+
+Спан команды называется по команде (`find`, `insert`) и вложен в спан операции. Его `server.address` и `server.port` — хост и порт сервера, выполнившего команду, а не только первый хост строки подключения; у него есть и `db.collection.name`.
+
+## Метрики пула соединений
+
+`poolMetrics: true` включает метрики `db.client.connection.count`, `pending_requests`, `wait_time`, `use_time` и другие. Метрика `db.client.operation.duration` считается всегда. Пул, созданный до подписки адаптера, в лимитах не учитывается: его создание адаптер не видел.
+
+## Операции уровня базы
+
+Ситуация: вы запускаете агрегацию над всей базой ([`connection.aggregate`](../reference/connection/connection.mdx#connectionaggregate): `$documents`, `$currentOp`, `$listLocalSessions`). У такой операции нет модели, поэтому адаптер называет спан по базе: `Typemo.aggregate (database bank)`. Атрибутов `typemo.model` и `db.collection.name` у него нет: адаптер не записывает пустых значений. Исключение — `Pipeline.sessions()`: он читает коллекцию `config.system.sessions`, и его спан `Typemo.aggregate (database config)` несёт `db.namespace: "config"` и `db.collection.name: "system.sessions"`. Подробнее об операциях уровня базы — в руководстве [Запросы уровня базы](../aggregation/database-level.mdx).
+
+## Не отдать данные пользователей
+
+Ситуация: трассы уходят во внешний сервис. Атрибут `db.query.text` содержит форму запроса, и по умолчанию все значения в нём `"?"`: `{"filter":{"balance":{"$gt":"?"},"iban":"?"}}`. Опция `sensitive` работает так же, как у [подписчика ядра](../reference/observability/events.mdx#subscribersensitive), и действует и на исключение, записанное в спан. Поля, помеченные `sensitive` в схеме, остаются замаскированными даже при `"show"`. Тенант в `typemo.tenant` у спана операции попадает только с `includeTenant: true`.
+
+```ts
+TypemoOpenTelemetry.instrument(client, { sensitive: "mask", includeTenant: false });
+```
+
+## Как выбрать
+
+Задайте вопрос: **что я хочу увидеть?** Дерево вызовов и время внутри операции — включите `stepSpans`. Какие команды и на какие серверы ушли — `commandSpans`. Состояние пула — `poolMetrics`. Если нужна только базовая картина, оставьте умолчания: они дешевле всего.
+
+## Когда это не нужно
+
+Если нужны только ошибки в трекере, хватит [Sentry](./sentry.mdx). Если нужна своя система, напишите подписчика: [Своя интеграция](./custom-integration.mdx). Не включайте адаптер вместе с `@opentelemetry/instrumentation-mongodb`: он патчит драйвер и создаёт свой спан на каждую команду, команды окажутся в трассе дважды. Нужны спаны команд — используйте `commandSpans`.
+
+## Частые ошибки
+
+### Два спана на одну операцию
+
+Адаптер зарегистрирован дважды (например, на клиенте и на `Typemo`). Регистрируйте его один раз на цель.
+
+### У спанов нет родителя
+
+Не зарегистрирован менеджер контекста; см. выше.
+
+### Спаны команд не появляются
+
+`commandSpans: true` требует `monitorCommands: true` у клиента; без него регистрация падает `ConfigurationError`. Спаны не создаются для команд, которые Typemo не отправлял.
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник OpenTelemetry" href="../reference/observability/opentelemetry.mdx">
+  Все опции, атрибуты и метрики.
+</Card>
+<Card title="Sentry" href="./sentry.mdx">
+  Ошибки с контекстом и breadcrumbs.
+</Card>
+<Card title="События операций" href="./events.mdx">
+  Что адаптер получает от ядра.
+</Card>
+</Cards>

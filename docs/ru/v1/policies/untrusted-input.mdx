@@ -1,0 +1,216 @@
+---
+title: Принять фильтр из запроса клиента
+description: "Как не дать клиенту подменить значение оператором запроса и открыть скрытое поле через проекцию"
+icon: ShieldAlert
+---
+
+Когда данные для фильтра приходят от клиента (тело запроса, строка запроса), клиент может прислать вместо строки объект с оператором и изменить смысл запроса. Функция [`untrusted`](../reference/policies/soft-delete-and-untrusted.mdx#untrusted) помечает такие данные: если внутри них на любой глубине есть ключ с `$` или `+`, бросается [`StrictModeError`](../reference/policies/violations.mdx#sanitize) с причиной `sanitize`. Вторым аргументом [`UntrustedPlace`](../reference/policies/soft-delete-and-untrusted.mdx#untrustedplace) вы говорите, куда попадут данные: в фильтр, в обновление или в проекцию. Проверка от этого не меняется, зато текст ошибки объясняет опасность именно в этом месте. Это **дополнительная** защита: основная — проверить ввод схемой и построить фильтр самому.
+
+<Callout type="warning" title="Фильтр { name: body.name } не защищён сам по себе">
+
+Если поле фильтра берётся из тела запроса как есть, `find({ name: body.name })`, клиент может прислать вместо строки объект с оператором: `{"name": {"$gt": ""}}`. Для строкового поля `name` условие `{ $gt: "" }` — правильное типизированное условие, поэтому Typemo его выполняет, и запрос вместо одного пользователя возвращает всех. Компилятор этого не видит: тип `body.name` вы объявили сами. Защита — обернуть данные клиента в [`untrusted`](../reference/policies/soft-delete-and-untrusted.mdx#untrusted) или проверить, что пришла строка. Подробно — в разделе [Оператор вместо значения](#оператор-вместо-значения).
+
+</Callout>
+
+## Что предполагается
+
+Клиент подключён по руководству [Подключиться к базе](../connection/connect.mdx). Примеры используют модель пользователя блога.
+
+```ts twoslash title="users/user.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+}
+```
+
+## Быстрый путь
+
+Оберните данные клиента в `untrusted` в том месте, где кладёте их в фильтр:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, untrusted, StrictModeError } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Users = client.connection.model(User);
+// ---cut---
+const body = JSON.parse('{"name":{"$ne":"zzz"}}') as { name: string };
+try {
+  await Users.find(untrusted(body)).plain();
+} catch (error) {
+  if (error instanceof StrictModeError) console.log(error.reason, error.path);
+  // → "sanitize" "name.$ne"
+}
+```
+
+Данные клиента обычно приходят словарём `Record<string, unknown>`. Такой фильтр компилируется без приведения типов, а имена его ключей проверяются при запуске, после проверки `untrusted`: ключ, которого нет в схеме, останавливает запрос до обращения к базе.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, untrusted, StrictModeError } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Users = client.connection.model(User);
+// ---cut---
+const fromQuery: Record<string, unknown> = JSON.parse('{"nope":"x"}');
+try {
+  await Users.find(untrusted(fromQuery)).plain();
+} catch (error) {
+  if (error instanceof StrictModeError) console.log(error.message);
+  // → filter: "nope" is not a field of User [unknown-path]
+}
+```
+
+## Оператор вместо значения
+
+Приложение ищет пользователя по имени из тела запроса: `find({ name: body.name })`. Клиент присылает `{"name": {"$gt": ""}}`: условие «имя равно» превращается в «имя больше пустой строки», и находятся все пользователи. В коллекции три пользователя, `ann`, `bob` и `cy`:
+
+```ts twoslash title="users/users.service.ts"
+import { Entity, Prop, Schema, TypemoClient, untrusted, StrictModeError } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Users = client.connection.model(User);
+// ---cut---
+const body = JSON.parse('{"name":{"$gt":""}}') as { name: string };
+
+const found = await Users.find({ name: body.name }).plain();
+console.log(found.map((user) => user.name));
+// → ["ann", "bob", "cy"]
+```
+
+Почему Typemo это пропускает? Фильтр допускает операторы полей как обычное условие, и `{ $gt: "" }` для строкового поля — правильное условие нужного типа: строгие проверки сверяют путь, оператор и тип операнда, а не то, откуда взялось значение. Приведение типов остановило бы только оператор с операндом другого типа. Компилятор тоже молчит: `JSON.parse` возвращает то, что вы объявили, и тип `string` у `body.name` — ваше обещание, а не проверка. Typemo не может отличить условие, которое написал программист, от условия, которое прислал клиент, поэтому данные клиента нужно пометить.
+
+`untrusted` останавливает такой ввод до обращения к базе и называет путь к оператору:
+
+```ts twoslash title="users/users.service.ts"
+import { Entity, Prop, Schema, TypemoClient, untrusted, StrictModeError } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Users = client.connection.model(User);
+// ---cut---
+const body = JSON.parse('{"name":{"$gt":""}}') as { name: string };
+
+try {
+  await Users.find(untrusted({ name: body.name })).plain();
+} catch (error) {
+  if (error instanceof StrictModeError) console.log(error.message);
+}
+// → untrusted value: "$gt" at "name.$gt" — an operator inside data from outside (query selector injection); validate the input and build the filter yourself [sanitize]
+```
+
+Обернуть можно и одно значение, `{ name: untrusted(body.name) }`: тогда путь в ошибке начинается с оператора (`$gt`). Надёжнее всего проверить ввод схемой (`typeof body.name === "string"` или валидатор запроса) и уже потом строить фильтр, а `untrusted` оставить страховкой.
+
+Проверка идёт на любой глубине, включая массивы и `Map`: `untrusted({ a: [{ b: { $gt: 1 } }] })` называет путь `a.0.b.$gt`. Даты, регулярные выражения и значения BSON считаются данными и не разбираются.
+
+## Не отдать скрытое поле через проекцию
+
+В проекции ключ `+путь` добавляет [скрытое поле](../reference/schemas/field-markers.mdx#hidden). Если клиент выбирает поля сам (`?fields=…`), он мог бы прислать `{"+passwordHash": true}`. Для проекции передайте второй аргумент `"projection"`: такая проекция отвергается, а текст называет именно эту угрозу: `untrusted value: "+passwordHash" at "+passwordHash" — a "+path" key inside data from outside would select a Hidden field; validate the input and build the projection yourself [sanitize]`. Ключ с `$` в проекции тоже отвергается, потому что он превратил бы проекцию в вычисляемое выражение: `untrusted value: "$slice" at "a.$slice" — an operator inside data from outside would turn the projection into a computed expression; validate the input and build the projection yourself [sanitize]`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, untrusted } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Users = client.connection.model(User);
+// ---cut---
+export const listFields = async (fields: { name: 1 }) =>
+  Users.find().select(untrusted(fields, "projection")).plain();
+```
+
+## Данные клиента в обновлении
+
+Тот же риск есть у обновления: клиент присылает поля для изменения, а в них оказывается ключ оператора. Передайте `"update"`, и ошибка скажет, что именно изменило бы такое значение:
+
+```ts twoslash
+import { untrusted, StrictModeError } from "@venloc/typemo";
+// ---cut---
+const patch = JSON.parse('{"$set":{"role":"admin"}}') as { name?: string };
+
+try {
+  untrusted(patch, "update");
+} catch (error) {
+  if (error instanceof StrictModeError) console.log(error.message);
+  // → untrusted value: "$set" at "$set" — an operator inside data from outside would change what the update does (update operator injection); validate the input and build the update yourself [sanitize]
+}
+```
+
+Ключ `+` в фильтре или обновлении тоже отвергается: это не имя поля, а синтаксис проекции, и в данных клиента ему делать нечего. Если вместо места передать что-то, кроме трёх допустимых значений (это возможно только без типов), бросается [`QueryError`](../reference/errors/query-errors.mdx#queryerror): `untrusted(value, place): place must be "filter", "update" or "projection", got string "nope"`.
+
+## Проверить целый объект отдельно
+
+Когда значение надо проверить, но не пропускать через функцию, вызовите [`Untrusted.check`](../reference/policies/soft-delete-and-untrusted.mdx#untrustedcheck): она делает ту же проверку и ничего не возвращает.
+
+## Что делает Typemo и без untrusted
+
+Строгие проверки фильтра работают всегда: неизвестный оператор, оператор на верхнем уровне, смесь операторов и полей, `$where` и другие вычисления на сервере отвергаются с причиной `sanitize`. Например `filter.$where` даёт `"$where" runs JavaScript on the server and is not supported (at "filter.$where"): JavaScript code in a query runs with the rights of the database, cannot be checked against the schema, and turns injected input into executed code (Mongoose CVE-2025-23061, $where in populate); write the condition with query or aggregation operators ($expr) instead [sanitize]`. Текст объясняет причину: JavaScript в запросе исполняется с правами базы, а подмена значения в нём превращается в выполнение чужого кода. Условие, которое хотелось написать на JavaScript, записывается операторами запроса или агрегации. Полный список — в [Нарушениях политик](../reference/policies/violations.mdx#sanitize).
+
+## Как выбрать
+
+Спросите себя: **пришло ли значение от человека или другой системы?** Если да — проверьте его схемой валидации, постройте фильтр из проверенных значений и добавьте `untrusted` как страховку. Если значение создано вашим кодом, `untrusted` не нужен.
+
+## Когда это не нужно
+
+Для значений, которые вы сами собрали из проверенных полей, `untrusted` только добавляет обход. Он не заменяет проверку типов и диапазонов и не решает, какие поля клиенту можно запрашивать.
+
+## Частые ошибки
+
+### Считать untrusted проверкой ввода
+
+`untrusted` смотрит только на ключи. Строка `"; drop"` или отрицательное число проходят. Проверяйте тип, форму и диапазон отдельно.
+
+### Пометить не всё
+
+Защищено только то, что пропущено через функцию. Если `untrusted` обёрнут вокруг `body.name`, а `body.filter` кладётся в запрос как есть, оператор пройдёт. Оборачивайте каждый кусок данных клиента.
+
+## Полный пример
+
+```ts twoslash title="users/users.service.ts"
+import { Entity, Prop, Schema, TypemoClient, untrusted } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Users = client.connection.model(User);
+// ---cut---
+// код читателя: проверка формы ввода
+declare const __parseQuery__: (raw: unknown) => { readonly name: string };
+
+export const searchUsers = async (raw: unknown) => {
+  const query = __parseQuery__(raw);
+  // страховка: даже проверенное значение проходит через untrusted
+  return Users.find({ name: untrusted(query.name) }).plain();
+};
+```
+
+<Callout type="migration">
+
+В Mongoose для этого служит `sanitizeFilter`, который надо включать. В Typemo строгие проверки фильтра работают всегда, а `untrusted` добавляет запрет операторов и `+`-ключей внутри данных клиента.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Строгие пути" href="./strict-paths.mdx">
+  Что происходит с неизвестными полями в фильтрах и обновлениях.
+</Card>
+<Card title="Справочник: untrusted" href="../reference/policies/soft-delete-and-untrusted.mdx#untrusted">
+  Сигнатуры и ошибки `untrusted` и `Untrusted.check`.
+</Card>
+</Cards>

@@ -1,0 +1,377 @@
+---
+title: Контракты
+description: "expect, parse, Contract.check и типы Selected, SelectedLean, SelectedJson: как проверить форму ответа при компиляции и во время работы"
+icon: FileCheck
+---
+
+**Контракт** — это описание формы ответа, которое вы пишете сами и которое Typemo сверяет с тем, что запрос действительно возвращает. Он нужен там, где форма ответа — договорённость с другим кодом: тело ответа API, сообщение в очередь, вход для другого сервиса. Если вы добавите в модель поле или измените запрос, контракт не даст этому незаметно изменить ответ. Проверка делается двумя способами. При компиляции [`.expect`](#expect) и [`Contract.check`](#contractcheck) сравнивают тип результата с вашим описанием и ничего не стоят во время работы. Во время работы [`.parse`](#parse) прогоняет каждую строку через схему проверки данных.
+
+Если вы только начинаете, сначала прочитайте руководство [Проверка формы ответа](../../queries/contracts.mdx). Эта страница — справочник.
+
+Все примеры используют одну модель пользователя с обязательным именем, необязательным возрастом и скрытым хешем пароля:
+
+```ts twoslash title="models/user.ts"
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => Number)
+  age?: number;
+
+  @Prop(() => String, { hidden: true })
+  passwordHash?: Hidden<string>;
+}
+```
+
+В коллекции два пользователя: Alice (30 лет) и Bob (без возраста).
+
+---
+
+## .expect
+
+`.expect<Shape>()` сверяет строку результата с описанием `Shape` **точно**: те же поля, та же необязательность, те же `null` и те же типы значений на любой глубине. Если совпадает, запрос возвращается как был, а тип результата не меняется. Если нет, вызов не компилируется, и ошибка называет, что не так. Во время работы метод ничего не делает и ничего не стоит.
+
+```ts twoslash
+import { Contract, Entity, type Hidden, Prop, Schema, type Selected, type SelectedJson, type SelectedLean, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+type UserCard = Selected<User, "name">;
+
+const cards = await Users.find().select({ name: 1 }).plain().expect<UserCard>();
+console.log(cards.map((card) => card.name));
+// → ["Alice", "Bob"]
+```
+
+Здесь `Selected<User, "name">` — описание строки в plain-виде с полем `name` (и `_id`, который есть всегда). Запрос вернул ровно это, поэтому проверка проходит.
+
+<Returns type="этот же запрос">
+
+Тот же строитель, тип результата не меняется. Метод ничего не выполняет.
+
+</Returns>
+
+<Params>
+<Param name="Shape" type="тип-параметр" required>
+
+Ожидаемая строка. Любой тип, чаще всего [`Selected`](#selected), [`SelectedLean`](#selectedlean) или [`SelectedJson`](#selectedjson).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+expect<Shape>(
+  this: RowsOnly<Form, ExpectRows<ResultDoc<T, S, E, Form, N, X>, Shape>, "expect<Shape>() checks rows: …">,
+): QueryBuilder<T, Op, S, E, Form, Found, N, X>
+```
+
+</FullType>
+
+### Что показывает ошибка
+
+Ошибка называет три вида расхождений: `missing` — поле есть в контракте, но нет в результате; `extra` — поле есть в результате, но нет в контракте; `mismatch` — поле есть в обоих, но тип, `null` или необязательность разные. Пути записываются через точку, элемент массива — `[]`, а сам результат — `(root)`.
+
+`extra` всегда считается ошибкой. Присваивание значения с лишним полем в TypeScript молча отбросило бы это поле, а контракт существует именно затем, чтобы поле не появлялось в ответе незамеченным. Допустим, запрос выбрал ещё и `age`, а контракт о нём не знает:
+
+```ts twoslash
+import { Contract, Entity, type Hidden, Prop, Schema, type Selected, type SelectedJson, type SelectedLean, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+type UserCard = Selected<User, "name">;
+
+// @errors: 2684
+await Users.find().select({ name: 1, age: 1 }).plain().expect<UserCard>();
+```
+
+### Только для lean и plain
+
+Контракт описывает данные, а документ — это объект с методами. Поэтому `.expect` работает у `.lean()` и `.plain()`, а у документа не компилируется. Для документа сверяйте результат его метода: `Contract.check<Shape>()(doc.$toPlain())`, см. [`Contract.check`](#contractcheck).
+
+---
+
+## .parse
+
+`.parse(schema)` проверяет каждую строку **во время работы**. Это защита от данных, которые в базе не такие, как обещает тип: их могли записать старой версией приложения, скриптом или напрямую через драйвер. Схема — любая, которая следует стандарту Standard Schema (zod, valibot, arktype или своя), то есть объект с полем `"~standard"`. Результат запроса — то, что вернула схема: она может не только проверять, но и преобразовывать строки.
+
+Ниже своя схема на несколько строк: она требует имя не короче четырёх символов и переводит его в верхний регистр. С библиотекой проверки данных это выглядит так же: вы передаёте её схему.
+
+```ts twoslash
+import { Contract, Entity, type Hidden, Prop, Schema, type Selected, type SelectedJson, type SelectedLean, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+const nameRow = {
+  "~standard": {
+    version: 1 as const,
+    vendor: "app",
+    validate: (value: unknown) => {
+      const row = value as { name?: unknown };
+      if (typeof row.name !== "string" || row.name.length < 4) {
+        return { issues: [{ message: "name is too short", path: ["name"] }] };
+      }
+      return { value: { name: row.name.toUpperCase() } };
+    },
+    types: undefined as unknown as { input: unknown; output: { name: string } },
+  },
+};
+
+const rows = await Users.find({ name: "Alice" }).plain().parse(nameRow);
+//    ^?
+console.log(rows);
+// → [{ name: "ALICE" }]
+```
+
+<Returns type="ParsedQuery">
+
+Запрос, который после `await` даёт результат схемы: для `find` — массив, для `findOne` — строку или `null`. Если ничего не найдено, `null` остаётся `null` и схемой не проверяется. Запрос завершающий: у него есть `exec`, `cursor` (для списков) и `expect`, но нет других методов строителя, потому что запрос фиксируется до разбора.
+
+</Returns>
+
+<Params>
+<Param name="schema" type="Standard Schema" required>
+
+Схема стандарта Standard Schema. Асинхронная схема допустима: Typemo дожидается её. Если передан не такой объект, бросается `QueryError` с текстом `parse: a Standard Schema v1 validator (an object with "~standard": { version: 1, validate })`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+parse<Sch extends AnyStandardSchema>(
+  this: RowsOnly<Form, unknown, "parse() validates rows: call .lean() or .plain() before .parse(schema)">,
+  schema: Sch,
+): ParsedQuery<QueryResult<Many<Op>, Found, StandardSchemaOutput<Sch>>, StandardSchemaOutput<Sch>, Many<Op>>
+```
+
+</FullType>
+
+### Ошибка проверки
+
+Если строка не прошла схему, запрос завершается [`ValidationError`](../errors/data-errors.mdx#validationerror). Ошибка одна на весь запрос и содержит замечания по всем строкам, а путь начинается с номера строки. Bob без имени нужной длины стоит второй, поэтому путь начинается с `1`:
+
+```ts twoslash
+import { Contract, Entity, type Hidden, Prop, Schema, type Selected, type SelectedJson, type SelectedLean, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+declare const nameRow: { "~standard": { version: 1; vendor: string; validate: (value: unknown) => { value: { name: string } } | { issues: { message: string; path: string[] }[] }; types: { input: unknown; output: { name: string } } } };
+// ---cut---
+try {
+  await Users.find().sort({ name: 1 }).lean().parse(nameRow);
+} catch (error) {
+  console.log(String(error));
+  // → 'ValidationError: Validation failed: "1.name": row 1: name is too short [schema]'
+}
+```
+
+### Курсор
+
+У `.parse` для списков есть [`.cursor()`](./cursor.mdx): строки проверяются по мере чтения, и первая неверная строка завершает чтение ошибкой `ValidationError` с номером строки в потоке. Курсор при этом закрывается.
+
+### Только для lean и plain
+
+Документ не «просто данные», поэтому `.parse` работает у `.lean()` и `.plain()`. У документа метод не компилируется, а если вызов пришёл из кода без типов, бросается `QueryError`:
+
+```text
+QueryError: parse() validates rows: call .lean() or .plain() before .parse(schema)
+```
+
+### Когда `.parse` не подходит
+
+Если вы доверяете данным в базе и нужно только зафиксировать форму ответа, проверки во время работы не нужны: используйте [`.expect`](#expect), он бесплатен. Схемы полей модели проверяют записываемые данные, а не читаемые: чтение не проверяет строки само.
+
+---
+
+## Contract.check
+
+`Contract.check<Shape>()(value)` сверяет значение с описанием при компиляции: возвращает то же значение, но с типом `Shape`, а если тип значения не совпадает с `Shape` точно, вызов не компилируется. Это тот же вид проверки, что у [`.expect`](#expect), но для любого значения, а не для результата запроса. Особенно удобен для документов: `Contract.check<Shape>()(doc.$toPlain())`.
+
+```ts twoslash
+import { Contract, Entity, type Hidden, Prop, Schema, type Selected, type SelectedJson, type SelectedLean, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+const alice = await Users.findOne({ name: "Alice" }).orFail();
+
+type AliceJson = SelectedJson<User, "name" | "age">;
+const json = Contract.check<AliceJson>()(alice.$toJSON());
+//    ^?
+console.log(json.name, json.age);
+// → "Alice" 30
+```
+
+Вызов записан в две скобки намеренно: первая фиксирует ожидаемый тип, вторая принимает значение, и TypeScript выводит тип значения самостоятельно.
+
+<Returns type="Shape">
+
+Само переданное значение, без копирования и проверок во время работы.
+
+</Returns>
+
+<FullType>
+
+```ts
+class Contract {
+  static check<Expected>(): <V>(
+    value: V & (ContractCheck<V, Expected> extends true ? unknown : ContractCheck<V, Expected>),
+  ) => Expected
+}
+```
+
+</FullType>
+
+---
+
+## Selected
+
+`Selected<Entity, Fields, Overrides>` — описание строки **plain-вида**: то, что возвращают [`.plain()`](./reading.mdx#plain) и `$toPlain()`. `_id` включён по умолчанию, в plain-виде это строка; `"-_id"` среди полей его убирает. Поля перечисляются именами; для необязательных полей необязательность сохраняется.
+
+```ts twoslash
+import { Contract, Entity, type Hidden, Prop, Schema, type Selected, type SelectedJson, type SelectedLean, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+type Row = Selected<User, "name" | "age">;
+//   ^?
+
+type WithoutId = Selected<User, "name" | "-_id">;
+//   ^?
+```
+
+Третий параметр, `Overrides`, нужен для полей, форма которых зависит от запроса: виртуальных ссылок, которые заполняются через `populate`, и вложенных документов. В нём вы даёте форму заполненного поля: `{ author: Selected<User, "name" | "-_id"> }`. Ключ переопределения обязан быть одним из выбранных полей.
+
+<FullType>
+
+```ts
+type Selected<
+  Entity,
+  Fields extends SelectedFields<Entity>,
+  Overrides extends SelectedOverrides<Fields, Overrides> = Record<never, never>,
+> = Simplify<IdPart<…> & Plain<Pick<Entity, …>> & VirtualPart<…> & OverridePart<…> & VirtualWithoutOverride<…>>
+```
+
+</FullType>
+
+`SelectedFields` — имена, которые можно выбрать: поля данных, виртуальные ссылки (с переопределением), геттер-виртуальные поля и `"-_id"`. `SelectedOverrides` — ограничение параметра `Overrides`: ключ вне выбранных полей превращается в читаемую ошибку `the override "…" is not one of the selected fields`.
+
+---
+
+## SelectedLean
+
+`SelectedLean<Entity, Fields, Overrides>` — то же для **lean-вида**: значения такие, как их отдаёт драйвер (`_id` — `ObjectId`, 64-битные числа — `bigint`, поля-`Map` — объекты). Геттер-виртуальных полей у lean-строки нет. Сверяйте с `.lean().expect<…>()`.
+
+```ts twoslash
+import { Contract, Entity, type Hidden, Prop, Schema, type Selected, type SelectedJson, type SelectedLean, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+type Row = SelectedLean<User, "name" | "-_id">;
+//   ^?
+
+const rows = await Users.find().select({ name: 1, _id: 0 }).lean().expect<Row>();
+console.log(rows.length);
+// → 2
+```
+
+<FullType>
+
+```ts
+type SelectedLean<
+  Entity,
+  Fields extends SelectedLeanFields<Entity>,
+  Overrides extends SelectedOverrides<Fields, Overrides> = Record<never, never>,
+> = Simplify<IdPart<…> & Lean<Pick<Entity, …>> & OverridePart<…> & VirtualWithoutOverride<…>>
+```
+
+</FullType>
+
+`SelectedLeanFields` — допустимые имена для lean-контракта: как у `SelectedFields`, но без геттер-виртуальных.
+
+---
+
+## SelectedJson
+
+`SelectedJson<Entity, Fields, Overrides>` — то же для **JSON-вида**, то есть того, что возвращает `$toJSON()`: идентификаторы, даты, 64-битные числа и `Decimal128` — строки, `Map` — объект. Используйте его для ответов API, которые вы собираете из документа.
+
+```ts twoslash
+import { Contract, Entity, type Hidden, Prop, Schema, type Selected, type SelectedJson, type SelectedLean, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => String, { hidden: true }) passwordHash?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Users = client.db().model(User);
+// ---cut---
+type UserJson = SelectedJson<User, "name" | "age">;
+//   ^?
+```
+
+<FullType>
+
+```ts
+type SelectedJson<
+  Entity,
+  Fields extends SelectedJsonFields<Entity>,
+  Overrides extends SelectedOverrides<Fields, Overrides> = Record<never, never>,
+> = Simplify<IdPart<…> & PlainJson<Pick<Entity, …>> & VirtualPart<…> & OverridePart<…> & VirtualWithoutOverride<…>>
+```
+
+</FullType>
+
+`SelectedJsonFields` — допустимые имена, те же, что у `SelectedFields`.
+
+---
+
+## Остальные типы
+
+`ContractCheck<Actual, Expected>` — тип, лежащий в основе всех проверок: `true`, если типы совпадают точно, иначе отчёт вида `{ missing: "email"; extra: "password" }`. `ContractMismatch` — сам отчёт, `ExpectRows` — параметр `this` метода `.expect`, `ContractArgumentError` — читаемая ошибка неверного аргумента контракта. Обычно их не пишут вручную: они видны в подсказках редактора и в текстах ошибок.

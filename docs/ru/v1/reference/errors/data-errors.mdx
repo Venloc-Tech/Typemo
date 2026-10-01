@@ -1,0 +1,458 @@
+---
+title: Ошибки данных
+description: "ValidationError, CastError, StrictModeError, UnknownFieldsError, DirectWriteError и PartialArrayError: когда бросаются, какие поля несут и как их обработать"
+icon: ShieldAlert
+---
+
+Ошибки данных приходят из самой библиотеки, ещё до того, как что-то ушло на сервер: значение не подходит схеме, запрос нарушает правило строгости, сохранение стёрло бы данные, которых схема не знает. Поэтому эти ошибки почти всегда означают либо неверный ввод клиента, либо ошибку в вашем коде, а не сбой базы. Каждая из них несёт структурированные поля, по которым обработчик может ответить клиенту точно, не разбирая текст сообщения.
+
+Если вы только начинаете, сначала прочитайте руководство [Обработка ошибок](../../errors/handling.mdx). Эта страница — справочник. Общий корень всех ошибок и их дерево описаны в разделе [Иерархия ошибок](./hierarchy.mdx).
+
+Во всех примерах используется одна модель счёта. Поля `balance`, `status`, `tags` и `lines` нужны, чтобы на них проявлялись разные ошибки: числовая граница, перечень допустимых значений, массив строк и массив вложенных документов.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema()
+export class Line {
+  @Prop(() => String, { required: true })
+  sku!: string;
+}
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { min: 0 })
+  balance?: number;
+
+  @Prop(() => String, { enum: ["open", "frozen"] })
+  status?: "open" | "frozen";
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => [Line])
+  lines!: Line[];
+}
+```
+
+Ошибки из групп соседних страниц: [ошибки запросов](./query-errors.mdx), [ошибки сервера](./server-errors.mdx), [ошибки конфигурации и подключения](./configuration-errors.mdx).
+
+---
+
+## ValidationError
+
+`ValidationError` бросается, когда документ или ввод нарушил схему, и перечисляет **все** найденные нарушения, а не только первое. Это его главное отличие от [`CastError`](#casterror), который бросается сразу на первом значении, не приводимом к типу. Ошибка нужна там, где клиент присылает форму целиком: полезно вернуть ему сразу весь список полей с проблемами, а не заставлять исправлять по одному.
+
+Ошибка приходит при создании ([`create`](../writes/writes.mdx#create)), при [`$save`](../documents/document-api.mdx#save) и явном [`$validate`](../documents/document-api.mdx#validate). Здесь тело запроса пришло без владельца, с отрицательным балансом и статусом вне перечня:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, ValidationError } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0 }) balance?: number;
+  @Prop(() => String, { enum: ["open", "frozen"] }) status?: "open" | "frozen";
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const body = JSON.parse('{"title":"Main","balance":-5,"status":"gone"}');
+
+try {
+  await Accounts.create(body);
+} catch (error) {
+  if (error instanceof ValidationError) {
+    console.log(error.message);
+    // → Validation failed: "owner": the field is required [required]; "balance": must be at least 0 [min]; "status": must be one of "open", "frozen" [enum]
+    console.log(Object.keys(error.errors));
+    // → ["owner", "balance", "status"]
+  }
+}
+```
+
+Сообщение собрано из нарушений: путь в кавычках, описание и причина в квадратных скобках. Нарушения идут в порядке полей схемы, а не в порядке, в котором случайно завершились проверки: одинаковый ввод всегда даёт одинаковое сообщение, даже если у полей есть асинхронные проверки. Сами нарушения лежат в поле `issues`, а поле `errors` группирует их по пути через точку, что удобно, если нужно подсветить поле в форме.
+
+### Поля
+
+<Params title="Поля ошибки">
+<Param name="issues" type="readonly SchemaIssue[]">
+
+Каждое нарушение, в порядке полей схемы. Массив заморожен. У нарушения есть `path` (сегменты пути: строки, а для элементов массива числа), `reason` (машинная причина), `message` (текст для человека), `value` (проверяемое значение как есть) и необязательный `cause` (ошибка приведения или оригинальное нарушение внешней схемы).
+
+</Param>
+<Param name="errors" type="Readonly<Record<string, readonly SchemaIssue[]>>">
+
+Те же нарушения, сгруппированные по пути через точку (`lines.0.sku`). Для пути с несколькими нарушениями в группе несколько элементов: значение может одновременно не пройти приведение и границу.
+
+</Param>
+</Params>
+
+Причина нарушения `reason` — закрытый список: `cast` (значение не приведено, в `cause` лежит `CastError`; такую запись собирают только [`Model.validate`](../documents/model-document-methods.mdx#modelvalidate) и Standard Schema, а `create` и `$save` бросают сам `CastError`), `required` (обязательное поле отсутствует или `null`), `unknown-key` (ключ, которого нет в схеме), `enum`, `min`, `max`, `minLength`, `maxLength`, `match` (встроенные проверки опций поля), `validator` (ваша функция `validate` вернула сообщение или бросила ошибку), `discriminator` (значение различителя не называет известный класс) и `schema` (нарушение сообщила внешняя схема Standard Schema, переданная в `.parse`).
+
+### Ответ клиенту
+
+Значения нарушений могут быть большими или секретными, поэтому `toJSON()` их опускает и возвращает только имя, сообщение и список `path`, `reason`, `message`. Этот объект безопасно отдавать клиенту как тело ответа 422:
+
+```ts twoslash
+import { ValidationError } from "@venloc/typemo";
+declare const error: ValidationError;
+// ---cut---
+const payload = error.toJSON();
+// → { name: "ValidationError", message: "Validation failed: …", issues: [{ path: "owner", reason: "required", message: "the field is required" }, …] }
+```
+
+### Когда не подходит
+
+Проверять ввод клиента до вызова библиотеки этим классом не нужно: схема модели и есть проверка, а ошибка — её результат. Если вам нужна проверка формы ответа, а не данных для записи, используйте [`.expect`](../query/contracts.mdx#expect) и [`.parse`](../query/contracts.mdx#parse).
+
+---
+
+## CastError
+
+`CastError` бросается, когда значение нельзя превратить в тип его поля. Typemo не угадывает: строка `"12"` в числовом поле не превращается в число, а объект в строковом не превращается в строку. Иначе опечатка клиента молча превратилась бы в неверное значение в базе. Ошибка несёт путь, само значение, ожидаемый тип и машинную причину, поэтому по ней можно ответить точно.
+
+Правило одно на всю библиотеку: значение, которое не приводится, — всегда `CastError`, одна ошибка на поле, на любой глубине. Ограничения этого поля (`min`, `enum`, ваши проверки) при этом не выполняются: у значения неверный тип, и спрашивать про диапазон бессмысленно. Момент ошибки зависит от того, как значение попало в библиотеку. Через её методы (`create`, `Model.new`, [`$set`](../documents/document-api.mdx#set), методы массивов и Map, фильтры и обновления) оно приводится сразу. Простое присваивание `account.balance = …` перехватить нельзя, поэтому ошибка приходит на ближайшем [`$validate`](../documents/document-api.mdx#validate) или [`$save`](../documents/document-api.mdx#save), до всякой проверки схемы, и в базу ничего не уходит.
+
+Здесь тело запроса пришло с балансом-строкой:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, CastError } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0 }) balance?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const body = JSON.parse('{"title":"Main","owner":"alice","tags":[],"balance":"12"}');
+
+try {
+  await Accounts.create(body);
+} catch (error) {
+  if (error instanceof CastError) {
+    console.log(error.message);
+    // → Cast to number failed at path "balance" for "12" (string): expected a number [type]
+    console.log(error.path, error.expected, error.reason);
+    // → "balance" "number" "type"
+  }
+}
+```
+
+В сообщении есть всё: ожидаемый тип, путь, короткое описание значения (длинные строки обрезаются, массивы описываются длиной, а не содержимым), пояснение и причина. Для элемента массива путь включает индекс: значение `[1]` в поле `tags` даёт путь `tags.0`.
+
+### Поля
+
+<Params title="Поля ошибки">
+<Param name="path" type="string">
+
+Путь значения через точку (`tags.0`). Пустая строка, если значение приводилось само по себе.
+
+</Param>
+<Param name="value" type="unknown">
+
+Значение, не прошедшее приведение, как оно было передано: не копия и не строка. Оно может быть большим или секретным, поэтому `toJSON()` его не включает.
+
+</Param>
+<Param name="expected" type="string">
+
+Ожидаемый тип в словаре библиотеки: `number`, `string`, `ObjectId`, `Int32`, `Array<string>`.
+
+</Param>
+<Param name="reason" type="CastReason">
+
+Машинная причина. По ней можно ветвиться без разбора сообщения.
+
+</Param>
+<Param name="detail" type="string">
+
+Одно предложение для человека: что именно не так.
+
+</Param>
+</Params>
+
+<TypeTable
+  type={{
+    undefined: { description: "Значение `undefined`. Оно недопустимо: драйвер записал бы вместо него `null`." },
+    "null": { description: "`null` там, где поле не допускает `null`." },
+    type: { description: "Неверный тип JavaScript или BSON, и допустимого преобразования из него нет." },
+    format: { description: "Тип верный, но текст не того формата: шестнадцатеричная запись, ISO 8601, UUID, десятичное число." },
+    integer: { description: "Дробное число там, где нужно целое." },
+    range: { description: "Вне диапазона целевого типа: Int32, Int64, int8, float32, даты." },
+    finite: { description: "`NaN` или бесконечность там, где нужно конечное число." },
+    precision: { description: "Преобразование потеряло бы точность: небезопасное целое, неточный Decimal128." },
+    subtype: { description: "Binary другого подтипа или вектор другого типа элементов." },
+    dimensions: { description: "Вектор неверной длины." },
+    flags: { description: "Флаги регулярного выражения, которые не переживают запись в BSON." },
+    key: { description: "Ключ Map, который MongoDB не может хранить или адресовать." },
+    "unknown-key": { description: "Поле, которого нет в описании вложенного документа или модели." },
+    "union-no-match": { description: "Ни один вариант объединения не принимает значение." },
+    "union-ambiguous": { description: "Значение принимают несколько вариантов объединения: библиотека не выбирает за вас." },
+    json: { description: "У значения нет JSON-формы: `NaN`, «сырой» `Long`." },
+    discriminator: { description: "Значение различителя во вложенном документе не называет известный класс." },
+  }}
+/>
+
+Причин семнадцать. Значение `reason` из этой таблицы видно в квадратных скобках в конце сообщения.
+
+### Присваивание без приведения
+
+Обычное присваивание поля документа (`account.balance = ...`) ошибки не бросает: тип поля запрещает неверное значение при компиляции, а если оно всё-таки попало через приведение типов, библиотека узнает об этом на следующем [`$validate`](../documents/document-api.mdx#validate) или [`$save`](../documents/document-api.mdx#save). Там она бросит тот же `CastError` с тем же сообщением, что и `$set` (запуск: присваивание `"12"` полю-числу и `$save`, затем `$set` и `$validate` дали одну и ту же ошибку). Различается только момент: `$set` приводит значение сразу, а присваивание ждёт вызова.
+
+Когда значения собираются без записи — [`Model.validate`](../documents/model-document-methods.mdx#modelvalidate) и Standard Schema, — приведение не бросает ошибку, а попадает в [`ValidationError`](#validationerror) записью с причиной `cast`: эти вызовы нарочно собирают все проблемы формы, а не останавливаются на первой. Исходный `CastError` лежит в `cause` этой записи.
+
+### Когда не подходит
+
+Если нужно собрать все проблемы формы, а не остановиться на первой, используйте [`ValidationError`](#validationerror). Если клиент присылает числа строками (значения из адреса страницы), приведите их в своём коде до вызова: библиотека `"12"` в число сама не превратит.
+
+---
+
+## StrictModeError
+
+`StrictModeError` бросается, когда операция нарушила правило строгости. Typemo не смягчает эти правила ни опциями, ни режимами: правило либо соблюдено, либо операция не уходит на сервер. Ошибка нужна, чтобы опечатка в имени поля, пустой фильтр или конкурирующий вызов не превратились в тихую потерю или порчу данных.
+
+Поле `reason` называет нарушенное правило, поле `path` — где в вводе оно нарушено (если правило касается всей операции, `path` равен `undefined`), а в конец сообщения дописана причина в квадратных скобках.
+
+<TypeTable
+  type={{
+    "unknown-path": { description: "Путь, которого нет в схеме: в фильтре, обновлении, проекции, сортировке или конвейере." },
+    "not-hidden": { description: "`+имя` в проекции у поля, которое не скрыто: такой ключ ничего бы не изменил." },
+    undefined: { description: "`undefined` как значение: драйвер отправил бы `null`." },
+    "empty-filter": { description: "Пустой фильтр у записи: `updateOne`, `updateMany`, `deleteOne`, `deleteMany`, `replaceOne`, `findOneAnd*`, а также такая операция внутри `bulkWrite`." },
+    "empty-logical": { description: "Пустой `$and`, `$or` или `$nor`." },
+    "empty-update": { description: "Обновление, пустое после приведения." },
+    immutable: { description: "Запись неизменяемого поля вне `$setOnInsert`." },
+    limit: { description: "`limit` не больше нуля." },
+    sanitize: { description: "Оператор там, где ожидалось значение: защита от подмены значения запросом клиента." },
+    tenant: { description: "Операция вышла бы за пределы арендатора или у неё нет арендатора." },
+    "soft-delete": { description: "Операция, область которой политика мягкого удаления определить не может." },
+    "transaction-option": { description: "`readConcern` или `writeConcern` у операции внутри транзакции." },
+    "concurrent-session": { description: "Сессия уже занята другой операцией." },
+  }}
+/>
+
+Часть этих нарушений построитель запросов ловит раньше и сообщает как [`QueryError`](./query-errors.mdx#queryerror): например, `limit(0)` и `undefined` в фильтре в запуске пришли как `QueryError`. Значит, ветвиться по `reason` для них не нужно: ловите оба класса. Запуском проверены причины `unknown-path`, `not-hidden`, `empty-filter`, `immutable`, `sanitize`, `tenant`, `soft-delete`, `transaction-option` и `concurrent-session` (их тексты — в справочнике [Нарушения политик](../policies/violations.mdx)); остальные четыре в обычных вызовах перехватывает `QueryError`.
+
+### Неизвестный путь
+
+Самая частая причина: фильтр или обновление называют поле, которого нет в модели. Здесь фильтр пришёл от клиента как JSON:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, StrictModeError } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const filter = JSON.parse('{"nope":1}');
+
+try {
+  await Accounts.find(filter);
+} catch (error) {
+  if (error instanceof StrictModeError) {
+    console.log(error.message);
+    // → filter: "nope" is not a field of Account [unknown-path]
+    console.log(error.reason, error.path);
+    // → "unknown-path" "filter.nope"
+  }
+}
+```
+
+Путь в сообщении печатается один раз, в начале, а полный путь лежит в поле `path` и начинается с места ввода: для фильтра `filter.nope`, для обновления `$set.nope`, для проекции `projection.nope`, для сортировки `sort.nope`. Внутри `$or` путь длиннее: `filter.$or.0.nope`.
+
+### Пустой фильтр
+
+Пустой фильтр в записи означает «все документы» (или «любой документ», если вы меняете один). Одна опечатка, и вы стёрли бы коллекцию или изменили случайный документ, поэтому `updateOne`, `updateMany`, `deleteOne`, `deleteMany`, `replaceOne` и `findOneAnd*` с пустым фильтром отвергаются до отправки, в том числе внутри `bulkWrite`. Текст ошибки называет способ сказать «все» осознанно (`Filters.all()`):
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, StrictModeError } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const filter = JSON.parse("{}");
+
+try {
+  await Accounts.deleteMany(filter);
+} catch (error) {
+  if (error instanceof StrictModeError) console.log(error.message);
+  // → deleteMany with an empty filter would affect every document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]
+}
+```
+
+Запуск показал, что текст одинаков для всех этих операций: у `updateOne` и `deleteOne` он тоже начинается с имени вызова и говорит «every document», хотя затронут был бы один. Причина `empty-filter` и способ исправления при этом те же. Для чтения пустой фильтр разрешён: `find()` вернёт всё.
+
+### Поля
+
+<Params title="Поля ошибки">
+<Param name="reason" type="StrictModeReason">
+
+Нарушенное правило: одно из значений таблицы выше.
+
+</Param>
+<Param name="path" type="string | undefined">
+
+Где в вводе нарушено правило (`filter.nope`, `$set.nope`), либо `undefined`, если правило касается всей операции.
+
+</Param>
+</Params>
+
+Причины `transaction-option` и `concurrent-session` подробно разобраны в руководствах [Транзакции](../../transactions/transactions.mdx) и [Сессии вручную](../../transactions/sessions.mdx): там же видны их точные сообщения.
+
+### Когда не подходит
+
+Смягчить правило нельзя: нет опции, которая разрешает пустой фильтр или неизвестный путь. Если вы действительно хотите сделать то, что запрещено, назовите это явно, например через [`Filters.all()`](../../writes/empty-filters.mdx), либо выберите другой инструмент: пакетные и служебные команды идут через [`client.unsafeDriver()`](../connection/typemo-client.mdx#clientunsafedriver), где защиты библиотеки не действуют.
+
+---
+
+## UnknownFieldsError
+
+`UnknownFieldsError` бросается при сохранении, которое **стёрло бы из базы** поля вложенного документа, о которых схема не знает: это данные более старой или новой версии схемы. Typemo не теряет сохранённые данные молча. Когда документ читается, библиотека запоминает такие ключи (лишнего запроса это не требует), а при сохранении сверяет: если запись заменит вложенный документ целиком или перепишет массив или Map, где он лежит, неизвестные поля пропали бы.
+
+Допустим, в базе у первой строки счёта осталось поле `legacy`, которого в схеме уже нет. Изменить соседние поля или добавить строку в конец безопасно, а заменить саму строку нельзя:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, UnknownFieldsError } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => [Line]) lines!: Line[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+const id = (await Accounts.findOne().orFail())._id;
+// ---cut---
+const account = await Accounts.findById(id).orFail();
+account.lines.set(0, { sku: "z" });
+
+try {
+  await account.$save();
+} catch (error) {
+  if (error instanceof UnknownFieldsError) {
+    console.log(error.message);
+    // → the save would drop fields the schema does not know from stored data: "lines.0" (legacy); migrate the data or the schema, or pass { dropUnknownFields: true } to $save()/bulkSave() to accept the loss
+    console.log(error.fields);
+    // → [{ path: "lines.0", keys: ["legacy"] }]
+  }
+}
+```
+
+<Params title="Поля ошибки">
+<Param name="fields" type="readonly UnknownFields[]">
+
+Каждый вложенный документ, который запись переписала бы без неизвестных полей. У элемента `path` — путь в коде (`lines.0`, `address`, `notes.home`) и `keys` — сохранённые ключи, которых нет в схеме, в порядке хранения. Массив заморожен.
+
+</Param>
+</Params>
+
+Два способа выйти. Правильный: перенести данные или обновить схему, чтобы поле стало известным. Осознанный: вызвать `$save({ dropUnknownFields: true })` (то же для `bulkSave`), тогда потеря принимается явно. Замена элемента с неизвестными полями (`set`, `replace`, `splice`) и `clear()` у массива или Map бросают ту же ошибку, что и `set`: запуск подтвердил каждый из этих вызовов. Удаление элемента через `pull` или `pop` и `$unset` поля потерей не считаются: спрашивать разрешения там не нужно, а `push` не трогает существующие элементы. Для проверки в коде есть функция `isUnknownFieldsError(error)`, эквивалентная `instanceof`.
+
+### Когда не подходит
+
+Если вам нужно записать поле и оставить остальные как есть, меняйте поле по пути, а не заменяйте вложенный документ целиком: путь внутри документа неизвестные поля не трогает.
+
+---
+
+## DirectWriteError
+
+`DirectWriteError` бросается при сохранении, когда отслеживаемую коллекцию (массив, Map, массив вложенных документов) изменили **в обход её методов**: записью по индексу, записью в `length`, прямым вызовом `Map.prototype.set` или заменой поля-контейнера обычным значением. Тип запрещает всё это при компиляции, так что ошибка возможна только через приведение типа, `any` или чистый JavaScript. Библиотека не пытается угадать, что такая запись имела в виду: сохранение отвергается, а текст называет метод, которым нужно пользоваться.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, DirectWriteError } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+const id = (await Accounts.findOne().orFail())._id;
+// ---cut---
+const account = await Accounts.findById(id).orFail();
+(account.tags as unknown as string[])[0] = "hack";
+
+try {
+  await account.$save();
+} catch (error) {
+  if (error instanceof DirectWriteError) {
+    console.log(error.message);
+    // → "tags" was changed around its methods: position 0 was assigned directly (use set(0, value))
+    console.log(error.path);
+    // → "tags"
+  }
+}
+```
+
+<Params title="Поля ошибки">
+<Param name="path" type="string">
+
+Путь коллекции в коде (`tags`, `revisions.1.lines`).
+
+</Param>
+</Params>
+
+Исправление всегда в сообщении. Запись по индексу: `use set(0, value)`. Изменение `length`: `its length is 0 instead of 2 (use push(), pop(), splice(), clear() or replace())`. Замена поля-контейнера обычным значением: `the field was replaced by assignment; use $set("tags", value) or the container's methods`. Все три текста получены запуском.
+
+---
+
+## PartialArrayError
+
+`PartialArrayError` бросается при сохранении массива, который загружен **только частично** (проекция `$slice`, позиционная `arr.$` или `$elemMatch`), если изменение перезаписало бы элементы, которых вы не загружали. Пример: вы прочитали первый тег и заменили его по индексу. Позиции загруженного среза не совпадают с позициями в базе, и запись по позиции затёрла бы чужой элемент. Mongoose делал такую запись молча. Typemo её отказывается отправлять.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, PartialArrayError } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => [String]) tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+const id = (await Accounts.findOne().orFail())._id;
+// ---cut---
+const account = await Accounts.findById(id).select({ tags: { $slice: 1 } }).orFail();
+account.tags.set(0, "Z");
+
+try {
+  await account.$save();
+} catch (error) {
+  if (error instanceof PartialArrayError) {
+    console.log(error.message);
+    // → "tags" was loaded partially (projection); a positional $set would overwrite the elements that were not loaded
+    console.log(error.path);
+    // → "tags"
+  }
+}
+```
+
+<Params title="Поля ошибки">
+<Param name="path" type="string">
+
+Путь массива в коде.
+
+</Param>
+</Params>
+
+Запрещены записи, зависящие от позиций: замена всего массива, позиционный `$set` и `$pop`. Операции, которым позиции не нужны, остаются разрешены: `push` добавляет элемент в конец, `addToSet` и `pull` находят элемент по значению. В запуске `push` к частично загруженному массиву сохранился без ошибки.
+
+### Когда не подходит
+
+Если вам нужно заменить элемент массива по позиции, загрузите массив целиком или используйте обновление по условию через [`updateOne`](../writes/writes.mdx#updateone) с фильтром по значению элемента.

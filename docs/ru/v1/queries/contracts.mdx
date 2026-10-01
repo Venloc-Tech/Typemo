@@ -1,0 +1,550 @@
+---
+title: Проверка формы ответа
+description: "Как зафиксировать форму ответа при компиляции и проверить данные из базы во время работы, чтобы ответ API не менялся незаметно"
+icon: FileCheck
+---
+
+Чтобы форма ответа не менялась незаметно, опишите её **контрактом** — типом, который вы пишете сами, — и попросите Typemo сверить с ним то, что запрос действительно возвращает. Это нужно там, где форма ответа — договорённость с другим кодом: тело ответа API, сообщение в очередь, вход для другого сервиса. Добавили поле в модель, поменяли выбор полей в запросе — и сверка при компиляции скажет, что ответ разошёлся с контрактом, а не клиент, который получил лишнее поле или потерял нужное.
+
+Проверка бывает двух видов, и они решают разные задачи. **При компиляции** — [`.expect`](../reference/query/contracts.mdx#expect) и [`Contract.check`](../reference/query/contracts.mdx#contractcheck): сравнивают тип результата с вашим описанием и ничего не стоят во время работы. **Во время работы** — [`.parse`](../reference/query/contracts.mdx#parse): прогоняет каждую строку через схему проверки данных. Второй вид нужен, потому что тип обещает форму, а база хранит то, что в неё записали: старая версия приложения, разовый скрипт, запись через драйвер.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель счёта из файла `accounts/account.ts`. В ней есть необязательная заметка и скрытый `pin`, чтобы на них были видны особые случаи.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true })
+  balance!: number;
+
+  @Prop(() => String)
+  note?: string;
+
+  @Prop(() => String, { hidden: true })
+  pin?: Hidden<string>;
+}
+```
+
+В коллекции три счёта: Alice (`Main`, баланс 100), Bob (`Savings`, баланс 250) и Carol, чью запись старый скрипт сделал напрямую в базу с балансом-строкой `"n/a"`.
+
+## Быстрый путь
+
+Три способа для трёх ситуаций. Контракт для строки результата запроса — при компиляции, через [`.expect`](../reference/query/contracts.mdx#expect) и описание [`Selected`](../reference/query/contracts.mdx#selected) («поля этой модели в plain-виде»):
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, type Selected, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String) note?: string;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+type BalanceRow = Selected<Account, "owner" | "balance">;
+
+const rows = await Accounts.find({ owner: { $ne: "carol" } })
+  .select({ owner: 1, balance: 1 })
+  .sort({ owner: 1 })
+  .plain()
+  .expect<BalanceRow>();
+console.log(rows.map((row) => [row.owner, row.balance]));
+// → [["alice", 100], ["bob", 250]]
+```
+
+Проверка данных во время работы — [`.parse`](../reference/query/contracts.mdx#parse) со схемой; для готового документа — [`Contract.check`](../reference/query/contracts.mdx#contractcheck) при компиляции. Остальная страница разбирает всё на задачах.
+
+## Зафиксировать форму ответа при компиляции
+
+Допустим, обработчик отдаёт клиенту список счетов с владельцем и балансом. Вы выбираете два поля методом [`.select`](../reference/query/reading.mdx#select), превращаете результат в обычные объекты через [`.plain()`](../reference/query/reading.mdx#plain) и добавляете `.expect<Форма>()`. Форма записывается через `Selected<Модель, "поле" | "поле">`: это тип строки plain-вида с этими полями. `_id` в него включён по умолчанию (в plain-виде это строка), а `"-_id"` среди полей его убирает.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, type Selected, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String) note?: string;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+// ---cut---
+type BalanceRow = Selected<Account, "owner" | "balance">;
+//   ^?
+
+type BalanceRowWithoutId = Selected<Account, "owner" | "balance" | "-_id">;
+//   ^?
+```
+
+`.expect` сверяет **точно**: те же поля, та же необязательность, те же `null`. Если совпало, запрос возвращается как был, а тип результата не меняется. Во время работы метод ничего не делает, поэтому его можно оставлять в коде навсегда.
+
+### Что ловит проверка
+
+Три вида расхождений, и все они видны при компиляции. Выбрали не все поля контракта:
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, type Selected, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String) note?: string;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+type BalanceRow = Selected<Account, "owner" | "balance">;
+// ---cut---
+// @errors: 2684
+await Accounts.find().select({ owner: 1 }).plain().expect<BalanceRow>();
+// компилятор: … is not assignable to method's 'this' of type '{ readonly missing: "balance"; }'
+```
+
+`missing` — поле есть в контракте, но нет в результате. Обратная ситуация — выбрали лишнее поле:
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, type Selected, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String) note?: string;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+type BalanceRow = Selected<Account, "owner" | "balance">;
+// ---cut---
+// @errors: 2684
+await Accounts.find().select({ owner: 1, balance: 1, note: 1 }).plain().expect<BalanceRow>();
+// компилятор: … is not assignable to method's 'this' of type '{ readonly extra: "note"; }'
+```
+
+`extra` — поле есть в результате, но нет в контракте. Лишнее поле здесь всегда ошибка, хотя обычная проверка типов TypeScript пропустила бы объект с лишним полем: контракт существует именно затем, чтобы поле не попадало в ответ незамеченным (например, чужая заметка клиенту). Третий вид, `mismatch`, — поле есть в обоих местах, но тип, `null` или необязательность разные:
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String) note?: string;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+type BalanceRow = { _id: string; owner: string; balance: string };
+
+// @errors: 2684
+await Accounts.find().select({ owner: 1, balance: 1 }).plain().expect<BalanceRow>();
+// компилятор: … is not assignable to method's 'this' of type '{ readonly mismatch: "balance"; }'
+```
+
+Сообщение называет поле, на котором расхождение. Пути вложенных полей записываются через точку, элементы массива — `[]`, а сам результат — `(root)`.
+
+## Сверить готовый документ или JSON
+
+`.expect` работает только у запросов. Когда у вас уже есть документ (например, после `findOne` или `create`), а клиенту вы отдаёте его `$toJSON()`, сверяйте значение через [`Contract.check`](../reference/query/contracts.mdx#contractcheck): она принимает любое значение и возвращает его же с типом контракта. Вызов записан в две скобки намеренно: первые фиксируют ожидаемый тип, вторые принимают значение, и TypeScript выводит его тип сам.
+
+```ts twoslash title="accounts/accounts.api.ts"
+import { Contract, Entity, type Hidden, Prop, Schema, type SelectedJson, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String) note?: string;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+type AccountJson = SelectedJson<Account, "owner" | "title" | "balance" | "note">;
+
+export const getAccountJson = async (owner: string) => {
+  const account = await Accounts.findOne({ owner }).orFail();
+  const json = Contract.check<AccountJson>()(account.$toJSON());
+  //    ^?
+  return json;
+};
+```
+
+Скрытый `pin` в контракте не назван, и проверка проходит: `$toJSON()` его не отдаёт. Убрали бы вы из описания `title` и `note` — проверка остановила бы вас, потому что документ отдаёт больше, чем обещает контракт:
+
+```ts twoslash
+import { Contract, Entity, type Hidden, Prop, Schema, type SelectedJson, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String) note?: string;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+const account = await Accounts.findOne({ owner: "alice" }).orFail();
+// ---cut---
+type Narrow = SelectedJson<Account, "owner" | "balance">;
+
+// @errors: 2379
+Contract.check<Narrow>()(account.$toJSON());
+// компилятор: … Property 'extra' is missing in type … but required in type '{ readonly extra: "title" | "note"; }'
+```
+
+## Какое описание взять
+
+Три типа описания различаются тем, в каком виде показывают значения, — так же, как различаются виды результата запроса. [`Selected`](../reference/query/contracts.mdx#selected) описывает plain-вид (`.plain()` и `$toPlain()`): идентификаторы — строки, есть геттер-виртуальные поля. [`SelectedLean`](../reference/query/contracts.mdx#selectedlean) описывает lean-вид (`.lean()`): значения как отдаёт драйвер, `_id` — `ObjectId`, 64-битные числа — `bigint`. [`SelectedJson`](../reference/query/contracts.mdx#selectedjson) описывает то, что возвращает `$toJSON()`: идентификаторы, даты и 64-битные числа — строки. Берите то, чем вы отдаёте данные: если ответ идёт клиенту через JSON, сверяйте с `SelectedJson`; если внутри приложения работаете с lean — с `SelectedLean`.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, type SelectedLean, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String) note?: string;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+type LeanRow = SelectedLean<Account, "owner" | "balance" | "-_id">;
+
+const rows = await Accounts.find({ owner: "alice" })
+  .select({ owner: 1, balance: 1, _id: 0 })
+  .lean()
+  .expect<LeanRow>();
+console.log(rows);
+// → [{ owner: "alice", balance: 100 }]
+```
+
+Если поле заполняется через `populate` или это вложенный документ, форма зависит от запроса, и её нужно назвать третьим параметром `Selected` — переопределением: `Selected<Post, "title" | "author", { author: Selected<User, "name" | "-_id"> }>`. Подробности — в справочнике [Контракты](../reference/query/contracts.mdx#selected).
+
+## Проверить данные из базы во время работы
+
+Тип обещает форму, а база хранит то, что в неё записали. Допустим, старый скрипт сохранил баланс Carol строкой `"n/a"`. Сверка при компиляции этого не увидит: для неё запись — просто число по типу модели. Чтобы поймать такую запись до того, как она уйдёт клиенту, передайте [`.parse`](../reference/query/contracts.mdx#parse) схему.
+
+Схема — любая, которая следует стандарту **Standard Schema**: объект с полем `"~standard"` (так устроены схемы популярных библиотек проверки данных, и их можно передавать без обёрток). Ниже — своя схема на несколько строк, чтобы не зависеть от библиотеки: она пропускает строку, только если владелец — строка, а баланс — число.
+
+```ts twoslash title="accounts/balance-row.ts"
+export const balanceRow = {
+  "~standard": {
+    version: 1 as const,
+    vendor: "app",
+    validate: (value: unknown) => {
+      const row = value as { owner?: unknown; balance?: unknown };
+      if (typeof row.owner !== "string") return { issues: [{ message: "owner must be a string", path: ["owner"] }] };
+      if (typeof row.balance !== "number") return { issues: [{ message: "balance must be a number", path: ["balance"] }] };
+      return { value: { owner: row.owner, balance: row.balance } };
+    },
+    types: undefined as unknown as { input: unknown; output: { owner: string; balance: number } },
+  },
+};
+```
+
+Перед проверкой результат нужно превратить в обычные объекты: `.parse` работает у `.lean()` и `.plain()`. Если все строки верны, вы получаете то, что вернула схема: она может не только проверять, но и преобразовывать строки.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String) note?: string;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+const balanceRow = {
+  "~standard": {
+    version: 1 as const,
+    vendor: "app",
+    validate: (value: unknown) => {
+      const row = value as { owner?: unknown; balance?: unknown };
+      if (typeof row.owner !== "string") return { issues: [{ message: "owner must be a string", path: ["owner"] }] };
+      if (typeof row.balance !== "number") return { issues: [{ message: "balance must be a number", path: ["balance"] }] };
+      return { value: { owner: row.owner, balance: row.balance } };
+    },
+    types: undefined as unknown as { input: unknown; output: { owner: string; balance: number } },
+  },
+};
+// ---cut---
+const bob = await Accounts.find({ owner: "bob" }).plain().parse(balanceRow);
+//    ^?
+console.log(bob);
+// → [{ owner: "bob", balance: 250 }]
+```
+
+А если в результат попадает запись Carol, запрос завершается ошибкой [`ValidationError`](../reference/errors/data-errors.mdx#validationerror). Ошибка одна на весь запрос и содержит замечания по всем строкам; путь начинается с номера строки в результате (счёт с нуля). Carol стоит третьей по владельцу, поэтому путь начинается с `2`:
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String) note?: string;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+const balanceRow = {
+  "~standard": {
+    version: 1 as const,
+    vendor: "app",
+    validate: (value: unknown) => {
+      const row = value as { owner?: unknown; balance?: unknown };
+      if (typeof row.owner !== "string") return { issues: [{ message: "owner must be a string", path: ["owner"] }] };
+      if (typeof row.balance !== "number") return { issues: [{ message: "balance must be a number", path: ["balance"] }] };
+      return { value: { owner: row.owner, balance: row.balance } };
+    },
+    types: undefined as unknown as { input: unknown; output: { owner: string; balance: number } },
+  },
+};
+// ---cut---
+try {
+  await Accounts.find().sort({ owner: 1 }).plain().parse(balanceRow);
+} catch (error) {
+  console.log(String(error));
+  // → 'ValidationError: Validation failed: "2.balance": row 2: balance must be a number [schema]'
+}
+```
+
+Схемы проверяют **читаемые** данные; схемы полей модели проверяют **записываемые**. Само чтение строки не проверяет: если в базе оказалось значение не того типа, обычный `find` вернёт его как есть. Поэтому `.parse` ставят там, где данные пересекают границу доверия.
+
+### Один документ и списки
+
+Для `findOne` результат — строка или `null`. Если ничего не найдено, `null` остаётся `null` и схемой не проверяется: отсутствие документа — не нарушение формы.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String) note?: string;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+const balanceRow = {
+  "~standard": {
+    version: 1 as const,
+    vendor: "app",
+    validate: (value: unknown) => {
+      const row = value as { owner?: unknown; balance?: unknown };
+      if (typeof row.owner !== "string") return { issues: [{ message: "owner must be a string", path: ["owner"] }] };
+      if (typeof row.balance !== "number") return { issues: [{ message: "balance must be a number", path: ["balance"] }] };
+      return { value: { owner: row.owner, balance: row.balance } };
+    },
+    types: undefined as unknown as { input: unknown; output: { owner: string; balance: number } },
+  },
+};
+// ---cut---
+const nobody = await Accounts.findOne({ owner: "nobody" }).plain().parse(balanceRow);
+console.log(nobody);
+// → null
+```
+
+### Большие выборки
+
+Если вы читаете список курсором ([`.cursor()`](../reference/query/cursor.mdx)), строки проверяются по мере чтения: первая неверная строка завершает чтение ошибкой `ValidationError` с номером строки в потоке, а курсор закрывается. Строки, прочитанные до ошибки, вы уже успели обработать — это ожидаемое поведение потока, а не потеря данных.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String) note?: string;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+const balanceRow = {
+  "~standard": {
+    version: 1 as const,
+    vendor: "app",
+    validate: (value: unknown) => {
+      const row = value as { owner?: unknown; balance?: unknown };
+      if (typeof row.owner !== "string") return { issues: [{ message: "owner must be a string", path: ["owner"] }] };
+      if (typeof row.balance !== "number") return { issues: [{ message: "balance must be a number", path: ["balance"] }] };
+      return { value: { owner: row.owner, balance: row.balance } };
+    },
+    types: undefined as unknown as { input: unknown; output: { owner: string; balance: number } },
+  },
+};
+// ---cut---
+const cursor = Accounts.find().sort({ owner: 1 }).plain().parse(balanceRow).cursor();
+const seen: string[] = [];
+try {
+  for await (const row of cursor) seen.push(row.owner);
+} catch (error) {
+  console.log(seen, String(error));
+  // → ["alice", "bob"] 'ValidationError: Validation failed: "2.balance": row 2: balance must be a number [schema]'
+}
+```
+
+## Как выбрать
+
+Задайте себе один вопрос: **кому вы не доверяете — коду или данным?** Если вы боитесь, что кто-то из команды изменит модель или запрос и ответ разойдётся с договорённостью, используйте `.expect` и `Contract.check`: они бесплатны и работают при компиляции. Если вы боитесь, что данные в базе не такие, как обещает тип (записаны старым приложением, импортом, руками), нужен `.parse`. На границе с внешним миром часто нужны оба: `.expect` фиксирует, что запрос выбирает нужные поля, а `.parse` проверяет, что значения этих полей пригодны.
+
+## Когда это не нужно
+
+Если ответ не покидает приложение и вы сами владеете и запросом, и потребителем, отдельный контракт лишний: тип результата запроса и так известен компилятору, и вы увидите его в подсказке редактора. Не ставьте `.parse` на горячий путь чтения, когда вы доверяете данным: он разбирает каждую строку, и это стоит времени. Для документов (гидратированных) `.expect` и `.parse` не применяются: контракт описывает данные, а документ — объект с методами, поэтому сверяйте результат его метода через `Contract.check`.
+
+## Частые ошибки
+
+### `.expect` не компилируется на документе
+
+Вы вызвали `.expect` у запроса без `.plain()` или `.lean()`. Контракт описывает данные, а документ — объект с методами, и точное сравнение с ним не имеет смысла. Компилятор говорит прямо, что делать:
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, type Selected, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String) note?: string;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+type BalanceRow = Selected<Account, "owner" | "balance">;
+// ---cut---
+// неправильно: у документа нет контракта
+// @errors: 2684
+await Accounts.find().select({ owner: 1, balance: 1 }).expect<BalanceRow>();
+// компилятор: … 'PathError<"expect<Shape>() checks rows: call .plain() or .lean() first (for a document, Contract.check its $toPlain())">'
+
+// правильно: строки результата в plain-виде
+await Accounts.find().select({ owner: 1, balance: 1 }).plain().expect<BalanceRow>();
+```
+
+### Контракт разошёлся из-за `_id`
+
+Вы описали форму как `{ owner: string; balance: number }`, а запрос вернул ещё и `_id`. `_id` в результате есть всегда, если вы не исключили его: `.select({ owner: 1, balance: 1, _id: 0 })`. Либо добавьте его в контракт, либо используйте `Selected<Account, "owner" | "balance">`, который его уже включает, или `"-_id"`, если исключаете.
+
+### Выбрали одно, описали другое: `extra` или `missing`
+
+Причина всегда в разнице между `.select` и контрактом: одно из них изменили, а другое нет. Ошибка называет поле. Верный путь — держать `.select` и контракт рядом и менять вместе; удобнее всего задать `Selected` от того же списка полей.
+
+### `.parse` до `.plain()`
+
+`.parse` проверяет данные, а гидратированный документ данными не является, поэтому вызов до `.lean()` или `.plain()` не компилируется, а из кода без типов бросает `QueryError`:
+
+```text
+QueryError: parse() validates rows: call .lean() or .plain() before .parse(schema)
+```
+
+Добавьте `.plain()` перед `.parse(схема)`.
+
+## Полный пример
+
+Один файл собирает всё: контракт запроса при компиляции, проверку данных во время работы и сверку документа. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="accounts/accounts.api.ts"
+import { Contract, Entity, type Hidden, Prop, Schema, type Selected, type SelectedJson, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true })
+  balance!: number;
+
+  @Prop(() => String)
+  note?: string;
+
+  @Prop(() => String, { hidden: true })
+  pin?: Hidden<string>;
+}
+
+// код читателя: ошибка на границе приложения и схема проверки данных
+class __BadData__ extends Error {}
+declare const __balanceRow__: {
+  "~standard": {
+    version: 1;
+    vendor: string;
+    validate: (value: unknown) => { value: { owner: string; balance: number } } | { issues: { message: string; path: string[] }[] };
+    types: { input: unknown; output: { owner: string; balance: number } };
+  };
+};
+
+type BalanceRow = Selected<Account, "owner" | "balance">;
+type AccountJson = SelectedJson<Account, "owner" | "title" | "balance" | "note">;
+
+export const createApi = (client: TypemoClient) => {
+  const Accounts = client.db().model(Account);
+
+  // список: форма зафиксирована при компиляции
+  const listBalances = () =>
+    Accounts.find().select({ owner: 1, balance: 1 }).sort({ owner: 1 }).plain().expect<BalanceRow>();
+
+  // список из ненадёжного источника: значения проверяются во время работы
+  const listCheckedBalances = async () => {
+    try {
+      return await Accounts.find().sort({ owner: 1 }).plain().parse(__balanceRow__);
+    } catch (error) {
+      throw new __BadData__("account data is corrupted", { cause: error });
+    }
+  };
+
+  // один счёт: документ превращается в JSON по контракту
+  const getAccount = async (owner: string) => {
+    const account = await Accounts.findOne({ owner }).orFail();
+    return Contract.check<AccountJson>()(account.$toJSON());
+  };
+
+  return { listBalances, listCheckedBalances, getAccount };
+};
+```
+
+<Callout type="migration">
+
+В Mongoose форма результата `lean()` описывалась вручную дженериком, и ничто не сверяло его с запросом: тип можно было написать любой. В Typemo форму сверяет компилятор: [`.expect`](../reference/query/contracts.mdx#expect) сравнивает описание с типом результата и сообщает о расхождении, а [`.parse`](../reference/query/contracts.mdx#parse) добавляет проверку во время работы схемой Standard Schema.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник: Контракты" href="../reference/query/contracts.mdx">
+  Все методы и типы контрактов с точными сигнатурами и ошибками.
+</Card>
+<Card title="Выбор полей и тип результата" href="./projections.mdx">
+  Как `select` меняет тип результата и почему `Selected` повторяет его.
+</Card>
+<Card title="Маски ответа" href="./response-masks.mdx">
+  Как показать клиенту только часть значения, не убирая поле целиком.
+</Card>
+<Card title="Чтение данных" href="./reading-data.mdx">
+  Документ, lean и plain: в каком виде отдавать данные из запроса.
+</Card>
+</Cards>

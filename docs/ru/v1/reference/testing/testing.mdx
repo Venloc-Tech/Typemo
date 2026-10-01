@@ -1,0 +1,406 @@
+---
+title: "@venloc/typemo/testing"
+description: "Фабрики тестовых данных и проверка использования индекса: defineFactory, explainIndexUsage, expectIndexScan, expectCollScan"
+icon: FlaskConical
+---
+
+Отдельный вход пакета, `@venloc/typemo/testing`, содержит инструменты для тестов вашего приложения: **фабрики** тестовых данных, которые проверяет компилятор, и проверки плана запроса, которые роняют тест, когда запрос перестал использовать индекс. Вход зависит только от ядра: ни сервера для тестов, ни других пакетов он не тянет, поэтому тестовую базу вы поднимаете сами.
+
+Как их применять в тестах приложения, рассказывает руководство [Тестировать приложение](../../testing/testing-apps.mdx). Эта страница — справочник.
+
+Примеры используют модель счёта. Значения получены запуском на настоящей базе: в коллекции три счёта `Account 1`, `Account 2`, `Account 3`, у `title` уникальный индекс.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true })
+  balance!: number;
+}
+```
+
+---
+
+## defineFactory
+
+`defineFactory` создаёт фабрику: вы один раз описываете, как выглядит обычный документ, а в тесте задаёте только то, что для теста важно. Фабрика типизирована по модели: переименовали поле модели, и сломается фабрика, а не молча тест. Данные строит функция от номера (1, 2, …), поэтому уникальные поля не конфликтуют.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+import { defineFactory } from "@venloc/typemo/testing";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank-test" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const accounts = defineFactory(Accounts, (n) => ({ title: `Account ${n}`, balance: 100 }));
+
+const draft = accounts.build({ balance: 5 });
+// → { title: "Account 1", balance: 5 }
+const saved = await accounts.createMany(2);
+// → документы с title "Account 2" и "Account 3"
+```
+
+<Params>
+<Param name="model" type="FactoryModel<T>" required>
+
+Модель, которая сохраняет документы: подойдёт любая модель Typemo (нужны только `entity` и `create`).
+
+</Param>
+<Param name="defaults" type="(n: number) => CreateInput<T>" required>
+
+Значения по умолчанию по номеру. Тип `CreateInput<T>` — то, что принимает `create`: обязательные поля обязательны и здесь.
+
+</Param>
+</Params>
+
+<Returns type="Factory<T>">
+
+Замороженный объект фабрики, см. [`Factory`](#factory). Ни умолчания, ни переопределения не изменяются: каждый вызов строит новый объект.
+
+</Returns>
+
+<FullType>
+
+```ts
+const defineFactory: <T extends object>(
+  model: FactoryModel<T>,
+  defaults: (n: number) => CreateInput<T>,
+) => Factory<T>;
+```
+
+</FullType>
+
+---
+
+## Factory
+
+`Factory` — то, что вернул `defineFactory`. Счётчик номера общий для всех методов: каждый `build` увеличивает его на единицу.
+
+<TypeTable
+  type={{
+    "build(overrides?)": { description: "Данные одного документа (умолчания, затем переопределения), без сохранения. `build({ balance: 5 })` дал `{ title: \"Account 2\", balance: 5 }` вторым по счёту вызовом.", type: "(overrides?: FactoryOverrides<T>) => CreateInput<T>" },
+    "buildMany(count, overrides?)": { description: "Данные `count` документов. Не целое неотрицательное число бросает `TypemoError: defineFactory: count must be a non-negative integer, got -1`.", type: "(count: number, overrides?: FactoryOverrides<T>) => CreateInput<T>[]" },
+    "create(overrides?)": { description: "Строит и сохраняет один документ через `model.create`; возвращает документ.", type: "(overrides?: FactoryOverrides<T>) => Promise<HydratedDoc<T>>" },
+    "createMany(count, overrides?)": { description: "Строит и сохраняет `count` документов по одному, в порядке номеров; для `count` то же условие, что у `buildMany`.", type: "(count: number, overrides?: FactoryOverrides<T>) => Promise<HydratedDoc<T>[]>" },
+    "reset()": { description: "Возвращает счётчик к началу: следующий номер снова 1. Нужен между тестами, если уникальные поля не должны зависеть от порядка запуска.", type: "() => void" },
+  }}
+/>
+
+Переопределение — объект с частью полей или функция от номера: `accounts.build((n) => ({ title: "VIP " + n }))` дал `{ title: "VIP 3", balance: 100 }` (третий вызов). Переопределение заменяет поле целиком, вложенные объекты не сливаются.
+
+<FullType>
+
+```ts
+type FactoryOverrides<T> = Partial<CreateInput<T>> | ((n: number) => Partial<CreateInput<T>>);
+
+interface FactoryModel<T> {
+  readonly entity: abstract new () => T;
+  create(doc: NoInfer<CreateInput<T>>): Promise<HydratedDoc<NoInfer<T>>>;
+}
+
+interface Factory<T> {
+  build(overrides?: FactoryOverrides<T>): CreateInput<T>;
+  buildMany(count: number, overrides?: FactoryOverrides<T>): CreateInput<T>[];
+  create(overrides?: FactoryOverrides<T>): Promise<HydratedDoc<T>>;
+  createMany(count: number, overrides?: FactoryOverrides<T>): Promise<HydratedDoc<T>[]>;
+  reset(): void;
+}
+```
+
+</FullType>
+
+`FactoryOverrides` и `FactoryModel` — типы аргументов; отдельного раздела они не требуют.
+
+---
+
+## explainIndexUsage
+
+`explainIndexUsage` спрашивает у базы план запроса (`explain("executionStats")`) и превращает ответ сервера в короткий отчёт: какие стадии, какие индексы, сколько документов прочитано. Он нужен там, где вы хотите смотреть на план сами: в отладке или в собственной проверке.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+import { explainIndexUsage } from "@venloc/typemo/testing";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank-test" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const usage = await explainIndexUsage(Accounts.find({ title: "Account 1" }));
+// → { stages: ["EXPRESS_IXSCAN"], indexes: ["title_1"], collectionScan: false, usesIndex: true,
+//     docsExamined: 1, keysExamined: 1, docsReturned: 1, covered: false }
+```
+
+Запрос по уникальному индексу сервер выполняет стадией `EXPRESS_IXSCAN`: индекс находит документ, и сервер читает его целиком, поэтому `docsExamined: 1` и `covered: false`. Если запросу нужны только поля индекса, документ читать не надо. Тогда `docsExamined` равен нулю, а `covered` — `true`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+import { explainIndexUsage } from "@venloc/typemo/testing";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank-test" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const covered = await explainIndexUsage(Accounts.find({ title: { $gte: "A" } }).select({ title: 1, _id: 0 }));
+// → { stages: ["PROJECTION_COVERED", "IXSCAN"], indexes: ["title_1"], collectionScan: false, usesIndex: true,
+//     docsExamined: 0, keysExamined: 3, docsReturned: 3, covered: true }
+```
+
+<Params>
+<Param name="query" type="Explainable" required>
+
+Запрос `find`/`findOne` или агрегация модели: всё, у чего есть метод `explain`.
+
+</Param>
+</Params>
+
+<Returns type="Promise<IndexUsage>">
+
+Замороженный отчёт [`IndexUsage`](#indexusage).
+
+</Returns>
+
+Бросает `TypemoError: explainIndexUsage: the server returned no plan`, если сервер не вернул план.
+
+<Callout type="warning">
+
+Поле `covered` — `true` только когда запрос идёт через индекс, не читает всю коллекцию, не содержит стадии `FETCH` и сервер не прочитал ни одного документа (`docsExamined` равен нулю). Стадии `FETCH` у `EXPRESS_IXSCAN` нет, но он документ читает, поэтому одного отсутствия `FETCH` мало: `findById` и `find` по уникальному полю дают `covered: false`. Чтобы запрос стал покрытым, ограничьте его полями индекса через [`select`](../query/reading.mdx#select) и уберите `_id`, если его нет в индексе.
+
+</Callout>
+
+<FullType>
+
+```ts
+const explainIndexUsage: (query: Explainable) => Promise<IndexUsage>;
+
+interface Explainable {
+  explain(verbosity?: "queryPlanner" | "executionStats" | "allPlansExecution"): PromiseLike<unknown>;
+}
+```
+
+</FullType>
+
+---
+
+## IndexUsage
+
+`IndexUsage` — отчёт о том, как запрос читает коллекцию. Его возвращают `explainIndexUsage`, `expectIndexScan` и `expectCollScan`, а `IndexUsageError` хранит его в `usage`.
+
+<TypeTable
+  type={{
+    "stages": { description: "Стадии выигравшего плана, внешняя первой: `[\"LIMIT\", \"FETCH\", \"IXSCAN\"]`.", type: "readonly string[]" },
+    "indexes": { description: "Индексы, по которым идёт план (`IXSCAN`, `DISTINCT_SCAN`, `COUNT_SCAN`, `EXPRESS_IXSCAN`).", type: "readonly string[]" },
+    "collectionScan": { description: "Какая-то стадия читает всю коллекцию (`COLLSCAN`).", type: "boolean" },
+    "usesIndex": { description: "План читает через индекс.", type: "boolean" },
+    "docsExamined": { description: "Сколько документов прочитал сервер (`totalDocsExamined`).", type: "number" },
+    "keysExamined": { description: "Сколько ключей индекса прочитал сервер.", type: "number" },
+    "docsReturned": { description: "Сколько документов вернул запрос.", type: "number" },
+    "covered": { description: "Результат получен только из индекса: нет `FETCH` и `COLLSCAN`, `docsExamined` равен нулю; см. предупреждение у `explainIndexUsage`.", type: "boolean" },
+  }}
+/>
+
+---
+
+## expectIndexScan
+
+`expectIndexScan` роняет тест, если запрос читает всю коллекцию или не использует индекс. Индекс легко потерять: переименовали поле, поменяли порядок ключей, и запрос молча стал медленным. Проверка превращает потерю в красный тест.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+import { expectIndexScan } from "@venloc/typemo/testing";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank-test" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await expectIndexScan(Accounts.find({ title: "Account 1" }), { index: "title_1", maxDocsExamined: 1 });
+// проходит и возвращает IndexUsage
+
+await expectIndexScan(Accounts.find({ balance: 100 }));
+// бросает IndexUsageError
+```
+
+<Params>
+<Param name="query" type="Explainable" required>
+
+Запрос `find`/`findOne` или агрегация.
+
+</Param>
+<Param name="options" type="ExpectIndexOptions" default="{}">
+
+Дополнительные ожидания. `index` — имя индекса, который должен использоваться; `maxDocsExamined` — потолок прочитанных документов; `covered: true` — результат только из индекса, без чтения документов (`docsExamined` равен нулю).
+
+</Param>
+</Params>
+
+<Returns type="Promise<IndexUsage>">
+
+Отчёт, если план соответствует ожиданиям.
+
+</Returns>
+
+**Ошибки.** [`IndexUsageError`](#indexusageerror) с перечнем проблем и планом. Тексты, полученные запуском:
+
+- без индекса: `the query is not served by an index: it scans the whole collection (COLLSCAN). plan: COLLSCAN; examined 3 documents, returned 3`;
+- не тот индекс: `the query is not served by an index: it does not use the index "nope_1" (it uses: title_1). plan: EXPRESS_IXSCAN; examined 1 documents, returned 1`.
+
+Если ни `COLLSCAN`, ни индекса нет, текст: `it uses no index`. Превышение `maxDocsExamined`: `it examined N documents, more than M`. Требование `covered`: `it is not covered by the index (it fetches documents)`. Несколько проблем склеиваются через `; `.
+
+Обратная проверка — [`expectCollScan`](#expectcollscan).
+
+<FullType>
+
+```ts
+const expectIndexScan: (query: Explainable, options?: ExpectIndexOptions) => Promise<IndexUsage>;
+```
+
+</FullType>
+
+---
+
+## ExpectIndexOptions
+
+Объект необязательных ожиданий для [`expectIndexScan`](#expectindexscan): `index?: string`, `maxDocsExamined?: number`, `covered?: boolean`. Все поля описаны там же.
+
+<FullType>
+
+```ts
+interface ExpectIndexOptions {
+  readonly index?: string;
+  readonly maxDocsExamined?: number;
+  readonly covered?: boolean;
+}
+```
+
+</FullType>
+
+---
+
+## expectCollScan
+
+`expectCollScan` роняет тест, если запрос **не** читает всю коллекцию. Нужен, когда отсутствие индекса задумано: например, редкий отчёт по полю, индекс на которое не стоит держать, и вы хотите заметить, если кто-то его добавит или запрос изменится.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+import { expectCollScan } from "@venloc/typemo/testing";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank-test" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const usage = await expectCollScan(Accounts.find({ balance: 100 }));
+// → usage.collectionScan === true
+```
+
+<Params>
+<Param name="query" type="Explainable" required>
+
+Запрос или агрегация.
+
+</Param>
+</Params>
+
+<Returns type="Promise<IndexUsage>">
+
+Отчёт, если запрос читает всю коллекцию.
+
+</Returns>
+
+Ошибка: `IndexUsageError: the query does not scan the collection. plan: EXPRESS_IXSCAN; examined 1 documents, returned 1`.
+
+<FullType>
+
+```ts
+const expectCollScan: (query: Explainable) => Promise<IndexUsage>;
+```
+
+</FullType>
+
+---
+
+## Explainable
+
+`Explainable` — то, что принимают проверки: любой объект с методом `explain(verbosity?)`. Запрос `find`/`findOne` и агрегация модели такими являются. Отдельно описывать нечего; тип объявлен в блоке «Полный тип» у [`explainIndexUsage`](#explainindexusage).
+
+---
+
+## IndexUsageError
+
+`IndexUsageError` — ошибка проверок `expectIndexScan` и `expectCollScan`. Она наследует `TypemoError`, а в поле `usage` хранит [`IndexUsage`](#indexusage) плана, который не прошёл проверку, чтобы тест мог вывести детали.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+import { expectIndexScan, IndexUsageError } from "@venloc/typemo/testing";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank-test" });
+const Accounts = client.db().model(Account);
+// ---cut---
+try {
+  await expectIndexScan(Accounts.find({ balance: 100 }));
+} catch (error) {
+  if (error instanceof IndexUsageError) console.log(error.usage.stages);
+  // → ["COLLSCAN"]
+}
+```
+
+<FullType>
+
+```ts
+class IndexUsageError extends TypemoError {
+  readonly usage: IndexUsage;
+  constructor(message: string, usage: IndexUsage, options?: TypemoErrorOptions);
+}
+```
+
+</FullType>
+
+---
+
+## Когда это не подходит
+
+Проверки плана нужны в тестах и отладке: они выполняют `explain`, то есть лишний запрос. В рабочем коде используйте [`.explain`](../query/search-and-explain.mdx#explain) напрямую. Тестовую базу поднимайте средствами приложения: `@venloc/typemo/testing` её не создаёт.
+
+## Что дальше
+
+<Cards>
+<Card title="Тестировать приложение" href="../../testing/testing-apps.mdx">
+  Тестовая база, фабрики и проверка индексов в реальном тесте.
+</Card>
+<Card title="Скорость запросов" href="../../queries/performance.mdx">
+  Как читать план запроса и когда добавлять индекс.
+</Card>
+</Cards>

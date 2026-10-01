@@ -1,0 +1,148 @@
+---
+title: Неизменяемые поля
+description: "Как запретить менять поле после создания документа и какие записи Typemo при этом останавливает"
+icon: Lock
+---
+
+Есть данные, которые задаются один раз и дальше не меняются: страна, в которой открыт счёт, номер во внешней системе, дата создания. Если такое поле можно изменить, то однажды его изменит случайное обновление или ошибка в коде, и вы не заметите этого, пока не сойдутся отчёты. Опция [`immutable: true`](../reference/schemas/prop.mdx#immutable) и тип [`Immutable<T>`](../reference/schemas/field-markers.mdx#immutable) закрывают эту дыру: значение записывается при создании документа, а любая попытка изменить его — ошибка.
+
+Так же устроены `_id` и `createdAt`: их неизменяемость — та же опция.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель счёта из файла `accounts/account.ts`.
+
+## Быстрый путь
+
+Поле объявляется парой: опция `immutable: true` и тип `Immutable<T>`. Компилятор проверяет, что они идут вместе, и не пускает такое поле в оператор обновления:
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, type Defaulted, type Immutable, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { immutable: true }) // [!code highlight]
+  country?: Immutable<string>;
+}
+
+const Accounts = client.db().model(Account);
+await Accounts.create({ country: "PL" });
+// @errors: 2769
+await Accounts.updateOne({ country: "PL" }, { $set: { country: "DE" } });
+```
+
+Остальная страница разбирает, что именно запрещено, и как обойти запрет там, где это законно.
+
+## Что запрещено после создания
+
+Запрещена любая запись, которая меняет неизменяемый путь, включая его удаление и замену родителя. Проверка идёт во время работы, поэтому её проходят и обновления, собранные без типов. Во всех случаях ошибка — [`StrictModeError`](../reference/errors/data-errors.mdx#strictmodeerror) с причиной `immutable`, а текст указывает оператор и путь.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { Entity, type Defaulted, type Immutable, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { immutable: true }) country?: Immutable<string>;
+  @Prop(() => Number, { default: 0 }) balance!: Defaulted<number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const account = await Accounts.create({ country: "PL" });
+try {
+  await Accounts.updateOne({ _id: account._id }, { $set: { country: "DE" } } as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → $set.country: "country" is immutable; it is written only when the document is created ($setOnInsert on upsert) [immutable]
+```
+
+Тот же текст (с другим оператором) вы получите от `$unset`, от [`findOneAndUpdate`](../reference/writes/writes.mdx#findoneandupdate), от `bulkWrite` и от [`$save`](../reference/documents/document-api.mdx#save): присваивание `account.country = "DE"` не бросает ошибку сразу, но сохранить такой документ нельзя. Пути внутри поддокументов защищены так же, и замена всего поддокумента, содержащего неизменяемое поле, тоже отвергается: `$set.address: "address.country" is immutable; …`.
+
+Обычные поля того же документа меняются как всегда: `$inc` по `balance` проходит. Защита точечная, она ограничивает только помеченные пути.
+
+## Записать значение при создании
+
+Значение неизменяемого поля пишется в момент создания документа. Если документ создаётся обновлением с `upsert`, значение нужно передать через `$setOnInsert`: этот оператор срабатывает только при вставке, поэтому нарушить неизменяемость им нельзя. `$set` с `upsert` для такого поля — та же ошибка.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { Entity, type Defaulted, type Immutable, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { immutable: true }) country?: Immutable<string>;
+  @Prop(() => Number, { default: 0 }) balance!: Defaulted<number>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ balance: 0 }, { $setOnInsert: { country: "FR" } }, { upsert: true });
+// создан документ со country: "FR"; следующий upsert по нему country не тронет
+```
+
+## Заменить документ целиком
+
+Замена [`replaceOne`](../reference/writes/writes.mdx#replaceone) переписывает документ целиком, поэтому про неизменяемое поле она обязана сказать то же, что уже хранится: то же значение, если поле в документе есть, и ничего, если его нет. Сохранённый документ знает только сервер, поэтому Typemo добавляет это условие в фильтр замены, и сервер сравнивает значения в той же операции. Замена с другим значением не записывается: `a replacement of Account changes the immutable field "country"; the document was not replaced. Carry the stored value [immutable]`. Замена без поля, которое в документе есть, отвергается с текстом `without the immutable field "country" would drop it from the stored document`, а замена, которая добавляет поле, отсутствующее в документе, — с текстом `sets the immutable field "country", which the stored document does not have`. Необязательное неизменяемое поле, которого нет ни в замене, ни в документе, замене не мешает. Так же проверяются [`findOneAndReplace`](../reference/writes/writes.mdx#findoneandreplace) и `replaceOne` в `bulkWrite`, подробности и `upsert` — в руководстве [Заменить документ](../writes/replace.mdx#замена-расходится-с-полем-immutable). `_id` в замене запрещён всегда, даже прежний: `a replacement of Account carries "_id": a replacement keeps the stored _id and cannot change it; leave "_id" out and select the document by _id in the filter [immutable]`.
+
+Обновление-конвейер ([`UpdatePipelines`](../reference/writes/pipeline-updates.mdx#updatepipelines)) проверяется так же строго: `set` неизменяемого поля — `StrictModeError` (`update.0.$set.country: "country" is immutable; …`), а стадия `replaceWith`, которая теряет такое поле, отвергается с подсказкой перенести его как есть: `$replaceWith rewrites the whole document and would change or drop the immutable fields country; carry each unchanged (country: "$country") or use $set/$unset of the other fields [immutable]`.
+
+## Как выбрать
+
+Задайте себе один вопрос: **может ли это значение когда-нибудь стать другим законно?** Если нет (страна регистрации, внешний идентификатор) — `immutable`. Если оно меняется редко, но бывает (адрес) — оставьте обычным полем, а историю изменений ведите [аудитом](../policies/audit.mdx). Если значение нельзя менять только определённым ролям, это правило приложения, а не схемы.
+
+## Когда это не нужно
+
+`immutable` защищает от обновлений через Typemo, а не от прямой записи в базу и не от операций драйвера, полученных через [`client.unsafeDriver`](../reference/connection/typemo-client.mdx#clientunsafedriver): они обходят все политики. Для полей, которые вы иногда исправляете вручную, ограничение будет мешать: там лучше обычное поле и аудит.
+
+## Частые ошибки
+
+### Опция без типа
+
+Опция и тип идут парой. Если поле объявлено обычным типом, компилятор ответит: `@Prop "country": "immutable" is set, declare the field as Immutable<T>`; а `Immutable<T>` без опции: `@Prop "country": the field is Immutable<T>, add immutable: true`. Так тип результата не расходится с поведением записи.
+
+### Исправить опечатку в неизменяемом поле
+
+Обновление отвергнуто, а значение нужно поправить. Через модель это невозможно намеренно. Поправьте значение разовым скриптом через [`client.unsafeDriver`](../reference/connection/typemo-client.mdx#clientunsafedriver) или пересоздайте документ.
+
+### Upsert падает на `$set`
+
+Если upsert должен создавать документ с неизменяемым полем, переведите это поле из `$set` в `$setOnInsert`.
+
+## Полный пример
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { Entity, type Defaulted, type Immutable, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  // страна регистрации не меняется никогда
+  @Prop(() => String, { immutable: true })
+  country?: Immutable<string>;
+
+  @Prop(() => Number, { default: 0 })
+  balance!: Defaulted<number>;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+
+// открытие: страна пишется при создании
+export const open = async (country: string) => Accounts.create({ country });
+
+// пополнение: обычное поле меняется свободно
+export const deposit = async (id: Account["_id"], amount: number) =>
+  Accounts.updateOne({ _id: id }, { $inc: { balance: amount } });
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Метки времени и версии" href="./timestamps-and-versions.mdx">
+  `createdAt` — готовый пример неизменяемого поля.
+</Card>
+<Card title="Справочник: маркерные типы" href="../reference/schemas/field-markers.mdx">
+  `Immutable`, `Hidden` и другие типы-метки.
+</Card>
+<Card title="Справочник: @Prop" href="../reference/schemas/prop.mdx">
+  Все опции поля, в том числе `immutable`.
+</Card>
+</Cards>

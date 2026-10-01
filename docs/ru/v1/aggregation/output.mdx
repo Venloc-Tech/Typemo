@@ -1,0 +1,285 @@
+---
+title: Сохранить результат
+description: "Как записать результат агрегации в коллекцию через out и merge, обновлять его и когда вместо этого нужно материализованное представление"
+icon: Save
+---
+
+Тяжёлый отчёт не стоит пересчитывать на каждый показ: его считают раз в час или раз в день, а результат сохраняют в отдельную коллекцию и читают оттуда обычным [`find`](../reference/query/reading.mdx#modelfind). Две последние стадии конвейера делают это без участия приложения: [`out`](../reference/aggregation/stages.mdx#out) **заменяет** коллекцию результатом целиком, а [`merge`](../reference/aggregation/stages.mdx#merge) **вливает** строки в существующую коллекцию: вставляет новые и по правилу обновляет совпавшие.
+
+После `out` или `merge` конвейер закончен: добавить ещё стадию нельзя, и агрегация возвращает пустой массив, а не строки. Если строки результата нужны и приложению, запустите второй запрос к получившейся коллекции.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и запуск агрегации из руководства [Первая агрегация](first-aggregation.mdx). Заказы (`customer`, `status`, `total`, `placedAt`) уже лежат в коллекции `orders`: две оплаченных суммы за январь и февраль (120 и 80) и одна за февраль (50). Результат хранится в модели `MonthlyRevenue`, где `_id` — месяц, то есть строка. Поэтому модель наследует не [`Entity`](../reference/schemas/base-classes.mdx#entity), а [`EntityWithId`](../reference/schemas/base-classes.mdx#entitywithid) со строковым `_id`: ключ группы становится `_id` строки результата, и цель `out` или `merge` должна иметь `_id` того же типа. Подробнее о таких моделях — в руководстве [Задать свой тип _id](../schemas/custom-ids.mdx#записать-результат-агрегации-в-такую-коллекцию).
+
+```ts twoslash title="orders/models.ts"
+import { Entity, EntityWithId, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true })
+  status!: string;
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+
+@Schema({ collection: "monthly_revenue" })
+export class MonthlyRevenue extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true })
+  revenue!: number;
+}
+```
+
+## Быстрый путь
+
+Завершите конвейер `out` с классом-результатом. Строки должны подходить его полям: компилятор сверяет их.
+
+```ts twoslash
+import { Entity, EntityWithId, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+@Schema({ collection: "monthly_revenue" })
+class MonthlyRevenue extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true }) revenue!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Monthly = client.connection.model(MonthlyRevenue);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .group((f) => ({ _id: fn.dateToString({ date: f.placedAt, format: "%Y-%m" }), revenue: fn.sum(f.total) }))
+    .out(MonthlyRevenue),
+);
+// → []
+console.log(await Monthly.find().sort({ _id: 1 }).lean());
+// → [{ _id: "2026-01", revenue: 120 }, { _id: "2026-02", revenue: 130 }]
+```
+
+Чтобы не заменять коллекцию, а обновлять, используйте `merge`. Остальная страница разбирает оба способа.
+
+## Заменить коллекцию результатом
+
+Прежнее содержимое целевой коллекции при `out` пропадает целиком: остаются только строки этого запуска. Поэтому `out` подходит для отчёта, который каждый раз считается заново по всем данным.
+
+В `out` можно передать класс (тогда строки проверяются по его полям), имя коллекции этой же базы или объект `{ db, coll }` для другой базы: в объекте `db` обязателен, иначе сервер отвергнет запрос. Имя коллекции проверять не по чему, поэтому тип строк там не сверяется.
+
+```ts twoslash
+import { Entity, EntityWithId, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+@Schema({ collection: "monthly_revenue" })
+class MonthlyRevenue extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true }) revenue!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Monthly = client.connection.model(MonthlyRevenue);
+// ---cut---
+await Orders.aggregate((p) => p.match({ status: "paid" }).out("paid_orders"));
+await Orders.aggregate((p) => p.match({ status: "paid" }).out({ db: "reports", coll: "paid_orders" }));
+```
+
+Запись выполняется один раз на объект запроса: второй `await` того же запроса бросает `QueryError: aggregate: this operation was already executed; build a new one, or run it again deliberately with exec({ force: true }) (a write runs once per builder)`. Это защита от случайного двойного пересчёта; чтобы пересчитать нарочно, создайте новый запрос или вызовите [`.exec({ force: true })`](../reference/aggregation/pipeline.mdx#exec).
+
+## Влить строки в существующую коллекцию
+
+Если строки нужно добавлять или обновлять, а остальное оставить, используйте `merge`. Параметр `on` называет поля, по которым строка результата сопоставляется со строкой цели (по умолчанию `_id`), а `whenMatched` — что делать с совпавшей строкой: `"replace"` (заменить), `"keepExisting"` (оставить прежнюю), `"merge"` (слить поля), `"fail"` (ошибка) или конвейер. `whenNotMatched` решает судьбу новой строки.
+
+```ts twoslash
+import { Entity, EntityWithId, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+@Schema({ collection: "monthly_revenue" })
+class MonthlyRevenue extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true }) revenue!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Monthly = client.connection.model(MonthlyRevenue);
+// ---cut---
+await Orders.aggregate((p) =>
+  p
+    .group((f) => ({ _id: fn.dateToString({ date: f.placedAt, format: "%Y-%m" }), revenue: fn.sum(f.total) }))
+    .merge({ into: MonthlyRevenue, whenMatched: "replace" }),
+);
+console.log(await Monthly.find().sort({ _id: 1 }).lean());
+// → [{ _id: "2026-01", revenue: 120 }, { _id: "2026-02", revenue: 155 }, { _id: "2026-04", revenue: 10 }]
+```
+
+Результат показан после того, как в `orders` добавились ещё два заказа, пока не оплаченные: 25 за февраль и 10 за апрель. Февраль обновился (130 стало 155), апрель вставился, январь остался прежним. Строки, для которых свежих данных нет, `merge` не удаляет: если месяц исчез из исходных данных, его строка в результате останется.
+
+Поля `on` должны быть под **уникальным индексом** цели: иначе сервер не сможет однозначно найти совпавшую строку. Для `_id` индекс уже есть.
+
+## Обновить строку по своему правилу
+
+В `whenMatched` можно передать функцию, которая строит конвейер обновления над существующей строкой. Новая строка доступна как `v.new`, поэтому можно, например, прибавить свежую сумму к прежней.
+
+```ts twoslash
+import { Entity, EntityWithId, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+@Schema({ collection: "monthly_revenue" })
+class MonthlyRevenue extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true }) revenue!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Monthly = client.connection.model(MonthlyRevenue);
+// ---cut---
+const increment = Orders.aggregate((p) =>
+  p
+    .match({ status: "paid" })
+    .group((f) => ({ _id: fn.dateToString({ date: f.placedAt, format: "%Y-%m" }), revenue: fn.sum(f.total) }))
+    .merge({
+      into: MonthlyRevenue,
+      on: "_id",
+      whenMatched: (u, v) => u.set((f) => ({ revenue: fn.add(f.revenue, v.new.revenue) })),
+    }),
+);
+```
+
+<Callout type="warning" title="Полный пересчёт со сложением удваивает итоги">
+
+Этот конвейер **нельзя запускать повторно на тех же заказах**. `merge` не знает, какие заказы уже учтены в сохранённой строке: при каждом запуске `group` заново считает сумму по всем оплаченным заказам, а `fn.add` прибавляет её к прежней. Второй запуск на тех же данных дал январю 240 вместо 120, февралю — 285 вместо 155, третий утроил бы суммы. Ошибки при этом нет: так работает сервер, Typemo не может отличить новую добавку от повторной.
+
+Если конвейер пересчитывает **все** заказы, используйте `whenMatched: "replace"`: строка заменяется свежим итогом, и повторный запуск даёт то же число. Сложение подходит только тогда, когда `match` отбирает лишь новые заказы, например `placedAt` позже последнего обновления.
+
+</Callout>
+
+## Как выбрать
+
+Задайте вопрос: пересчитывается ли результат целиком? Если да и вы готовы заменить коллекцию, берите `out`. Если результат обновляется частями или коллекцию читают другие процессы, берите `merge` с `"replace"` для пересчёта и с конвейером для добавки. Если результат нужно регулярно обновлять и вы хотите описать пару «источник — результат» один раз, используйте [материализованное представление](../collections/materialized-views.mdx): оно само добавляет `merge` и проверяет индекс.
+
+## Когда это не нужно
+
+Если результат нужен только на время запроса, не сохраняйте его: читайте строки агрегации. Если результат должен всегда быть свежим, а не пересчитываться по расписанию, посмотрите [представление](../collections/views.mdx): оно считается при каждом чтении.
+
+## Частые ошибки
+
+### Второй `await` не выполняет запись
+
+Запись выполняется один раз на объект запроса. Повторный `await` (например, при повторной попытке) бросает `QueryError` с текстом из раздела выше. Создайте запрос заново.
+
+### Результат удвоился после `merge` со сложением
+
+Причина описана выше: конвейер пересчитал все заказы, а `whenMatched` прибавил их к прежним. Для пересчёта используйте `"replace"`; в опыте выше январь при сложении дал 240 вместо 120, февраль — 285 вместо 155.
+
+### Компилятор: строки не подходят цели
+
+Из группы получились строки `{ _id, total }`, а у класса-результата обязательное поле `revenue`. Компилятор отвергает `out` на месте вызова и называет поле для проверки:
+
+```ts twoslash
+// @errors: 2769
+import { Entity, EntityWithId, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+}
+
+@Schema({ collection: "monthly_revenue" })
+class MonthlyRevenue extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true }) revenue!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+await Orders.aggregate((p) => p.group((f) => ({ _id: f.status, total: fn.sum(f.total) })).out(MonthlyRevenue));
+```
+
+Сообщение содержит `PathError<"the pipeline rows do not match the target model: check the field \"revenue\"">`. Так же компилятор отвечает на `merge({ into: MonthlyRevenue })`. Переименуйте поле в `group` или приведите класс-результат к строкам, которые вы записываете.
+
+### `out` затёр коллекцию
+
+`out` заменяет целевую коллекцию целиком, в том числе если вы указали не ту. Класс модели в качестве цели защищает лучше строкового имени: имя коллекции берётся из схемы, а строки сверяются с её полями.
+
+## Полный пример
+
+```ts twoslash title="reports/monthly.job.ts"
+import { Entity, EntityWithId, Prop, Schema, TypemoClient, fn } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+@Schema({ collection: "monthly_revenue" })
+class MonthlyRevenue extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true }) revenue!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+const Monthly = client.connection.model(MonthlyRevenue);
+// ---cut---
+// 1. Полный пересчёт: строки заменяются, месяцы без заказов остаются.
+export const refreshMonthly = () =>
+  Orders.aggregate((p) =>
+    p
+      .match({ status: "paid" })
+      .group((f) => ({ _id: fn.dateToString({ date: f.placedAt, format: "%Y-%m" }), revenue: fn.sum(f.total) }))
+      .merge({ into: MonthlyRevenue, whenMatched: "replace" }),
+  );
+
+// 2. Чтение результата обычной моделью.
+export const monthlyReport = () => Monthly.find().sort({ _id: 1 }).lean();
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Материализованные представления" href="../collections/materialized-views.mdx">
+  Пара «источник — результат» с готовым обновлением и проверкой индекса.
+</Card>
+<Card title="Представления" href="../collections/views.mdx">
+  Результат, который считается при каждом чтении.
+</Card>
+<Card title="Справочник: стадии" href="../reference/aggregation/stages.mdx#merge">
+  Все параметры `out` и `merge`.
+</Card>
+</Cards>

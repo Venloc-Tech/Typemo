@@ -1,0 +1,498 @@
+---
+title: "@Pre, @Post и @PostError"
+description: "Три декоратора хуков, полный список событий, что получает хук и чем он отличается на разных событиях"
+icon: Webhook
+---
+
+**Хук** — это метод вашей модели, который Typemo вызывает до или после операции: до сохранения документа, до чтения, после удаления. Хуки нужны, когда одно и то же действие должно происходить при любом пути к операции: привести поле к нужному виду перед сохранением, добавить условие к каждому чтению, записать в журнал результат записи. Эта страница описывает три декоратора, которыми хуки объявляются, и все события, на которые их можно повесить.
+
+Если вы впервые пишете хуки, сначала прочитайте руководства [Хуки операций](../../hooks/operation-hooks.mdx) и [Хуки документа](../../hooks/document-hooks.mdx). Эта страница — справочник. Что видит хук операции и что он может изменить, описано на странице [Контекст операции](./operation-context.mdx).
+
+Все примеры используют одну модель счёта.
+
+```ts twoslash title="accounts/account.ts"
+import { type Defaulted, Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { default: 0 })
+  balance!: Defaulted<number>;
+}
+```
+
+---
+
+## @Pre
+
+`@Pre` запускает метод **перед** событием. Событие называет операцию вместе с её областью: `document.save` — сохранение документа, `query.updateMany` — запрос `updateMany`, `model.insertMany` — пакетная вставка, `aggregate` — агрегация. Область в имени нужна, чтобы хук не приходилось угадывать: в Mongoose имя `updateOne` означало и хук документа, и хук запроса, и выбор между ними делали флагами. Здесь у каждого события одна область, и от неё зависит, чем будет `this`.
+
+```ts twoslash
+import { Entity, Pre, Prop, Schema } from "@venloc/typemo";
+// ---cut---
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Pre("document.save")
+  normalizeTitle(this: Account): void {
+    this.title = this.title.trim();
+  }
+}
+```
+
+После этого `create` и `$save` перед записью убирают пробелы по краям названия. Запуск: `create({ title: "  Main  " })` сохранил `"Main"`.
+
+<Params>
+<Param name="events" type="HookEvent | [HookEvent, ...HookEvent[]]" required>
+
+Одно событие или непустой список событий. Со списком один метод обслуживает несколько событий, например `["query.find", "query.findOne"]`. Список событий — [`HOOK_EVENTS`](#hook_events). Событие, которого в списке нет, компилятор не принимает; в JavaScript-коде без типов декоратор его не проверяет.
+
+</Param>
+</Params>
+
+<Returns type="MethodDecorator">
+
+Декоратор метода. Он сверяет подпись метода с событием: тип `this` и аргументы должны подходить событию. Метод должен быть методом экземпляра, а не статическим. Возвращаемое значение метода игнорируется, но если метод возвращает промис, Typemo его дожидается.
+
+</Returns>
+
+<FullType>
+
+```ts
+const Pre: <const E extends HookEvent | readonly [HookEvent, ...HookEvent[]]>(
+  events: E,
+) => HookDecorator<E, "pre">;
+
+type HookDecorator<E, P extends HookPhase> = <T extends object, K extends string, M extends HookMethod<E, T, P>>(
+  target: T,
+  key: K,
+  descriptor: TypedPropertyDescriptor<M> & HookCheck<E, T, M, P>,
+) => void;
+
+type HookMethod<E, T, P extends HookPhase> = (this: HookThisOf<E, T>, ...args: HookArgs<P, E, T>) => unknown;
+```
+
+</FullType>
+
+### `this` зависит от области события
+
+Для событий `document.*` `this` — гидратированный экземпляр вашего класса: документ модели или, если класс встроен в другую модель, поддокумент. Хук класса запускается в обоих случаях, поэтому его тип — [`HookThis<"document.save", Account>`](#hookthis), то есть `HydratedDoc<Account> | Subdocument<Account>`. Без проверки на нём доступны поля класса и общие методы `$isNew()`, `$isModified()` и `$isRoot()`; методы, которые есть только у корня (`$getChanges()`, `$save()` и остальные), — после [`if (this.$isRoot())`](../documents/document-api.mdx#isroot). Для остальных событий `this` — [`OperationHookContext`](./operation-context.mdx#operationhookcontext), представление операции, которое умеет [`.skip`](./operation-context.mdx#skip) и [`.modify`](./operation-context.mdx#modify). Тип `this` нужно объявить в подписи метода: `this: HookThis<"document.save", Account>` или `this: OperationHookContext<Account, "query.find">`. Так компилятор знает, какие поля и методы у вас есть, а если вы объявили не то, отказывает:
+
+```ts twoslash
+import { Entity, Pre, Prop, Schema, type OperationHookContext } from "@venloc/typemo";
+// ---cut---
+// @errors: 1241
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Pre("query.find")
+  wrong(this: Account): void {}
+}
+```
+
+`this: Account` тоже допустим: это тот же документ, но в типе только поля класса, без методов с `$`. Если `this` не объявить вовсе, внутри метода он тоже получит тип класса.
+
+Объявить `this: HydratedDoc<Account>` нельзя: этот тип обещает методы корня, которых у поддокумента нет, и вызов упал бы во время работы, если класс окажется встроенным. Компилятор отказывает с текстом, который называет декоратор и событие:
+
+```ts twoslash
+import { Entity, type HydratedDoc, Pre, Prop, Schema } from "@venloc/typemo";
+// ---cut---
+// @errors: 1241
+@Schema()
+export class Line extends Entity {
+  @Prop(() => Number, { required: true })
+  qty!: number;
+
+  @Pre("document.save")
+  check(this: HydratedDoc<Line>): void {}
+}
+```
+
+Текст ошибки: `@Pre("document.save"): a document hook may also run on a subdocument of the class; declare this as HydratedDoc<Entity> | Subdocument<Entity>, or narrow with if (this.$isRoot())`. Объявите `this: HookThis<"document.save", Line>` и сужайте его проверкой `$isRoot()`.
+
+### Несколько хуков на одно событие
+
+Хуки одного события и одной фазы не заменяют друг друга: выполняются все, строго друг за другом, каждый дожидается предыдущего. Порядок: сначала хуки базового класса, затем хуки самого класса в порядке объявления в файле, затем хуки плагинов. Один метод можно повесить на несколько событий списком. Подробнее о порядке и ошибках — в руководстве [Порядок и ошибки хуков](../../hooks/order-and-errors.mdx).
+
+### Ошибки
+
+Декоратор проверяет метод при объявлении класса. Для статического метода он бросает `ConfigurationError`:
+
+```text
+ConfigurationError: Account: a hook must be an instance method, "audit" is static
+```
+
+Декораторы `@Pre`, `@Post` и `@PostError` из `@venloc/typemo` работают с legacy-декораторами; для TC39 есть такие же в пакете `@venloc/typemo-decorators`. Если ваш `@Pre` бросает ошибку, она доходит до вызывающего кода как есть, а операция не выполняется: подробнее в руководстве [Порядок и ошибки хуков](../../hooks/order-and-errors.mdx#ошибка-в-pre-хуке).
+
+### Хук операции в классе поддокумента
+
+<Callout type="warning">
+
+Хук операции (`query.*`, `model.*`, `aggregate`) запускается только для операций **модели** этого класса. В классе, который используется только как поддокумент (встроен в другой класс и не передаётся в `connection.model`), такой хук не запускается никогда, и об этом не сообщают ни компилятор, ни создание модели: операции идут к модели внешнего класса, и выполняются её хуки. Объявляйте хуки операций в классе модели. Хуки документа (`document.*`) в классе поддокумента работают: `this` в них — поддокумент.
+
+</Callout>
+
+Ошибки здесь нет потому, что тот же класс может быть моделью в другом месте приложения: там его хук операции нужен и работает. Пример и исправление — в руководстве [Вмешаться в операцию](../../hooks/operation-hooks.mdx#хук-операции-в-классе-поддокумента-не-вызывается).
+
+### Когда `@Pre` не подходит
+
+Если вам нужно только приводить и проверять значения поля, используйте опции [`@Prop`](../schemas/prop.mdx) (`trim`, `lowercase`, `validate`): они работают и в обновлениях, а хук `document.save` — только при сохранении документа. Если нужно наблюдать за операциями, не вмешиваясь в них, используйте [события операций](../observability/events.mdx). Если один и тот же набор хуков нужен многим моделям, оформите его как [плагин](./plugins.mdx#schemaplugin).
+
+---
+
+## @Post
+
+`@Post` запускает метод **после** события, когда оно завершилось успешно. Метод получает результат операции. Он нужен для действий, которые имеют смысл только после успеха: записать в журнал, сколько документов изменилось, сбросить кеш, отправить сообщение.
+
+```ts twoslash
+import { Entity, Post, Prop, Schema, type OperationHookContext } from "@venloc/typemo";
+// ---cut---
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Post("query.deleteMany")
+  logDeleted(this: OperationHookContext<Account, "query.deleteMany">, result: { readonly deletedCount: number | null }): void {
+    console.log(`удалено счетов: ${result.deletedCount}`);
+  }
+}
+```
+
+Запуск: `deleteMany({ owner: "bob" })` при одном счёте у Боба вывел `удалено счетов: 1`. Тип `deletedCount` здесь `number | null`, потому что тот же хук вызывается и для `deleteMany` внутри [`bulkWrite`](../../writes/bulk.mdx#хуки-операций-внутри-bulkwrite), где число удалённых по одной операции неизвестно: подробнее в разделе [Результат для каждого события](#результат-для-каждого-события).
+
+<Params>
+<Param name="events" type="HookEvent | [HookEvent, ...HookEvent[]]" required>
+
+Одно событие или список событий, как у [`@Pre`](#pre).
+
+</Param>
+</Params>
+
+<Returns type="MethodDecorator">
+
+Декоратор метода. Единственный аргумент метода — результат события, его тип задаёт [`PostResult`](#postresult): для `document.save` это сам документ, для `query.countDocuments` число, для `query.deleteMany` `DeleteResult`. Метод, который принимает не тот тип, компилятор отвергает.
+
+</Returns>
+
+<FullType>
+
+```ts
+const Post: <const E extends HookEvent | readonly [HookEvent, ...HookEvent[]]>(
+  events: E,
+) => HookDecorator<E, "post">;
+```
+
+</FullType>
+
+### Результат для каждого события
+
+Что именно получает `@Post`, зависит от события. Для `query.find` и других чтений с массивом результат — список документов в том виде, в каком его получит вызывающий код (гидратированный или lean), поэтому тип элементов здесь `unknown`, а не ваша модель: вид документа выбирает вызывающий. Для курсора хук вызывается на каждую порцию, которую база отдала целиком, после гидратации: при `batchSize(3)` и семи документах хук сработал три раза, с тремя, тремя и одним документом. Полная таблица — в разделе [PostResult](#postresult).
+
+У хуков `query.updateOne`, `query.updateMany`, `query.replaceOne`, `query.deleteOne` и `query.deleteMany` результат зависит от того, откуда пришла операция. Вызов `Accounts.updateOne(...)` даёт [`UpdateResult`](../writes/writes.mdx#updateresult) с настоящими счётчиками. Но те же хуки вызываются и для каждой операции внутри [`bulkWrite`](../writes/writes.mdx#bulkwrite), а сервер сообщает по отдельной операции пакета только идентификатор вставленного через `upsert` документа. Поэтому там хук получает [`BulkOperationResult`](./operation-context.mdx#bulkoperationresult), в котором счётчики равны `null`, а не выдуманным нулям. Хук, который читает `matchedCount`, должен проверять `null`, а различить вызовы можно по `this.bulkIndex`: у обычного вызова он `undefined`.
+
+### Ошибка внутри `@Post`
+
+Что получит вызывающий код, если `@Post` бросил ошибку, зависит от того, успела ли операция что-то записать. Операция к этому моменту уже выполнена, поэтому `@PostError` не запускается: сообщать об ошибке операции было бы неправдой.
+
+Для **чтения** вызывающий код получает ошибку хука как есть. Запуск: `find`, чей `@Post` бросил `Error("find post failed")`, отклонился этой ошибкой.
+
+Для **записи** вне транзакции запись остаётся в базе, и Typemo не отдаёт ошибку хука как есть: иначе повтор вызова записал бы документ второй раз. Вызывающий код получает [`PostHookError`](../errors/hierarchy.mdx#posthookerror) с `applied: true`, названием вызванного метода в `operation`, результатом записи в `result` и ошибкой хука в `cause`. Запуск: `create` с `@Post("document.save")`, бросившим `Error("post failed")`, отклонился так: `PostHookError: Account.create: a post hook failed after the write succeeded: post failed. The write IS applied (outside a transaction nothing rolls it back); do not repeat it — the hook's error is the cause`; документ в коллекции есть. Для `bulkWrite` в поле `operation` стоит `bulkWrite`.
+
+Внутри транзакции запись откатывается вместе с ошибкой хука, поэтому вызывающий код получает саму ошибку хука, а не `PostHookError`. Запуск: тот же `create` внутри `client.transaction(...)` отклонился `Error: post failed`, а документа в коллекции нет.
+
+### Когда `@Post` не подходит
+
+Если нужно получить результат операции в том же месте, где вы её вызвали, хук не нужен: результат вернёт сам вызов. Если хук должен изменить результат, `@Post` для этого не годится: значение, которое он возвращает, игнорируется. Изменять операцию можно в [`@Pre`](#pre) через [`.modify`](./operation-context.mdx#modify) и [`.skip`](./operation-context.mdx#skip).
+
+---
+
+## @PostError
+
+`@PostError` — это **отдельный декоратор**, а не вариант `@Post`. Он запускает метод вместо `@Post`, когда событие завершилось ошибкой, и передаёт методу эту ошибку. Отдельным его сделали ради типов: аргумент ошибки в `@PostError` имеет тип `unknown`, а аргумент `@Post` — результат события, и одна функция не могла бы честно описать оба.
+
+```ts twoslash
+import { Entity, PostError, Prop, Schema } from "@venloc/typemo";
+// ---cut---
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @PostError("document.save")
+  reportFailure(this: Account, error: unknown): void {
+    console.error(`не удалось сохранить ${this.title}:`, error instanceof Error ? error.message : error);
+  }
+}
+```
+
+<Params>
+<Param name="events" type="HookEvent | [HookEvent, ...HookEvent[]]" required>
+
+Одно событие или список событий, как у [`@Pre`](#pre).
+
+</Param>
+</Params>
+
+<Returns type="MethodDecorator">
+
+Декоратор метода. Метод принимает один аргумент, `error: unknown`. Возвращаемое значение игнорируется.
+
+</Returns>
+
+<FullType>
+
+```ts
+const PostError: <const E extends HookEvent | readonly [HookEvent, ...HookEvent[]]>(
+  events: E,
+) => HookDecorator<E, "postError">;
+```
+
+</FullType>
+
+### На каждое событие — один из двух: `@Post` или `@PostError`
+
+Если хотя бы один `@Pre` события был вызван, событие заканчивается ровно одним из двух: `@Post` или `@PostError`. Ошибка внутри самого `@Pre` тоже считается ошибкой события: до драйвера операция не дошла, но `@PostError` вызывается. Ошибка приведения или проверки фильтра, которая случается ещё до `@Pre`, тоже приводит к `@PostError`, а хуки `@Pre` в этом случае не вызываются (запуск: `find({ nope: 1 })` вызвал только `@PostError` с `StrictModeError`).
+
+### Ошибка внутри `@PostError`
+
+Если `@PostError` бросает ошибку, вызывающий код получит её вместо исходной, но исходная не теряется: она лежит в `cause` новой ошибки. Запуск: хук, выбросивший `Error("postError failed")` при ошибке фильтра, подменил `StrictModeError`, и `error.cause` остался `StrictModeError`. То же у `create` с неверным значением: вызывающий код получил `Error: postError failed`, а в `cause` — `ValidationError`. Всё равно не бросайте ошибку из `@PostError`: если нужно только записать её в журнал, просто запишите и вернитесь.
+
+### Когда `@PostError` не подходит
+
+Чтобы обработать ошибку операции там, где вы её вызвали, достаточно `try`/`catch`: смотрите [Обработка ошибок](../../errors/handling.mdx). `@PostError` нужен, когда одна реакция на ошибку должна работать для всех путей к операции.
+
+---
+
+## HOOK_EVENTS
+
+`HOOK_EVENTS` — замороженный список всех событий, на которые можно повесить хук. Он нужен, когда вы пишете плагин и хотите повесить хук сразу на все события, или проверяете имя события, которое пришло из конфигурации.
+
+```ts twoslash
+import { HOOK_EVENTS } from "@venloc/typemo";
+// ---cut---
+console.log(HOOK_EVENTS.length, HOOK_EVENTS.filter((event) => event.startsWith("document.")));
+// → 21 ["document.save", "document.validate", "document.init", "document.updateOne", "document.deleteOne"]
+```
+
+Тип события — `HookEvent`, объединение трёх групп и одного события `"aggregate"`: `DocumentHookEvent`, `QueryHookEvent` и `ModelHookEvent`. В каждой группе `this` устроен одинаково.
+
+### События документа
+
+Для них `this` — документ (`HydratedDoc<T>`), а ошибки и результаты касаются его самого. Хуки поддокументов запускаются вместе с хуками корня: подробнее в руководстве [Хуки документа](../../hooks/document-hooks.mdx).
+
+<TypeTable
+  type={{
+    "document.save": { description: "Сохранение документа: `create`, `insertOne`, `insertMany`, `Model.new` + `$save`, `$save`, `bulkSave`, а также вставка `insertOne` внутри `bulkWrite`. Запускается и у документа без изменений. Результат `@Post` — сам документ.", type: "this: HydratedDoc<T> | Subdocument<T>" },
+    "document.validate": { description: "Проверка документа. Вложена в `document.save` и запускается отдельно при `$validate()`. Результат `@Post` — документ.", type: "this: HydratedDoc<T> | Subdocument<T>" },
+    "document.init": { description: "Документ создан из данных, прочитанных из базы (гидратация), в том числе `Model.hydrate`. Только `@Pre` и `@Post`, результат — документ. Для lean-чтения не вызывается.", type: "this: HydratedDoc<T> | Subdocument<T>" },
+    "document.updateOne": { description: "Метод документа `$updateOne`. Запрос `updateOne` модели этого события не вызывает. Результат `@Post` — `UpdateResult`.", type: "this: HydratedDoc<T> | Subdocument<T>" },
+    "document.deleteOne": { description: "Метод документа `$deleteOne`. Запрос `deleteOne` модели этого события не вызывает. Результат `@Post` — `DeleteResult`.", type: "this: HydratedDoc<T> | Subdocument<T>" },
+  }}
+/>
+
+### События запросов
+
+Для них `this` — [`OperationHookContext`](./operation-context.mdx#operationhookcontext). Хук может изменить запрос ключами из третьего столбца и пропустить его, отдав результат, форму которого задаёт `SkipResult`.
+
+<TypeTable
+  type={{
+    "query.find": { description: "`find`. Можно изменить: `where`, `select`, `sort`.", type: "post: readonly unknown[]" },
+    "query.findOne": { description: "`findOne`, а также `findById` и `exists`. Можно изменить: `where`, `select`, `sort`.", type: "post: unknown" },
+    "query.countDocuments": { description: "`countDocuments`. Можно изменить: `where`.", type: "post: number" },
+    "query.estimatedDocumentCount": { description: "`estimatedDocumentCount`. Изменять нечего.", type: "post: number" },
+    "query.distinct": { description: "`distinct`. Можно изменить: `where`.", type: "post: readonly unknown[]" },
+    "query.updateOne": { description: "`updateOne`, а также такая же операция внутри `bulkWrite`. Можно изменить: `where`, `update`.", type: "post: UpdateResult | BulkOperationResult" },
+    "query.updateMany": { description: "`updateMany`, а также такая же операция внутри `bulkWrite`. Можно изменить: `where`, `update`.", type: "post: UpdateResult | BulkOperationResult" },
+    "query.replaceOne": { description: "`replaceOne`, а также такая же операция внутри `bulkWrite`. Можно изменить: `where`.", type: "post: UpdateResult | BulkOperationResult" },
+    "query.deleteOne": { description: "`deleteOne`, а также такая же операция внутри `bulkWrite`. Можно изменить: `where`.", type: "post: DeleteResult | BulkOperationResult" },
+    "query.deleteMany": { description: "`deleteMany`, а также такая же операция внутри `bulkWrite`. Можно изменить: `where`.", type: "post: DeleteResult | BulkOperationResult" },
+    "query.findOneAndUpdate": { description: "`findOneAndUpdate` и `findByIdAndUpdate`. Можно изменить: `where`, `update`, `select`, `sort`.", type: "post: unknown" },
+    "query.findOneAndReplace": { description: "`findOneAndReplace`. Можно изменить: `where`, `select`, `sort`.", type: "post: unknown" },
+    "query.findOneAndDelete": { description: "`findOneAndDelete` и `findByIdAndDelete`. Можно изменить: `where`, `select`, `sort`.", type: "post: unknown" },
+  }}
+/>
+
+### События модели и агрегации
+
+<TypeTable
+  type={{
+    "model.insertMany": { description: "`insertMany`, в том числе с пустым списком. Изменять нечего. Результат `@Post` — вставленные документы. Хуки документа каждого вставляемого документа выполняются внутри этого события.", type: "post: readonly unknown[]" },
+    "model.bulkWrite": { description: "`bulkWrite`, в том числе с пустым списком. Изменять нечего. Результат `@Post` — `BulkWriteResult`. Хуки операций пакета выполняются вокруг этого события.", type: "post: BulkWriteResult" },
+    "aggregate": { description: "`aggregate`. Можно изменить: `stages` (стадии добавляются в конец).", type: "post: readonly unknown[]" },
+  }}
+/>
+
+### Какие хуки запускают вставки
+
+Любой способ создать документ запускает хуки документа `document.save` и `document.validate`: [`create`](../writes/writes.mdx#create), [`insertOne`](../writes/writes.mdx#insertone), [`insertMany`](../writes/writes.mdx#insertmany), `$save` нового документа, [`bulkSave`](../writes/writes.mdx#bulksave) и вставка `insertOne` внутри [`bulkWrite`](../writes/writes.mdx#bulkwrite). Поэтому правило «при любой вставке» достаточно повесить на `document.save`. Запуск: `insertOne`, `insertMany` из двух документов и `create` оставили одинаковые события на каждый документ (`pre document.save`, `post document.save`), а изменение из `@Pre` (`stamp`) попало в базу.
+
+Собственные события есть у пакетных методов целиком: `insertMany` запускает ещё `model.insertMany`, `bulkWrite` — `model.bulkWrite`. У `insertOne` собственного события нет: его хуки — это хуки документа. Порядок событий пакета описан в руководстве [Хуки операций внутри `bulkWrite`](../../writes/bulk.mdx#хуки-операций-внутри-bulkwrite).
+
+### Какие события `findById` и другие методы запускают
+
+Методы-обёртки запускают событие своей основной операции: `findById` и `exists` — `query.findOne`, `findByIdAndUpdate` — `query.findOneAndUpdate`, `findByIdAndDelete` — `query.findOneAndDelete`. Если чтение возвращает гидратированные документы, после `query.*` для каждого документа запускается `document.init`. Для lean-чтения `document.init` не запускается.
+
+---
+
+## HookPhase
+
+`HookPhase` — фаза хука относительно события: `"pre"`, `"post"` или `"postError"`. Тип нужен, когда вы добавляете хук в плагине через [`PluginBuilder.addHook`](./plugins.mdx#pluginbuilder) и указываете фазу вручную.
+
+<FullType>
+
+```ts
+type HookPhase = "pre" | "post" | "postError";
+```
+
+</FullType>
+
+## HookArgs
+
+`HookArgs<P, E, T>` — кортеж аргументов хука: у `pre` их нет, у `post` один, результат [`PostResult`](#postresult), у `postError` один, `error: unknown`.
+
+<FullType>
+
+```ts
+type HookArgs<P extends HookPhase, E = HookEvent, T = unknown> = P extends "pre"
+  ? []
+  : P extends "post"
+    ? [result: PostResult<EventsOf<E>, T>]
+    : [error: unknown];
+```
+
+</FullType>
+
+## HookThis
+
+`HookThis<E, T>` — тип `this` для события `E` модели `T`: `HydratedDoc<T> | Subdocument<T>` для событий `document.*` (хук класса запускается и на документе, и на поддокументе; сужает тип [`$isRoot()`](../documents/document-api.mdx#isroot)), [`OperationHookContext<T, E>`](./operation-context.mdx#operationhookcontext) для остальных. `HookThisOf<E, T>` то же самое для списка событий: это объединение типов `this` каждого события списка.
+
+<FullType>
+
+```ts
+type HookThis<E, T> = E extends DocumentHookEvent
+  ? HydratedDoc<T> | Subdocument<T>
+  : E extends OperationHookEvent
+    ? OperationHookContext<T, E>
+    : never;
+
+type HookThisOf<E, T> = E extends readonly (infer U)[] ? HookThis<U, T> : HookThis<E, T>;
+```
+
+</FullType>
+
+## PostResult
+
+`PostResult<E, T>` — то, что получает `@Post` события `E`. Для событий `document.save`, `document.validate` и `document.init` это документ `T`; для `document.deleteOne` — `DeleteResult`; для `document.updateOne` — `UpdateResult`; для `query.deleteOne` и `query.deleteMany` — `DeleteResult` или [`BulkOperationResult`](./operation-context.mdx#bulkoperationresult) с `deletedCount: null` (вторая форма приходит от операции внутри `bulkWrite`); для `query.updateOne`, `query.updateMany` и `query.replaceOne` — `UpdateResult` или `BulkOperationResult` со счётчиками `null`; для подсчёта число; для чтений, `distinct`, `insertMany` и `aggregate` список значений; для `bulkWrite` `BulkWriteResult`. Для `query.findOne` и трёх `findOneAnd…` тип `unknown`: вид документа выбирает вызывающий код.
+
+<FullType>
+
+```ts
+type PostResult<E, T> = E extends "document.save" | "document.validate" | "document.init"
+  ? T
+  : E extends "document.deleteOne"
+    ? DeleteResult
+    : E extends "query.deleteOne" | "query.deleteMany"
+      ? DeleteResult | Extract<BulkOperationResult<IdOf<T>>, { readonly deletedCount: null }>
+      : E extends "document.updateOne"
+        ? UpdateResult<IdOf<T>>
+        : E extends "query.updateOne" | "query.updateMany" | "query.replaceOne"
+          ? UpdateResult<IdOf<T>> | Extract<BulkOperationResult<IdOf<T>>, { readonly matchedCount: null }>
+          : E extends "query.countDocuments" | "query.estimatedDocumentCount"
+            ? number
+            : E extends "query.find" | "query.distinct" | "model.insertMany" | "aggregate"
+              ? readonly unknown[]
+              : E extends "model.bulkWrite"
+                ? BulkWriteResult<IdOf<T>>
+                : unknown;
+```
+
+</FullType>
+
+Неверный тип аргумента компилятор отвергает: `@Post("query.countDocuments")` принимает число, но не строку.
+
+```ts twoslash
+import { Entity, Post, Schema, type OperationHookContext } from "@venloc/typemo";
+// ---cut---
+// @errors: 1241
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Post("query.countDocuments")
+  counted(this: OperationHookContext<Account>, result: string): void {}
+}
+```
+
+## SkipResult
+
+`SkipResult<E, T>` — то, что [`.skip`](./operation-context.mdx#skip) принимает для события `E`: значение, которое вернул бы сервер, в кодовых именах. Документы даются в lean-виде, результат записи и число — обычными значениями. Для `query.find` и `model.insertMany` это `readonly Lean<T>[]`, для `query.findOne` и трёх `findOneAnd…` `Lean<T> | null`, для подсчётов `number`, для `query.distinct` и `aggregate` `readonly unknown[]`, для обновлений `UpdateResult`, для удалений `DeleteResult`, для `model.bulkWrite` `BulkWriteResult`.
+
+<FullType>
+
+```ts
+type SkipResult<E, T> = E extends "query.find" | "model.insertMany"
+  ? readonly Lean<T>[]
+  : E extends "query.findOne" | "query.findOneAndUpdate" | "query.findOneAndReplace" | "query.findOneAndDelete"
+    ? Lean<T> | null
+    : E extends "query.countDocuments" | "query.estimatedDocumentCount"
+      ? number
+      : E extends "query.distinct" | "aggregate"
+        ? readonly unknown[]
+        : E extends "query.updateOne" | "query.updateMany" | "query.replaceOne"
+          ? UpdateResult<IdOf<T>>
+          : E extends "query.deleteOne" | "query.deleteMany"
+            ? DeleteResult
+            : E extends "model.bulkWrite"
+              ? BulkWriteResult<IdOf<T>>
+              : never;
+```
+
+</FullType>
+
+Событий `document.*` в `SkipResult` нет: хук документа не может пропустить операцию, он может только бросить ошибку.
+
+## OperationHookEvent и другие типы событий
+
+Остальные типы событий — сужения `HookEvent`: `DocumentHookEvent` (пять событий `document.*`), `QueryHookEvent` (тринадцать `query.*`), `ModelHookEvent` (`model.insertMany`, `model.bulkWrite`), `OperationHookEvent` (всё, кроме `document.*`, то есть события, у которых `this` — контекст операции).
+
+<FullType>
+
+```ts
+type DocumentHookEvent = "document.save" | "document.validate" | "document.init" | "document.updateOne" | "document.deleteOne";
+type ModelHookEvent = "model.insertMany" | "model.bulkWrite";
+type OperationHookEvent = Exclude<HookEvent, DocumentHookEvent>;
+type HookEvent = DocumentHookEvent | QueryHookEvent | ModelHookEvent | "aggregate";
+```
+
+</FullType>
+
+`QueryHookEvent` содержит тринадцать значений из таблицы выше: от `query.find` до `query.findOneAndDelete`.
+
+## Остальные элементы
+
+Тип `HookMethod<E, T, P>` — тип метода-хука, которым декораторы проверяют подпись; он показан в «Полном типе» у [`@Pre`](#pre). Типы `OperationChanges`, `OperationChange` и `ChangeKeys`, которые описывают изменения запроса в [`.modify`](./operation-context.mdx#modify), и тип [`BulkOperationResult`](./operation-context.mdx#bulkoperationresult), который получает хук операции внутри `bulkWrite`, собраны на странице [Контекст операции](./operation-context.mdx).
+
+## Что дальше
+
+<Cards>
+<Card title="Хуки операций" href="../../hooks/operation-hooks.mdx">
+  Как добавить условие ко всем чтениям, дописать обновление и пропустить операцию.
+</Card>
+<Card title="Хуки документа" href="../../hooks/document-hooks.mdx">
+  Что можно сделать до и после сохранения, проверки и удаления документа.
+</Card>
+<Card title="Порядок и ошибки хуков" href="../../hooks/order-and-errors.mdx">
+  Что выполняется раньше, что будет при ошибке и как хуки ведут себя в транзакции.
+</Card>
+<Card title="Контекст операции" href="./operation-context.mdx">
+  Поля `this` хука операции, методы `skip` и `modify`.
+</Card>
+</Cards>

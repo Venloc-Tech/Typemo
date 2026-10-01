@@ -1,0 +1,310 @@
+---
+title: Синхронизировать индексы
+description: "Как создать индексы из схемы, увидеть расхождение с базой до деплоя, исправить его и не пропустить сбой при запуске"
+icon: ListChecks
+---
+
+Индексы, которые вы описали в схеме (`unique`, `index`, [`@Index`](../reference/schemas/index-decorators.mdx#index)), сами в базе не появляются: Typemo создаёт их только тогда, когда вы об этом просите. Поэтому у каждого приложения есть шаг «привести индексы в соответствие со схемой» — при старте, при деплое или в скрипте миграции. На этой странице разобрано, чем этот шаг отличается в трёх вариантах и как выбрать нужный.
+
+**Индекс** — служебная структура MongoDB, которая ускоряет поиск по полю, а для `unique` ещё и не даёт записать два документа с одинаковым значением. Пока индекса нет, запись с дубликатом пройдёт без ошибки: проверено запуском, после `create` на новой модели в коллекции только `_id_`.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель счёта. В ней два индекса: уникальное название и индекс по владельцу.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true, index: true })
+  owner!: string;
+}
+```
+
+## Быстрый путь
+
+Три способа для трёх ситуаций. При старте приложения создайте недостающее: [`connection.init`](../reference/connection/connection.mdx#connectioninit). В деплое приведите всё в точное соответствие со схемой: [`connection.syncAll`](../reference/connection/connection.mdx#connectionsyncall). Для одной модели используйте [`syncIndexes`](../reference/collections/model-indexes.mdx#modelsyncindexes).
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+const Accounts = connection.model(Account);
+// ---cut---
+await connection.init(); // только создаёт недостающее
+await connection.syncAll(); // приводит всё в точное соответствие
+await Accounts.syncIndexes(); // то же для одной модели
+```
+
+Остальная страница разбирает каждый вариант на реальных задачах.
+
+## Создать индексы при старте
+
+Ситуация: приложение запускается на новой или уже работающей базе, и нужно, чтобы индексы из схемы существовали. Зарегистрируйте модели и вызовите [`connection.init`](../reference/connection/connection.mdx#connectioninit): он создаёт недостающее и **ничего не удаляет и не меняет**.
+
+```ts twoslash title="db/start.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+export const prepareDatabase = async () => {
+  client.connection.model(Account);
+  const report = await client.connection.init();
+  console.log(report.collections[0]?.indexes?.toCreate);
+  // → ["title_1", "owner_1"]
+  console.log(report.inSync, report.created);
+  // → true ["collection accounts", "index accounts.title_1", "index accounts.owner_1"]
+};
+```
+
+При первом запуске `init` создал коллекцию и оба индекса и перечислил это в списке `created`. После успешного `init` база совпадает со схемой, поэтому `inSync` равен `true` и в этом случае. При втором запуске он ничего не создаёт: список `toCreate` пустой, `created` тоже. Сбой `init` — это не `inSync: false`, а исключение: о нём ниже.
+
+Индекс, которого нет в схеме, `init` оставляет: вдруг он нужен другому приложению. А индекс, который есть и в схеме, и в базе, но объявлен по-разному, `init` считает ошибкой, потому что менять его без вашего согласия нельзя. Допустим, кто-то вручную сделал `owner_1` уникальным. Запуск останавливается с ошибкой [`SyncError`](../reference/errors/configuration-errors.mdx#syncerror), в которой перечислены все сбои:
+
+```text
+SyncError: connection.init() of "app": 1 failure(s) — collection "accounts": Account: 1 index operation(s) failed: create owner_1: index "owner_1" exists on the server with other keys or options; init() never drops or changes an index — run syncIndexes()/syncAll() to replace it
+```
+
+У ошибки есть три поля, по которым сбой разбирается в коде: `failures` — сбои по коллекциям и представлениям (имя, класс модели, список ошибок), `errors` — все исходные ошибки подряд (здесь одна, [`IndexSyncError`](../reference/errors/configuration-errors.mdx#indexsyncerror); та же в `cause`, в `AggregateError`) и `report` — полный отчёт о том, что нашлось и что сделано. `IndexSyncError` напрямую бросает только `syncIndexes`; `init` и `syncAll` оборачивают его в `SyncError`.
+
+## Посмотреть расхождение до деплоя
+
+Ситуация: вы поменяли индексы в схеме и хотите знать, что произойдёт с базой, прежде чем выкатывать. [`connection.syncAll`](../reference/connection/connection.mdx#connectionsyncall) с `dryRun: true` ничего не записывает (ни индексов, ни коллекций, ни представлений) и возвращает план.
+
+```ts twoslash title="scripts/check-indexes.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+connection.model(Account);
+const raw = client.unsafeDriver().db("app").collection("accounts");
+await connection.init();
+await raw.dropIndex("owner_1");
+await raw.createIndex({ owner: 1 }, { name: "owner_1", unique: true });
+await raw.createIndex({ closed: 1 }, { name: "closed_1" });
+// ---cut---
+const plan = await connection.syncAll({ dryRun: true });
+console.log(plan.collections[0]?.indexes);
+// → { toCreate: ["owner_1"], toDrop: ["owner_1", "closed_1"], toModify: [], dryRun: true }
+console.log(plan.inSync, plan.created);
+// → false ["index accounts.owner_1"]
+```
+
+Как читать план: `closed_1` есть в базе и нет в схеме, поэтому он в `toDrop`. Индекс `owner_1` в базе объявлен иначе, чем в схеме, поэтому его имя и в `toDrop`, и в `toCreate`: его удалят и создадут заново. Подробнее о том, как метод решает, что индекс «тот же» — в справочнике [`diffIndexes`](../reference/collections/model-indexes.mdx#modeldiffindexes). Для одной модели тот же план даёт [`diffIndexes`](../reference/collections/model-indexes.mdx#modeldiffindexes).
+
+## Применить изменения
+
+Ситуация: план вас устроил, нужно привести базу в соответствие. Вызовите [`connection.syncAll`](../reference/connection/connection.mdx#connectionsyncall) без `dryRun`. Он удалит лишние индексы, пересоздаст изменённые и создаст недостающие; те, что можно изменить на месте (видимость и срок жизни TTL), изменит без пересоздания.
+
+```ts twoslash title="scripts/sync-indexes.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+connection.model(Account);
+// ---cut---
+const report = await connection.syncAll();
+console.log(report.failed, report.inSync);
+// → false false
+
+const again = await connection.syncAll();
+console.log(again.inSync);
+// → true
+```
+
+Первый вызов изменил базу, поэтому `inSync` равен `false`; повторный подтверждает, что расхождений не осталось. При сбое `syncAll`, как и `init`, бросает [`SyncError`](../reference/errors/configuration-errors.mdx#syncerror): у возвращённого отчёта `failed` всегда `false`, а отчёт со сбоями лежит в `error.report`. Деплой с непостроенным индексом поэтому не пройдёт «успешно», даже если вы ничего не проверяете.
+
+## Индекс не построился
+
+Самая частая причина — данные, которые уже нарушают уникальность. Допустим, в `accounts` два счёта с названием `Main`. [`syncIndexes`](../reference/collections/model-indexes.mdx#modelsyncindexes) не останавливается на первой ошибке: он создаёт всё, что получается, и в конце бросает одну [`IndexSyncError`](../reference/errors/configuration-errors.mdx#indexsyncerror) со всеми неудачами. Через `init` или `syncAll` та же ошибка придёт внутри [`SyncError`](../reference/errors/configuration-errors.mdx#syncerror).
+
+```ts twoslash title="scripts/sync-accounts.ts"
+import { Entity, IndexSyncError, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.connection.model(Account);
+await client.unsafeDriver().db("app").collection("accounts").insertMany([
+  { title: "Main", owner: "alice" },
+  { title: "Main", owner: "bob" },
+]);
+// ---cut---
+try {
+  await Accounts.syncIndexes();
+} catch (error) {
+  if (error instanceof IndexSyncError) {
+    for (const failure of error.failures) console.log(failure.name, failure.action, failure.error.name);
+    // → "title_1" "create" "DuplicateKeyError"
+  }
+}
+console.log((await Accounts.listIndexes()).map((index) => index.name));
+// → ["_id_", "owner_1"]
+```
+
+Индекс `owner_1` создан, `title_1` — нет. Сообщение ошибки короткое и без служебных подробностей сборки индекса: `duplicate key on title_1: { title: "Main" } (code 11000 DuplicateKey)`; длинный текст сервера лежит в `serverMessage` вложенной ошибки. Исправьте дубликаты (удалите или переименуйте один из счетов) и вызовите `syncIndexes` ещё раз: создастся только недостающий.
+
+## Текстовый индекс и повторный запуск
+
+Ситуация: в схеме объявлен текстовый индекс по нескольким полям, и приложение перезапускается. Сервер хранит у текстового индекса веса полей и сам ставит вес 1 тем, для которых вы его не задали. Typemo учитывает это правило при сравнении: сразу после создания такой индекс совпадает со схемой, и второй `init` не находит расхождения и не падает.
+
+```ts twoslash title="posts/start.ts"
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+@Index({ title: "text", body: "text" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+client.connection.model(Post);
+// ---cut---
+const first = await client.connection.init();
+console.log(first.created);
+// → ["collection posts", "index posts.title_text_body_text"]
+
+const second = await client.connection.init();
+console.log(second.inSync, second.created);
+// → true []
+```
+
+Явный вес, который отличается от единицы (`weights: { title: 5 }`), сравнивается как обычная опция индекса: изменили вес в схеме, и `syncAll` пересоздаст индекс.
+
+## Исключить модель из `init` и `syncAll`
+
+Ситуация: коллекцией или её индексами управляет другая система, и приложение не должно их трогать. Опция схемы [`autoIndex: false`](../reference/schemas/schema.mdx#autoindex) выводит индексы модели из `init` и `syncAll`, а [`autoCreate: false`](../reference/schemas/schema.mdx#autocreate) — саму коллекцию. Эти опции читают только два метода подключения: прямой вызов [`syncIndexes`](../reference/collections/model-indexes.mdx#modelsyncindexes) у модели по-прежнему строит индексы.
+
+```ts twoslash title="legacy/start.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "legacy", autoIndex: false })
+class Legacy extends Entity {
+  @Prop(() => String, { required: true, unique: true }) code!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Legacies = client.connection.model(Legacy);
+// ---cut---
+const report = await client.connection.init();
+console.log(report.collections[0]?.indexes);
+// → undefined
+console.log((await Legacies.listIndexes()).map((index) => index.name));
+// → ["_id_"]
+
+await Legacies.syncIndexes();
+console.log((await Legacies.listIndexes()).map((index) => index.name));
+// → ["_id_", "code_1"]
+```
+
+Схема с `autoCreate: false`, у которой нет ни индексов, ни поисковых индексов, тоже пропускается целиком. Это удобно для журнала с параметрами, задаваемыми только при создании (`capped`, `timeseries`, `clustered`, `collation`), который создаёт и обслуживает его владелец: пока коллекции нет, `init` и `syncAll` не считают это ошибкой. Если у такой схемы есть индексы, а коллекции нет, индекс создал бы её без этих параметров, и вызов остановится с `SyncError`, как описано [ниже](#configurationerror-коллекции-нет-а-параметры-задаются-только-при-создании).
+
+## Как выбрать
+
+Задайте себе один вопрос: **может ли этот шаг что-то удалить?** Если приложение при старте не должно ничего менять в чужой базе, вызывайте [`connection.init`](../reference/connection/connection.mdx#connectioninit): он безопасен и остановит запуск, если база устроена иначе. Если это шаг деплоя, которым вы управляете, вызывайте [`connection.syncAll`](../reference/connection/connection.mdx#connectionsyncall): он приводит базу в точное соответствие, а о сбоях сообщает одной ошибкой `SyncError` со всем отчётом. Если нужно поправить одну модель, используйте [`syncIndexes`](../reference/collections/model-indexes.mdx#modelsyncindexes), а если хотите только «доложить» недостающее без сравнения — [`createIndexes`](../reference/collections/model-indexes.mdx#modelcreateindexes).
+
+## Когда это не нужно
+
+Синхронизация не нужна в тестах с пустой базой, где уникальность не проверяется, и в одноразовых скриптах, которые ничего не ищут. Для параметров коллекции (`capped`, валидатор) индексных методов недостаточно: они описаны в руководстве [Создание коллекций](./create.mdx). Не запускайте `syncAll` на каждый запрос или в горячем пути приложения: это команды администратора, и место им в запуске и деплое.
+
+## Частые ошибки
+
+### Уникальность не работает
+
+Запись с дубликатом прошла без ошибки. Индекс из схемы не создаётся сам: пока вы не вызвали [`init`](../reference/connection/connection.mdx#connectioninit), [`syncAll`](../reference/connection/connection.mdx#connectionsyncall) или [`syncIndexes`](../reference/collections/model-indexes.mdx#modelsyncindexes), в базе только `_id_`. Вызовите один из них при запуске.
+
+### Запуск остановился с `SyncError` от `init`
+
+В сообщении есть `exists on the server with other keys or options`. Индекс с таким именем в базе устроен иначе, чем в схеме, а `init` ничего не меняет. Проверьте расхождение через `syncAll({ dryRun: true })` и, если удалять и пересоздавать индекс можно, примените `syncAll()`.
+
+### Запуск остановился с `SyncError`: `exists with options MongoDB cannot change`
+
+Коллекция уже есть в базе, а схема объявляет параметр, который MongoDB у существующей коллекции изменить не умеет (`capped`, вид коллекции, `collation`). Сообщение называет параметр и выход: `collection "logs": exists with options MongoDB cannot change (capped): drop the collection and create it again`. Имя коллекции в нём одно, а текст тот же, что у [`createCollection`](../reference/collections/collection-manager.mdx#modelcreatecollection) и `ensureCollection`. Удалять коллекцию Typemo не станет: удалите её сами и вызовите `init` ещё раз.
+
+### `ConfigurationError`: коллекции нет, а параметры задаются только при создании
+
+У модели есть `capped`, `timeseries`, `clustered` или `collation`, а коллекции ещё нет: [`syncIndexes`](../reference/collections/model-indexes.mdx#modelsyncindexes) и [`createIndexes`](../reference/collections/model-indexes.mdx#modelcreateindexes) ничего не создают, потому что индекс создал бы обычную коллекцию, и параметры были бы потеряны. Сначала создайте коллекцию: [`init`](../reference/connection/connection.mdx#connectioninit) и [`syncAll`](../reference/connection/connection.mdx#connectionsyncall) делают это в правильном порядке. Подробнее — в руководстве [Создание коллекций](./create.mdx).
+
+## Полный пример
+
+Скрипт деплоя: сначала план, затем применение. Сбой выводится по коллекциям и останавливает деплой.
+
+```ts twoslash title="scripts/deploy-database.ts"
+import { Entity, Prop, Schema, SyncError, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true, index: true })
+  owner!: string;
+}
+
+const deploy = async (uri: string) => {
+  const client = await TypemoClient.connect(uri, { name: "deploy" });
+  try {
+    const connection = client.connection;
+    connection.model(Account);
+
+    // план: что изменится, ничего не записывая
+    const plan = await connection.syncAll({ dryRun: true });
+    console.log("planned changes:", plan.created);
+
+    // применение: при сбое syncAll бросит SyncError со всем отчётом
+    await connection.syncAll();
+  } catch (error) {
+    if (error instanceof SyncError) {
+      for (const failure of error.failures) console.error(failure.kind, failure.name, failure.errors.map((e) => e.message));
+    }
+    throw error;
+  } finally {
+    await client.close();
+  }
+};
+
+await deploy("mongodb://localhost:27017/app");
+```
+
+<Callout type="migration">
+
+В Mongoose индексы по умолчанию строились сами, в момент регистрации модели (`autoIndex`), а `syncIndexes` останавливался на первой ошибке. В Typemo индексы не строятся сами никогда: вы вызываете [`init`](../reference/connection/connection.mdx#connectioninit), [`syncAll`](../reference/collections/sync-all.mdx) или [`syncIndexes`](../reference/collections/model-indexes.mdx#modelsyncindexes) явно. Сбои собираются все, а не только первый, и приходят одной ошибкой [`SyncError`](../reference/errors/configuration-errors.mdx#syncerror). Сравнение точное: `unique: false` и `sparse: false` на сервере не считаются отличием, правило сортировки строк сравнивается так, как его применяет сервер, а срок жизни TTL и видимость индекса меняются без пересоздания.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Создание коллекций" href="./create.mdx">
+  Параметры коллекции (`capped`, валидатор, временные ряды) и как их применить до первой записи.
+</Card>
+<Card title="Поисковые индексы" href="./search-indexes.mdx">
+  Индексы Atlas Search и Vector Search: как описать и как синхронизировать.
+</Card>
+<Card title="Справочник: индексы модели" href="../reference/collections/model-indexes.mdx">
+  `diffIndexes`, `syncIndexes`, `createIndexes` и точные типы результатов.
+</Card>
+<Card title="Справочник: SyncAll" href="../reference/collections/sync-all.mdx">
+  Отчёт синхронизации: что означает каждое поле и как читать сбои.
+</Card>
+</Cards>

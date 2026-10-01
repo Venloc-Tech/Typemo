@@ -1,0 +1,205 @@
+---
+title: Добавить вычисляемые поля и обратные связи
+description: "Как описать значение, которое не хранится в базе: геттер по полям документа или связь «все посты автора», и где оно появляется в результатах"
+icon: Sparkles
+---
+
+**Виртуальное поле** — поле, которого нет в базе: оно вычисляется при чтении. В Typemo их два вида. Первый — обычный **геттер** класса, который собирает значение из полей документа, например полное имя из имени и фамилии. Второй — **виртуальная связь** [`@Virtual`](../reference/schemas/virtual.mdx#virtual): она подтягивает документы другой модели по обратной ссылке, например все посты автора, у которого списка постов нет.
+
+Виртуальные поля нужны, чтобы не хранить то, что можно вычислить: копия устаревает, а вычисление всегда свежее. Оба вида не попадают в запись, в фильтры и в lean-вид.
+
+## Что предполагается
+
+Ссылки описаны по руководству [Ссылаться на другие модели](./references.mdx). Примеры строят блог: автор и его посты.
+
+## Быстрый путь
+
+Геттер с типом [`Computed<T>`](../reference/schemas/field-markers.mdx#computed) — вычисляемое значение, а `@Virtual` с типом [`VirtualRef`](../reference/schemas/field-markers.mdx#virtualref) — связь:
+
+```ts twoslash title="blog/author.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "authors" })
+export class Author extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+
+  get label(): Computed<string> {
+    return `Author ${this.name}` as Computed<string>;
+  }
+
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" })
+  posts!: VirtualRef<Post>;
+}
+
+@Schema({ collection: "posts" })
+export class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Author, required: true }) author!: Ref<Author>;
+}
+
+const Authors = client.connection.model(Author);
+const Posts = client.connection.model(Post);
+const ann = await Authors.create({ name: "Ann" });
+await Posts.create({ title: "p1", author: ann._id });
+const loaded = await Authors.findOne({ name: "Ann" }).populate("posts").orFail();
+console.log(loaded.label, loaded.posts.map((post) => post.title));
+// → Author Ann [ "p1" ]
+```
+
+Остальная страница разбирает каждый вид отдельно.
+
+## Вычислить значение из полей
+
+Геттер без сеттера — вычисляемое поле. Декоратор не нужен: класс сам говорит, что это не данные. Тип `Computed<T>` нужен, чтобы компилятор отличал вычисляемое значение от хранимого и не пускал его в фильтры и запись. Значение приводят через `as Computed<string>`: обычную строку в маркерный тип компилятор сам не превращает.
+
+Вычисляемое поле доступно у загруженного документа, но не входит в результаты по умолчанию: ни lean, ни plain-вид, ни [`$toPlain()`](../reference/documents/document-api.mdx#toplain) его не содержат, пока вы не попросите `{ virtuals: true }`. Присвоить ему значение нельзя.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "authors" })
+class Author extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  get label(): Computed<string> {
+    return `Author ${this.name}` as Computed<string>;
+  }
+}
+const Authors = client.connection.model(Author);
+await Authors.create({ name: "Ann" });
+// ---cut---
+const author = await Authors.findOne({ name: "Ann" }).orFail();
+console.log(author.$toPlain());
+// → { _id: "…", name: "Ann" }
+console.log(author.$toPlain({ virtuals: true }));
+// → { _id: "…", name: "Ann", label: "Author Ann" }
+try {
+  (author as { label: string }).label = "x";
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Attempted to assign to readonly property.
+```
+
+Искать по вычисляемому полю нельзя: его нет в базе, и библиотека говорит это прямо, а не возвращает пустой результат: `StrictModeError: filter: "label" is not a field of Author [unknown-path]`. Условие нужно выразить через настоящие поля, из которых значение вычисляется.
+
+## Подтянуть документы по обратной связи
+
+Ссылка живёт у поста: он хранит `author`. Чтобы получить посты автора, не нужно заводить у автора список идентификаторов, который пришлось бы поддерживать. Достаточно описать связь: [`@Virtual`](../reference/schemas/virtual.mdx#virtual) называет модель ([`ref`](../reference/schemas/virtual.mdx#ref)), поле автора, по которому идёт сопоставление ([`localField`](../reference/schemas/virtual.mdx#localfield), обычно `_id`), и поле поста, в котором лежит значение ([`foreignField`](../reference/schemas/virtual.mdx#foreignfield)). Поле не хранит ничего и заполняется, только когда вы просите `populate`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "authors" })
+class Author extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" })
+  posts!: VirtualRef<Post>;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author", count: true }) // [!code ++]
+  postCount!: VirtualRef<Post, false, true>; // [!code ++]
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Author, required: true }) author!: Ref<Author>;
+}
+const Authors = client.connection.model(Author);
+const Posts = client.connection.model(Post);
+const ann = await Authors.create({ name: "Ann" });
+await Posts.create({ title: "p1", author: ann._id });
+await Posts.create({ title: "p2", author: ann._id });
+// ---cut---
+const plainRead = await Authors.findOne({ name: "Ann" }).orFail();
+console.log(plainRead.posts);
+// → undefined
+const loaded = await Authors.findOne({ name: "Ann" }).populate("posts").populate("postCount").orFail();
+console.log(loaded.posts.map((post) => post.title), loaded.postCount);
+// → [ "p1", "p2" ] 2
+```
+
+Без `populate` поле `undefined`: библиотека не делает лишних запросов. Опция `count: true` подставляет число документов вместо самих документов, а [`justOne`](../reference/schemas/virtual.mdx#justone) — один документ вместо массива. Флаги в типе `VirtualRef<M, JustOne, Count>` должны совпадать с опциями: компилятор это проверяет. Сортировка, ограничение и фильтр связи задаются в [`options`](../reference/schemas/virtual.mdx#options), [`match`](../reference/schemas/virtual.mdx#match) и [`perDocumentLimit`](../reference/schemas/virtual.mdx#perdocumentlimit).
+
+## Как выбрать
+
+Задайте себе один вопрос: **вычисляется ли значение из полей этого же документа?** Если да (полное имя, итог по строкам), это геттер с `Computed<T>`. Если значение живёт в других документах (посты автора, число комментариев), это `@Virtual`. Если значение нужно искать и сортировать в базе, виртуальное поле не подойдёт: храните его настоящим полем и обновляйте при изменении.
+
+## Когда это не нужно
+
+Значение, по которому вы фильтруете или строите индекс, должно быть в базе: у виртуальных полей путей в базе нет. Для отдельных вычислений над коллекцией целиком есть конвейер: [Первая агрегация](../aggregation/first-aggregation.mdx). Тяжёлый расчёт в геттере выполняется при каждом обращении: если он дорогой, сохраните результат в поле.
+
+## Частые ошибки
+
+### Виртуальное поле пропало из ответа
+
+`author.label` есть, а в `$toPlain()` его нет. Причина в том, что вычисляемые значения по умолчанию не включаются в сериализацию: их не было бы у тех, кто читает lean-вид. Передайте `{ virtuals: true }`.
+
+### `@Virtual` на поле с другим типом
+
+Поле объявлено строкой, а не `VirtualRef`: компилятор остановит с `@Virtual "posts": declare the field as VirtualRef<Model, JustOne, Count>`. Объявите поле типом `VirtualRef<Post>`.
+
+### `@Prop` на геттере
+
+`@Prop` на методе или геттере — `ConfigurationError` при объявлении класса: `G: @Prop on "x", which is a method or an accessor (getters are virtuals and need no decorator)`. Уберите декоратор.
+
+## Полный пример
+
+Один файл собирает автора с вычисляемым и виртуальным полями и чтение. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="blog/authors.service.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+// модели: посты ссылаются на автора, автор описывает обратную связь
+@Schema({ collection: "authors" })
+class Author extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  get label(): Computed<string> {
+    return `Author ${this.name}` as Computed<string>;
+  }
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" })
+  posts!: VirtualRef<Post>;
+}
+
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Author, required: true }) author!: Ref<Author>;
+}
+
+// код читателя: ошибка на границе приложения
+class __NotFound__ extends Error {}
+
+// профиль автора: посты подтягиваются одним запросом
+export const authorProfile = async (name: string) => {
+  const Authors = client.connection.model(Author);
+  client.connection.model(Post);
+  const author = await Authors.findOne({ name }).populate("posts");
+  if (author === null) throw new __NotFound__(name);
+  return { label: author.label, titles: author.posts.map((post) => post.title) };
+};
+
+const ann = await client.connection.model(Author).create({ name: "Ann" });
+await client.connection.model(Post).create({ title: "Hello", author: ann._id });
+console.log(await authorProfile("Ann"));
+// → { label: "Author Ann", titles: [ "Hello" ] }
+```
+
+<Callout type="migration">
+
+В Mongoose виртуальные поля описывают через `schema.virtual(...)`, в том числе для связей с `localField` и `foreignField`. В Typemo геттер класса с типом `Computed<T>` заменяет обычный виртуал, а связь описывает декоратор `@Virtual` с теми же понятиями `ref`, `localField`, `foreignField`, `justOne`, `count`. Виртуальные поля не входят в `lean()` и в `$toPlain()` без `{ virtuals: true }`.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Связанные данные" href="../populate/basics.mdx">
+  Как заполнять связи, в том числе виртуальные, и ограничивать выборку.
+</Card>
+<Card title="Справочник: @Virtual" href="../reference/schemas/virtual.mdx">
+  Все опции связи и ошибки сборки.
+</Card>
+<Card title="Маркерные типы полей" href="../reference/schemas/field-markers.mdx">
+  `Computed`, `VirtualValue` и `VirtualRef`.
+</Card>
+</Cards>

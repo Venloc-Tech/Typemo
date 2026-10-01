@@ -1,0 +1,310 @@
+---
+title: Сохранить результат агрегации и обновлять его
+description: "Как хранить итоги агрегации в отдельной коллекции, обновлять их по команде и выбрать между режимами merge и replace"
+icon: DatabaseZap
+---
+
+Если итоги считаются долго, а нужны часто — сводка по клиентам, дневная выручка, рейтинг, — пересчитывать их на каждом чтении дорого. **Материализованное представление** решает это иначе: результат агрегации записывается в обычную коллекцию, читается оттуда быстро и обновляется тогда, когда вы решите. В Typemo такую пару «источник → результат» описывает `Materialized`: типы результата проверяются при компиляции, а обновляет его метод `refresh`.
+
+Если вы впервые работаете с агрегациями, сначала прочитайте руководство [Первая агрегация](../aggregation/first-aggregation.mdx). Если результат должен быть всегда свежим и читается умеренно, вам нужно не это, а [представление](./views.mdx).
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и счета. В `accounts` три документа: Main (владелец alice, баланс 120, открыт), Old (alice, 0, закрыт) и Savings (bob, 500, открыт). Нужны итоги по владельцам открытых счетов.
+
+```ts twoslash title="accounts/models.ts"
+import { Entity, EntityWithId, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { required: true })
+  balance!: number;
+
+  @Prop(() => Boolean, { required: true })
+  closed!: boolean;
+}
+
+@Schema({ collection: "owner_totals" })
+export class OwnerTotal extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number, { required: true })
+  count!: number;
+}
+```
+
+Класс результата — обычная сущность, но со своим типом `_id`: [`EntityWithId`](../reference/schemas/base-classes.mdx#entitywithid) с типом `String` делает `_id` строкой. Здесь это имя владельца: по нему итог однозначно находится. Подробнее о таких идентификаторах — в руководстве [Задать свой тип _id](../schemas/custom-ids.mdx).
+
+## Быстрый путь
+
+Определите результат через [`Materialized.define`](../reference/collections/materialized.mdx#materializeddefine), вызовите [`refresh`](../reference/collections/materialized.mdx#materializedrefresh) и читайте через `model`.
+
+```ts twoslash
+import { Entity, EntityWithId, fn, Materialized, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => Boolean, { required: true }) closed!: boolean;
+}
+@Schema({ collection: "owner_totals" })
+class OwnerTotal extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Number, { required: true }) count!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+// ---cut---
+const ownerTotals = Materialized.define(connection, OwnerTotal, {
+  from: Account,
+  pipeline: (p) =>
+    p.match({ closed: false }).group((f) => ({ _id: f.owner, total: fn.sum(f.balance), count: fn.sum(1) })),
+});
+await ownerTotals.refresh();
+console.log(await ownerTotals.model.find().sort({ _id: 1 }).lean());
+// → [{ _id: "alice", total: 120, count: 1 }, { _id: "bob", total: 500, count: 1 }]
+```
+
+Остальная страница разбирает режимы обновления и типичные задачи.
+
+## Описать результат
+
+Ситуация: вам нужны итоги, которые читаются чаще, чем меняются данные. Опишите класс результата и определите пару. Конвейер собирается тем же строителем, что и обычная агрегация, и сверяется с классом при компиляции. Стадии записи (`$merge`, `$out`) добавлять не нужно: их добавляет `refresh`.
+
+`define` ничего не считает и не создаёт. Пока `refresh` не вызван, коллекции результата в базе нет: запуск показал, что после `define` в базе только `accounts`. Определение при этом доступно сразу: [`definition`](../reference/collections/materialized.mdx#materializedinfo) показывает источник, цель, режим и стадии.
+
+## Обновить результат
+
+Ситуация: данные изменились, и итоги нужно пересчитать. Вызовите [`refresh`](../reference/collections/materialized.mdx#materializedrefresh) там, где это уместно: из задачи по расписанию, после пакетной загрузки, из обработчика административной кнопки. Автоматически результат не обновляется никогда.
+
+```ts twoslash title="accounts/totals.job.ts"
+import { Entity, EntityWithId, fn, Materialized, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => Boolean, { required: true }) closed!: boolean;
+}
+@Schema({ collection: "owner_totals" })
+class OwnerTotal extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Number, { required: true }) count!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+const Accounts = connection.model(Account);
+const ownerTotals = Materialized.define(connection, OwnerTotal, {
+  from: Account,
+  pipeline: (p) =>
+    p.match({ closed: false }).group((f) => ({ _id: f.owner, total: fn.sum(f.balance), count: fn.sum(1) })),
+});
+await ownerTotals.refresh();
+// ---cut---
+export const refreshTotals = async () => {
+  await ownerTotals.refresh();
+};
+
+await Accounts.updateOne({ title: "Main" }, { $set: { balance: 150 } });
+console.log((await ownerTotals.model.findOne({ _id: "alice" }))?.total);
+// → 120
+
+await refreshTotals();
+console.log((await ownerTotals.model.findOne({ _id: "alice" }))?.total);
+// → 150
+```
+
+Пока `refresh` не вызван, результат хранит прежнее значение: 120. После вызова — 150. Это цена материализации: скорость чтения в обмен на свежесть.
+
+## Выбрать режим записи
+
+Ситуация: счёт закрыли, и владелец пропал из выборки. Что делать с его старой строкой в результате? Это решает режим. По умолчанию, режим `merge`, результат **никогда не очищается**: `$merge` вставляет новые строки и обновляет совпавшие, а строки без свежих данных остаются. Запуск показал: после закрытия Savings итог bob остался прежним (500).
+
+Если результат должен в точности повторять конвейер, включите `mode: "replace"`: коллекция целиком заменяется результатом, и исчезнувшие строки пропадают.
+
+```ts twoslash
+import { Entity, EntityWithId, fn, Materialized, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => Boolean, { required: true }) closed!: boolean;
+}
+@Schema({ collection: "owner_totals" })
+class OwnerTotal extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Number, { required: true }) count!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+const Accounts = connection.model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Savings" }, { $set: { closed: true } });
+
+const totals = Materialized.define(connection, OwnerTotal, {
+  from: Account,
+  mode: "replace",
+  pipeline: (p) =>
+    p.match({ closed: false }).group((f) => ({ _id: f.owner, total: fn.sum(f.balance), count: fn.sum(1) })),
+});
+await totals.refresh();
+console.log((await totals.model.find().sort({ _id: 1 }).lean()).map((row) => row._id));
+// → ["alice"]
+```
+
+Строки bob больше нет: `replace` записал ровно то, что вернул конвейер. Выбор описан ниже, в разделе «Как выбрать».
+
+## Слить по другому полю
+
+Ситуация: результат идентифицируется не по `_id`, а по полю, например названию счёта. В режиме `merge` укажите поле в `on`. Для этого в целевой коллекции нужен уникальный индекс ровно по этому полю, иначе сервер не может однозначно узнать «ту же» строку. Typemo проверяет это перед запуском. Если индекса ещё нет, вы получаете понятную ошибку, а после [`syncIndexes`](../reference/collections/model-indexes.mdx#modelsyncindexes) `refresh` работает:
+
+```ts twoslash title="accounts/balances.ts"
+import { ConfigurationError, Entity, Index, Materialized, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+@Index({ title: 1 }, { unique: true })
+@Schema({ collection: "account_balances" })
+class AccountBalance extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+// ---cut---
+const balances = Materialized.define(connection, AccountBalance, {
+  from: Account,
+  on: "title",
+  pipeline: (p) => p.project({ _id: 0, title: 1, balance: 1 }),
+});
+
+try {
+  await balances.refresh();
+} catch (error) {
+  if (error instanceof ConfigurationError) console.log("no unique index yet");
+  // → "no unique index yet"
+}
+
+await balances.model.syncIndexes();
+await balances.refresh();
+console.log(await balances.model.countDocuments());
+// → 3
+```
+
+Полный текст ошибки и остальные значения `whenMatched` — в справочнике [`refresh`](../reference/collections/materialized.mdx#materializedrefresh).
+
+## Как выбрать
+
+Задайте себе один вопрос: **должна ли исчезнувшая строка пропасть из результата?** Если да, берите `replace`: результат всегда равен конвейеру, а цена — полная перезапись коллекции на каждом обновлении. Если строки нужно накапливать, а обновлять только изменившиеся, берите `merge` (по умолчанию): он записывает только то, что вернул конвейер, но старые строки не удаляет, поэтому «мёртвые» строки нужно убирать самому.
+
+Отдельный вопрос — стоит ли материализовать вообще. Если выборка быстрая или её читают редко, лучше [представление](./views.mdx): оно не хранит данных и не устаревает.
+
+## Когда это не нужно
+
+Если итог считается за миллисекунды, храните только запрос: материализация добавляет коллекцию, за свежестью которой вы должны следить. Если результат нужен один раз, достаточно обычной [агрегации](../aggregation/first-aggregation.mdx). Если данные результата надо ещё и менять руками, `refresh` будет затирать эти изменения (в режиме `replace`) или смешивать с ними (в режиме `merge`).
+
+## Частые ошибки
+
+### Результат пустой
+
+`model.find()` вернул `[]`. Коллекция результата появляется только после первого [`refresh`](../reference/collections/materialized.mdx#materializedrefresh): вызовите его при запуске или по расписанию.
+
+### В результате остались «мёртвые» строки
+
+Владелец, у которого больше нет открытых счетов, всё ещё в итогах. Так работает режим `merge`: он не очищает коллекцию. Включите `mode: "replace"` или удаляйте устаревшие строки сами.
+
+### `needs a unique index on exactly these fields`
+
+`$merge` по полю, не `_id`, без уникального индекса. Объявите `@Index({ поле: 1 }, { unique: true })` на классе результата и вызовите [`syncIndexes`](../reference/collections/model-indexes.mdx#modelsyncindexes), либо сливайте по `_id`.
+
+### Конвейер не компилируется
+
+Компилятор называет поля класса результата, которых нет в строках конвейера. Добавьте их в стадию `group` или `project`, либо уберите из класса. Единственное исключение — `_id`: его можно не выдавать, `$merge` и `$out` присвоят его сами.
+
+## Полный пример
+
+Файл описывает результат и задачу, которая его обновляет.
+
+```ts twoslash title="accounts/owner-totals.ts"
+import { Entity, EntityWithId, fn, Materialized, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { required: true })
+  balance!: number;
+
+  @Prop(() => Boolean, { required: true })
+  closed!: boolean;
+}
+
+@Schema({ collection: "owner_totals" })
+class OwnerTotal extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number, { required: true })
+  count!: number;
+}
+
+const main = async () => {
+  const client = await TypemoClient.connect("mongodb://localhost:27017/app", { name: "main" });
+  const connection = client.connection;
+  connection.model(Account);
+
+  // определение: итоги открытых счетов по владельцам, результат повторяет конвейер
+  const ownerTotals = Materialized.define(connection, OwnerTotal, {
+    from: Account,
+    mode: "replace",
+    pipeline: (p) =>
+      p.match({ closed: false }).group((f) => ({ _id: f.owner, total: fn.sum(f.balance), count: fn.sum(1) })),
+  });
+
+  // обновление: вызывается по расписанию
+  await ownerTotals.refresh();
+
+  // чтение: обычная модель
+  const totals = await ownerTotals.model.find().sort({ _id: 1 }).lean();
+  console.log(totals.length);
+
+  await client.close();
+};
+
+await main();
+```
+
+<Callout type="migration">
+
+В Mongoose материализованного представления нет: его собирают вручную, добавляя к агрегации `$merge` или `$out` и вызывая её по расписанию. В Typemo та же стадия добавляется автоматически, а определение пары «источник → результат» типизировано: строки конвейера сверяются с классом результата, а `$merge` по неуникальному полю отвергается до отправки на сервер.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Представления" href="./views.mdx">
+  Всегда свежая выборка без хранения данных.
+</Card>
+<Card title="Синхронизировать индексы" href="./index-sync.mdx">
+  Как создать уникальный индекс, который нужен `$merge` по своему полю.
+</Card>
+<Card title="Справочник: Materialized" href="../reference/collections/materialized.mdx">
+  `define`, `refresh`, режимы записи и точные типы.
+</Card>
+</Cards>

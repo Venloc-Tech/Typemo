@@ -1,0 +1,349 @@
+---
+title: Тесты Nest-приложения
+description: "Модульные тесты сервисов с моками моделей и клиента, интеграционные и e2e-тесты на настоящей MongoDB с TypemoTestingModule"
+icon: FlaskConical
+---
+
+Сервисы с моделями Typemo тестируются двумя способами: без базы, когда модель заменена моком и проверяется логика сервиса, и на настоящей базе, когда проверяется всё вместе — запросы, индексы, транзакции, ответы HTTP. Для первого пакет даёт `provideModelMock` и `provideClientMock`, для второго — `TypemoTestingModule`. Всё это лежит в отдельной точке входа `@venloc/typemo-nestjs/testing`, чтобы тестовые помощники не попадали в код приложения.
+
+## Что предполагается
+
+Сервис счетов из руководства [Подключить Typemo к NestJS](./setup.mdx) и тестовый фреймворк с `describe`/`test` (примеры написаны для `bun:test`; с Jest и Vitest код тот же). Для тестов на базе нужна MongoDB, запущенная как реплика-сет: так работают транзакции.
+
+```ts twoslash title="accounts/accounts.service.ts"
+import { Injectable } from "@nestjs/common";
+import { Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, Transactional } from "@venloc/typemo-nestjs";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  balance!: number;
+}
+
+@Injectable()
+export class AccountsService {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+
+  countFunded() {
+    return this.accounts.countDocuments({ balance: { $gt: 0 } });
+  }
+
+  @Transactional()
+  async openPair(title: string): Promise<number> {
+    await this.accounts.create({ title, balance: 1 });
+    await this.accounts.create({ title, balance: 2 });
+    return this.accounts.countDocuments({ title });
+  }
+}
+```
+
+## Быстрый путь
+
+Модульный тест с моком модели:
+
+```ts twoslash title="accounts/accounts.service.spec.ts"
+// @filename: accounts.service.ts
+import { Injectable } from "@nestjs/common";
+import { Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+@Injectable()
+export class AccountsService {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+  countFunded() {
+    return this.accounts.countDocuments({ balance: { $gt: 0 } });
+  }
+}
+// @filename: spec.ts
+// ---cut---
+import { expect, test } from "bun:test";
+import { Test } from "@nestjs/testing";
+import { provideModelMock } from "@venloc/typemo-nestjs/testing";
+import { Account, AccountsService } from "./accounts.service";
+
+test("counts funded accounts", async () => {
+  const moduleRef = await Test.createTestingModule({
+    providers: [AccountsService, provideModelMock(Account, { countDocuments: async () => 3 })],
+  }).compile();
+  expect(await moduleRef.get(AccountsService).countFunded()).toBe(3);
+});
+```
+
+Остальная страница разбирает моки и тесты на базе.
+
+## Заменить модель моком
+
+Ситуация: нужно проверить логику сервиса, а не базу. [`provideModelMock(Account, mock)`](../../reference/integrations/nestjs.mdx#providemodelmock) регистрирует провайдер под тем же токеном, что и настоящая модель, поэтому сервис получает мок через свой `@InjectModel(Account)` без изменений.
+
+Мок проверяется компилятором: каждый метод сохраняет имя и параметры метода модели ([`ModelMock`](../../reference/integrations/nestjs.mdx#modelmock)), а результат может быть любым — мок не обязан строить настоящий запрос. Опечатка в имени не компилируется:
+
+```ts twoslash
+import { Entity, Prop, Schema } from "@venloc/typemo";
+import { provideModelMock } from "@venloc/typemo-nestjs/testing";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+// ---cut---
+// @errors: 2353
+provideModelMock(Account, { countAll: async () => 3 });
+```
+
+Метод, которого в моке нет, равен `undefined`: если сервис вызовет забытый метод, тест упадёт с `TypeError`, а не получит правдоподобный ответ. Запуск сервиса, который вызвал `deleteOne` при моке только с `countDocuments`, упал с `TypeError`.
+
+Мок модели другого клиента или базы регистрируют с той же целью, что и `forFeature`: `provideModelMock(Account, mock, { db: "archive" })`.
+
+## Сервис с транзакциями без реплика-сета
+
+Ситуация: метод сервиса помечен `@Transactional()`, а модульному тесту база не нужна. [`provideClientMock()`](../../reference/integrations/nestjs.mdx#provideclientmock) подставляет клиента, у которого `transaction(fn)` сразу вызывает `fn`, и связывает декоратор с этим клиентом:
+
+```ts twoslash title="accounts/accounts.service.spec.ts"
+// @filename: accounts.service.ts
+import { Injectable } from "@nestjs/common";
+import { Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, Transactional } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+@Injectable()
+export class AccountsService {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+  @Transactional()
+  async openPair(title: string): Promise<number> {
+    await this.accounts.create({ title, balance: 1 });
+    return this.accounts.countDocuments({ title });
+  }
+}
+// @filename: spec.ts
+// ---cut---
+import { expect, test } from "bun:test";
+import { Test } from "@nestjs/testing";
+import { provideClientMock, provideModelMock } from "@venloc/typemo-nestjs/testing";
+import { Account, AccountsService } from "./accounts.service";
+
+test("opens a pair in a transaction", async () => {
+  const calls: string[] = [];
+  const moduleRef = await Test.createTestingModule({
+    providers: [
+      AccountsService,
+      provideModelMock(Account, { create: async () => ({}), countDocuments: async () => 2 }),
+      ...provideClientMock({
+        transaction: async (fn: (scope: never) => Promise<unknown>) => {
+          calls.push("transaction");
+          return fn(undefined as never);
+        },
+      }),
+    ],
+  }).compile();
+  await moduleRef.init();
+  expect(await moduleRef.get(AccountsService).openPair("Main")).toBe(2);
+  expect(calls).toEqual(["transaction"]);
+});
+```
+
+`moduleRef.init()` обязателен: декоратор связывается с клиентом при инициализации модуля. Без `provideClientMock` вызов декорированного метода в модульном тесте — ошибка «called on an object no Nest application with TypemoModule has registered», а не тихий вызов без транзакции.
+
+## Тест на настоящей базе
+
+Ситуация: нужно проверить, что запросы, индексы и транзакции работают на сервере. [`TypemoTestingModule.forRoot(uri)`](../../reference/integrations/nestjs.mdx#typemotestingmoduleforroot) — `TypemoModule.forRoot` для теста: своя база на каждый вызов (тесты не видят данных друг друга), коллекции и индексы создаются при старте, одна попытка подключения.
+
+```ts twoslash title="accounts/accounts.int-spec.ts"
+// @filename: accounts.service.ts
+import { Injectable } from "@nestjs/common";
+import { Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, Transactional } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+@Injectable()
+export class AccountsService {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+  @Transactional()
+  async openPair(title: string): Promise<number> {
+    await this.accounts.create({ title, balance: 1 });
+    await this.accounts.create({ title, balance: 2 });
+    return this.accounts.countDocuments({ title });
+  }
+}
+// @filename: spec.ts
+// ---cut---
+import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
+import { Test, type TestingModule } from "@nestjs/testing";
+import { TypemoModule } from "@venloc/typemo-nestjs";
+import { TypemoTestingModule } from "@venloc/typemo-nestjs/testing";
+import { Account, AccountsService } from "./accounts.service";
+
+let moduleRef: TestingModule;
+
+beforeAll(async () => {
+  moduleRef = await Test.createTestingModule({
+    imports: [TypemoTestingModule.forRoot(process.env.MONGO_URI ?? ""), TypemoModule.forFeature([Account])],
+    providers: [AccountsService],
+  }).compile();
+  await moduleRef.init();
+});
+afterEach(() => TypemoTestingModule.clear(moduleRef));
+afterAll(() => moduleRef.close());
+
+test("opens a pair", async () => {
+  expect(await moduleRef.get(AccountsService).openPair("Main")).toBe(2);
+});
+```
+
+[`TypemoTestingModule.clear`](../../reference/integrations/nestjs.mdx#typemotestingmoduleclear) после каждого теста удаляет документы всех моделей `forFeature` — во всех тенантах и вместе с мягко удалёнными, — чтобы каждый тест начинал с пустых коллекций. База теста после `close()` остаётся на сервере: удаляйте тестовый сервер целиком или базу по имени, если сервер общий.
+
+Создание коллекций при старте (`sync: "init"`) здесь важно не только для индексов: транзакция в MongoDB не может создать коллекцию, которую в тот же момент создаёт другая операция, и первая запись в транзакции на пустой базе могла бы упасть.
+
+## e2e-тест HTTP
+
+Ситуация: нужно проверить ответы приложения целиком — статусы, тела, ошибки. Поднимите приложение из тестового модуля на свободном порту и отправляйте запросы обычным `fetch`:
+
+```ts twoslash title="test/accounts.e2e-spec.ts"
+import { afterAll, beforeAll, expect, test } from "bun:test";
+import { Module, type INestApplication } from "@nestjs/common";
+import { Test } from "@nestjs/testing";
+import { TypemoExceptionFilter } from "@venloc/typemo-nestjs";
+import { TypemoTestingModule } from "@venloc/typemo-nestjs/testing";
+@Module({})
+class AccountsModule {}
+// ---cut---
+let app: INestApplication;
+let url = "";
+
+beforeAll(async () => {
+  const moduleRef = await Test.createTestingModule({
+    imports: [TypemoTestingModule.forRoot(process.env.MONGO_URI ?? ""), AccountsModule],
+  }).compile();
+  app = moduleRef.createNestApplication();
+  app.useGlobalFilters(new TypemoExceptionFilter());
+  await app.listen(0, "127.0.0.1");
+  url = `http://127.0.0.1:${(app.getHttpServer().address() as { port: number }).port}`;
+});
+afterAll(() => app.close());
+
+test("a malformed id is 400", async () => {
+  const response = await fetch(`${url}/accounts/not-an-id`);
+  expect(response.status).toBe(400);
+});
+```
+
+Фильтры, перехватчики и пайпы подключаются к тестовому приложению так же, как в `main.ts`: в e2e-тесте проверяется то, что увидит клиент.
+
+## Как выбрать: мок или база
+
+Спросите себя, что может сломаться в проверяемом коде. Если ошибка возможна в логике сервиса (условие, расчёт, порядок вызовов), мок быстрее и точнее. Если ошибка возможна в общении с базой (фильтр не тот, индекс не используется, транзакция не откатывается, тенант не применился), мок её не покажет — нужен тест на настоящем сервере.
+
+## Когда это не нужно
+
+Тип внедрённой модели и форма результатов проверяются компилятором; повторять их в тестах моками не нужно. Тест «модуль собирается» без проверок поведения тоже мало что даёт: ошибка внедрения проявится в первом же e2e-тесте.
+
+## Частые ошибки
+
+### @Transactional в модульном тесте падает с «no Nest application»
+
+Нет `provideClientMock()` в провайдерах или не вызван `moduleRef.init()`.
+
+### Тесты видят данные друг друга
+
+Модуль на файл тестов с общей базой и без `clear`. Вызывайте `TypemoTestingModule.clear(moduleRef)` в `afterEach` или создавайте модуль на каждый тест.
+
+### Мок не подменил модель
+
+Мок зарегистрирован с другой целью: `provideModelMock(Account, mock)` подменяет модель базы по умолчанию, а сервис внедряет `@InjectModel(Account, { db: "archive" })`. Передайте ту же цель третьим аргументом.
+
+## Полный пример
+
+Модульный тест сервиса с моками и интеграционный тест на базе в одном файле.
+
+```ts twoslash title="accounts/accounts.spec.ts"
+// @filename: accounts.service.ts
+import { Injectable } from "@nestjs/common";
+import { Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, Transactional } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+@Injectable()
+export class AccountsService {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+  countFunded() {
+    return this.accounts.countDocuments({ balance: { $gt: 0 } });
+  }
+  @Transactional()
+  async openPair(title: string): Promise<number> {
+    await this.accounts.create({ title, balance: 1 });
+    await this.accounts.create({ title, balance: 2 });
+    return this.accounts.countDocuments({ title });
+  }
+}
+// @filename: spec.ts
+// ---cut---
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { Test, type TestingModule } from "@nestjs/testing";
+import { TypemoModule } from "@venloc/typemo-nestjs";
+import { provideClientMock, provideModelMock, TypemoTestingModule } from "@venloc/typemo-nestjs/testing";
+import { Account, AccountsService } from "./accounts.service";
+
+// без базы: логика сервиса
+describe("AccountsService with mocks", () => {
+  test("counts funded accounts", async () => {
+    const moduleRef = await Test.createTestingModule({
+      providers: [AccountsService, provideModelMock(Account, { countDocuments: async () => 3 }), ...provideClientMock()],
+    }).compile();
+    await moduleRef.init();
+    expect(await moduleRef.get(AccountsService).countFunded()).toBe(3);
+  });
+});
+
+// на базе: запросы и транзакция
+describe("AccountsService on MongoDB", () => {
+  let moduleRef: TestingModule;
+  beforeAll(async () => {
+    moduleRef = await Test.createTestingModule({
+      imports: [TypemoTestingModule.forRoot(process.env.MONGO_URI ?? ""), TypemoModule.forFeature([Account])],
+      providers: [AccountsService],
+    }).compile();
+    await moduleRef.init();
+  });
+  afterEach(() => TypemoTestingModule.clear(moduleRef));
+  afterAll(() => moduleRef.close());
+
+  test("opens a pair in one transaction", async () => {
+    expect(await moduleRef.get(AccountsService).openPair("Main")).toBe(2);
+  });
+});
+```
+
+<Callout type="migration" title="Если вы пришли из @nestjs/mongoose">
+
+`{ provide: getModelToken(Cat.name), useValue: mock }` → `provideModelMock(Cat, mock)`: токен строится по классу, а мок проверяется по методам модели. `mongodb-memory-server` и ручное `connection.dropDatabase()` между тестами заменяют своя база на модуль и `TypemoTestingModule.clear`.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Тестирование без Nest" href="../../testing/testing-apps.mdx">
+  Фабрики документов и проверка использования индексов.
+</Card>
+<Card title="Справочник: /testing" href="../../reference/integrations/nestjs.mdx#тестирование-venloctypemo-nestjstesting">
+  Все помощники точки входа `/testing`.
+</Card>
+<Card title="REST API на NestJS" href="../../recipes/nestjs-rest-api.mdx">
+  Готовое приложение с e2e-тестами.
+</Card>
+</Cards>

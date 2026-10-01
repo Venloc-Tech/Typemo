@@ -1,0 +1,117 @@
+---
+title: Передать тенанта и актора через весь запрос
+description: "Как один раз открыть контекст политик при обработке запроса и не передавать тенанта параметром в каждую функцию"
+icon: Braces
+---
+
+Политикам нужны значения из окружения: чей тенант, кто действует, показывать ли удалённые. Чтобы не тянуть их параметром через каждую функцию сервиса, откройте область [`PolicyContext.run`](../reference/policies/policy-context.mdx#policycontextrun) один раз, там, где эти значения известны (обычно на входе обработки запроса). Все операции моделей, **построенные** внутри, получат значения сами. Для одной операции с особыми значениями есть [`.policy()`](../reference/query/options.mdx#policy).
+
+## Что предполагается
+
+Есть модель с политикой тенанта, как в руководстве [Мультитенантность](./tenants.mdx): заказы организаций.
+
+## Быстрый путь
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, PolicyContext, Tenant, type TenantField } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Orders = client.connection.model(Order);
+// ---cut---
+const count = await PolicyContext.run({ tenant: "acme", actor: "user-1" }, async () => {
+  await Orders.create({ number: "A-1" });
+  return Orders.countDocuments();
+});
+// → 1
+```
+
+## Область в асинхронном коде
+
+Область сохраняется во всей цепочке вызовов внутри функции: после `await`, в колбэках, после таймера. Запуск с паузой `setTimeout` внутри области по-прежнему видел тенанта. Поэтому функции сервиса не принимают тенанта параметром: они просто вызывают модель.
+
+## Когда область берётся
+
+Значения фиксируются, когда операция **строится**, а не когда её ждут. Запрос, построенный внутри `run` и дождавшийся снаружи, остаётся запросом своего тенанта; запрос, построенный снаружи, тенанта не получит, даже если его дождались внутри. Так запрос в переменной модуля не подхватит тенанта чужого запроса.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, PolicyContext, Tenant, type TenantField } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Orders = client.connection.model(Order);
+// ---cut---
+// построен внутри области, дождались снаружи: тенант acme сохранился
+const pending = PolicyContext.run({ tenant: "acme" }, () => Orders.find().plain());
+const rows = await pending;
+```
+
+## Вложенные области
+
+Внутренний `run` накладывает значения на внешние. Внутренний `tenant` перекрывает внешний, `actor` остаётся; `allTenants: true` снимает унаследованный `tenant`, и наоборот. Результат `run({ tenant: "a", actor: "u1" }, () => run({ tenant: "b" }, current))` — `{ tenant: "b", actor: "u1" }`. Так фоновая задача внутри запроса может явно перейти на все тенанты, не теряя актора.
+
+## Значения одной операции
+
+[`.policy()`](../reference/query/options.mdx#policy) накладывается на область и действует на одну операцию: `Orders.find().policy({ tenant: "globex" })` прочитает `globex`, даже внутри области `acme`. Внутрь [`PolicyContext.current()`](../reference/policies/policy-context.mdx#policycontextcurrent) такие значения не попадают.
+
+## Что контекст проверяет
+
+Неизвестный ключ, флаг не `true` и противоречия (`tenant` вместе с `allTenants`, `includeDeleted` вместе с `onlyDeleted`) отвергаются [`QueryError`](../reference/errors/query-errors.mdx#queryerror) сразу. Опечатка `tenat` называется в ошибке: `PolicyContext.run: unknown policy value "tenat" (known: tenant, allTenants, actor, includeDeleted, onlyDeleted, hardDelete)`. Пустой тенант (пустая строка, строка из пробелов, `null`) отвергается как [`StrictModeError`](../reference/policies/violations.mdx#tenant) с причиной `tenant`: `PolicyContext.run: the tenant is empty (null); a tenant is a non-empty value, or allTenants: true for cross-tenant work [tenant]`.
+
+## Как выбрать
+
+Спросите себя: **общее ли это значение для всей обработки?** Тенант и актор запроса — да, открывайте `run`. Особый режим одной операции (показать удалённые, прочитать другого тенанта) — `.policy()`.
+
+## Когда это не нужно
+
+Если политик у модели нет, контекст ничего не меняет. Не кладите в контекст то, что политики не читают: у него шесть ключей и нет пользовательских. Если вы пишете обёртку или плагин, которые сами строят операции, значения области берут методы [`PolicyContext.captured`](../reference/policies/policy-context.mdx#policycontextcaptured) и [`PolicyContext.merge`](../reference/policies/policy-context.mdx#policycontextmerge): они публичны для таких случаев, прикладному коду они не нужны.
+
+## Частые ошибки
+
+### Запрос построен вне области
+
+Симптом: `StrictModeError … the operation has no tenant … [tenant]` при ожидании внутри `run`. Причина в том, что область берётся при построении. Стройте запрос внутри `run`.
+
+### Область потеряна в очереди или другом процессе
+
+`run` живёт в одном процессе. Если работа уходит в очередь, передайте значения (`PolicyContext.current()`) в сообщении и откройте `run` заново у обработчика.
+
+## Полный пример
+
+```ts twoslash title="http/handler.ts"
+import { Entity, Prop, Schema, TypemoClient, PolicyContext, Tenant, type TenantField } from "@venloc/typemo";
+@Schema({ collection: "orders", tenant: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Orders = client.connection.model(Order);
+// ---cut---
+declare const __readToken__: (token: string) => { readonly orgId: string; readonly userId: string };
+
+export const handle = (token: string) => {
+  const { orgId, userId } = __readToken__(token);
+  return PolicyContext.run({ tenant: orgId, actor: userId }, () => Orders.find().plain());
+};
+
+// задача очереди: значения передаются явно
+export const enqueue = () => PolicyContext.current();
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник: PolicyContext" href="../reference/policies/policy-context.mdx">
+  Все методы, значения и тексты ошибок.
+</Card>
+<Card title="Мультитенантность" href="./tenants.mdx">
+  Как политика использует тенанта.
+</Card>
+</Cards>

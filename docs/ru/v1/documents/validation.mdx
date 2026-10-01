@@ -1,0 +1,245 @@
+---
+title: Проверить документ до сохранения
+description: "Как проверить документ и обычные данные по схеме, получить все ошибки сразу и понять, откуда каждая берётся"
+icon: ShieldCheck
+---
+
+Чтобы проверить документ по схеме, вызовите [`$validate`](../reference/documents/document-api.mdx#validate): метод соберёт все найденные проблемы в одну [`ValidationError`](../reference/errors/data-errors.mdx#validationerror) и ничего не запишет. Чтобы проверить обычные данные, из которых документа ещё нет (тело запроса, строка импорта), вызовите [`Model.validate`](../reference/documents/model-document-methods.mdx#modelvalidate). [`$save`](../reference/documents/document-api.mdx#save) проверяет документ сам перед каждой записью.
+
+Все проблемы собираются вместе, а не по одной, потому что пользователю, который заполнил форму, нужен список того, что исправить, а не первая ошибка из пяти. Каждая проблема — запись с путём поля, причиной и сообщением.
+
+## Что предполагается
+
+Примеры используют товар `Product` с обязательным именем, асинхронным валидатором, числом с границами и значением по умолчанию и полем с перечислением. Правила полей описаны в разделе [Валидация полей](../schemas/validation.mdx).
+
+```ts twoslash title="models/product.ts"
+import { type Defaulted, Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "products" })
+export class Product extends Entity {
+  @Prop(() => String, {
+    required: true,
+    validate: async (value: string) => value !== "bad" || "the name is taken",
+  })
+  name!: string;
+
+  @Prop(() => Number, { min: 0, max: 10, default: 1 })
+  size!: Defaulted<number>;
+
+  @Prop(() => String, { enum: ["a", "b"] })
+  kind?: "a" | "b";
+}
+```
+
+## Быстрый путь
+
+```ts twoslash
+import { type Defaulted, Entity, Prop, Schema, TypemoClient, ValidationError } from "@venloc/typemo";
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, {
+    required: true,
+    validate: async (value: string) => value !== "bad" || "the name is taken",
+  })
+  name!: string;
+  @Prop(() => Number, { min: 0, max: 10, default: 1 }) size!: Defaulted<number>;
+  @Prop(() => String, { enum: ["a", "b"] }) kind?: "a" | "b";
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const product = Products.new({ name: "bad", size: 99 });
+
+try {
+  await product.$validate();
+} catch (error) {
+  if (error instanceof ValidationError) {
+    console.log(error.issues.map((issue) => [issue.path.join("."), issue.reason]));
+    // → [["name", "validator"], ["size", "max"]]
+  }
+}
+```
+
+Остальная страница разбирает, что в каждой проблеме, как проверять данные без документа и когда проверка срабатывает сама.
+
+## Проверить документ
+
+[`$validate`](../reference/documents/document-api.mdx#validate) проверяет весь документ: обязательные поля, границы, перечисления, свои функции `validate`. Асинхронные валидаторы дожидаются. Метод возвращает `void` при успехе и бросает `ValidationError` при любой проблеме, а документ не меняет. Тот же вызов делает [`$save`](../reference/documents/document-api.mdx#save), поэтому проверять перед сохранением вручную не нужно: `$validate` нужен, когда вы хотите узнать об ошибках **до** записи, например, чтобы показать их пользователю.
+
+Каждый пункт в `issues` — объект с полями `path` (массив сегментов пути), `reason` (причина: `required`, `min`, `max`, `enum`, `validator`, `cast` и другие), `message` и `value`. Полный список причин — в справочнике [`ValidationError`](../reference/errors/data-errors.mdx#validationerror).
+
+```text
+ValidationError: Validation failed: "name": the name is taken [validator]; "size": must be at most 10 [max]
+```
+
+Порядок пунктов такой же, как у полей в классе. Так же упорядочены ошибки `$save` и `Model.validate`.
+
+## Понять, что документ не сохранится
+
+Приведение типов идёт при создании, а правила — при проверке. Поэтому документ можно создать, а сохранить нельзя. Здесь `qty` строки заказа не может быть отрицательным (`min: 0`), но добавление строки в массив такое значение принимает: правило проверяется при `$validate` и `$save`.
+
+```ts twoslash
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+import { ValidationError } from "@venloc/typemo";
+// ---cut---
+const order = Orders.new({ customer: "alice", tags: [], lines: [] });
+order.lines.push({ sku: "B2", qty: -1 });
+
+try {
+  await order.$save();
+} catch (error) {
+  console.log(error instanceof ValidationError && error.issues[0]?.path.join("."));
+  // → "lines.0.qty"
+}
+```
+
+Путь `lines.0.qty` называет точное место: строку и поле. Документ при этом не записывается ни частично, ни целиком.
+
+## Проверить данные без документа
+
+Если вы принимаете данные снаружи, документ создавать незачем: [`Model.validate`](../reference/documents/model-document-methods.mdx#modelvalidate) приводит и проверяет обычный объект и возвращает готовое значение со значениями по умолчанию, в том числе `_id`.
+
+```ts twoslash
+import { type Defaulted, Entity, Prop, Schema, TypemoClient, ValidationError } from "@venloc/typemo";
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, {
+    required: true,
+    validate: async (value: string) => value !== "bad" || "the name is taken",
+  })
+  name!: string;
+  @Prop(() => Number, { min: 0, max: 10, default: 1 }) size!: Defaulted<number>;
+  @Prop(() => String, { enum: ["a", "b"] }) kind?: "a" | "b";
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+const value = await Products.validate({ name: "lamp" });
+console.log(value.name, value.size);
+// → "lamp" 1
+
+try {
+  await Products.validate({ name: "bad", size: 99, kind: "z" });
+} catch (error) {
+  if (error instanceof ValidationError) {
+    console.log(error.issues.map((issue) => [issue.path.join("."), issue.reason]));
+    // → [["name", "validator"], ["size", "max"], ["kind", "enum"]]
+  }
+}
+```
+
+Обратите внимание на порядок пунктов: они идут в порядке полей схемы, как они объявлены в классе (`name`, `size`, `kind`), хотя валидатор имени асинхронный и заканчивается позже остальных. Порядок не зависит от того, какая проверка закончилась первой, поэтому список в форме не «прыгает» между запусками.
+
+Если нужно только привести значения, не проверяя правила, есть [`Model.castObject`](../reference/documents/model-document-methods.mdx#modelcastobject): он останавливается на первой ошибке приведения и не подставляет значения по умолчанию.
+
+## Разобрать ошибку приведения типа
+
+Приведение значения к типу поля и проверка его правил — два разных шага, и ошибка у них разная. Значение, которое не приводится к типу поля, — это `CastError`: и проверять его по правилам пока нечего, потому что `"abc"` не число и сравнивать его с `max` бессмысленно. Значение нужного типа, которое нарушает правило, — пункт `ValidationError`.
+
+Где именно появляется `CastError`, зависит от того, как значение попало в документ. Методы (`Model.new`, `$set`, методы массивов) приводят значение сразу, на вызове. Простое присваивание (`product.size = "abc"`) приводится позже, на ближайшем `$validate()` или `$save()`: метод бросает `CastError` до всякой валидации, и в базу ничего не уходит. Ограничения этого поля не проверяются, поэтому вторая, побочная ошибка по тому же полю не появляется.
+
+```text
+CastError: Cast to number failed at path "size" for "abc" (string): expected a number [type]
+```
+
+`Model.validate` ведёт себя иначе, потому что его задача — собрать все проблемы данных снаружи. Значение неверного типа он не бросает, а добавляет в список пунктом с причиной `cast`; сама `CastError` лежит в `cause` этого пункта. По каждому полю пункт один: если значение не приводится, его ограничения не проверяются.
+
+```text
+ValidationError: Validation failed: "size": Cast to number failed at path "size" for "4" (string): expected a number [type] [cast]
+```
+
+Строгость намеренная: `"4"` не превращается в число молча.
+
+## Как выбрать
+
+Спросите себя: **есть ли у меня документ?** Если документ уже создан (`Model.new`, прочитан из базы) — [`$validate`](../reference/documents/document-api.mdx#validate) или сразу [`$save`](../reference/documents/document-api.mdx#save). Если у вас только данные снаружи и вы хотите узнать, годятся ли они, — [`Model.validate`](../reference/documents/model-document-methods.mdx#modelvalidate). Если нужно только привести типы — [`Model.castObject`](../reference/documents/model-document-methods.mdx#modelcastobject).
+
+## Когда это не нужно
+
+Перед `$save` вызывать `$validate` отдельно не нужно: сохранение проверяет документ само. Для изменений через [`updateOne`](../reference/writes/writes.mdx#updateone) документ вообще не нужен: приведение типов и проверки при обновлении описаны в руководстве [Валидация полей](../schemas/validation.mdx).
+
+## Частые ошибки
+
+### Проверка прошла, а сохранение отказало
+
+`$validate` проверяет данные документа, но не версию и не уникальные индексы: конфликт версий — [`VersionError`](../reference/errors/query-errors.mdx#versionerror), а нарушение уникальности — [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicatekeyerror). Их сообщает база при записи, заранее их не найти. Исправление: ловите эти ошибки вокруг `$save`.
+
+### Ошибка не показывает, какое поле виновато
+
+Текст `ValidationError` называет пути, но для формы удобнее разобрать `issues`: у каждого пункта есть `path` и `reason`. Исправление: используйте `error.issues`, как в примерах выше, а не разбирайте `message`.
+
+## Полный пример
+
+Функция принимает тело запроса, проверяет его и возвращает либо созданный товар, либо список проблем полей.
+
+```ts twoslash title="products/products.service.ts"
+import { type Defaulted, Entity, Prop, Schema, TypemoClient, ValidationError } from "@venloc/typemo";
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, {
+    required: true,
+    validate: async (value: string) => value !== "bad" || "the name is taken",
+  })
+  name!: string;
+  @Prop(() => Number, { min: 0, max: 10, default: 1 }) size!: Defaulted<number>;
+  @Prop(() => String, { enum: ["a", "b"] }) kind?: "a" | "b";
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Products = client.db().model(Product);
+// ---cut---
+export const createProduct = async (body: unknown) => {
+  try {
+    const value = await Products.validate(body);
+    const product = await Products.create(value);
+    return { ok: true as const, id: product._id };
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      return { ok: false as const, problems: error.issues.map((issue) => ({ field: issue.path.join("."), reason: issue.reason })) };
+    }
+    throw error;
+  }
+};
+```
+
+## Если вы пришли из Mongoose
+
+<Callout type="migration">
+
+`doc.validate()` называется `$validate()`, а `Model.validate(obj)` возвращает приведённое значение. Значение, которое не приводится, — `CastError` (у `Model.validate` — пункт с причиной `cast`), а не `invalidate`; асинхронные валидаторы дожидаются всегда, а `ValidationError` содержит все пункты, а не первый, в порядке полей схемы.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Валидация полей" href="../schemas/validation.mdx">
+  Все правила полей: `min`, `max`, `enum`, `match` и свои валидаторы.
+</Card>
+<Card title="ValidationError" href="../reference/errors/data-errors.mdx#validationerror">
+  Полный список причин и устройство `issues`.
+</Card>
+<Card title="Методы модели для документов" href="../reference/documents/model-document-methods.mdx">
+  Подробно про `Model.validate` и `Model.castObject`.
+</Card>
+</Cards>

@@ -1,0 +1,534 @@
+---
+title: Индексы модели
+description: "listIndexes, diffIndexes, syncIndexes, createIndexes, diffSearchIndexes и syncSearchIndexes: что сравнивают, что меняют и какие ошибки возвращают"
+icon: ListTree
+---
+
+На этой странице собраны методы модели, которые работают с **индексами** коллекции — служебными структурами MongoDB, благодаря которым запросы не перебирают всю коллекцию, а уникальные поля остаются уникальными. Схема описывает нужные индексы (`unique`, `index`, [`@Index`](../schemas/index-decorators.mdx#index)), а методы отсюда сравнивают описание с тем, что реально лежит на сервере, и при необходимости приводят сервер в соответствие. Отдельная группа методов — для **поисковых индексов** ([`@SearchIndex`](../schemas/index-decorators.mdx#searchindex)), которым нужен Atlas Search.
+
+Если вы впервые настраиваете индексы, сначала прочитайте руководство [Синхронизация индексов](../../collections/index-sync.mdx). Эта страница — справочник: к ней возвращаются, когда нужно уточнить конкретную деталь.
+
+Все примеры используют модель счёта: уникальное поле, обычный индекс через `index: true` и TTL-индекс (индекс, по которому сервер сам удаляет старые документы) через [`@Index`](../schemas/index-decorators.mdx#index).
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Index, Prop, Schema } from "@venloc/typemo";
+
+@Index({ opened: 1 }, { name: "opened_ttl", expireAfterSeconds: 3600 })
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true, index: true })
+  owner!: string;
+
+  @Prop(() => Date)
+  opened?: Date;
+}
+```
+
+Схема объявляет три индекса: `title_1`, `owner_1` и `opened_ttl`. Имя без явного `name` строится из ключей: `поле_направление`. Индекс `_id_` сервер создаёт сам, и Typemo его не трогает. Результаты в комментариях `// →` получены на пустой базе, в которой коллекции `accounts` ещё нет; если данные нужны, они описаны рядом с примером.
+
+Методы работают только с коллекцией модели. Все они сначала ждут подключения клиента (см. [`client.ready`](../connection/typemo-client.mdx#clientready)). Все модели подключения сразу синхронизирует [`connection.syncAll`](../connection/connection.mdx#connectionsyncall), описанный на странице [`SyncAll`](./sync-all.mdx).
+
+Опция схемы `autoIndex` на эти методы не действует: она говорит только [`connection.init`](../connection/connection.mdx#connectioninit) и `connection.syncAll`, строить ли индексы модели. Если вы вызвали `syncIndexes` или `createIndexes` у модели с `autoIndex: false` сами, индексы будут построены (запуск на MongoDB 9.0 показал `["code_1"]` у такой модели).
+
+---
+
+## Model.listIndexes
+
+`listIndexes` возвращает индексы, которые сейчас лежат на сервере, в том виде, в каком их отдаёт драйвер. Он нужен для проверок и служебных скриптов: посмотреть, какие индексы уже есть, прежде чем что-то менять, или убедиться после деплоя, что нужный индекс создан.
+
+Метод ничего не сравнивает со схемой: он показывает сервер как есть. Если коллекции ещё нет, вы получаете пустой массив, а не ошибку.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ opened: 1 }, { name: "opened_ttl", expireAfterSeconds: 3600 })
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+  @Prop(() => Date) opened?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.connection.model(Account);
+// ---cut---
+console.log(await Accounts.listIndexes());
+// → []
+
+await Accounts.syncIndexes();
+const indexes = await Accounts.listIndexes();
+console.log(indexes.map((index) => [index.name, index.unique, index.expireAfterSeconds]));
+// → [["_id_", undefined, undefined], ["title_1", true, undefined],
+//    ["owner_1", undefined, undefined], ["opened_ttl", undefined, 3600]]
+```
+
+<Returns type="Promise<IndexDescriptionInfo[]>">
+
+Массив описаний индексов из драйвера `mongodb`: у каждого есть `name`, `key` (ключи с направлениями) и версия `v`, а также те опции, которые заданы у индекса: `unique`, `expireAfterSeconds`, `hidden`, `partialFilterExpression`, `collation`. Индекс `_id_` в списке всегда есть, если коллекция существует. Для несуществующей коллекции массив пустой.
+
+</Returns>
+
+Принимает ничего.
+
+<FullType>
+
+```ts
+listIndexes(): Promise<IndexDescriptionInfo[]>
+```
+
+</FullType>
+
+### Что показывает сервер, а не схема
+
+`listIndexes` отдаёт то, что записал сервер, поэтому в описаниях могут быть поля, которых вы не задавали. Например, MongoDB 9 добавляет к каждому индексу `collation: { locale: "simple" }`. Сравнивать вручную описание индекса из `listIndexes` со схемой не нужно: за это отвечает [`diffIndexes`](#modeldiffindexes).
+
+---
+
+## Model.diffIndexes
+
+`diffIndexes` сравнивает индексы схемы с индексами сервера и говорит, что нужно создать, что удалить и что изменить на месте. Он ничего не записывает. Пользуйтесь им, чтобы увидеть расхождение до того, как его исправит [`syncIndexes`](#modelsyncindexes): например, в проверке перед деплоем.
+
+Сравнение строгое и симметричное. Индекс считается одним и тем же, если совпали ключи и порядок, `unique`, `sparse`, `partialFilterExpression`, настройки текстового индекса и правило сортировки строк (collation). Опция, равная значению по умолчанию, равна отсутствующей: `unique: false` и `sparse: false` на сервере не считаются отличием. Изменить на месте, без пересоздания, сервер умеет только видимость индекса (`hidden`) и срок жизни TTL-индекса, поэтому эти два различия попадают в отдельный список.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ opened: 1 }, { name: "opened_ttl", expireAfterSeconds: 3600 })
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+  @Prop(() => Date) opened?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.connection.model(Account);
+// ---cut---
+const diff = await Accounts.diffIndexes();
+console.log(diff);
+// → { toCreate: ["title_1", "owner_1", "opened_ttl"], toDrop: [], toModify: [] }
+```
+
+<Returns type="Promise<IndexDiff>">
+
+Объект [`IndexDiff`](#indexdiff) с тремя списками: `toCreate` (индексы схемы, которых нет на сервере или которые отличаются), `toDrop` (индексы сервера, которых нет в схеме или которые отличаются) и `toModify` (изменения на месте). Если всё сходится, все три списка пустые.
+
+</Returns>
+
+Принимает ничего.
+
+<FullType>
+
+```ts
+diffIndexes(): Promise<IndexDiff>
+```
+
+</FullType>
+
+### Текстовый индекс
+
+Текстовый индекс (`@Index({ title: "text", body: "text" })`) сервер хранит вместе с весами полей: если вы их не задали, каждое поле получает вес 1. Typemo знает это правило, поэтому сразу после создания такой индекс совпадает со схемой, и повторный вызов не находит различий. Явный вес, отличный от единицы, сравнивается так же, как остальные опции индекса.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+@Index({ title: "text", body: "text" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Posts = client.connection.model(Post);
+// ---cut---
+console.log((await Posts.diffIndexes()).toCreate);
+// → ["title_text_body_text"]
+
+await Posts.syncIndexes();
+console.log(await Posts.diffIndexes());
+// → { toCreate: [], toDrop: [], toModify: [] }
+```
+
+### Лишний индекс
+
+Индекс, которого нет в схеме, попадает в `toDrop`. Схема — полное описание: если кто-то создал индекс вручную, а в схеме его нет, Typemo считает его лишним. Допустим, в коллекции есть индекс `closed_1`, которого схема не объявляет:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ opened: 1 }, { name: "opened_ttl", expireAfterSeconds: 3600 })
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+  @Prop(() => Date) opened?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.connection.model(Account);
+await Accounts.syncIndexes();
+await client.unsafeDriver().db("app").collection("accounts").createIndex({ closed: 1 }, { name: "closed_1" });
+// ---cut---
+console.log(await Accounts.diffIndexes());
+// → { toCreate: [], toDrop: ["closed_1"], toModify: [] }
+```
+
+`_id_` в `toDrop` не попадает никогда: это индекс сервера, а не схемы. Так же не считаются лишними индекс кластерной коллекции и служебный индекс коллекции временных рядов, который сервер создаёт сам.
+
+### Индекс объявлен иначе
+
+Если индекс с тем же именем есть и там и там, но ключи или опции отличаются, изменить его на месте нельзя. Тогда его имя стоит **и в `toDrop`, и в `toCreate`**: индекс нужно удалить и создать заново. Здесь на сервере `owner_1` сделан уникальным, а схема этого не требует:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ opened: 1 }, { name: "opened_ttl", expireAfterSeconds: 3600 })
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+  @Prop(() => Date) opened?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.connection.model(Account);
+const raw = client.unsafeDriver().db("app").collection("accounts");
+await Accounts.syncIndexes();
+await raw.dropIndex("owner_1");
+await raw.createIndex({ owner: 1 }, { name: "owner_1", unique: true });
+// ---cut---
+console.log(await Accounts.diffIndexes());
+// → { toCreate: ["owner_1"], toDrop: ["owner_1"], toModify: [] }
+```
+
+### Изменение на месте
+
+Срок жизни TTL-индекса и видимость индекса меняются командой сервера без пересоздания, поэтому такие различия попадают в `toModify` вместе с новым значением. Здесь кто-то вручную сократил срок жизни `opened_ttl` до минуты:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ opened: 1 }, { name: "opened_ttl", expireAfterSeconds: 3600 })
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+  @Prop(() => Date) opened?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.connection.model(Account);
+await Accounts.syncIndexes();
+await client.unsafeDriver().db("app").command({
+  collMod: "accounts",
+  index: { name: "opened_ttl", expireAfterSeconds: 60 },
+});
+// ---cut---
+console.log(await Accounts.diffIndexes());
+// → { toCreate: [], toDrop: [], toModify: [{ name: "opened_ttl", expireAfterSeconds: 3600 }] }
+```
+
+Добавление или снятие TTL у существующего индекса код считает перестройкой, а не изменением на месте, чтобы у индекса не менялся смысл без пересоздания. Этот случай описан по коду, запуском не проверялся.
+
+---
+
+## Model.syncIndexes
+
+`syncIndexes` приводит индексы сервера в точное соответствие со схемой: удаляет лишние, меняет на месте то, что можно, и создаёт недостающие. Это метод для шага деплоя и для скрипта миграции. Автоматически Typemo индексы не создаёт: пока вы не вызвали `syncIndexes` (или [`createIndexes`](#modelcreateindexes), или [`connection.init`](../connection/connection.mdx#connectioninit)), уникальность из схемы на сервере не гарантирована.
+
+Если у модели есть параметры, которые задаются только при создании коллекции (`capped`, `timeseries`, `clustered`, `collation`), а коллекции ещё нет, `syncIndexes` ничего не создаёт и бросает [`ConfigurationError`](../errors/configuration-errors.mdx#configurationerror): индекс создал бы коллекцию обычной, и параметры были бы потеряны. Сначала создайте коллекцию ([`ensureCollection`](./collection-manager.mdx#modelensurecollection) или [`connection.init`](../connection/connection.mdx#connectioninit)). С `dryRun: true` такой проверки нет: он ничего не пишет.
+
+Порядок работы такой: сначала удаляются индексы из `toDrop`, затем применяются изменения из `toModify`, затем создаются индексы из `toCreate`. Пересоздаваемый индекс сначала удаляется, потом создаётся. Если что-то не удалось, метод не останавливается: он пробует всё остальное и в конце бросает одну ошибку [`IndexSyncError`](../errors/configuration-errors.mdx#indexsyncerror) со всеми неудачами. Индексы, которые получилось применить, остаются применёнными.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ opened: 1 }, { name: "opened_ttl", expireAfterSeconds: 3600 })
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+  @Prop(() => Date) opened?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.connection.model(Account);
+// ---cut---
+const result = await Accounts.syncIndexes();
+console.log(result.toCreate, result.dryRun);
+// → ["title_1", "owner_1", "opened_ttl"] false
+```
+
+<Returns type="Promise<IndexSyncResult>">
+
+Объект [`IndexSyncResult`](#indexsyncresult): те же три списка, что у [`IndexDiff`](#indexdiff), плюс поле `dryRun`. Списки описывают то, что было применено (или, при `dryRun`, что было бы применено). При повторном вызове на синхронизированной коллекции все списки пустые.
+
+</Returns>
+
+<Params>
+<Param name="options.dryRun" type="boolean" default="false">
+
+Только сообщить, что изменилось бы, и ничего не записывать. Результат при этом тот же, что у [`diffIndexes`](#modeldiffindexes), но с `dryRun: true`. Так удобно проверить деплой заранее.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+syncIndexes(options?: { readonly dryRun?: boolean }): Promise<IndexSyncResult>
+```
+
+</FullType>
+
+### Проверить, не записывая
+
+С `dryRun: true` метод возвращает план и не трогает сервер:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ opened: 1 }, { name: "opened_ttl", expireAfterSeconds: 3600 })
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+  @Prop(() => Date) opened?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.connection.model(Account);
+// ---cut---
+const plan = await Accounts.syncIndexes({ dryRun: true });
+console.log(plan.dryRun, plan.toCreate);
+// → true ["title_1", "owner_1", "opened_ttl"]
+console.log((await Accounts.listIndexes()).length);
+// → 0
+```
+
+### Данные нарушают уникальность
+
+Самая частая причина сбоя: в коллекции уже лежат документы, которые нарушают новый уникальный индекс. Пусть в `accounts` два счёта с названием `Main`, а схема требует уникальное `title`. Метод создаёт остальные индексы и бросает ошибку про `title_1`:
+
+```ts twoslash
+import { Entity, Index, IndexSyncError, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ opened: 1 }, { name: "opened_ttl", expireAfterSeconds: 3600 })
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+  @Prop(() => Date) opened?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.connection.model(Account);
+await client.unsafeDriver().db("app").collection("accounts").insertMany([
+  { title: "Main", owner: "alice" },
+  { title: "Main", owner: "bob" },
+]);
+// ---cut---
+try {
+  await Accounts.syncIndexes();
+} catch (error) {
+  if (error instanceof IndexSyncError) {
+    console.log(error.model, error.failures.map((f) => [f.name, f.action, f.error.name]));
+    // → "Account" [["title_1", "create", "DuplicateKeyError"]]
+    console.log((await Accounts.listIndexes()).map((index) => index.name));
+    // → ["_id_", "owner_1", "opened_ttl"]
+  }
+}
+```
+
+Текст ошибки короткий: у `DuplicateKeyError` внутри него индекс, значение и код. Длинный текст сервера, с идентификаторами сборки индекса (он зависит от версии MongoDB), лежит в `serverMessage` вложенной ошибки:
+
+```text
+IndexSyncError: Account: 1 index operation(s) failed: create title_1: duplicate key on title_1: { title: "Main" } (code 11000 DuplicateKey)
+```
+
+`owner_1` и `opened_ttl` созданы и остались: неудача одного индекса не откатывает остальные. Исправьте данные и вызовите `syncIndexes` ещё раз: создастся только недостающий `title_1`.
+
+---
+
+## Model.createIndexes
+
+`createIndexes` создаёт индексы схемы и ничего не удаляет и не сравнивает. Он нужен, когда вы уверены, что лишних индексов нет, а хотите просто «доложить» недостающие. В остальных случаях выбирайте [`syncIndexes`](#modelsyncindexes): он же умеет и удалять, и менять.
+
+Как и `syncIndexes`, метод собирает все неудачи и бросает одну [`IndexSyncError`](../errors/configuration-errors.mdx#indexsyncerror), а у модели с параметрами «только при создании» и без коллекции бросает ту же [`ConfigurationError`](../errors/configuration-errors.mdx#configurationerror), что и `syncIndexes`. Повторный вызов безопасен: индекс, который уже есть в точности таким же, сервер не пересоздаёт.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ opened: 1 }, { name: "opened_ttl", expireAfterSeconds: 3600 })
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true, index: true }) owner!: string;
+  @Prop(() => Date) opened?: Date;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.connection.model(Account);
+// ---cut---
+console.log(await Accounts.createIndexes());
+// → ["title_1", "owner_1", "opened_ttl"]
+console.log(await Accounts.createIndexes());
+// → ["title_1", "owner_1", "opened_ttl"]
+```
+
+<Returns type="Promise<readonly string[]>">
+
+Имена **всех** индексов схемы, которые после вызова есть на сервере. Имена возвращаются и для индексов, которые уже существовали в точности такими же (второй вызов выше вернул тот же список), поэтому по списку нельзя понять, что было создано именно сейчас. Для этого вызовите [`diffIndexes`](#modeldiffindexes) до `createIndexes`: его `toCreate` — это то, что будет создано.
+
+</Returns>
+
+Принимает ничего.
+
+<FullType>
+
+```ts
+createIndexes(): Promise<readonly string[]>
+```
+
+</FullType>
+
+### Индекс с тем же именем, но другими опциями
+
+`createIndexes` не заменяет существующий индекс. Если на сервере есть индекс `title_1` без `unique`, а схема требует уникальный, сервер откажется создавать второй индекс с тем же именем, и вы получите `IndexSyncError`:
+
+```text
+IndexSyncError: Account: 1 index operation(s) failed: create title_1: An existing index has the same name as the requested index. (code 86 IndexKeySpecsConflict)
+```
+
+Для такого случая нужен [`syncIndexes`](#modelsyncindexes): он видит различие, удаляет старый индекс и создаёт новый.
+
+---
+
+## Model.diffSearchIndexes <Badge variant="requires">Atlas Search</Badge>
+
+`diffSearchIndexes` сравнивает **поисковые индексы** схемы с теми, что есть на сервере: индексы Atlas Search и Atlas Vector Search, которые вы описываете декоратором [`@SearchIndex`](../schemas/index-decorators.mdx#searchindex). Они не обычные: сервер строит их отдельным процессом и хранит отдельно от обычных индексов, а работают они только там, где есть Atlas Search (Atlas или локальное развёртывание Atlas CLI). Сравнение идёт по имени: тип и определение индекса должны совпасть.
+
+Обычный `mongod` без Atlas Search отвечает на такой запрос ошибкой, и Typemo не превращает её в «индексов нет»: ошибка доходит до вас. Так вы не примете отсутствие поиска на сервере за «всё синхронизировано».
+
+<Returns type="Promise<SearchIndexDiff>">
+
+Объект [`SearchIndexDiff`](#searchindexdiff): `toCreate` (индексов схемы нет на сервере), `toUpdate` (индекс есть, но тип или определение отличаются) и `toDrop` (индексы сервера, которых нет в схеме).
+
+</Returns>
+
+Принимает ничего.
+
+<FullType>
+
+```ts
+diffSearchIndexes(): Promise<SearchIndexDiff>
+```
+
+</FullType>
+
+```ts twoslash
+import { Entity, Prop, Schema, SearchIndex, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "articles" })
+@SearchIndex({ name: "articles_text", definition: { mappings: { dynamic: true } } })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) body!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.connection.model(Article);
+// ---cut---
+const diff = await Articles.diffSearchIndexes();
+console.log(diff.toCreate, diff.toUpdate, diff.toDrop);
+// на сервере с Atlas Search: ["articles_text"] [] []
+```
+
+Результат этого примера **не проверялся запуском**: тестовый сервер не поддерживает Atlas Search. Что метод делает на сервере без поиска, проверено: он бросает [`ServerError`](../errors/server-errors.mdx#servererror) с кодом `31082` (`SearchNotEnabled`). В `message` — причина и код, а полный текст сервера с подсказкой, куда подключиться, лежит в [`serverMessage`](../errors/server-errors.mdx#servererror):
+
+```text
+ServerError: Using Atlas Search Database Commands and the $listSearchIndexes aggregation stage requires additional configuration. (code 31082 SearchNotEnabled)
+```
+
+---
+
+## Model.syncSearchIndexes <Badge variant="requires">Atlas Search</Badge>
+
+`syncSearchIndexes` приводит поисковые индексы сервера в соответствие со схемой: создаёт недостающие, обновляет отличающиеся и удаляет лишние. Он работает так же, как [`syncIndexes`](#modelsyncindexes) для обычных индексов: пробует все шаги, собирает неудачи и в конце бросает [`IndexSyncError`](../errors/configuration-errors.mdx#indexsyncerror). Порядок шагов: удаление, обновление, создание.
+
+<Returns type="Promise<SearchIndexSyncResult>">
+
+Объект [`SearchIndexSyncResult`](#searchindexsyncresult): три списка, как у [`SearchIndexDiff`](#searchindexdiff), плюс `dryRun`.
+
+</Returns>
+
+<Params>
+<Param name="options.dryRun" type="boolean" default="false">
+
+Только сообщить, что изменилось бы. Но проверка всё равно обращается к серверу за списком поисковых индексов, поэтому на сервере без поиска `dryRun` тоже бросает `ServerError` с кодом `31082`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+syncSearchIndexes(options?: { readonly dryRun?: boolean }): Promise<SearchIndexSyncResult>
+```
+
+</FullType>
+
+Поведение на сервере с Atlas Search **не проверялось запуском** (нет окружения), описано по коду. Проверено то, что на обычном `mongod` вызов, в том числе с `dryRun: true`, бросает `ServerError` с кодом `31082`.
+
+---
+
+## IndexDiff
+
+Результат [`diffIndexes`](#modeldiffindexes) и основа [`IndexSyncResult`](#indexsyncresult).
+
+<TypeTable
+  type={{
+    toCreate: { type: "readonly string[]", description: "Имена индексов схемы, которых нет на сервере или которые там отличаются. Пересоздаваемый индекс есть и здесь, и в `toDrop`." },
+    toDrop: { type: "readonly string[]", description: "Имена индексов сервера, которых нет в схеме или которые отличаются. `_id_` сюда не попадает." },
+    toModify: { type: "readonly IndexModification[]", description: "Изменения на месте: видимость (`hidden`) и срок жизни TTL." },
+  }}
+/>
+
+### IndexModification
+
+Одно изменение на месте. Поле `name` есть всегда, остальные заполнены только у того, что изменилось.
+
+<TypeTable
+  type={{
+    name: { type: "string", required: true, description: "Имя индекса." },
+    hidden: { type: "boolean", description: "Новое значение видимости: `true` скрывает индекс от планировщика запросов, но продолжает его обновлять." },
+    expireAfterSeconds: { type: "number", description: "Новый срок жизни TTL-индекса в секундах." },
+  }}
+/>
+
+---
+
+## IndexSyncResult
+
+Результат [`syncIndexes`](#modelsyncindexes): всё то же, что в [`IndexDiff`](#indexdiff), и поле `dryRun`.
+
+<TypeTable
+  type={{
+    dryRun: { type: "boolean", required: true, description: "`true`, если сервер не менялся: вызван `syncIndexes({ dryRun: true })`." },
+  }}
+/>
+
+---
+
+## SearchIndexDiff
+
+Результат [`diffSearchIndexes`](#modeldiffsearchindexes).
+
+<TypeTable
+  type={{
+    toCreate: { type: "readonly string[]", description: "Имена поисковых индексов схемы, которых нет на сервере." },
+    toUpdate: { type: "readonly string[]", description: "Имена индексов, которые есть на сервере, но тип или определение отличаются: они обновляются, а не пересоздаются." },
+    toDrop: { type: "readonly string[]", description: "Имена поисковых индексов сервера, которых нет в схеме." },
+  }}
+/>
+
+---
+
+## SearchIndexSyncResult
+
+Результат [`syncSearchIndexes`](#modelsyncsearchindexes): то же, что в [`SearchIndexDiff`](#searchindexdiff), и поле `dryRun`.
+
+<TypeTable
+  type={{
+    dryRun: { type: "boolean", required: true, description: "`true`, если сервер не менялся." },
+  }}
+/>
+
+---
+
+## Когда методы не подходят
+
+Если нужно привести в порядок всю базу за один вызов — коллекции, индексы, поисковые индексы и представления сразу, — используйте [`connection.syncAll`](../connection/connection.mdx#connectionsyncall): он проходит по всем моделям, не останавливается на первом сбое и в конце бросает одну [`SyncError`](../errors/configuration-errors.mdx#syncerror) со всеми сбоями и полным отчётом. Если нужно только создать недостающее и ничего не менять, а при расхождении получить ошибку, используйте [`connection.init`](../connection/connection.mdx#connectioninit). Для коллекции и её параметров (`capped`, валидатор, временные ряды) индексные методы не подходят: они описаны в [`CollectionManager`](./collection-manager.mdx) и в методах модели [`ensureCollection`](./collection-manager.mdx#modelensurecollection) и [`createCollection`](./collection-manager.mdx#modelcreatecollection).
+
+Руководство с реальными задачами — [Синхронизация индексов](../../collections/index-sync.mdx) и [Поисковые индексы](../../collections/search-indexes.mdx).

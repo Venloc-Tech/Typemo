@@ -1,0 +1,828 @@
+---
+title: Типы populate
+description: "Типы и функции populate: PopulatedField, Depopulated, ApplyPopulate, AnyPopulationDoc, isPopulated, isPresent и типы проверки путей"
+icon: Braces
+---
+
+Когда вы вызываете [`.populate`](./populate.mdx#populate), компилятор не просто разрешает вызов: он меняет тип результата. Поле `author` из `Ref<User>` становится документом пользователя (или `null`, если документ пропал), виртуальное поле `comments` из служебного маркера становится массивом комментариев. На этой странице описаны публичные типы, из которых это устроено, и две функции, которые нужны коду, не знающему, загружена ли связь: [`isPopulated`](#ispopulated) и [`isPresent`](#ispresent). Какие из типов читатель встречает в подсказках редактора и в сообщениях об ошибках, а какие пригодятся для собственных обёрток над результатами populate, сказано в описании каждого.
+
+Если вы впервые встречаете связанные данные, начните с руководства [Показать связанные данные](../../populate/basics.mdx), а о проверке типа в своём коде читайте в руководстве [Убедиться, что связь загружена](../../populate/type-checks.mdx). Эта страница — справочник по самим типам.
+
+Примеры используют модель блога со страницы [`.populate`](./populate.mdx): пост со ссылкой на автора, тегами и виртуальным полем комментариев. В базе два пользователя (Alice и Bob), два тега (`db` и `ts`), три поста и три комментария, как на странице [`.populate`](./populate.mdx).
+
+Элементы страницы: [`PopulatedField`](#populatedfield), [`Depopulated`](#depopulated), [`ApplyPopulate`](#applypopulate), [`isPresent`](#ispresent), [`isPopulated`](#ispopulated), [`AnyPopulationDoc`](#anypopulationdoc), [`PartlyPopulatedDoc`](#partlypopulateddoc), [`AnyPopulationMethods`](#anypopulationmethods), [`PopulatableKeys`](#populatablekeys) и [остальные типы](#остальные-типы): проверка путей, аргумент `populate`, `transform`.
+
+---
+
+## PopulatedField
+
+`PopulatedField<Value, Original>` описывает поле документа, которое уже загружено: `Value` — то, что поле хранит после populate (документ или `null`, массив документов, число, результат `transform`), а `Original` — то, что лежало в поле до этого (`Ref<M>`, `Ref<M>[]`, `Map<string, Ref<M>>`, `VirtualRef`). Это тип-маркер: значения такого типа во время работы не существует, он нужен только компилятору, чтобы помнить оба состояния одного поля.
+
+Зачем помнить оба? Потому что документ можно вернуть назад. [`$depopulate`](../documents/document-api.mdx#depopulate) кладёт на место документов исходные идентификаторы, а [`$set`](../documents/document-api.mdx#set) загруженного поля принимает идентификаторы, а не документы. Оба типа берутся из `Original`. Читатель поля всегда видит `Value`: представление документа сворачивает маркер до значения, и в подсказках `PopulatedField` не встречается.
+
+<Params title="Параметры типа">
+<Param name="Value" type="unknown" required>
+
+Что поле хранит после populate: `HydratedDoc<User> | null` для одной ссылки (`null` — документ пропал или не прошёл `match`), `readonly HydratedDoc<Tag>[]` для массива, `ReadonlyMap<string, HydratedDoc<User> | null>` для карты, число для счётчика.
+
+</Param>
+<Param name="Original" type="unknown" required>
+
+Что поле хранило до populate. Этот тип вернёт `$depopulate` и его же принимает `$set`.
+
+</Param>
+<Param name="Transformed" type="boolean" default="false">
+
+`true`, когда в поле лежат результаты `transform`, а не документы. Тогда значение не нужно преобразовывать в plain или lean: это уже готовые данные.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+export interface PopulatedField<Value, Original, Transformed extends boolean = false> {
+  readonly [POPULATED]: readonly [Value, Original, Transformed];
+}
+```
+
+</FullType>
+
+Вспомогательные типы читают маркер: [`PopulatedValueOf<V>`](#остальные-типы) даёт `Value` (для не-маркера — сам `V`), [`PopulatedOriginalOf<V>`](#остальные-типы) даёт `Original`, [`IsTransformed<V>`](#остальные-типы) даёт `Transformed`, а `AnyPopulatedField` — общий вид любого маркера для проверок «это загруженное поле?».
+
+Подсказка редактора для самого заполненного документа маркер не показывает: она называет класс и загруженные поля, `HydratedDocWith<Post, { author: HydratedDoc<User> | null }>`. Второй аргумент — это `Value` каждого загруженного поля, а `Original` тип берёт из объявления класса. Подробнее эта форма описана в справочнике [`HydratedDocWith`](../values/form-types.mdx#hydrateddocwith).
+
+## Depopulated
+
+`Depopulated<T, K>` — тип документа после [`$depopulate(key)`](../documents/document-api.mdx#depopulate): поля под ключом `K` вернулись к исходному типу идентификаторов. Тип заменяет маркеры `PopulatedField` на их `Original` внутри поля глубиной до четырёх уровней: в массивах, картах и вложенных объектах. Остальные поля остаются как были.
+
+<Params>
+<Param name="T" type="object" required>
+
+Форма гидратированного документа.
+
+</Param>
+<Param name="K" type="PropertyKey" required>
+
+Ключ или объединение ключей, чьи загруженные поля надо вернуть в исходный вид.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+export type Depopulated<T, K extends PropertyKey> = { [P in keyof T]: P extends K ? Unboxed<T[P], 4> : T[P] };
+```
+
+</FullType>
+
+Вы почти не пишете `Depopulated` сами: по нему `$depopulate` вычисляет, какие поля вернулись к идентификаторам. В подсказке результата его не видно: поле, которое вернулось к объявленному в классе типу, уходит из второго аргумента [`HydratedDocWith`](../values/form-types.mdx#hydrateddocwith). Когда загруженных полей не остаётся, документ снова `HydratedDoc<Post>`, а загруженные ключи в нём снова `Ref<User>`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const post = await Posts.findOne({ title: "Hello" }).orFail();
+const untouched = post.$depopulate("author");
+//    ^?
+const loaded = await post.$populate(["author", "tags"]);
+const partly = loaded.$depopulate("author");
+//    ^?
+const back = partly.author;
+//    ^?
+```
+
+## ApplyPopulate
+
+`ApplyPopulate<T, Entries, IsLean>` — главный тип: он превращает тип модели в тип результата после populate. `T` — исходный тип модели, `Entries` — накопленные записи о загруженных путях (по одной на путь, с проекцией и особенностями формы), `IsLean` говорит, нужны ли простые объекты или гидратированные документы. Всю работу он делает одним проходом по ключам: цена растёт пропорционально числу путей, а не их сочетаниям. Строитель запроса накапливает записи через `ExtractPopulationEntries` и `ReplaceEntries`, поэтому повторный вызов для того же пути заменяет запись, как и во время работы.
+
+Напрямую `ApplyPopulate` вызывают редко: вы видите его результат в типе любого запроса с `populate`. Так выглядит lean-строка после `.populate("author")`:
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+const row = await Posts.findOne({ title: "Hello" }).populate("author").orFail().lean();
+//    ^?
+```
+
+Загруженная ссылка сохраняет необязательность (`editor?` остался необязательным), а загруженное виртуальное поле после populate присутствует всегда. Тип понимает объединения (встроенные дискриминаторы): каждый член загружается отдельно.
+
+<FullType>
+
+```ts
+export type ApplyPopulate<T, Entries extends PopulationEntry, IsLean extends boolean> = [Entries] extends [never]
+  ? T
+  : T extends unknown
+    ? Simplify<
+        Omit<T, PopulatedKeys<T, Entries>> & {
+          -readonly [K in keyof T as K extends PopulatedKeys<T, Entries>
+            ? IsVirtualRef<T[K]> extends true
+              ? never
+              : K
+            : never]: K extends string ? ApplyField<T, K, Entries, IsLean> : never;
+        } & {
+          -readonly [K in PopulatedKeys<T, Entries> as IsVirtualRef<T[K]> extends true ? K : never]-?: K extends string
+            ? ApplyField<T, K, Entries, IsLean>
+            : never;
+        }
+      >
+    : never;
+```
+
+</FullType>
+
+Что попадёт в поле, определяет форма пути. Ссылка-массив в гидратированном виде превращается в `readonly HydratedDoc<M>[]` (массив только для чтения), карта — в `ReadonlyMap`, в lean — в `M[]` и объект. Единичная ссылка всегда допускает `null`: документ, на который она указывала, могли удалить, а опция [`match`](./populate.mdx#match) могла его отсеять. Опция [`required`](./populate.mdx#required) убирает `| null`, [`transform`](./populate.mdx#transform) заменяет тип значения результатом функции. Типы, описывающие эти особенности, лежат в `PopulateShape` и `PopulationEntry`.
+
+## isPresent
+
+`isPresent(value)` отвечает на вопрос «значение есть?»: `true`, если оно не `null` и не `undefined`. Функция нужна из-за `null` в загруженной единичной ссылке: после `populate("author")` поле `post.author` — документ или `null`, и без проверки обратиться к `post.author.name` компилятор не даст. `isPresent` — охранник типа: внутри `if` тип сужается до `NonNullable`, и работает он с любой формой — документом, lean, plain, загруженным полем и элементом списка.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+import { isPresent } from "@venloc/typemo";
+
+const post = await Posts.findOne({ title: "Hello" }).populate("author").orFail();
+console.log(isPresent(post.author) ? post.author.name : "автор удалён");
+// → "Alice"
+
+const authors = [post.author, null].filter(isPresent);
+console.log(authors.length);
+// → 1
+```
+
+<Returns type="boolean">
+
+`true`, если значение не `null` и не `undefined`. Возвращаемый тип — `value is NonNullable<T>`: в ветке `true` компилятор убирает `null` и `undefined` из типа.
+
+</Returns>
+
+<Params>
+<Param name="value" type="T" required>
+
+Проверяемое значение: поле загруженного документа, элемент списка, результат `findOne` без `orFail`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+export const isPresent = <T>(value: T): value is NonNullable<T> => value !== null && value !== undefined;
+```
+
+</FullType>
+
+### Список с пустыми элементами
+
+У списка, загруженного с опцией [`retainNullValues`](./populate.mdx#retainnullvalues), на месте пропавшей ссылки стоит `null`. `isPresent` удобно передавать прямо в `.filter`: тип массива сужается вместе с проверкой, и `null` в нём не остаётся.
+
+### Когда `isPresent` не нужна
+
+Если пропавшая ссылка для вас ошибка данных, не проверяйте `null`, а попросите [`required: true`](./populate.mdx#required): такая ссылка бросит [`DocumentNotFoundError`](../errors/query-errors.mdx#documentnotfounderror), а тип результата не будет содержать `null`. Проверить, загружена ли связь вообще, `isPresent` не может: для этого служат [`isPopulated`](#ispopulated) и [`$assertPopulated`](../documents/document-api.mdx#assertpopulated).
+
+## isPopulated
+
+`isPopulated(doc, path)` проверяет во время работы, что связь `path` у документа загружена, и сужает тип документа до [`PartlyPopulatedDoc<T, path>`](#partlypopulateddoc): поле `path` в нём читается как загруженное. Функция нужна там, где один код получает документы в любом состоянии: ещё без populate, с populate по одному пути или по нескольким. Документ такой функции описывают параметром [`AnyPopulationDoc<T>`](#anypopulationdoc), а `isPopulated` выбирает ветку. Проверка читает те же записи о загрузке, что и [`$populated`](../documents/document-api.mdx#populated): `true`, пока поле хранит то, что туда положил populate.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+import { type AnyPopulationDoc, isPopulated } from "@venloc/typemo";
+
+const authorName = (post: AnyPopulationDoc<Post>): string | undefined =>
+  isPopulated(post, "author") ? post.author?.name : undefined;
+
+const bare = await Posts.findOne({ title: "Hello" }).orFail();
+console.log(authorName(bare));
+// → undefined
+
+const loaded = await Posts.findOne({ title: "Hello" }).populate("author").orFail();
+console.log(authorName(loaded));
+// → "Alice"
+```
+
+Одна и та же функция приняла и пост без populate, и пост с загруженным автором. Внутри ветки `true` поле `post.author` имеет тип `AnyPopulationDoc<User> | null`: `null` остался, потому что автора могли удалить. Вне ветки поле читается как `Ref<User> | AnyPopulationDoc<User> | null`, и обратиться к `post.author.name` нельзя.
+
+<Returns type="boolean">
+
+`true`, если `path` загружен: populate выполнялся и поле хранит его результат. Возвращаемый тип — охранник типа: в ветке `true` документ сужается до `PartlyPopulatedDoc<T, path>`. Ссылка, для которой документа не нашлось, тоже считается загруженной: populate выполнялся, результат — `null`. Поле, которого в документе вообще не было (у поста «Hello» нет `editor`), не загружено: populate нечего было подставлять.
+
+</Returns>
+
+<Params>
+<Param name="doc" type="D" required>
+
+Документ, объявленный как `AnyPopulationDoc<T>`. Обычный `HydratedDoc<T>` и результат запроса с `populate`, не приведённый к этому типу, не подходят: см. раздел [Ограничения](#ограничения-ispopulated).
+
+</Param>
+<Param name="path" type="PopulatableKeys<T>" required>
+
+Ключ верхнего уровня: ссылка, массив ссылок, карта ссылок или виртуальное поле с populate. Путь через точку не принимается: вложенную связь проверяют вторым вызовом на загруженном документе (`isPopulated(post.author, "posts")`). Ключ, который не ссылка, — ошибка компиляции.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+export const isPopulated = <D extends object, const P extends PopulatableKeys<AnyPopulationOf<D>[0]>>(
+  doc: D,
+  path: P,
+): doc is Extract<PartlyPopulatedDoc<AnyPopulationOf<D>[0], AnyPopulationOf<D>[1] | P>, D> =>
+  PopulatedFields.get(doc, path) !== undefined && (doc as Readonly<Record<string, unknown>>)[path] !== undefined;
+```
+
+</FullType>
+
+### Все виды связей
+
+Функция различает связи по тому, что объявлено в модели. Массив ссылок сужается до `readonly (AnyPopulationDoc<Tag> | null)[]`: `null` в элементе бывает при `retainNullValues`. Карта даёт `ReadonlyMap<string, AnyPopulationDoc<…> | null>`. Виртуальное поле даёт список документов, один документ или `null` (`justOne`) и число для счётчика.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+import { type AnyPopulationDoc, isPopulated, isPresent } from "@venloc/typemo";
+
+const describe = (post: AnyPopulationDoc<Post>): string[] => {
+  const parts: string[] = [];
+  if (isPopulated(post, "tags")) parts.push(post.tags.filter(isPresent).map((tag) => tag.label).join("+"));
+  if (isPopulated(post, "comments")) parts.push(post.comments.map((comment) => comment.text).join("+"));
+  if (isPopulated(post, "commentCount")) parts.push(String(post.commentCount));
+  return parts;
+};
+
+const post = await Posts.findOne({ title: "Hello" }).populate(["tags", "comments", "commentCount"]).orFail();
+console.log(describe(post));
+// → ["db+ts", "c1+c2", "2"]
+
+const tagsOnly = async (doc: AnyPopulationDoc<Post>) => {
+  if (!isPopulated(doc, "tags")) return undefined;
+  return doc.tags;
+//           ^?
+};
+```
+
+### Вложенные связи
+
+Документ внутри загруженного поля сам имеет тип `AnyPopulationDoc`, поэтому вложенную связь проверяют тем же вызовом: сначала `isPopulated(post, "author")`, затем убедиться, что `post.author` не `null`, и `isPopulated(post.author, "posts")`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+import { type AnyPopulationDoc, isPopulated } from "@venloc/typemo";
+
+const authorPostCount = (post: AnyPopulationDoc<Post>): number => {
+  if (!isPopulated(post, "author") || post.author === null) return -1;
+  return isPopulated(post.author, "posts") ? post.author.posts.length : -1;
+};
+
+const nested = await Posts.findOne({ title: "Hello" }).populate({ path: "author", populate: "posts" }).orFail();
+console.log(authorPostCount(nested));
+// → 2
+```
+
+### Ограничения isPopulated
+
+Функция намеренно уже, чем может показаться, и у каждого ограничения есть причина.
+
+**Принимается только `AnyPopulationDoc`.** Обычный `HydratedDoc<Post>` говорит компилятору, что ссылки в нём идентификаторы, поэтому спрашивать «загружена ли» у него нечего. Документ, полученный из `populate` и не приведённый к `AnyPopulationDoc<Post>`, тоже не подходит: его тип уже описывает загруженные поля. Вызов даёт ошибку компиляции, в которой путь не принимается (`parameter of type 'never'`). Обычно достаточно объявить параметр функции как `AnyPopulationDoc<Post>`: оба вида документов к нему присваиваются. Если функции нужен именно `HydratedDoc<Post>`, а связь могла загрузить другой код, используйте [`$assertPopulated`](../documents/document-api.mdx#assertpopulated).
+
+```ts twoslash
+// @errors: 2345
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+import { type HydratedDoc, isPopulated } from "@venloc/typemo";
+
+const check = (post: HydratedDoc<Post>) => isPopulated(post, "author");
+```
+
+**Элементы массива остаются `| null`.** После сужения тип массива ссылок — `readonly (AnyPopulationDoc<Tag> | null)[]`, хотя без `retainNullValues` `null` в нём не бывает. Тип формы не знает, с какими опциями шёл populate, поэтому не обещает лишнего. Уберите `null` через `.filter(isPresent)`.
+
+**Часть документов не подходит под `AnyPopulationDoc`.** Форма описывает документ целиком, поэтому к ней не присваиваются документы, у которых populate изменил состав или вид значений:
+
+- с `select`, если выборка убирает обязательные поля загруженного документа (`select: { email: 1 }` убирает обязательное `name`; выборка, которая убирает только необязательные поля, присваивается);
+- с `transform`: в поле лежит не документ, а результат вашей функции;
+- с `justOne` над массивом ссылок или списком виртуального поля: вместо списка один документ.
+
+Такой документ передаётся функции ошибкой компиляции `TS2379`. Если функции нужен именно такой результат, опишите параметр типом результата запроса: как это сделать, показано в руководстве [Убедиться, что связь загружена](../../populate/type-checks.mdx#передать-загруженный-документ-в-другую-функцию).
+
+```ts twoslash
+// @errors: 2379
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+import type { AnyPopulationDoc } from "@venloc/typemo";
+
+const show = (post: AnyPopulationDoc<Post>) => post.title;
+const partial = await Posts.findOne({ title: "Hello" })
+  .populate({ path: "author", select: { email: 1 } })
+  .orFail();
+show(partial);
+```
+
+## AnyPopulationDoc
+
+`AnyPopulationDoc<T>` — тип гидратированного документа модели `T` в любом состоянии загрузки: к нему присваиваются и обычный `HydratedDoc<T>`, и документ с populate по любым путям, вложенные связи включены. Он нужен функциям, которым всё равно, загружена ли связь: форматированию поста, проверке, расчёту. Без него пришлось бы описывать отдельную сигнатуру для каждого сочетания загруженных путей.
+
+Поля такой формы читаются осторожно: ссылка — это `Ref<M> | AnyPopulationDoc<M> | null` (идентификатор, документ или пропавший документ), массив ссылок — массив такого же вида по элементам, значения карты — тоже. Виртуальное поле читается как свой маркер или как загруженное значение. Все поля только для чтения, а поля с `Hidden` необязательны, потому что чтение без них — тоже документ `T`. Чтобы увидеть ссылку загруженной, сузьте документ через [`isPopulated`](#ispopulated).
+
+<Params title="Параметры типа">
+<Param name="T" type="object" required>
+
+Класс модели.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+export type AnyPopulationDoc<T> = AnyPopulationFields<T, never> & AnyPopulationMethods;
+```
+
+</FullType>
+
+Методы в форме ограничены теми, смысл которых не зависит от состояния загрузки, — [`AnyPopulationMethods`](#anypopulationmethods). Поэтому `post.$populate(...)`, `post.$set(...)` и присваивание поля не компилируются: форма не знает, что лежит в поле, и не может ни принять запись, ни загрузить связь. Для этих действий возьмите конкретный тип документа.
+
+Отдельно о подсказке редактора. Форма вынесена в собственное имя, а не в второй параметр `HydratedDoc`, чтобы редактор показывал `AnyPopulationDoc<Post>`, а не раскрытое пересечение типов.
+
+## PartlyPopulatedDoc
+
+`PartlyPopulatedDoc<T, P>` — документ в любом состоянии, у которого ключи `P` известны как загруженные. Это тип, к которому сужает [`isPopulated`](#ispopulated): ключи из `P` читаются как документы (или `null`) и присутствуют, остальные — как в [`AnyPopulationDoc<T>`](#anypopulationdoc). Значение `PartlyPopulatedDoc` присваивается обратно к `AnyPopulationDoc<T>`, а документ, знающий больше загруженных ключей, присваивается тому, кто знает меньше.
+
+Записывать тип самому приходится редко: он виден в подсказке сужённого документа (`PartlyPopulatedDoc<Post, "author">`) и нужен, когда функция принимает уже проверенный документ.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+import { type AnyPopulationDoc, isPopulated, type PartlyPopulatedDoc } from "@venloc/typemo";
+
+const signature = (post: PartlyPopulatedDoc<Post, "author">): string => `— ${post.author?.name ?? "аноним"}`;
+
+const greet = (post: AnyPopulationDoc<Post>): string => (isPopulated(post, "author") ? signature(post) : "—");
+
+console.log(greet(await Posts.findOne({ title: "Hello" }).populate("author").orFail()));
+// → "— Alice"
+```
+
+<Params title="Параметры типа">
+<Param name="T" type="object" required>
+
+Класс модели.
+
+</Param>
+<Param name="P" type="string" required>
+
+Ключи, о которых известно, что они загружены: объединение строковых литералов из [`PopulatableKeys<T>`](#populatablekeys).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+export type PartlyPopulatedDoc<T, P extends string> = AnyPopulationFields<T, P> & AnyPopulationMethods;
+```
+
+</FullType>
+
+Почему это отдельное имя, а не второй параметр у `AnyPopulationDoc`: значение параметра по умолчанию редактор печатает в подсказке (`AnyPopulationDoc<Person, never>`) везде, где тип вычислен, а не написан вручную.
+
+## AnyPopulationMethods
+
+`AnyPopulationMethods` — методы документа, которые есть у формы [`AnyPopulationDoc<T>`](#anypopulationdoc) и [`PartlyPopulatedDoc<T, P>`](#partlypopulateddoc): те, чей смысл не зависит от состояния загрузки. Это [`$isNew`](../documents/document-api.mdx#isnew), [`$locals`](../documents/document-api.mdx#locals), [`$isModified`](../documents/document-api.mdx#ismodified), [`$getChanges`](../documents/document-api.mdx#getchanges), [`$validate`](../documents/document-api.mdx#validate), [`$save`](../documents/document-api.mdx#save), [`$deleteOne`](../documents/document-api.mdx#deleteone), [`$toObject`](../documents/document-api.mdx#toobject), [`$toJSON`](../documents/document-api.mdx#tojson), [`$toPlain`](../documents/document-api.mdx#toplain), [`$populated`](../documents/document-api.mdx#populated) и [`$session`](../documents/document-api.mdx#session).
+
+Методов записи и загрузки в списке нет: `$set`, `$get`, `$markModified`, `$populate`, `$depopulate`, `$assertPopulated`, `$is` и `$updateOne` на форме не компилируются, потому что их типы зависят от того, какие поля загружены. Методы сериализации возвращают широкий объект `Record<string, unknown>`: загруженное поле сериализуется документом, незагруженное — идентификатором, и форма не знает, какое из двух. `$save` возвращает ту же форму, а загруженное поле сохраняется идентификаторами.
+
+<FullType>
+
+```ts
+export interface AnyPopulationMethods {
+  $isNew(): boolean;
+  $locals(): Record<string, unknown>;
+  $isModified(path?: string): boolean;
+  $getChanges(): DocumentChanges;
+  $validate(): Promise<void>;
+  $save(options?: SaveOptions): Promise<this>;
+  $deleteOne(options?: SaveOptions): Promise<DeleteResult>;
+  $toObject(options?: SerializeOptions): Record<string, unknown>;
+  $toJSON(options?: SerializeOptions): Record<string, unknown>;
+  $toPlain(options?: SerializeOptions): Record<string, unknown>;
+  $populated(path: string): unknown;
+  $session(): ClientSession | undefined;
+  $session(session: ClientSession | null): this;
+}
+```
+
+</FullType>
+
+## PopulatableKeys
+
+`PopulatableKeys<T>` — объединение ключей модели `T`, которые можно загрузить populate: ссылки (одна, массив, карта ссылок) и виртуальные поля с populate. Это тип аргумента `path` у [`isPopulated`](#ispopulated): ключ, которого в объединении нет, не компилируется, а редактор предлагает в этом аргументе именно эти ключи. Для модели блога объединение такое: `"author" | "editor" | "tags" | "reviewers" | "comments" | "commentCount"`. Поля `title` и `views` не ссылки, поэтому их в объединении нет.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Ref, type VirtualRef } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String) email?: string;
+  @Virtual({ ref: () => Post, localField: "_id", foreignField: "author" }) posts?: VirtualRef<Post>;
+}
+@Schema({ collection: "tags" })
+class Tag extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+  @Prop(() => Types.ObjectId, { ref: () => User }) editor?: Ref<User>;
+  @Prop(() => [Types.ObjectId], { ref: () => Tag }) tags!: Ref<Tag>[];
+  @Prop(() => Spec.map(Types.ObjectId), { ref: () => User }) reviewers?: Map<string, Ref<User>>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post" }) comments?: VirtualRef<Comment>;
+  @Virtual({ ref: () => Comment, localField: "_id", foreignField: "post", count: true }) commentCount?: VirtualRef<Comment, false, true>;
+}
+@Schema({ collection: "comments" })
+class Comment extends Entity {
+  @Prop(() => String, { required: true }) text!: string;
+  @Prop(() => Types.ObjectId, { ref: () => Post, required: true }) post!: Ref<Post>;
+  @Prop(() => Types.ObjectId, { ref: () => User, required: true }) author!: Ref<User>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Users = client.db().model(User);
+const Tags = client.db().model(Tag);
+const Posts = client.db().model(Post);
+const Comments = client.db().model(Comment);
+// ---cut---
+import type { AnyPopulationDoc, PopulatableKeys } from "@venloc/typemo";
+
+const isLoaded = (post: AnyPopulationDoc<Post>, key: PopulatableKeys<Post>): boolean =>
+  post.$populated(key) !== undefined;
+
+const post = await Posts.findOne({ title: "Hello" }).populate("tags").orFail();
+console.log(isLoaded(post, "tags"), isLoaded(post, "author"));
+// → true false
+```
+
+<Params title="Параметры типа">
+<Param name="T" type="object" required>
+
+Класс модели.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+export type PopulatableKeys<T> = {
+  [K in keyof T & string]-?: IsVirtualRef<T[K]> extends true
+    ? K
+    : K extends DataKeys<T>
+      ? [RefModel<T[K]>] extends [never]
+        ? NonNullable<T[K]> extends ReadonlyMap<string, infer E>
+          ? [RefModel<E>] extends [never]
+            ? never
+            : K
+          : never
+        : K
+      : never;
+}[keyof T & string];
+```
+
+</FullType>
+
+## Остальные типы
+
+Остальные публичные типы служат проверкам и подсказкам. Читателю они встречаются в сообщениях об ошибках и в подсказках, а собственные обёртки пишутся на них редко.
+
+<TypeTable
+  type={{
+    "PopulateArgument<T, Ps, Pa, Sel, O, L>": { description: "Тип параметра `populate` и `$populate`: путь, объект с опциями или список. Вычисляется по тому, что передано, и при неверном аргументе содержит текст причины вместо длинного списка перегрузок.", type: "type" },
+    "PopulateArgumentEntries<Ps, Pa, O, L>": { description: "Записи о загруженных путях для вызова `populate`: из строки, из объекта или из списка, в зависимости от аргумента.", type: "type" },
+    "PopulatePathHint<T>": { description: "Что предлагает редактор в аргументе `path`: пути до трёх сегментов, любой ключ модели, любое продолжение через точку и любая строка (последнее — чтобы неверный путь дошёл до проверки и получил понятное сообщение).", type: "type" },
+    "PopulatePaths<T, D>": { description: "Перечисленные пути модели до глубины `D` (по умолчанию три сегмента). Используется только для подсказки.", type: "type" },
+    "CheckedPopulatePath<T, P>": { description: "Сам путь `P`, если он верен, иначе строка с причиной: `Invalid populate path \"title\": \"title\" is not a reference`. Для строки, не являющейся литералом, — `populate path must be a literal`.", type: "type" },
+    "WalkPopulate<T, P, D>": { description: "Проверка пути по сегментам: `true` или текст причины. Понимает `$*` для карт, встроенные документы, виртуальные поля и объединения.", type: "type" },
+    "PopulateTargetOf<T, P>": { description: "Тип документа, на который ведёт путь `P`. Для `Post` и `\"author\"` — `User`.", type: "type" },
+    "SegmentTarget<V>": { description: "Модель, на которую ведёт один сегмент: ссылка, виртуальное поле или встроенный элемент. `never`, если сегмент не ведёт никуда.", type: "type" },
+    "MaxPopulateDepth": { description: "Потолок проверки глубины пути: `7`.", type: "7" },
+    "PopulateHintDepth": { description: "Глубина путей в подсказке редактора: `3`.", type: "3" },
+    "ExtractPopulationEntries<Spec>": { description: "Запись (или объединение записей) о загруженных путях, полученная из аргумента `populate`: строки, объекта или списка.", type: "type" },
+    "ReplaceEntries<Old, New>": { description: "Накопленные записи, в которых пути из `New` заменены: так типы повторяют правило «повторный вызов заменяет».", type: "type" },
+    "PopulationEntry": { description: "Одна запись: `path`, `select` и `shape`.", type: "interface" },
+    "PopulateShape": { description: "Особенности значения по опциям объекта: `justOne`, `retain`, `matched`, `required`, `transform`.", type: "interface" },
+    "DefaultShape": { description: "Форма строкового пути: ни одна опция не задана.", type: "interface" },
+    "PopulatedKeys<T, Entries>": { description: "Ключи `T`, которых касаются записи: сам путь или путь ниже него.", type: "type" },
+    "LeanBase<T, Entries>": { description: "Lean-вид `T` до populate: загруженные ключи оставлены как объявлены, чтобы `ApplyPopulate` заменил их.", type: "type" },
+    "PopulatedValueOf<V>": { description: "Значение загруженного поля; для не-маркера — сам `V`.", type: "type" },
+    "PopulatedOriginalOf<V>": { description: "Исходное поле (идентификаторы) за загруженным; для не-маркера — сам `V`.", type: "type" },
+    "IsTransformed<V>": { description: "`true`, когда значения поля — результаты `transform`.", type: "type" },
+    "AnyPopulatedField": { description: "Общий вид любого `PopulatedField`: для проверки «поле загружено?».", type: "interface" },
+    "PopulateObject": { description: "Свободная форма объекта с опциями, по которой выводится аргумент; точную проверку делает `PopulateObjectCheck`.", type: "interface" },
+    "PopulateObjectSpec<T, P, S>": { description: "Опции объекта после того, как путь `P` выведен: `match` и `transform` типизированы по модели-цели.", type: "type" },
+    "PopulateObjectCheck<T, P>": { description: "Проверка объекта с опциями: `unknown`, если всё верно, иначе обязательное свойство `\"populate error\"` с текстом причины.", type: "type" },
+    "PopulateListCheck<T, P>": { description: "То же для списка: проверяется каждый элемент. Повтор одного пути в списке — тоже причина.", type: "type" },
+    "PopulateReport<Errors>": { description: "`unknown` для пустого набора ошибок, иначе `{ readonly \"populate error\": Errors }`.", type: "type" },
+    "PopulateQueryOptions<Target>": { description: "Опции запроса populate: `sort` по путям модели-цели, `limit`, `skip`.", type: "interface" },
+    "TransformDoc<T, P, S>": { description: "Документ, который получает `transform`: lean-вид модели-цели с учётом `select`, либо `null`.", type: "type" },
+    "TransformId<T, P>": { description: "Идентификатор, который получает `transform`: тип идентификатора ссылки (для виртуального поля — `unknown`).", type: "type" },
+  }}
+/>
+
+### Как читать сообщения об ошибках
+
+Ошибка в вызове `populate` приходит от компилятора одним сообщением `TS2345`: у метода одна сигнатура, а причина стоит в типе параметра, в который аргумент не вписался. Например, для `populate("title")`: `Argument of type '"title"' is not assignable to parameter of type 'PopulateObject | "Invalid populate path \"title\": \"title\" is not a reference"'`. Часть после `|` — текст причины. Для объекта с опциями причина приходит в свойстве `"populate error"` (`select of "author": unknown field "nope"`), а для слишком глубокого пути — сообщением `populate path is deeper than the 7-level ceiling`. Их порождают `CheckedPopulatePath`, `PopulateObjectCheck` и `PopulateListCheck`; сами сообщения перечислены в разделе [Ошибки](./populate.mdx#ошибки) страницы `.populate`.
+
+### Когда эти типы не нужны
+
+Большая часть кода обходится без явных типов populate: результат строителя выводится сам. Если вам нужно назвать тип результата (например, для возвращаемого значения функции), выведите его из вызова: `Awaited<ReturnType<typeof loadPost>>`. Явное построение через `ApplyPopulate` нужно почти только авторам библиотек. Если функции нужен пост в любом состоянии, опишите параметр типом [`AnyPopulationDoc`](#anypopulationdoc). Для проверки, что нужный путь уже загружен, когда документ объявлен как `HydratedDoc`, используйте [`$assertPopulated`](../documents/document-api.mdx#assertpopulated): он сужает тип без ручных выражений.

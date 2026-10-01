@@ -1,0 +1,291 @@
+---
+title: Описать модель
+description: "Как описать документ коллекции классом с @Schema и @Prop, откуда берётся тип поля и как получить модель для работы с данными"
+icon: Shapes
+---
+
+Модель в Typemo — это обычный класс: [`@Schema`](../reference/schemas/schema.mdx#schema) превращает его в описание документа, [`@Prop`](../reference/schemas/prop.mdx#prop) объявляет его поля, а [`connection.model`](../reference/connection/connection.mdx#connectionmodel) выдаёт по этому классу **модель** — объект, через который вы читаете и пишете коллекцию. **Схема** — это описание того, какие поля есть у документа, какого они типа и какие правила проверяют значения. Отдельного объекта «схема» вроде `new Schema({...})` здесь нет: схему собирает Typemo из самого класса, а тип документа TypeScript берёт из того же класса, поэтому описывать одно и то же дважды не нужно.
+
+Если вы впервые работаете с MongoDB, вам достаточно знать: сервер хранит **документы** (объекты с полями) в **коллекциях**, и по умолчанию он не требует, чтобы у документов одной коллекции были одинаковые поля. Схема Typemo как раз добавляет эту строгость на стороне приложения.
+
+## Что предполагается
+
+Клиент уже подключён по руководству [Подключиться к базе](../connection/connect.mdx), а `tsconfig` настроен по [Установке и настройке](../getting-started/installation.mdx). Примеры описывают регистрацию пользователей на сайте.
+
+## Быстрый путь
+
+Один класс, две декорации и одна строка получения модели:
+
+```ts twoslash title="users/user.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true })
+  login!: string;
+}
+
+const Users = client.connection.model(User);
+const user = await Users.create({ login: "ann" });
+console.log(user.login, user._id.constructor.name);
+// → ann ObjectId
+```
+
+Класс `User` наследует [`Entity`](../reference/schemas/base-classes.mdx#entity): это даёт поле `_id`, которое MongoDB требует у каждого документа. Остальная страница разбирает каждую часть: поля, тип поля, идентификатор, имя коллекции и получение модели.
+
+## Объявить поле
+
+Поле объявляется парой: свойство класса с типом TypeScript и декоратор `@Prop` над ним. Первый аргумент `@Prop` — **функция, которая возвращает тип поля во время работы**: `() => String`, `() => Number`, `() => Date`. Второй — необязательные опции: [`required`](../reference/schemas/prop.mdx#required), [`default`](../reference/schemas/prop.mdx#default), [`min`](../reference/schemas/prop.mdx#min) и другие.
+
+```ts twoslash title="users/user.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true })
+  login!: string;
+
+  @Prop(() => String) // [!code ++]
+  bio?: string; // [!code ++]
+
+  @Prop(() => Date) // [!code ++]
+  birthday?: Date; // [!code ++]
+}
+```
+
+Зачем нужен ещё и `() => String`, если у свойства уже есть тип `string`? Потому что типы TypeScript исчезают при компиляции, а Typemo должен во время работы знать, как приводить и проверять значение. Подсказать тип могли бы метаданные компилятора `design:type`, но они не отличают `int32` от `double`, не знают тип элемента массива и путают `null` с отсутствием значения, поэтому Typemo их не читает: ни `emitDecoratorMetadata`, ни `reflect-metadata` вам не нужны. Тип задаётся явно на каждом поле, а стрелка нужна, чтобы класс, объявленный ниже по файлу или в другом модуле, успел появиться к моменту сборки схемы. Список всех типов и их отличий — в руководстве [Типы полей](./field-types.mdx).
+
+Два типа — рантайм-тип и тип свойства — обязаны совпадать, и компилятор это проверяет. Если вы написали `() => Number`, а свойство объявили строкой, код не скомпилируется:
+
+```ts twoslash title="users/user.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+// @errors: 1240
+@Schema()
+class Wrong extends Entity {
+  @Prop(() => Number)
+  login!: string;
+}
+```
+
+Внутри сообщения компилятора стоит текст `@Prop "login": the runtime type () => X does not match the field type`. Тот же контроль работает и в коде без типов: он срабатывает при получении модели и бросает [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configurationerror).
+
+## Получить модель
+
+[`connection.model`](../reference/connection/connection.mdx#connectionmodel) принимает класс и возвращает модель. Для одного класса на одном подключении вы всегда получаете один и тот же объект, поэтому вызывать `model` можно там, где удобно, и не хранить результат в глобальной переменной. При первом вызове Typemo собирает и проверяет схему: ошибка в описании полей появится здесь, а не при первой записи.
+
+```ts twoslash title="users/users.service.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) login!: string;
+}
+// ---cut---
+export const registerUser = async (login: string) => {
+  const Users = client.connection.model(User);
+  return Users.create({ login });
+};
+
+console.log(client.connection.model(User) === client.connection.model(User));
+// → true
+```
+
+Класс без `@Schema` модель не получит: Typemo не угадывает, что вы имели в виду, и говорит об этом сразу.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+class Plain {
+  login?: string;
+}
+try {
+  client.connection.model(Plain);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Plain: not a schema; decorate the class with @Schema()
+```
+
+## Идентификатор документа
+
+Каждому документу MongoDB нужен уникальный `_id`. Проще всего наследовать [`Entity`](../reference/schemas/base-classes.mdx#entity): он объявляет `_id` типа `ObjectId`, а значение создаёт библиотека, если вы его не передали. Тип `_id` в `Entity` помечен так, что при создании передавать его не нужно, а после создания менять нельзя.
+
+Если идентификатором должно быть ваше значение, например строка-слаг, вместо `Entity` наследуйте [`EntityWithId`](../reference/schemas/base-classes.mdx#entitywithid) и передайте ему тип `_id`:
+
+```ts twoslash title="pages/page.ts"
+import { EntityWithId, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "pages" })
+class Page extends EntityWithId(() => String) { // [!code highlight]
+  @Prop(() => String, { required: true })
+  title!: string;
+}
+
+const Pages = client.connection.model(Page);
+const page = await Pages.create({ _id: "home", title: "Home" });
+console.log(page._id);
+// → home
+```
+
+Без `default` такой идентификатор обязателен при создании, а с `default` (`EntityWithId(() => Types.UUID, { default: () => new UUID() })`) он создаётся сам. Как работают строковые, числовые и `UUID`-идентификаторы, ссылки на такие модели и `$out` в них, описано в руководстве [Задать свой тип _id](./custom-ids.mdx).
+
+Модель без `_id` не собирается: `NoId: a model needs an _id field (extend Entity or declare @Prop _id)`. Служебные метки времени и версию документа добавляют другие базовые классы, [`Timestamped`](../reference/schemas/base-classes.mdx#timestamped) и [`Versioned`](../reference/schemas/base-classes.mdx#versioned): о них — в руководстве [Метки времени и версии](./timestamps-and-versions.mdx).
+
+## Задать имя коллекции
+
+Опция [`collection`](../reference/schemas/schema.mdx#collection) называет коллекцию в базе. Без неё Typemo берёт имя класса в нижнем регистре и ставит его во множественное число по английским правилам, поэтому `UserProfile` попадёт в коллекцию `userprofiles`. Для новой коллекции этого достаточно, но если вы подключаетесь к уже существующей, называйте её явно, иначе модель молча начнёт работать с другой коллекцией.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema()
+class UserProfile extends Entity {}
+
+@Schema({ collection: "profiles" })
+class Profile extends Entity {}
+
+console.log(client.connection.model(UserProfile).collectionName);
+// → userprofiles
+console.log(client.connection.model(Profile).collectionName);
+// → profiles
+```
+
+Правила именования и способ поменять их для всего проекта — в руководстве [Имена коллекций](./collection-names.mdx).
+
+## Что делает схема при записи
+
+Схема строгая всегда. Поле, которого в классе нет, не записывается и не теряется молча, а вызывает ошибку [`CastError`](../reference/errors/data-errors.mdx#casterror) с причиной `unknown-key`. Значение не того типа тоже ошибка, а не тихое преобразование: `"5"` не станет числом.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) login!: string;
+}
+const Users = client.connection.model(User);
+// ---cut---
+try {
+  await Users.create({ login: "bob", nick: "b" } as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to User failed at path "nick" for "b" (string): not a field of User [unknown-key]
+```
+
+Так опечатка в имени поля или лишнее поле из внешнего запроса не попадают в базу. `as never` в примере нужен только для того, чтобы компилятор пропустил заведомо неверный вызов: в обычном коде [`create`](../reference/writes/writes.mdx#create) остановит такое ещё при компиляции. Отдельные опции вроде `strict` из Mongoose здесь не нужны: ослабить строгость нельзя.
+
+## Как выбрать: `Entity` или `EntityWithId`
+
+Задайте себе один вопрос: **есть ли у документа естественный уникальный ключ, который вы всё равно хотите хранить как `_id`?** Если нет (пользователь, заказ, пост), наследуйте `Entity`: `ObjectId` создаётся сам и хорошо подходит для индекса. Если есть (слаг страницы, код валюты, внешний идентификатор), наследуйте `EntityWithId` с нужным типом: отдельный ключ с уникальным индексом занимал бы место и требовал второго поиска.
+
+## Когда это не нужно
+
+Класс с `@Schema` — только для данных, которые хранятся в базе. Значение, которое вычисляется из других полей, не нужно объявлять через `@Prop`: для него есть геттер, см. [Виртуальные поля](./virtuals.mdx). Настройки подключения и клиента лежат в [`TypemoClient`](../reference/connection/typemo-client.mdx), а не в схеме. Если вам нужно только проверить произвольные данные без коллекции, для этого есть [`Model.validate`](../reference/documents/model-document-methods.mdx#modelvalidate).
+
+## Частые ошибки
+
+### Класс без `@Schema` не становится моделью
+
+Поле объявлено, `@Prop` стоит, а `connection.model(Plain)` бросает `ConfigurationError: Plain: not a schema; decorate the class with @Schema()`. Причина в том, что `@Prop` только записывает поле в описание класса, а собирает схему и помечает класс именно `@Schema`. Добавьте декоратор: `@Schema() class Plain extends Entity {}`.
+
+### Поле без `@Prop` не входит в схему
+
+Свойство класса без `@Prop` для Typemo не существует: его нет в проверках, в фильтрах и в записи. TypeScript о нём знает, потому что оно есть в классе, поэтому такой код **компилируется**. Но Typemo не оставляет это молча: если свойство действительно создаётся у экземпляра, сборка модели бросает [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configurationerror) и называет свойство. Поле без инициализатора создаётся при `useDefineForClassFields: true`, а при `target: "ESNext"` этот флаг включён по умолчанию. Свойство с инициализатором (`cache = new Map()`) или присвоенное в конструкторе ловится при любом значении флага.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true })
+  login!: string;
+
+  nick?: string; // забыли @Prop
+}
+try {
+  client.connection.model(User);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → User: property "nick" has no @Prop, so it is not a field of the schema (never stored, cast or loaded); decorate it with @Prop, declare it with "declare", or make it a getter or a method
+```
+
+Добавьте `@Prop(() => String)` над свойством: после этого оно станет полем схемы. Методы, геттеры, свойства, объявленные через `declare`, и неперечисляемые свойства проверка не трогает. Если же поле без инициализатора не создалось у экземпляра (`useDefineForClassFields: false`), ошибки сборки нет, а первая запись с таким ключом даст `CastError`: `Cast to User failed at path "nick" for "a" (string): not a field of User [unknown-key]`.
+
+### Значение по умолчанию в объявлении поля
+
+`login: string = "guest"` в теле класса не работает как значение по умолчанию: при сборке модели Typemo отклонит его, потому что для этого есть опция [`default`](../reference/schemas/prop.mdx#default): `User: field(s) "login" get a value from an initializer or the constructor; use the "default" option — service fields are filled by Typemo`. Как её использовать — в руководстве [Значения по умолчанию](./defaults.mdx).
+
+## Полный пример
+
+Один файл собирает всё вместе: модель, получение модели и создание документа с обработкой ошибки границы. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="users/users.service.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+// модель: класс с @Schema, идентификатор от Entity
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true })
+  login!: string;
+
+  @Prop(() => String)
+  bio?: string;
+
+  @Prop(() => Date)
+  birthday?: Date;
+}
+
+// код читателя: ошибка на границе приложения
+class __BadRequest__ extends Error {}
+
+// регистрация: модель берётся там, где нужна
+export const registerUser = async (login: string, bio?: string) => {
+  const Users = client.connection.model(User);
+  try {
+    return await Users.create({ login, ...(bio === undefined ? {} : { bio }) });
+  } catch (error) {
+    throw new __BadRequest__((error as Error).message);
+  }
+};
+
+const user = await registerUser("ann", "hello");
+console.log(user.$toPlain().login);
+// → ann
+```
+
+<Callout type="migration">
+
+В Mongoose схему создают отдельным объектом `new Schema({...})`, а модель — вызовом `mongoose.model("User", schema)`, и тип документа приходится описывать отдельным интерфейсом. В Typemo класс — это и схема, и тип, а модель приходит от подключения: `connection.model(User)`. Настройки `strict`, `timestamps`, `versionKey`, `toJSON` и `toObject` у `@Schema` отсутствуют: строгость абсолютная, а метки времени и версия приходят из базовых классов.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Свой тип _id" href="./custom-ids.mdx">
+  Строковый, числовой и UUID-идентификатор через `EntityWithId`.
+</Card>
+<Card title="Типы полей" href="./field-types.mdx">
+  Какие типы у полей бывают, как каждый хранится в базе и как выглядит в коде.
+</Card>
+<Card title="Обязательность, null и отсутствие" href="./required-and-null.mdx">
+  Чем обязательное поле отличается от поля, в котором лежит null.
+</Card>
+<Card title="Справочник: @Schema" href="../reference/schemas/schema.mdx">
+  Все опции схемы, включая особые коллекции и политики.
+</Card>
+<Card title="Справочник: @Prop" href="../reference/schemas/prop.mdx">
+  Все опции поля и то, к каким типам они применимы.
+</Card>
+</Cards>

@@ -1,0 +1,409 @@
+---
+title: Задать свой тип _id
+description: "Как хранить документы со строковым, числовым или UUID-идентификатором: EntityWithId, ссылки на такие модели, populate, $out и постраничное чтение"
+icon: Key
+---
+
+Обычный документ получает `_id` типа `ObjectId`, который MongoDB создаёт сама. Но идентификатор часто приходит снаружи: ISO-код страны, артикул товара, `UUID` сессии из другой системы, номер счётчика. Для таких моделей вместо [`Entity`](../reference/schemas/base-classes.mdx#entity) подходит [`EntityWithId`](../reference/schemas/base-classes.mdx#entitywithid): базовый класс, у которого тип `_id` выбираете вы. Тип идёт по всему коду сам: `findById` принимает строку, ссылка на модель хранит строку, `populate` находит документ по строке.
+
+Если вы впервые видите базовые классы, сначала прочитайте руководство [Описать модель](./define-model.mdx): там объяснено, что такое `Entity` и откуда у модели берётся `_id`.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модели справочника стран и городов. Каждая новая возможность добавляется в том разделе, где она нужна.
+
+## Быстрый путь
+
+Передайте в `EntityWithId` стрелку с типом `_id`, как в [`@Prop`](../reference/schemas/prop.mdx#prop). Без `default` идентификатор обязателен, с `default` он необязателен и создаётся сам:
+
+```ts twoslash title="countries/country.ts"
+import { EntityWithId, Prop, Schema, Timestamped, TypemoClient, Types, type Defaulted } from "@venloc/typemo";
+import { UUID } from "mongodb";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ collection: "countries" })
+class Country extends EntityWithId(() => String) { // [!code highlight]
+  @Prop(() => String, { required: true })
+  name!: string;
+}
+
+@Schema({ collection: "sessions" })
+class Session extends EntityWithId(() => Types.UUID, { default: () => new UUID() }) { // [!code highlight]
+  @Prop(() => String, { required: true })
+  user!: string;
+}
+
+@Schema({ collection: "counters" })
+class Counter extends EntityWithId(() => Number) { // [!code highlight]
+  @Prop(() => Number, { required: true, default: 0 })
+  hits!: Defaulted<number>;
+}
+
+const Countries = client.db().model(Country);
+const Sessions = client.db().model(Session);
+const france = await Countries.create({ _id: "FR", name: "France" });
+const session = await Sessions.create({ user: "ann" });
+console.log(france._id, session._id instanceof UUID);
+// → FR true
+```
+
+Остальная страница разбирает каждый вариант на задачах: как создавать такие документы, как на них ссылаться, как записывать в них результаты агрегации и как перейти со старого способа.
+
+## Строковый идентификатор из внешнего мира
+
+Справочник стран естественно ключуется ISO-кодом: по нему страну ищут, на него ссылаются, и выдумывать второй идентификатор незачем. Без `default` идентификатор обязателен: `create` принимает документ только с `_id`, а `findById` ищет по строке. Во Францию из быстрого пути добавим Италию.
+
+```ts twoslash title="countries/countries.service.ts"
+import { EntityWithId, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+@Schema({ collection: "countries" })
+class Country extends EntityWithId(() => String) {
+  @Prop(() => String, { required: true }) name!: string;
+}
+const Countries = client.db().model(Country);
+// ---cut---
+await Countries.create({ _id: "IT", name: "Italy" });
+
+const found = await Countries.findById("IT").orFail().lean();
+console.log(found);
+// → { _id: "IT", name: "Italy" }
+
+const missing = await Countries.findById("DE");
+console.log(missing);
+// → null
+```
+
+Идентификатор сохраняется ровно так, как вы его передали. Повторный `create` с тем же `_id` бросает [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicatekeyerror): сервер не допускает двух документов с одним `_id`. Без идентификатора документ не создаётся. Компилятор останавливает вызов, а в коде без типов приходит `ValidationError`:
+
+```ts twoslash title="countries/countries.service.ts"
+import { EntityWithId, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+@Schema({ collection: "countries" })
+class Country extends EntityWithId(() => String) {
+  @Prop(() => String, { required: true }) name!: string;
+}
+const Countries = client.db().model(Country);
+// ---cut---
+try {
+  await Countries.create({ name: "Nowhere" } as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "_id": the field is required [required]
+```
+
+Значение не того типа отвергается при приведении: `Countries.create({ _id: 5, name: "x" })` — `CastError` (`Cast to string failed at path "_id" for 5 (number): expected a string [type]`), а `Countries.findById(5)` — тот же `CastError`. Пустая строка считается допустимым идентификатором, поэтому пустой код страны нужно отсеивать самому.
+
+## Сгенерировать идентификатор при создании
+
+Когда идентификатор не приходит снаружи, но `ObjectId` не подходит (идентификатор сессии не должен быть предсказуемым, документы сливаются из нескольких баз), добавьте `default`: функцию, которая создаёт значение. Тогда `_id` необязателен: переданный вами сохранится, отсутствующий создаст функция.
+
+```ts twoslash title="sessions/session.ts"
+import { EntityWithId, Prop, Schema, Timestamped, TypemoClient, Types, Versioned } from "@venloc/typemo";
+import { UUID } from "mongodb";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ collection: "sessions" })
+class Session extends Versioned(Timestamped(EntityWithId(() => Types.UUID, { default: () => new UUID() }))) { // [!code highlight]
+  @Prop(() => String, { required: true })
+  user!: string;
+}
+
+const Sessions = client.db().model(Session);
+const created = await Sessions.create({ user: "ann" });
+console.log(created._id instanceof UUID, created.__v, created.createdAt instanceof Date);
+// → true 0 true
+
+const own = new UUID();
+const explicit = await Sessions.create({ _id: own, user: "bob" });
+console.log(explicit._id.equals(own));
+// → true
+```
+
+Обратите внимание на две вещи. Миксины [`Timestamped`](../reference/schemas/base-classes.mdx#timestamped) и [`Versioned`](../reference/schemas/base-classes.mdx#versioned) оборачивают `EntityWithId` так же, как `Entity`, и порядок не важен. А `UUID` в базе — двоичное значение подтипа 4: `findById` принимает и сам `UUID`, и его шестнадцатеричную строку, а в виде `plain`, `lean` и JSON идентификатор — строка вида `4d86ba33-df2d-49dd-9f01-8191006a98ed`, которую можно отдать клиенту.
+
+```ts twoslash title="sessions/sessions.service.ts"
+import { EntityWithId, Prop, Schema, TypemoClient, Types } from "@venloc/typemo";
+import { UUID } from "mongodb";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+@Schema({ collection: "sessions" })
+class Session extends EntityWithId(() => Types.UUID, { default: () => new UUID() }) {
+  @Prop(() => String, { required: true }) user!: string;
+}
+const Sessions = client.db().model(Session);
+const created = await Sessions.create({ user: "cid" });
+const id = created._id.toHexString();
+// ---cut---
+const session = await Sessions.findById(id).orFail().plain();
+console.log(session.user, typeof session._id);
+// → cid string
+```
+
+Строковый идентификатор со своей функцией работает так же: `EntityWithId(() => String, { default: () => crypto.randomUUID() })`.
+
+## Числовой идентификатор
+
+Счётчик или номер из другой системы — число. `Number` хранится как число MongoDB, `Types.Int32` — как 32-битное целое, `BigInt` — как 64-битное.
+
+```ts twoslash title="counters/counters.service.ts"
+import { EntityWithId, Prop, Schema, TypemoClient, type Defaulted } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ collection: "counters" })
+class Counter extends EntityWithId(() => Number) {
+  @Prop(() => Number, { required: true, default: 0 })
+  hits!: Defaulted<number>;
+}
+
+const Counters = client.db().model(Counter);
+await Counters.insertMany([1, 2, 3, 4, 5].map((_id) => ({ _id })));
+await Counters.updateOne({ _id: 3 }, { $inc: { hits: 5 } });
+
+const counter = await Counters.findById(3).orFail().lean();
+console.log(counter);
+// → { _id: 3, hits: 5 }
+```
+
+Постраничное чтение по курсору ([`keysetPage`](../reference/query/keyset.mdx#modelkeysetpage)) добавляет `_id` в конец сортировки сам, поэтому порядок строк с одинаковым значением предсказуем и для числового идентификатора:
+
+```ts twoslash title="counters/counters.service.ts"
+import { EntityWithId, Prop, Schema, TypemoClient, type Defaulted } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+@Schema({ collection: "counters" })
+class Counter extends EntityWithId(() => Number) {
+  @Prop(() => Number, { required: true, default: 0 }) hits!: Defaulted<number>;
+}
+const Counters = client.db().model(Counter);
+// ---cut---
+const first = await Counters.keysetPage({ sort: [["hits", "desc"]], limit: 2 });
+console.log(first.items.map((row) => [row._id, row.hits]));
+// → [[3, 5], [5, 0]]
+
+const second = await Counters.keysetPage({ sort: [["hits", "desc"]], limit: 2, after: first.nextCursor });
+console.log(second.items.map((row) => [row._id, row.hits]));
+// → [[4, 0], [2, 0]]
+```
+
+Поле сортировки `hits` объявлено обязательным: пропущенное значение не может быть позицией в курсоре.
+
+## Сослаться на такую модель
+
+Поле-ссылка хранит идентификатор целевой модели, поэтому тип идентификатора указывается вторым параметром [`Ref`](../reference/schemas/field-markers.mdx#ref): `Ref<Country, string>`. Первый аргумент `@Prop` — тип самого поля, то есть тип идентификатора. Для массива ссылок на сессии это `[Types.UUID]`. Франция из быстрого пути уже лежит в справочнике.
+
+```ts twoslash title="cities/city.ts"
+import { Entity, EntityWithId, Prop, Schema, TypemoClient, Types, type Ref } from "@venloc/typemo";
+import { UUID } from "mongodb";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+@Schema({ collection: "countries" })
+class Country extends EntityWithId(() => String) {
+  @Prop(() => String, { required: true }) name!: string;
+}
+@Schema({ collection: "sessions" })
+class Session extends EntityWithId(() => Types.UUID, { default: () => new UUID() }) {
+  @Prop(() => String, { required: true }) user!: string;
+}
+// ---cut---
+@Schema({ collection: "cities" })
+class City extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => String, { ref: () => Country }) // [!code highlight]
+  country?: Ref<Country, string>;
+
+  @Prop(() => [Types.UUID], { ref: () => Session }) // [!code highlight]
+  visitors!: Ref<Session, UUID>[];
+}
+
+const Countries = client.db().model(Country);
+const Sessions = client.db().model(Session);
+const Cities = client.db().model(City);
+const visitor = await Sessions.create({ user: "ann" });
+await Cities.create({ name: "Paris", country: "FR", visitors: [visitor._id] });
+
+const city = await Cities.findOne({ name: "Paris" }).populate("country").populate("visitors").orFail();
+console.log(city.country?.name, city.visitors[0]?.user);
+// → France ann
+```
+
+[`populate`](../reference/populate/populate.mdx#populate) находит документ по строке и по `UUID` так же, как по `ObjectId`. Вместо идентификатора в поле можно передать и сам документ, `ссылка` сохранит его `_id`: `Cities.create({ name: "Lyon", country: france })`.
+
+## Записать результат агрегации в такую коллекцию
+
+Результат агрегации часто записывают в отдельную коллекцию: сводку по странам, дневной отчёт. К Парижу из предыдущего раздела добавим Лион и Берлин. Группировка делает `_id` строкой (ключом группы), поэтому целью `$out` или `$merge` должна быть модель со строковым `_id`. Для неё `EntityWithId(() => String)` как раз подходит: компилятор сверяет строки конвейера с полями цели, и `_id`-строка совпадает с типом.
+
+```ts twoslash title="cities/totals.ts"
+import { Entity, EntityWithId, fn, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+@Schema({ collection: "cities" })
+class City extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { required: true }) country!: string;
+}
+// ---cut---
+@Schema({ collection: "country_totals" })
+class CountryTotal extends EntityWithId(() => String) { // [!code highlight]
+  @Prop(() => Number, { required: true })
+  cities!: number;
+}
+
+const Cities = client.db().model(City);
+const Totals = client.db().model(CountryTotal);
+await Cities.insertMany([
+  { name: "Lyon", country: "FR" },
+  { name: "Berlin", country: "DE" },
+]);
+await Cities.aggregate((p) => p.group((f) => ({ _id: f.country, cities: fn.sum(1) })).out(CountryTotal)); // [!code highlight]
+
+const totals = await Totals.find().sort({ _id: 1 }).lean();
+console.log(totals.map((row) => [row._id, row.cities]));
+// → [["DE", 1], ["FR", 2]]
+```
+
+Стадия [`merge`](../reference/aggregation/stages.mdx#merge) работает так же и дописывает к тому, что уже лежит в цели. Если вы раньше описывали такую цель обычным классом с `_id!: string`, замените его на `EntityWithId`: класс получит неизменяемый `_id` и тип идентификатора во всех операциях.
+
+## Идентификатор нельзя изменить
+
+`_id` у `EntityWithId` неизменяем, как у `Entity`. Обновление, которое его пишет, не компилируется, а в коде без типов бросает [`StrictModeError`](../reference/errors/data-errors.mdx#strictmodeerror) с причиной `immutable`. Заменить документ целиком тоже можно только без `_id`.
+
+```ts twoslash title="countries/countries.service.ts"
+import { EntityWithId, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+@Schema({ collection: "countries" })
+class Country extends EntityWithId(() => String) {
+  @Prop(() => String, { required: true }) name!: string;
+}
+const Countries = client.db().model(Country);
+// ---cut---
+try {
+  await Countries.updateOne({ _id: "FR" }, { $set: { _id: "XX" } } as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → $set._id: "_id" is immutable; it is written only when the document is created ($setOnInsert on upsert) [immutable]
+```
+
+Поэтому ошибочный код страны не исправить обновлением: создайте документ с правильным `_id` и удалите прежний.
+
+## Как было раньше
+
+Раньше идентификатор другого типа объявляли в обычном классе вручную, без базового класса:
+
+```ts twoslash title="countries/country.ts"
+import { Prop, Schema } from "@venloc/typemo";
+// ---cut---
+@Schema({ collection: "countries" })
+class Country {
+  @Prop(() => String, { required: true })
+  _id!: string;
+
+  @Prop(() => String, { required: true })
+  name!: string;
+}
+```
+
+Такой класс по-прежнему собирается, но `_id` в нём обычное обязательное поле: Typemo не защищает его от изменения (попытка записать его доходит до сервера, и отвечает сервер, а не библиотека), тип идентификатора не подхватывают `Timestamped` и `Versioned`, и нельзя задать `default`. Перейти просто: замените `class Country` на `class Country extends EntityWithId(() => String)` и удалите объявление `_id`. Если оставить оба, объявление `_id` с другим типом — `ConfigurationError` (`Country._id: redeclared with another type (number in Country, string in Identified)`).
+
+## Как выбрать
+
+Задайте себе один вопрос: **откуда берётся идентификатор?** Если он создаётся вашей базой и снаружи его никто не задаёт, оставьте `Entity`: `ObjectId` короткий, растёт со временем и не требует настройки. Если идентификатор приходит извне (код страны, артикул, номер из другой системы), берите `EntityWithId` без `default`: база не должна выдумывать то, что принадлежит внешнему миру. Если идентификатор нужно создавать самим, но он не должен быть предсказуемым или должен быть уникальным между базами, берите `EntityWithId` с `default`: `UUID` или строку со своим генератором.
+
+## Когда это не нужно
+
+Для большинства моделей хватает `Entity`. Свой тип `_id` не нужен, чтобы получить «красивую» строку в ответе API: у `ObjectId` есть `toHexString()`, а [`plain`](../reference/query/reading.mdx#plain) и JSON и так отдают его строкой. Не нужен он и для уникального поля, которое вам удобно искать: заведите обычное поле с `unique: true` ([Индексы](./indexes.mdx)), а `_id` оставьте за базой. `_id`-объект из нескольких полей (составной ключ) `EntityWithId` не поддерживает: допустимы только скалярные типы.
+
+## Частые ошибки
+
+### Документ создаётся без идентификатора
+
+Без `default` идентификатор обязателен, и код вида `Countries.create({ name: "x" })` не компилируется. Ошибка компилятора говорит, что `_id` отсутствует. Во время работы тот же вызов бросает `ValidationError`: `Validation failed: "_id": the field is required [required]`. Передайте `_id` или добавьте `default`.
+
+### Идентификатор не того типа
+
+Число в модели со строковым `_id` — `CastError`: `Cast to string failed at path "_id" for 5 (number): expected a string [type]`. Приведите значение заранее или смените тип идентификатора.
+
+### Фабрике передали сам тип, а не стрелку
+
+`EntityWithId(String)` не проходит проверку аргумента, потому что сам `String` — тоже функция, но сборка схемы его отвергает: `Country._id: the type thunk returned string, expected a type`. Пишите `EntityWithId(() => String)`.
+
+## Полный пример
+
+Один файл собирает справочник стран, сессии с `UUID`, города со ссылками и сводку по странам. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="geo/geo.service.ts"
+import { Entity, EntityWithId, fn, Prop, Schema, Timestamped, TypemoClient, Types, type Ref } from "@venloc/typemo";
+import { UUID } from "mongodb";
+
+// справочник: код страны задаёт вызывающий
+@Schema({ collection: "countries" })
+class Country extends EntityWithId(() => String) {
+  @Prop(() => String, { required: true }) name!: string;
+}
+
+// сессия: UUID создаётся сам, метки времени подмешиваются как обычно
+@Schema({ collection: "sessions" })
+class Session extends Timestamped(EntityWithId(() => Types.UUID, { default: () => new UUID() })) {
+  @Prop(() => String, { required: true }) user!: string;
+}
+
+// город ссылается на страну строкой и на сессии — UUID
+@Schema({ collection: "cities" })
+class City extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { ref: () => Country, required: true }) country!: Ref<Country, string>;
+  @Prop(() => [Types.UUID], { ref: () => Session }) visitors!: Ref<Session, UUID>[];
+}
+
+// сводка: результат группировки по стране
+@Schema({ collection: "country_totals" })
+class CountryTotal extends EntityWithId(() => String) {
+  @Prop(() => Number, { required: true }) cities!: number;
+}
+
+// код читателя: ошибка на границе приложения
+class __NotFound__ extends Error {}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Countries = client.db().model(Country);
+const Sessions = client.db().model(Session);
+const Cities = client.db().model(City);
+const Totals = client.db().model(CountryTotal);
+
+export const addCountry = async (code: string, name: string) => Countries.create({ _id: code, name });
+
+export const openSession = async (user: string) => Sessions.create({ user });
+
+export const addCity = async (name: string, country: string, visitors: UUID[]) =>
+  Cities.create({ name, country, visitors });
+
+export const cityWithCountry = async (name: string) => {
+  const city = await Cities.findOne({ name }).populate("country").orFail();
+  if (city.country === null) throw new __NotFound__(`no country for ${name}`);
+  return { city: city.name, country: city.country.name };
+};
+
+export const rebuildTotals = async () => {
+  await Cities.aggregate((p) => p.group((f) => ({ _id: f.country, cities: fn.sum(1) })).out(CountryTotal));
+  return Totals.find().sort({ _id: 1 }).lean();
+};
+```
+
+<Callout type="migration">
+
+В Mongoose тип `_id` задаётся полем схемы: `_id: String` или `_id: { type: String }`, а значение по умолчанию — `default`. В Typemo для этого есть базовый класс `EntityWithId`: тип идёт в `IdOf`, `findById`, ссылки и `populate`, а неизменяемость `_id` проверяется библиотекой.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник: EntityWithId" href="../reference/schemas/base-classes.mdx#entitywithid">
+  Аргументы, тип результата, `IdSpec` и все ошибки фабрики.
+</Card>
+<Card title="Ссылки на другие модели" href="./references.mdx">
+  `Ref`, `ref`, `refPath` и как ссылка хранится и читается.
+</Card>
+<Card title="Метки времени и версии" href="./timestamps-and-versions.mdx">
+  Миксины `Timestamped` и `Versioned`, которые сочетаются с `EntityWithId`.
+</Card>
+</Cards>

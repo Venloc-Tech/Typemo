@@ -1,0 +1,432 @@
+---
+title: Гео-запросы
+description: "Как хранить точки на карте, искать ближайшие места, находить документы внутри области и считать их в радиусе: GeoJSON, $near, $geoWithin и индекс 2dsphere"
+icon: MapPin
+---
+
+Чтобы искать места на карте — ближайшие к пользователю, внутри города или на пути маршрута, — храните координаты в формате **GeoJSON** и используйте гео-операторы фильтра: [`$near`](../reference/query/filter-operators.mdx#near) находит ближайшие, [`$geoWithin`](../reference/query/filter-operators.mdx#geowithin) — внутри области, [`$geoIntersects`](../reference/query/filter-operators.mdx#geointersects) — пересекающиеся с фигурой. Для запросов «ближайшие» базе нужен индекс `2dsphere`, для остальных он ускоряет поиск, но не обязателен.
+
+**GeoJSON** — стандартный способ записать фигуру на карте объектом: `{ type: "Point", coordinates: [2.35, 48.86] }` — это точка. Порядок координат — **долгота, затем широта**, а не наоборот: путаница здесь самая частая ошибка, и база её не заметит, если числа попадают в допустимые пределы. Чтобы не собирать такие объекты вручную, в Typemo есть помощник [`GeoJson`](../reference/query/filter-operators.mdx#geojson): он строит точку, линию и многоугольник и проверяет координаты до обращения к базе.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель места из файла `places/place.ts`. В коллекции три места: Louvre (`[2.3376, 48.8606]`), Eiffel Tower (`[2.2945, 48.8584]`) и Berlin Gate (`[13.3777, 52.5163]`). Индекс `2dsphere` создан [синхронизацией индексов](../collections/index-sync.mdx): сам Typemo индексы не создаёт.
+
+```ts twoslash title="places/place.ts"
+import { Entity, Index, Prop, Schema } from "@venloc/typemo";
+
+@Schema()
+export class GeoPoint {
+  @Prop(() => String, { enum: ["Point"], required: true })
+  type!: "Point";
+
+  @Prop(() => [Number], { required: true })
+  coordinates!: number[];
+}
+
+@Index({ location: "2dsphere" })
+@Schema({ collection: "places" })
+export class Place extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => GeoPoint, { required: true })
+  location!: GeoPoint;
+}
+```
+
+Точка описана вложенным классом с полями `type` и `coordinates`: так MongoDB ожидает GeoJSON. Индекс `2dsphere` строится по всему полю `location`.
+
+## Быстрый путь
+
+Найдите места не дальше пяти километров от точки. Расстояния в GeoJSON измеряются в **метрах**, а результат приходит от ближайшего к дальнему:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { enum: ["Point"], required: true }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Index({ location: "2dsphere" })
+@Schema({ collection: "places" })
+class Place extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => GeoPoint, { required: true }) location!: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Places = client.db().model(Place);
+// ---cut---
+const near = await Places.find({
+  location: { $near: { $geometry: { type: "Point", coordinates: [2.35, 48.86] }, $maxDistance: 5000 } },
+}).plain();
+console.log(near.map((place) => place.name));
+// → ["Louvre", "Eiffel Tower"]
+```
+
+Остальная страница разбирает каждый запрос отдельно.
+
+## Найти ближайшие места
+
+Допустим, приложение показывает пользователю ближайшие достопримечательности. `$near` принимает центр (`$geometry`) и, по желанию, границы расстояния: `$maxDistance` и `$minDistance` в метрах. Результат упорядочен по расстоянию от центра, поэтому явная сортировка не нужна. Без `$maxDistance` вернутся все места, от ближайшего к дальнему, и обычно его нужно задавать вместе с [`.limit`](../reference/query/reading.mdx#limit).
+
+Центр строит [`GeoJson.point`](../reference/query/filter-operators.mdx#geojson): он проверяет, что долгота лежит в пределах от −180 до 180, а широта от −90 до 90, и возвращает объект нужной формы.
+
+```ts twoslash title="places/places.service.ts"
+import { Entity, GeoJson, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { enum: ["Point"], required: true }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Index({ location: "2dsphere" })
+@Schema({ collection: "places" })
+class Place extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => GeoPoint, { required: true }) location!: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Places = client.db().model(Place);
+// ---cut---
+export const nearest = (longitude: number, latitude: number, count: number) =>
+  Places.find({
+    location: { $near: { $geometry: GeoJson.point(longitude, latitude) } },
+  })
+    .limit(count)
+    .plain();
+
+console.log((await nearest(2.35, 48.86, 1)).map((place) => place.name));
+// → ["Louvre"]
+```
+
+Место Louvre ближе всех к точке `[2.35, 48.86]`, и лимит 1 оставил только его. Если вы добавите `.sort(...)`, сортировка **заменит** порядок по расстоянию: запуск с `.sort({ name: 1 })` вернул места по алфавиту. Поэтому не сортируйте запрос с `$near`, если вам нужно «ближайшие первыми».
+
+### Кольцо вокруг точки
+
+`$minDistance` отсекает слишком близкие места: «не ближе двух километров и не дальше ста». `$nearSphere` принимает те же границы и тоже упорядочивает результат по расстоянию, но считает его на сфере.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { enum: ["Point"], required: true }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Index({ location: "2dsphere" })
+@Schema({ collection: "places" })
+class Place extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => GeoPoint, { required: true }) location!: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Places = client.db().model(Place);
+// ---cut---
+const ring = await Places.find({
+  location: {
+    $nearSphere: {
+      $geometry: { type: "Point", coordinates: [2.35, 48.86] },
+      $minDistance: 2000,
+      $maxDistance: 100000,
+    },
+  },
+}).plain();
+console.log(ring.map((place) => place.name));
+// → ["Eiffel Tower"]
+```
+
+Louvre ближе двух километров и в кольцо не попал, Berlin Gate дальше ста. Осталась Eiffel Tower.
+
+## Найти места внутри области
+
+Когда область задана границей — район города, зона доставки — используйте `$geoWithin` с многоугольником. Многоугольник — это замкнутое кольцо точек: **первая и последняя точки совпадают**, а точек не меньше четырёх. Индекс для `$geoWithin` не обязателен, он только ускоряет запрос.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { enum: ["Point"], required: true }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Index({ location: "2dsphere" })
+@Schema({ collection: "places" })
+class Place extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => GeoPoint, { required: true }) location!: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Places = client.db().model(Place);
+// ---cut---
+const paris = await Places.find({
+  location: {
+    $geoWithin: {
+      $geometry: {
+        type: "Polygon",
+        coordinates: [[[2.0, 48.7], [2.6, 48.7], [2.6, 49.0], [2.0, 49.0], [2.0, 48.7]]],
+      },
+    },
+  },
+})
+  .sort({ name: 1 })
+  .plain();
+console.log(paris.map((place) => place.name));
+// → ["Eiffel Tower", "Louvre"]
+```
+
+Тот же многоугольник можно построить через [`GeoJson.polygon`](../reference/query/filter-operators.mdx#geojson): он сразу проверит, что кольцо замкнуто и в нём не меньше четырёх точек. Типы `GeoJsonPolygon`, `GeoJsonPoint` и остальные экспортируются из пакета, если фигуру нужно назвать в сигнатуре своей функции.
+
+### Круг заданного радиуса
+
+Для круга есть особая запись `$centerSphere`: центр и радиус **в радианах**, а не в метрах. Чтобы перевести метры в радианы, разделите их на радиус Земли — 6 378 100 метров. Круг вокруг Louvre на пять километров — это `5000 / 6378100`.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { enum: ["Point"], required: true }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Index({ location: "2dsphere" })
+@Schema({ collection: "places" })
+class Place extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => GeoPoint, { required: true }) location!: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Places = client.db().model(Place);
+// ---cut---
+const EARTH_RADIUS_METERS = 6_378_100;
+
+export const countAround = (longitude: number, latitude: number, meters: number) =>
+  Places.countDocuments({
+    location: { $geoWithin: { $centerSphere: [[longitude, latitude], meters / EARTH_RADIUS_METERS] } },
+  });
+
+console.log(await countAround(2.35, 48.86, 5000));
+// → 2
+```
+
+Считать места в радиусе через `$near` нельзя: [`countDocuments`](../reference/query/reading.mdx#modelcountdocuments) с `$near` завершается ошибкой сервера (`ServerError: $geoNear, $near, and $nearSphere are not allowed in this context, as these operators require sorting geospatial data. (code 5626500 Location5626500)`). Полный текст сервера, с советом использовать `$geoWithin`, лежит в поле `serverMessage` ошибки. Круг через `$geoWithin` для подсчёта подходит.
+
+## Найти пересечения
+
+`$geoIntersects` находит документы, чья фигура пересекается с заданной: точка попадает в область, линия дороги пересекает район. Здесь в поле лежат точки, поэтому «пересекается» означает «внутри». Запрос с небольшим прямоугольником вокруг центра города находит одно место:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { enum: ["Point"], required: true }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Index({ location: "2dsphere" })
+@Schema({ collection: "places" })
+class Place extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => GeoPoint, { required: true }) location!: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Places = client.db().model(Place);
+// ---cut---
+const hit = await Places.find({
+  location: {
+    $geoIntersects: {
+      $geometry: {
+        type: "Polygon",
+        coordinates: [[[2.3, 48.8], [2.4, 48.8], [2.4, 48.9], [2.3, 48.9], [2.3, 48.8]]],
+      },
+    },
+  },
+}).plain();
+console.log(hit.map((place) => place.name));
+// → ["Louvre"]
+```
+
+## Построить точку, линию и многоугольник
+
+Фигуры из примеров выше можно записывать обычными объектами GeoJSON, но тогда за порядком координат и за замкнутостью кольца следите вы сами. [`GeoJson`](../reference/query/filter-operators.mdx#geojson) берёт это на себя: `GeoJson.point(долгота, широта)`, `GeoJson.lineString(...позиции)` и `GeoJson.polygon(...кольца)` возвращают объекты точной формы, которые подходят и для `create`, и для гео-операторов в фильтре. Линия из одной позиции и незамкнутое кольцо отвергаются сразу, при вызове, ошибкой `CastError` (не при записи сервером): компилятор требует не меньше двух позиций, а в коде без типов то же требование проверяется во время работы.
+
+```ts twoslash
+import { Entity, GeoJson, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { enum: ["Point"], required: true }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Index({ location: "2dsphere" })
+@Schema({ collection: "places" })
+class Place extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => GeoPoint, { required: true }) location!: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Places = client.db().model(Place);
+// ---cut---
+const created = await Places.create({ name: "Notre-Dame", location: GeoJson.point(2.3499, 48.8530) });
+console.log(created.location);
+// → GeoPoint { type: "Point", coordinates: [2.3499, 48.853] }
+
+const route = GeoJson.lineString([2.29, 48.85], [2.33, 48.86]);
+console.log(route);
+// → { type: "LineString", coordinates: [[2.29, 48.85], [2.33, 48.86]] }
+
+const district = GeoJson.polygon([[2.0, 48.7], [2.6, 48.7], [2.6, 49.0], [2.0, 49.0], [2.0, 48.7]]);
+const inside = await Places.find({ location: { $geoWithin: { $geometry: district } } }).sort({ name: 1 }).plain();
+console.log(inside.map((place) => place.name));
+// → ["Eiffel Tower", "Louvre", "Notre-Dame"]
+```
+
+Многоугольник принимает внешнее кольцо первым, а следующие кольца — это дыры внутри него. Значения копируются: изменение вашего массива после вызова построенный объект не затронет.
+
+Если координата не проходит проверку, помощник бросает [`CastError`](../reference/errors/data-errors.mdx#casterror) до обращения к базе. Сервер проверял бы тот же диапазон только при записи документа и отвечал бы `ServerError` уже после отправки:
+
+```text
+CastError: Cast to GeoJSON position failed at path "coordinates" for [array of 2]: the longitude is in [-180, 180] and the latitude in [-90, 90] (longitude first) [range]
+```
+
+Тот же `CastError` с описанием причины бросают другие нарушения: кольцо короче четырёх позиций или незамкнутое, нечисловая или бесконечная координата. Обычный объект `{ type: "Point", coordinates: [200, 100] }` Typemo пропустит, а отклонит его сервер: `ServerError: Could not extract geo keys at path 'location' for document with _id ObjectId('…'): Longitude/latitude is out of bounds, lng: 200 lat: 100 (code 510)`.
+
+## Как выбрать
+
+Задайте себе один вопрос: **что вы знаете заранее — центр или границу?** Если центр (позиция пользователя) и нужно «ближайшие», берите `$near` с `$maxDistance` и `.limit`. Если у вас граница (район, зона доставки), берите `$geoWithin`. Если нужно посчитать места в радиусе или получить их в произвольном порядке, берите `$geoWithin` с `$centerSphere`: он работает в `countDocuments` и допускает свою сортировку. Если вы ищете пересечения линий и областей, берите `$geoIntersects`.
+
+## Когда это не нужно
+
+Если вам нужна не выборка, а расстояние от точки до каждого места (чтобы показать «1,2 км»), запрос `find` его не даёт: используйте стадию `$geoNear` в [агрегации](../reference/aggregation/stages.mdx), она добавляет к строкам поле с расстоянием. Если точность в пределах города не нужна, а координаты используются только для хранения, гео-индекс не нужен вовсе.
+
+## Частые ошибки
+
+### `unable to find index for $geoNear query`
+
+Вы искали через `$near` (или `$nearSphere`) по полю без индекса `2dsphere`. Запрос завершается `ServerError`, и в тексте сервера есть слова `unable to find index for $geoNear query`: «ближайшие» без индекса база не находит, вместо того чтобы просмотреть все документы. Добавьте `@Index({ location: "2dsphere" })` и вызовите [`Model.syncIndexes`](../reference/collections/model-indexes.mdx#modelsyncindexes). Для `$geoWithin` и `$geoIntersects` индекс не обязателен: те же места нашлись и на коллекции без него.
+
+### Ближайшие места нашлись не там, где ожидали
+
+Вы записали координаты как `[широта, долгота]`. GeoJSON требует `[долгота, широта]`. Пока числа укладываются в допустимые пределы, ошибки нет, а точка оказывается совсем в другом месте: поиск вокруг перепутанных `[48.86, 2.35]` не нашёл ни одного из мест Парижа. Держите порядок в одной функции-конструкторе точки и не собирайте координаты вручную в разных местах.
+
+### Точка, собранная вне запроса, не компилируется
+
+В фильтре координаты должны быть парой чисел (`[долгота, широта]`), а не произвольным массивом. Если вы вынесли точку в переменную и не задали ей тип, TypeScript выводит `coordinates: number[]` — массив любой длины, — и компилятор отказывает: массив может оказаться короче пары. Постройте точку через [`GeoJson.point`](../reference/query/filter-operators.mdx#geojson): он возвращает точный тип `GeoJsonPoint`, и вместе с парой проверяется диапазон.
+
+```ts twoslash
+import { Entity, GeoJson, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { enum: ["Point"], required: true }) type!: "Point";
+  @Prop(() => [Number], { required: true }) coordinates!: number[];
+}
+@Index({ location: "2dsphere" })
+@Schema({ collection: "places" })
+class Place extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => GeoPoint, { required: true }) location!: GeoPoint;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Places = client.db().model(Place);
+// ---cut---
+// неправильно: coordinates выведено как number[]
+const wrong = { type: "Point" as const, coordinates: [2.35, 48.86] };
+// @errors: 2322
+await Places.find({ location: { $near: { $geometry: wrong } } }).plain();
+// компилятор: … Type 'number[]' is not assignable to type 'GeoPosition'. Target requires 3 element(s) but source may have fewer.
+
+// правильно: тип точный, диапазон проверен
+const center = GeoJson.point(2.35, 48.86);
+await Places.find({ location: { $near: { $geometry: center } } }).plain();
+```
+
+Если помощник вам не подходит, назовите тип точки явно: `const center: GeoJsonPoint = { type: "Point", coordinates: [2.35, 48.86] }`.
+
+### Координаты перепутаны местами
+
+Вы записали точку как `[широта, долгота]`. Помощник `GeoJson.point` проверяет диапазон, но не может знать, какое из двух чисел вы имели в виду: `GeoJson.point(48.86, 2.35)` проходит проверку, потому что оба числа лежат в допустимых пределах. Ошибка проявится только результатом: поиск вокруг точки `GeoJson.point(48.86, 2.35)` не нашёл ни одного места Парижа.
+
+### Сортировка сломала порядок «ближайшие первыми»
+
+`$near` сам упорядочивает результат по расстоянию, но явный `.sort(...)` заменяет этот порядок. Уберите `.sort` или сортируйте результат в коде уже после выборки.
+
+### `countDocuments` с `$near`
+
+Подсчёт с `$near` или `$nearSphere` сервер отвергает: эти операторы требуют сортировки. Используйте `$geoWithin` с `$centerSphere` (пример выше).
+
+## Полный пример
+
+Один файл собирает всё: запись места, ближайшие места, места в области и подсчёт в радиусе. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="places/places.service.ts"
+import { CastError, Entity, GeoJson, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema()
+class GeoPoint {
+  @Prop(() => String, { enum: ["Point"], required: true })
+  type!: "Point";
+
+  @Prop(() => [Number], { required: true })
+  coordinates!: number[];
+}
+
+@Index({ location: "2dsphere" })
+@Schema({ collection: "places" })
+class Place extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => GeoPoint, { required: true })
+  location!: GeoPoint;
+}
+
+// код читателя: ошибка на границе приложения
+class __BadCoordinates__ extends Error {}
+
+const EARTH_RADIUS_METERS = 6_378_100;
+
+export const createPlaces = (client: TypemoClient) => {
+  const Places = client.db().model(Place);
+
+  // запись: GeoJson.point проверяет координаты до обращения к базе
+  const add = async (name: string, longitude: number, latitude: number) => {
+    try {
+      return await Places.create({ name, location: GeoJson.point(longitude, latitude) });
+    } catch (error) {
+      if (error instanceof CastError) throw new __BadCoordinates__("coordinates are out of range");
+      throw error;
+    }
+  };
+
+  // ближайшие к пользователю, не дальше радиуса; порядок — по расстоянию
+  const nearest = (longitude: number, latitude: number, meters: number, count: number) =>
+    Places.find({ location: { $near: { $geometry: GeoJson.point(longitude, latitude), $maxDistance: meters } } })
+      .limit(count)
+      .plain();
+
+  // подсчёт в радиусе: $near тут нельзя, круг задаётся радианами
+  const countAround = (longitude: number, latitude: number, meters: number) =>
+    Places.countDocuments({
+      location: { $geoWithin: { $centerSphere: [[longitude, latitude], meters / EARTH_RADIUS_METERS] } },
+    });
+
+  return { add, nearest, countAround };
+};
+```
+
+<Callout type="migration">
+
+В Mongoose гео-запросы записывались через `find({ location: { $near: … } })` без проверки формы: любое значение проходило компилятор. В Typemo форма GeoJSON (`$geometry`, `$maxDistance`, многоугольник как массив колец) описана типами, и ошибка в структуре видна при компиляции. Отличие в подсчёте прежнее: `$near` в `countDocuments` не работает и здесь, потому что это ограничение сервера.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник: операторы фильтра" href="../reference/query/filter-operators.mdx">
+  `$near`, `$nearSphere`, `$geoWithin`, `$geoIntersects` и к каким типам полей они применимы.
+</Card>
+<Card title="Индексы" href="../schemas/indexes.mdx">
+  Как описать `2dsphere` и другие индексы в модели.
+</Card>
+<Card title="Синхронизация индексов" href="../collections/index-sync.mdx">
+  Как создать индекс в базе и не забыть об этом при развёртывании.
+</Card>
+<Card title="Стадии агрегации" href="../reference/aggregation/stages.mdx">
+  Стадия `geoNear`, которая добавляет к строкам расстояние до точки.
+</Card>
+</Cards>

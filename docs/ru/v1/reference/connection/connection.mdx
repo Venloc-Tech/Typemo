@@ -1,0 +1,400 @@
+---
+title: Connection
+description: "Одна база клиента: model, models, useDb, init, syncAll, aggregate, ready, transaction и плагины подключения"
+icon: Database
+---
+
+`Connection` — это одна база данных клиента вместе с её моделями. Через него вы получаете модель по классу-сущности, переходите к другой базе того же клиента, создаёте в базе то, что нужно моделям, и запускаете транзакции. Сам `Connection` не открывает соединений: сеть, пул и закрытие принадлежат [`TypemoClient`](./typemo-client.mdx), а `Connection` только выбирает базу.
+
+Объект `Connection` вы не создаёте: его выдаёт [`client.db`](./typemo-client.mdx#clientdb) или [`client.connection`](./typemo-client.mdx#clientconnection). Если вы только начинаете, сначала прочитайте руководство [Подключиться к базе](../../connection/connect.mdx). Эта страница — справочник.
+
+Примеры используют модель счёта. В ней есть уникальное поле, чтобы у `init` и `syncAll` было что создавать:
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+}
+```
+
+Поля `connection.client` (клиент-владелец) и `connection.name` (имя базы) только читаются:
+
+```ts twoslash
+import { TypemoClient } from "@venloc/typemo";
+const client = new TypemoClient("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+const connection = client.connection;
+console.log(connection.name, connection.client === client);
+// → "app" true
+```
+
+---
+
+## connection.model
+
+`connection.model` возвращает модель для класса, помеченного `@Schema`. Через модель вы читаете и пишете документы. Первый вызов компилирует схему класса: проверяет описание полей, применяет плагины и расширения. Поэтому ошибки в описании схемы вы видите на этом вызове, а не при первой операции.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+}
+const client = new TypemoClient("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+// ---cut---
+const Accounts = connection.model(Account);
+console.log(Accounts === connection.model(Account));
+// → true
+```
+
+<Returns type="Model<T>">
+
+Модель класса на этом подключении. Для одного класса вы всегда получаете один и тот же объект. На другом подключении (другой базе) модель того же класса будет другой: у неё своя база, а данные не пересекаются.
+
+</Returns>
+
+<Params>
+<Param name="entity" type="EntityClass<T>" required>
+
+Класс с `@Schema`. Если передать не класс, вы получите `ConfigurationError` сразу при вызове: `connection.model: an entity class (@Schema)`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+model<T extends object>(entity: EntityClass<T>): Model<T>
+```
+
+</FullType>
+
+Что можно делать с моделью, описано в руководствах раздела [Чтение](../../queries/reading-data.mdx) и [справочнике чтения](../query/reading.mdx).
+
+---
+
+## connection.models
+
+Все модели, которые уже зарегистрированы на этом подключении, в порядке регистрации. Пригодится для проверок и служебных скриптов: например, чтобы пройти по всем моделям и вывести имена коллекций.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+}
+const client = new TypemoClient("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+connection.model(Account);
+// ---cut---
+console.log(connection.models.map((model) => model.modelName));
+// → ["Account"]
+```
+
+Тип: `readonly Model<object>[]`. В списке только модели, для которых вы вызывали [`connection.model`](#connectionmodel): класс, который вы не регистрировали, в нём не появится.
+
+---
+
+## connection.useDb
+
+`connection.useDb` возвращает подключение к другой базе **того же клиента**. Это способ работать с несколькими базами (по одной на арендатора или на отчёты), не открывая новых соединений: пул общий, а модели у каждой базы свои.
+
+```ts twoslash
+import { TypemoClient } from "@venloc/typemo";
+const client = new TypemoClient("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+const reports = client.connection.useDb("reports");
+console.log(reports.name, reports === client.db("reports"));
+// → "reports" true
+```
+
+Метод — то же самое, что [`client.db(name)`](./typemo-client.mdx#clientdb), только вызванный от подключения. Закрывать `reports` отдельно не нужно и нельзя: закрывается весь клиент через [`client.close`](./typemo-client.mdx#clientclose). Пустое имя даёт `ConfigurationError`.
+
+<Params>
+<Param name="name" type="string" required>
+
+Имя базы.
+
+</Param>
+</Params>
+
+Возвращает `Connection`.
+
+---
+
+## connection.init
+
+`connection.init` создаёт в базе то, что нужно моделям этого подключения, но чего там ещё нет: коллекции (с параметрами схемы), индексы, поисковые индексы и представления. Вызов явный, автоматически Typemo ничего не создаёт: запускайте его при старте приложения или на шаге деплоя, после того как вы зарегистрировали модели через [`connection.model`](#connectionmodel).
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+connection.model(Account);
+// ---cut---
+const report = await connection.init();
+console.log(report.inSync, report.created);
+// → true ["collection accounts", "index accounts.title_1"]
+console.log(report.collections[0]?.indexes?.toCreate);
+// → ["title_1"]
+```
+
+`init` ничего не удаляет и не меняет: лишний индекс остаётся, а индекс или коллекция, объявленные иначе, чем в базе, — сбой (см. «Ошибки» ниже). Заменить существующее умеет [`connection.syncAll`](#connectionsyncall). Когда `init` вернул отчёт, база соответствует моделям, поэтому `inSync` равен `true` и в первый вызов, когда метод что-то создал, и в повторные. Что именно создал этот вызов, перечислено в `created`: названия вида `"collection accounts"`, `"index accounts.title_1"`, `"search index accounts.default"`, `"view active_accounts"`. Если создавать было нечего, список пуст: второй вызов подряд вернул `created: []`.
+
+<Returns type="Promise<SyncReport>">
+
+Отчёт о том, что есть и что создано: `collections` и `views` (по записи на каждую), `created`, `inSync` и `failed`. Возвращённый отчёт никогда не содержит сбоев: у него `failed: false`, а любой сбой шага превращается в исключение ниже. Описание полей отчёта — в справочнике [`SyncReport`](../collections/sync-all.mdx#syncreport).
+
+</Returns>
+
+Принимает ничего.
+
+<FullType>
+
+```ts
+init(): Promise<SyncReport>
+```
+
+</FullType>
+
+### Ошибки
+
+Все шаги всех моделей выполняются до конца: сбой одной модели не останавливает остальные. Если хоть один шаг не удался, вы получаете не отчёт, а [`SyncError`](../errors/configuration-errors.mdx#syncerror). У него есть `operation` (`"connection.init"`), `failures` (сбои по коллекциям и представлениям), `errors` (все исходные ошибки подряд) и `report` (полный отчёт, у него `failed: true`). В `cause` лежит `AggregateError` с теми же исходными ошибками. Типичный сбой — индекс, который в базе объявлен иначе, чем в схеме:
+
+```ts twoslash
+import { Entity, Prop, Schema, SyncError, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+connection.model(Account);
+// ---cut---
+try {
+  await connection.init();
+} catch (error) {
+  if (error instanceof SyncError) {
+    console.log(error.operation, error.failures.map((failure) => failure.name));
+    // → "connection.init" ["accounts"]
+  }
+}
+```
+
+Сообщение называет подключение, число сбоев и причину каждого. Текст получен запуском на базе, где индекс `title_1` уже создан без `unique`:
+
+```text
+SyncError: connection.init() of "app": 1 failure(s) — collection "accounts": Account: 1 index operation(s) failed: create title_1: index "title_1" exists on the server with other keys or options; init() never drops or changes an index — run syncIndexes()/syncAll() to replace it
+```
+
+Каждое имя в сообщении встречается один раз. Модель называет вложенная [`IndexSyncError`](../errors/configuration-errors.mdx#indexsyncerror) (`Account: 1 index operation(s) failed: …`), а её собственные сбои начинаются уже с действия и индекса. Если вложенная ошибка сама называет коллекцию, как `CollectionOptionsError` (`collection "logs": exists with options MongoDB cannot change (capped): drop the collection and create it again`), имя коллекции в сообщении `SyncError` тоже не повторяется. Причина ошибки, а не тихий пропуск, в том, что `init` обещает: «после меня база соответствует моделям». Индекс, который остался другим, это обещание нарушает, и приложение должно узнать об этом при старте, а не при первой дублирующей записи.
+
+Подробно про создание коллекций и индексов — в руководствах [Создание коллекций](../../collections/create.mdx) и [Синхронизация индексов](../../collections/index-sync.mdx).
+
+---
+
+## connection.syncAll
+
+`connection.syncAll` приводит коллекции, индексы, поисковые индексы и представления базы в соответствие со схемами моделей. В отличие от [`connection.init`](#connectioninit) он умеет и заменять существующее: менять индексы, которые отличаются от схемы, и (с `update`) параметры коллекций и представлений. Как и `init`, он выполняет все шаги всех моделей, а о сбоях сообщает одним [`SyncError`](../errors/configuration-errors.mdx#syncerror) в конце, поэтому вызов подходит для шага деплоя, который должен показать всё, что не сошлось.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+connection.model(Account);
+// ---cut---
+const plan = await connection.syncAll({ dryRun: true });
+console.log(plan.inSync, plan.created, plan.collections[0]?.indexes?.toCreate);
+// → false ["collection accounts", "index accounts.title_1"] ["title_1"]
+```
+
+С `dryRun: true` метод только показывает, что изменилось бы, и ничего не записывает: ни коллекции, ни индексы, ни представления. Так базу можно проверить перед деплоем. Пока есть что создавать или менять, `inSync` у пробного запуска `false`.
+
+<Params>
+<Param name="options.dryRun" type="boolean" default="false">
+
+Только сообщить о различиях, ничего не записывая. В отчёте `created` перечисляет то, что было бы создано.
+
+</Param>
+<Param name="options.update" type="boolean" default="false">
+
+Применить то, что умеет изменить `collMod`: параметры коллекции и конвейер представления. Без этой опции такое различие попадает в сбои шага.
+
+</Param>
+</Params>
+
+<Returns type="Promise<SyncReport>">
+
+Отчёт с полями `collections` и `views` (по записи на каждую), `created`, `inSync` (`true`, если ничего не отличалось и ничего не упало) и `failed` (у возвращённого отчёта всегда `false`). Если какой-то шаг не удался, вы получаете `SyncError` с `operation: "syncAll"`, а отчёт со сбоями лежит в его поле `report`: с `dryRun` тоже, если пробный запуск нашёл, что изменение невозможно.
+
+</Returns>
+
+<FullType>
+
+```ts
+syncAll(options?: SyncAllOptions): Promise<SyncReport>
+```
+
+</FullType>
+
+Подробности отчёта — в справочнике [`SyncAll`](../collections/sync-all.mdx).
+
+---
+
+## connection.aggregate
+
+`connection.aggregate` выполняет агрегацию уровня базы: план, который не читает коллекцию модели, а работает со всей базой этого подключения, с базой `admin` или с сессиями сервера. Так вы получаете выполняющиеся операции (`$currentOp`), литеральные документы (`$documents`) или локальные сессии (`$listLocalSessions`). План строят [`Pipeline.database`](../aggregation/pipeline.mdx#pipelinedatabase), [`Pipeline.admin`](../aggregation/pipeline.mdx#pipelineadmin) и [`Pipeline.sessions`](../aggregation/pipeline.mdx#pipelinesessions), а метод их выполняет.
+
+```ts twoslash
+import { Pipeline, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+// ---cut---
+const rows = await connection.aggregate(
+  Pipeline.database()
+    .documents([{ n: 1 }, { n: 2 }, { n: 3 }])
+    .match({ n: { $gt: 1 } })
+    .plan(),
+);
+console.log(rows);
+// → [{ n: 2 }, { n: 3 }]
+```
+
+Операция идёт тем же путём, что и запросы моделей: в транзакции `connection.transaction` она участвует сама, `timeoutMS` действует, ошибки сервера приходят как ошибки Typemo, а подписчики [`client.instrument`](./typemo-client.mdx#clientinstrument) получают события. Отличия от [`Model.aggregate`](../aggregation/pipeline.mdx#modelaggregate) два. У операции нет модели, поэтому в её событиях `model` и `collection` равны `null` (у плана `Pipeline.sessions` коллекция `"system.sessions"`), а `database` называет базу, в которой она выполнена. И хуки не вызываются: хуки регистрируются на моделях, а у такой операции модели нет. Политики моделей, к которым план обращается через `$lookup` или `$unionWith`, по-прежнему действуют.
+
+База определяется планом. `Pipeline.database()` работает в базе подключения, `Pipeline.admin()` всегда в `admin`, `Pipeline.sessions()` всегда в `config.system.sessions`, с какого бы подключения вы ни вызвали метод. Тот же метод есть у клиента: [`client.aggregate`](./typemo-client.mdx#clientaggregate) работает с базой по умолчанию клиента.
+
+<Returns type="AggregateQuery<R>">
+
+Запрос агрегации, типизированный строками плана. После `await` вы получаете массив строк; `.cursor()` отдаёт их по одной, `.explain()` показывает план сервера, `.plain()` превращает значения BSON в данные для клиента, а `.timeoutMS()`, `.session()`, `.policy()` и остальные методы настраивают запуск так же, как у `Model.aggregate`.
+
+</Returns>
+
+<Params>
+<Param name="plan" type="AggregatePlan<R>" required>
+
+План агрегации: результат `.plan()` у строителя `Pipeline.database()`, `Pipeline.admin()` или `Pipeline.sessions()`.
+
+</Param>
+<Param name="options" type="ModelAggregateOptions">
+
+Необязательные параметры запуска: `session` (своя сессия, `null` — выполнить вне текущей транзакции), `timeoutMS` (клиентский срок операции) и `policy` (значения политик поверх окружающего контекста).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+aggregate<R>(plan: AggregatePlan<R>, options?: ModelAggregateOptions): AggregateQuery<R>
+```
+
+</FullType>
+
+### Ошибки
+
+Метод бросает ошибку сразу при вызове, до обращения к базе, в двух случаях. Если аргумент не план агрегации, это `QueryError`, который называет вызванный метод. Если план читает коллекцию (`Pipeline.from(Account)`), это `ConfigurationError`: такие планы выполняет `Model.aggregate`. Обратная ошибка ждёт `Model.aggregate`, если отдать ему план уровня базы. Тексты получены запуском:
+
+```text
+QueryError: connection.aggregate: an aggregation plan of Pipeline.database(), Pipeline.admin() or Pipeline.sessions()
+ConfigurationError: connection.aggregate: the plan reads the collection "accounts"; run it with the model's aggregate()
+ConfigurationError: Account.aggregate: the plan reads a database, not this model's collection "accounts"; run it with connection.aggregate(plan) or client.aggregate(plan)
+```
+
+Ошибки самого сервера во время выполнения приходят как [`ServerError`](../errors/server-errors.mdx#servererror), а исходная ошибка драйвера лежит в `cause`.
+
+### Когда не подходит
+
+Для чтения и записи данных моделей используйте саму модель: она применяет политики, маски и хуки. `aggregate` подключения нужен только там, где у агрегации нет коллекции. Руководство с примерами `$currentOp`, `$documents` и `$listSessions` — [Запросы уровня базы](../../aggregation/database-level.mdx).
+
+---
+## connection.ready
+
+`connection.ready` ждёт, пока подключится клиент, которому принадлежит база. Это то же самое, что [`client.ready`](./typemo-client.mdx#clientready): метод существует, чтобы код, который получил только `Connection`, мог дождаться готовности.
+
+```ts twoslash
+import { TypemoClient } from "@venloc/typemo";
+const client = new TypemoClient("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+await client.connection.ready(2_000);
+```
+
+<Params>
+<Param name="timeoutMS" type="number" default="client.options.readyTimeoutMS">
+
+Сколько ждать, в миллисекундах. Ноль — без ограничения.
+
+</Param>
+</Params>
+
+Возвращает `Promise<void>`. Если время вышло, бросает `TimeoutError` с `kind: "connection"`.
+
+---
+
+## connection.transaction
+
+`connection.transaction` запускает транзакцию на клиенте этого подключения: это тот же [`client.transaction`](./typemo-client.mdx#clienttransaction), вызванный от `Connection`. Транзакция не привязана к базе, в ней могут участвовать операции моделей разных баз одного клиента.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const connection = client.connection;
+const Accounts = connection.model(Account);
+// ---cut---
+await connection.transaction(async () => {
+  await Accounts.create({ title: "Checking", owner: "alice" });
+});
+```
+
+Параметры, ошибки и поведение при повторах описаны у [`client.transaction`](./typemo-client.mdx#clienttransaction) и в руководстве [Транзакции](../../transactions/transactions.mdx).
+
+<FullType>
+
+```ts
+transaction<R>(fn: TransactionCallback<R>, options?: TransactionOptions): Promise<R>
+```
+
+</FullType>
+
+---
+
+## connection.plugins
+
+`connection.plugins` — реестр плагинов схем уровня подключения: `connection.plugins.use(plugin)` подключает плагин ко всем моделям этой базы, после глобальных плагинов (см. [`Typemo.plugin`](./typemo.mdx#typemoplugin)). Плагин регистрируется до первой модели подключения: реестр закрывает первая **успешная** компиляция схемы на этом подключении (упавшая компиляция его не закрывает), а позже схемы уже скомпилированы, и плагин не смог бы на них повлиять. Тогда вы получаете `ConfigurationError` (текст получен запуском):
+
+```text
+ConfigurationError: plugin "late": the connection plugins are fixed once a schema is compiled (Note was); register plugins before the first model
+```
+
+Как устроены плагины и что они могут добавить в схему, написано в руководстве [Плагины](../../hooks/plugins.mdx) и в справочнике [Плагины](../hooks/plugins.mdx).
+
+---
+
+## Когда `Connection` не подходит
+
+Если вам нужна сессия или подключение к другому серверу, `Connection` не поможет: это делают [`client.startSession`](./typemo-client.mdx#clientstartsession) и отдельный [`TypemoClient`](./typemo-client.mdx). Если нужна операция, которую модель не выполняет, обратитесь к [`client.unsafeDriver`](./typemo-client.mdx#clientunsafedriver), помня, что политики на неё не действуют.

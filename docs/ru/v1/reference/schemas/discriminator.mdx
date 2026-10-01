@@ -1,0 +1,289 @@
+---
+title: "@Discriminator"
+description: "Наследники одной коллекции: как объявить класс-дискриминатор, что записывается в ключ, тип Discriminators для базы и какие ошибки бросают декоратор и схема"
+icon: GitBranch
+---
+
+`@Discriminator` объявляет класс **дискриминатором** базового класса: наследником, документы которого лежат в той же коллекции, что и документы базы, а различаются значением специального поля. Так одна коллекция `shapes` хранит круги и квадраты, у каждого свои поля, а запрос по базовой модели возвращает всех. Сюда приходят, чтобы уточнить, как записывается значение, какие проверки делает декоратор и что происходит при ошибках.
+
+Руководство с примерами — [Наследование и дискриминаторы](../../schemas/discriminators.mdx). Эта страница — справочник.
+
+Примеры используют базовый класс `Shape` (поле `name`) и два наследника: `Circle` (поле `radius`) и `Square` (поле `side`). В коллекции три документа: круг `c` с радиусом 2, квадрат `s` со стороной 3 (их создаёт первый пример) и документ `base`, созданный через базовую модель (его создаёт второй).
+
+---
+
+## @Discriminator
+
+`@Discriminator("circle")` записывает значение, которое хранится в поле-ключе документа (по умолчанию `__t`, имя меняется опцией [`discriminatorKey`](./schema.mdx#discriminatorkey)). По значению Typemo выбирает класс при чтении: документ с `__t: "circle"` становится экземпляром `Circle`. Поля наследника — это поля базы плюс собственные. Собственный `@Schema` наследнику не нужен: он использует опции корня.
+
+Значение нужно передавать **литералом** и объявлять ключ в классе с тем же литералом: `declare readonly __t: DiscriminatorValue<"circle">`. Тогда типы lean и plain несут литерал, а объединение наследников сужается по ключу. Без объявления декоратор — ошибка компиляции.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ collection: "shapes" })
+class Shape extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+}
+
+@Discriminator("circle") // [!code highlight]
+class Circle extends Shape {
+  declare readonly __t: DiscriminatorValue<"circle">; // [!code highlight]
+  @Prop(() => Number, { required: true })
+  radius!: number;
+}
+
+@Discriminator("square")
+class Square extends Shape {
+  declare readonly __t: DiscriminatorValue<"square">;
+  @Prop(() => Number, { required: true })
+  side!: number;
+}
+const Shapes = client.db().model(Shape);
+const Circles = client.db().model(Circle);
+const Squares = client.db().model(Square);
+const circle = await Circles.create({ name: "c", radius: 2 });
+const square = await Squares.create({ name: "s", side: 3 });
+console.log(circle.__t, square.__t);
+// → circle square
+```
+
+<Params>
+<Param name="value" type="string">
+
+Литерал, который записывается в ключ. Если не передать, во время работы берётся имя класса, но тип проверить его не может, поэтому такой вызов — ошибка компиляции: `@Discriminator(): pass the value as a literal — @Discriminator("value") with declare readonly __t: DiscriminatorValue<"value"> (the class-name default cannot be checked by the type)`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+const Discriminator: <const V extends string = string>(
+  value?: V,
+) => <C extends EntityClass>(target: C & DiscriminatorCheck<C, V>) => void
+```
+
+</FullType>
+
+### Запросы по базовой и по дочерней модели
+
+Модель наследника видит только свои документы, модель базы — все. Документ создаётся классом, который назван его значением.
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ collection: "shapes" })
+class Shape extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+@Discriminator("circle")
+class Circle extends Shape {
+  declare readonly __t: DiscriminatorValue<"circle">;
+  @Prop(() => Number, { required: true }) radius!: number;
+}
+const Shapes = client.db().model(Shape);
+const Circles = client.db().model(Circle);
+await Shapes.create({ name: "base" });
+const all = await Shapes.find().sort({ name: 1 }).plain();
+console.log(all.map((shape) => shape.name));
+// → ["base", "c", "s"]
+const circles = await Circles.find().plain();
+console.log(circles.map((circle) => circle.name));
+// → ["c"]
+const loaded = await Shapes.find({ name: "c" });
+console.log(loaded[0]?.constructor.name);
+// → Circle
+```
+
+Документ, созданный через базовую модель, ключа не имеет, поэтому остаётся базовым `Shape`.
+
+### Поле, которое не принадлежит классу
+
+Поле другого наследника отвергается при приведении:
+
+```ts twoslash
+import { Discriminator, Entity, Index, Prop, Schema, SearchIndex, Spec, Timestamped, TypemoClient, Types, Versioned, Virtual, type Computed, type Defaulted, type DiscriminatorValue, type Hidden, type Immutable, type Ref, type SpecValue, type TenantField, type VirtualRef, type VirtualValue, type Unbranded, type Int64String, type Vector } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ collection: "shapes" })
+class Shape extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+@Discriminator("circle")
+class Circle extends Shape {
+  declare readonly __t: DiscriminatorValue<"circle">;
+  @Prop(() => Number, { required: true }) radius!: number;
+}
+const Circles = client.db().model(Circle);
+try {
+  await Circles.create({ name: "c", side: 2 } as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to Circle failed at path "side" for 2 (number): not a field of Circle [unknown-key]
+```
+
+---
+
+### Значение ключа неизменяемо
+
+Вид документа выбирается один раз, при создании. Ключ объявлен как `DiscriminatorValue<…>`, то есть неизменяемым, поэтому присваивание ему не компилируется, а обновление с ключом отклоняется до отправки в базу. Если обойти типы приведением, присваивание в загруженном документе само не бросает ошибку, но первый же `$save()` — `StrictModeError` с причиной `immutable`.
+
+```ts twoslash
+import { Discriminator, Entity, Prop, Schema, TypemoClient, type DiscriminatorValue } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+@Schema({ collection: "shapes" })
+class Shape extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+@Discriminator("circle")
+class Circle extends Shape {
+  declare readonly __t: DiscriminatorValue<"circle">;
+  @Prop(() => Number, { required: true }) radius!: number;
+}
+const Circles = client.db().model(Circle);
+const circle = await Circles.findOne({ name: "c" }).orFail();
+// ---cut---
+// @errors: 2540
+circle.__t = "square";
+```
+
+```ts twoslash
+import { Discriminator, Entity, Prop, Schema, TypemoClient, type DiscriminatorValue } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+@Schema({ collection: "shapes" })
+class Shape extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+@Discriminator("circle")
+class Circle extends Shape {
+  declare readonly __t: DiscriminatorValue<"circle">;
+  @Prop(() => Number, { required: true }) radius!: number;
+}
+const Circles = client.db().model(Circle);
+const circle = await Circles.findOne({ name: "c" }).orFail();
+// ---cut---
+try {
+  await Circles.updateOne({ name: "c" }, { $set: { __t: "square" } } as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → $set.__t: "__t" is immutable; it is written only when the document is created ($setOnInsert on upsert) [immutable]
+try {
+  (circle as { __t: string }).__t = "square";
+  await circle.$save();
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → $set.__t: "__t" is immutable; it is written only when the document is created ($setOnInsert on upsert) [immutable]
+```
+
+То же у `$unset` ключа. Чтобы сменить вид, создайте документ нужного вида и удалите прежний.
+
+---
+
+## Discriminators
+
+`Discriminators<C>` — тип ключа дискриминатора в классе **базы**, которая перечисляет наследников опцией [`discriminators`](./schema.mdx#опция-discriminators). Параметр `C` — объединение классов наследников: `declare readonly __t?: Discriminators<Circle | Square>`. Ключ необязателен, потому что документ, созданный через базовую модель, вида не имеет. Как и `DiscriminatorValue`, тип помечает ключ неизменяемым и заполняемым ядром ([маркерные типы](./field-markers.mdx#discriminators)).
+
+Зачем он нужен. Без списка модель базы возвращает документы, у которых известны только поля базы: `radius` и `side` компилятору неизвестны, вид приходится сообщать вручную. Со списком результат чтения через модель базы — объединение «база без ключа или любой из наследников». Так устроены гидратированные документы, `lean`, `plain`, JSON и курсоры. Объединение сужается проверкой ключа: внутри ветки `shape.__t === "circle"` доступны поля круга.
+
+```ts twoslash
+import { Discriminator, Entity, Prop, Schema, TypemoClient, type Discriminators, type DiscriminatorValue } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+// ---cut---
+@Schema({ collection: "shapes", discriminators: () => [Circle, Square] }) // [!code highlight]
+class Shape extends Entity {
+  declare readonly __t?: Discriminators<Circle | Square>; // [!code highlight]
+  @Prop(() => String, { required: true })
+  name!: string;
+}
+
+@Discriminator("circle")
+class Circle extends Shape {
+  declare readonly __t: DiscriminatorValue<"circle">;
+  @Prop(() => Number, { required: true })
+  radius!: number;
+}
+
+@Discriminator("square")
+class Square extends Shape {
+  declare readonly __t: DiscriminatorValue<"square">;
+  @Prop(() => Number, { required: true })
+  side!: number;
+}
+
+const Shapes = client.db().model(Shape);
+const shapes = await Shapes.find().sort({ name: 1 }).plain();
+const areas = shapes.map((shape) => {
+  if (shape.__t === "circle") {
+    const radius = shape.radius;
+    //    ^?
+    return Math.round(Math.PI * radius ** 2);
+  }
+  if (shape.__t === "square") return shape.side ** 2;
+  return 0;
+});
+console.log(areas);
+// → [0, 13, 9]
+```
+
+Ветка без проверок получает документ базы: у него нет ни ключа, ни полей наследников (`base` дал `0`). Круг `c` с радиусом 2 занимает примерно 13 единиц, квадрат `s` со стороной 3 — 9. Гидратированный документ сужается и проверкой ключа, и проверкой `instanceof`, а запрос к модели наследника по-прежнему возвращает только его тип.
+
+Со своим именем ключа тип объявляется при нём: `discriminatorKey: "kind"` и `declare readonly kind?: Discriminators<Click>`. Список проверяется при сборке схемы: лишний, пропущенный или повторённый класс — `ConfigurationError` ([тексты](./schema.mdx#опция-discriminators)). Объявление без опции `discriminators`, а также опция без объявления и разные классы в типе и в списке — ошибки компиляции с тем же набором сообщений.
+
+<FullType>
+
+```ts
+type Discriminators<C extends object> =
+  string & DefaultedMarker & ImmutableMarker & DiscriminatorsMarker<C>
+```
+
+</FullType>
+
+---
+
+## Ошибки
+
+Компилятор проверяет объявление ключа. Если в классе нет `declare readonly __t: DiscriminatorValue<"…">`, ошибка называет, что добавить:
+
+```ts twoslash
+import { Discriminator, Entity, Schema } from "@venloc/typemo";
+// ---cut---
+// @errors: 1238
+@Schema()
+class Shape extends Entity {}
+
+@Discriminator("circle")
+class Circle extends Shape {}
+```
+
+Текст внутри сообщения: `@Discriminator("circle"): declare the discriminator key with its value in the class — declare readonly __t: DiscriminatorValue<"circle"> (or your discriminatorKey instead of __t)`. Если литерал в классе другой, чем в декораторе: `@Discriminator: the class declares __t as "d", but the value is "c"`.
+
+Сборка ловит остальное, всё — `ConfigurationError`. Повторное значение находится при `model()` **любого** класса иерархии, в том числе того, которого повтор не касается: `Square: discriminator value "x" is already used by Circle in the hierarchy of Shape`. Остальное:
+
+- декоратор на классе без базы бросает ошибку сразу, при объявлении класса: `Orphan: @Discriminator needs a base class (class X extends Base)`;
+- собственный `@Schema` на наследнике: `Circle: a discriminator uses its root's schema options; remove @Schema (root: Shape)`;
+- корень иерархии без `@Schema`: `Circle: the root of its discriminator hierarchy (Shape) has no @Schema`;
+- ключ, заданный в `discriminatorKey`, не объявлен как строковое поле базы (без `discriminators`): `Shape: discriminatorKey "kind" is not a declared field (declare it as a string field, or list the discriminators and declare readonly kind?: Discriminators<…>)`;
+- ключ не строка или `nullable`: `Shape: the discriminator key "kind" must be a non-nullable string field`;
+- расхождение списка `discriminators` с иерархией — тексты в [`@Schema`](./schema.mdx#опция-discriminators).
+
+## Когда не подходит
+
+Если типы отличаются только значением одного поля, а полей у них нет, хватит [`enum`](./prop.mdx#enum) на обычном поле. Если классы лежат в разных коллекциях, наследование не нужно: это две модели. Значения скалярных типов в одном поле — [`Spec.union`](./types-and-spec.mdx#specunion).
+
+## Что дальше
+
+<Cards>
+<Card title="Наследование и дискриминаторы" href="../../schemas/discriminators.mdx">
+  Запросы по базовой и дочерней модели на реальных задачах.
+</Card>
+<Card title="@Schema" href="./schema.mdx">
+  Опции `discriminatorKey`, `discriminators` и остальные опции корневой схемы.
+</Card>
+</Cards>

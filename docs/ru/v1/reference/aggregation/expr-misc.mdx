@@ -1,0 +1,970 @@
+---
+title: Прочие выражения
+description: "Битовые операции, fn.rand, fn.meta, сходство векторов и системные переменные Vars: NOW, REMOVE, PRUNE и другие"
+icon: Shapes
+---
+
+Эта страница описывает **выражения** — операторы, которые внутри конвейера считают новое значение из полей документа, — которые не вошли в другие группы: битовые операции, случайное число, метаданные документа и сходство векторов. Во второй половине страницы собраны **системные переменные** — значения, которые сервер держит сам, например текущее время. В Typemo они лежат в классе `Vars`. Операторы лежат в объекте `fn` и вызываются в колбэке `(f) => …` стадий [`project`](./stages.mdx#project), [`addFields`](./stages.mdx#addfields) и других.
+
+Если вы только начинаете, прочитайте руководство [Выражения](../../aggregation/expressions.mdx). Эта страница — справочник.
+
+Все примеры используют одну модель заказа магазина. У неё есть текстовый индекс по полю `note`: он нужен `fn.meta`.
+
+```ts twoslash title="shop/order.ts"
+import { Entity, Index, Prop, Schema } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+```
+
+В примерах, кроме отмеченных, стоят стадии `sort` по дате и `limit(2)`, чтобы остались два первых заказа, и `project`. Заказ Alice на 120 оплачен, у него есть скидка 10 и заметка `gift`. Заказ Alice на 80 оплачен, без скидки и без заметки. Строки получены методом [`.plain()`](./pipeline.mdx#plain).
+
+## Битовые операции
+
+Битовые операторы принимают целые числа: `number` (`int32`) или `bigint` (`int64`). Если хотя бы один аргумент `bigint`, результат `bigint`, иначе `number`. Если аргумент может быть `null`, результат тоже может. В plain-виде `int64` приходит строкой. Нужен MongoDB 6.3 и новее (так сказано в описании операторов в коде).
+
+### fn.bitAnd
+
+`fn.bitAnd` считает побитовое «и» двух и более чисел.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, x: fn.bitAnd(f.total, 12) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, x: 8 },
+//   { total: 80, x: 0 },
+// ]
+```
+
+Число 120 в двоичной записи `1111000`, число 12 — `1100`; общие единицы дают 8. С `bigint` результат становится `int64`:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, x: fn.bitAnd(f.total, 12n) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, x: "8" },
+//   { total: 80, x: "0" },
+// ]
+```
+
+### fn.bitOr
+
+`fn.bitOr` считает побитовое «или».
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, x: fn.bitOr(f.total, 1) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, x: 121 },
+//   { total: 80, x: 81 },
+// ]
+```
+
+### fn.bitXor
+
+`fn.bitXor` считает побитовое «исключающее или».
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, x: fn.bitXor(f.total, 255) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, x: 135 },
+//   { total: 80, x: 175 },
+// ]
+```
+
+### fn.bitNot
+
+`fn.bitNot` инвертирует все биты одного числа. Для целого `x` результат равен `-x - 1`.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, x: fn.bitNot(f.total) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, x: -121 },
+//   { total: 80, x: -81 },
+// ]
+```
+
+## Случайное число
+
+### fn.rand
+
+`fn.rand` возвращает случайное число от 0 (включительно) до 1 (не включая). Принимает ничего, возвращает `number`. Значение вычисляется заново для каждого документа, поэтому в примере проверяется только диапазон:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      inRange: fn.and(fn.gte(fn.rand(), 0), fn.lt(fn.rand(), 1)),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, inRange: true },
+//   { total: 80, inRange: true },
+// ]
+```
+
+## Метаданные
+
+### fn.meta
+
+`fn.meta` возвращает служебные данные документа, которые заполняют некоторые стадии. Принимает имя данных, тип результата определяется этим именем. Для текстового поиска это `"textScore"`: показатель релевантности, который заполняет `$text`.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .match({ $text: { $search: "gift" } })
+    .project((f) => ({ _id: 0, customer: 1, score: fn.meta("textScore") })),
+).plain();
+console.log(rows);
+// → [{ customer: "Alice", score: 1.1 }]
+```
+
+Показатель есть только в конвейере, где стадия [`match`](./stages.mdx#match) с `$text` стоит первой. Полный список имён — тип `MetaValues`:
+
+<TypeTable
+  type={{
+    textScore: { description: "Релевантность `$text`.", type: "number" },
+    indexKey: { description: "Ключ индекса.", type: "{ [key: string]: unknown }" },
+    searchScore: { description: "Оценка Atlas Search.", type: "number" },
+    searchHighlights: { description: "Подсветки Atlas Search.", type: "unknown[]" },
+    searchScoreDetails: { description: "Детали оценки Atlas Search.", type: "{ [key: string]: unknown }" },
+    searchSequenceToken: { description: "Токен последовательности Atlas Search.", type: "string" },
+    vectorSearchScore: { description: "Оценка векторного поиска.", type: "number" },
+    geoNearDistance: { description: "Расстояние, посчитанное `geoNear`.", type: "number" },
+    geoNearPoint: { description: "Точка, найденная `geoNear`.", type: "unknown" },
+    randVal: { description: "Случайное значение документа.", type: "number" },
+    recordId: { description: "Идентификатор записи.", type: "bigint" },
+    sortKey: { description: "Ключ сортировки.", type: "{ [key: string]: unknown }" },
+    score: { description: "Оценка стадии `score`.", type: "number" },
+    scoreDetails: { description: "Детали оценки стадии `score`.", type: "{ [key: string]: unknown }" },
+  }}
+/>
+
+Проверялся только `"textScore"`: остальные имена требуют Atlas или особых стадий.
+
+## Сходство векторов
+
+**Вектор** — список чисел, например эмбеддинг текста. Три оператора считают, насколько два вектора похожи. Каждый принимает два вектора (массивы чисел или бинарные векторы) либо объект `{ vectors: [a, b], score }`, где `score: true` приводит результат к отрезку от 0 до 1. Если аргумент может быть `null` или отсутствовать, результат `number | null`. Нужен MongoDB 8.3.
+
+### fn.similarityCosine
+
+`fn.similarityCosine` считает косинусное сходство: угол между векторами.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, s: fn.similarityCosine([1, 0], [1, 1]) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, s: 0.7071067811865475 },
+//   { total: 80, s: 0.7071067811865475 },
+// ]
+```
+
+Записанное как объект, с `score: true`, результат приведён к отрезку от 0 до 1:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      s: fn.similarityCosine({
+        vectors: [
+          [1, 0],
+          [1, 1],
+        ],
+        score: true,
+      }),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, s: 0.8535533905932737 },
+//   { total: 80, s: 0.8535533905932737 },
+// ]
+```
+
+### fn.similarityDotProduct
+
+`fn.similarityDotProduct` считает скалярное произведение: `1·3 + 2·4 = 11`.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      s: fn.similarityDotProduct([1, 2], [3, 4]),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, s: 11 },
+//   { total: 80, s: 11 },
+// ]
+```
+
+### fn.similarityEuclidean
+
+`fn.similarityEuclidean` считает евклидово расстояние: между `[0, 0]` и `[3, 4]` оно равно 5.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      s: fn.similarityEuclidean([0, 0], [3, 4]),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, s: 5 },
+//   { total: 80, s: 5 },
+// ]
+```
+
+## Vars
+
+`Vars` — класс со статическими узлами системных переменных MongoDB. Переменная записывается не строкой `"$$NOW"`, а свойством класса: голая строка в позиции выражения превратилась бы в литерал, и сервер вернул бы её как текст. Переменные `$$ROOT` и `$$CURRENT` отдельных узлов не имеют: `$$ROOT` — это сам прокси `f`.
+
+### Vars.NOW
+
+`Vars.NOW` — текущее время. Тип `Date`. Значение одно на весь конвейер: все документы видят один и тот же момент.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      past: fn.lt(f.total, 1000),
+      fresh: fn.gt(Vars.NOW, new Date("2026-01-01T00:00:00Z")),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, past: true, fresh: true },
+//   { total: 80, past: true, fresh: true },
+// ]
+```
+
+Для него есть короткая запись `fn.now()`: она возвращает тот же узел.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({
+      _id: 0,
+      total: 1,
+      fresh: fn.gt(fn.now(), new Date("2026-01-01T00:00:00Z")),
+    })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, fresh: true },
+//   { total: 80, fresh: true },
+// ]
+```
+
+### Vars.CLUSTER_TIME
+
+`Vars.CLUSTER_TIME` — кластерное время. Тип `Timestamp`. Есть только на реплика-сете и шардированном кластере.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, t: fn.typeOf(Vars.CLUSTER_TIME) })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, t: "timestamp" },
+//   { total: 80, t: "timestamp" },
+// ]
+```
+
+### Vars.REMOVE
+
+`Vars.REMOVE` удаляет поле, которому его присвоили: ключ пропадает из результата, и по описанию в коде — из его типа. Обычно его ставят в одну из веток [`fn.cond`](./expr-logic.mdx#fncond).
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .set((f) => ({ total: fn.cond(fn.gt(f.total, 100), f.total, Vars.REMOVE) }))
+    .project((f) => ({ _id: 0, customer: 1, total: 1 })),
+).plain();
+console.log(rows);
+// → [
+//   { customer: "Alice", total: 120 },
+//   { customer: "Alice" },
+// ]
+```
+
+У второго заказа `total` меньше 100, поэтому поле удалено. Для безусловного удаления есть `fn.remove()`; он возвращает `Vars.REMOVE`:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .set((f) => ({ note: fn.remove() }))
+    .project((f) => ({ _id: 0, total: 1, note: 1 })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120 },
+//   { total: 80 },
+// ]
+```
+
+### Vars.USER_ROLES
+
+`Vars.USER_ROLES` — роли текущего пользователя, массив `UserRole[]`. Каждая роль — объект с полями `_id` (`"<база>.<пользователь>"`), `role` (имя роли) и `db` (база, в которой роль определена). Тип `UserRole` экспортируется из `@venloc/typemo`. На сервере без аутентификации переменная возвращает пустой массив:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .sort({ placedAt: 1 })
+    .limit(2)
+    .project((f) => ({ _id: 0, total: 1, r: Vars.USER_ROLES })),
+).plain();
+console.log(rows);
+// → [
+//   { total: 120, r: [] },
+//   { total: 80, r: [] },
+// ]
+```
+
+### Vars.DESCEND
+
+`Vars.DESCEND` нужна стадии [`redact`](./stages.mdx#redact): оставить поля этого уровня и проверить вложенные документы. Тип `RedactVerdict` объединяет три вердикта: `"descend"`, `"prune"` и `"keep"`. Примера с ней нет: см. замечание после `Vars.KEEP`.
+
+### Vars.PRUNE
+
+`Vars.PRUNE` отбрасывает документ или вложенный документ целиком.
+
+### Vars.KEEP
+
+`Vars.KEEP` оставляет этот уровень и всё, что ниже, без проверки.
+
+Стадия `redact` принимает только выражение, которое возвращает один из трёх вердиктов, чаще всего через `fn.cond`. Здесь отменённые заказы отброшены, остальные оставлены:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
+
+@Index({ note: "text" })
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
+  status!: "new" | "paid" | "cancelled";
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => String)
+  note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p
+    .redact((f) => fn.cond(fn.eq(f.status, "cancelled"), Vars.PRUNE, Vars.KEEP))
+    .sort({ placedAt: 1 })
+    .project((f) => ({ _id: 0, customer: 1, status: 1 })),
+).plain();
+console.log(rows);
+// → [
+//   { customer: "Alice", status: "paid" },
+//   { customer: "Alice", status: "paid" },
+//   { customer: "Bob", status: "new" },
+//   { customer: "Bob", status: "paid" },
+//   { customer: "Carol", status: "paid" },
+// ]
+```
+
+Вердикт `DESCEND` в примерах не показан: его описание взято из кода и не проверялось запуском.
+
+## Когда не подходит
+
+- Нужно выражение на JavaScript: оператора `fn.function` (`$function` сервера) в Typemo нет, его вызов — ошибка компиляции. Соберите выражение из операторов [логики](./expr-logic.mdx), [массивов](./expr-array.mdx) и [строк](./expr-string.mdx); подробности — в разделе [Код на JavaScript](./accumulators.mdx#код-на-javascript).
+- Нужна дата или время: смотрите [операторы дат](./expr-date.mdx), `Vars.NOW` даёт только текущий момент.
+- Нужно случайно выбрать документы: используйте стадию [`sample`](./stages.mdx#sample), а не `fn.rand` в фильтре.
+- Нужен векторный поиск по индексу: стадия [`vectorSearch`](./stages.mdx#vectorsearch), а не сравнение векторов каждого документа.

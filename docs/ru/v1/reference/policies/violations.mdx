@@ -1,0 +1,279 @@
+---
+title: "Нарушения политик"
+description: "StrictModeError и все его причины: что означает каждая, какой текст видит разработчик и как исправить вызов"
+icon: OctagonAlert
+---
+
+Когда операция нарушает правило политики или строгости, Typemo не отправляет её на сервер и бросает [`StrictModeError`](#strictmodeerror). Причина нарушения записана в поле `reason`, а в конец сообщения дописана в квадратных скобках. Правила нельзя смягчить ни опциями, ни режимами: это сделано, чтобы опечатка, пустой фильтр или забытый тенант не превратились в тихую потерю или утечку данных. Страница описывает каждую причину: что её вызывает, какой текст вы увидите и что менять. Если вы только начинаете, читайте руководства раздела [Политики данных](../../policies/overview.mdx).
+
+Общее описание класса и его полей есть в разделе ошибок данных: [`StrictModeError`](../errors/data-errors.mdx#strictmodeerror). Здесь причины разобраны по одной.
+
+## StrictModeError
+
+Ошибка несёт две особенности. Поле `reason` — одно из тринадцати значений (тип `StrictModeReason`), поле `path` — где во вводе нарушено правило (`filter.nope`, `$set.email`) или `undefined`, если нарушена операция целиком. Ветвитесь по `reason`, а не по тексту: текст можно уточнять, значение `reason` остаётся.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, StrictModeError } from "@venloc/typemo";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Users = client.connection.model(User);
+// ---cut---
+export const handle = async (filter: unknown) => {
+  try {
+    return await Users.find(filter as { name: string }).plain();
+  } catch (error) {
+    if (error instanceof StrictModeError) {
+      return { status: 400, reason: error.reason, path: error.path };
+    }
+    throw error;
+  }
+};
+```
+
+Часть нарушений построитель запросов замечает раньше, при построении операции, и сообщает как [`QueryError`](../errors/query-errors.mdx#queryerror): это `undefined` в значении, пустые `$and`/`$or`/`$nor`, пустое обновление и `limit`/`skip` вне допустимых границ. У `QueryError` поля `reason` нет. Поэтому ловите оба класса, если вы разбираете ошибки ввода клиента. Запуском подтверждены причины `unknown-path`, `not-hidden`, `empty-filter`, `immutable`, `sanitize`, `tenant`, `soft-delete`, `transaction-option` и `concurrent-session`; остальные четыре в обычных вызовах перехватывает `QueryError`.
+
+<TypeTable
+  type={{
+    "unknown-path": { description: "Путь, которого нет в схеме." },
+    "not-hidden": { description: "`+имя` в проекции у поля, которое не скрыто: ключ ничего бы не изменил." },
+    undefined: { description: "`undefined` как значение (в обычных вызовах — `QueryError`)." },
+    "empty-filter": { description: "Пустой фильтр у записи: `updateOne`, `updateMany`, `deleteOne`, `deleteMany`, `replaceOne`, `findOneAnd*`, в том числе внутри `bulkWrite`." },
+    "empty-logical": { description: "Пустой `$and`, `$or`, `$nor` (в обычных вызовах — `QueryError`)." },
+    "empty-update": { description: "Пустое обновление (в обычных вызовах — `QueryError`)." },
+    immutable: { description: "Запись неизменяемого поля." },
+    limit: { description: "`limit` не больше нуля (в обычных вызовах — `QueryError`)." },
+    sanitize: { description: "Оператор там, где ожидалось значение, или неизвестный оператор." },
+    tenant: { description: "У операции нет тенанта, тенант пустой или операция вышла бы за его пределы." },
+    "soft-delete": { description: "Операция, которую политика мягкого удаления не может ограничить." },
+    "transaction-option": { description: "`readConcern`, `writeConcern`, `readPreference` или `timeoutMS` у операции внутри транзакции." },
+    "concurrent-session": { description: "Сессия занята другой операцией." },
+  }}
+/>
+
+<FullType>
+
+```ts
+type StrictModeReason =
+  | "unknown-path" | "not-hidden" | "undefined" | "empty-filter" | "empty-logical" | "empty-update"
+  | "immutable" | "limit" | "sanitize" | "tenant" | "soft-delete" | "transaction-option" | "concurrent-session";
+
+class StrictModeError extends TypemoError {
+  readonly reason: StrictModeReason;
+  readonly path: string | undefined;
+}
+```
+
+</FullType>
+
+### unknown-path
+
+Фильтр, обновление, проекция, сортировка или конвейер называют путь, которого нет в схеме. Опечатка в имени поля без этой проверки дала бы фильтр, который ничего не находит, или обновление, которое молча ничего не пишет. `path` начинается с места ввода: `filter`, `$set`, `projection`, `sort`.
+
+```text
+StrictModeError: filter: "nope" is not a field of User [unknown-path]
+StrictModeError: filter.$or.0: "nope" is not a field of User [unknown-path]
+StrictModeError: $set: "nope" is not a field of User [unknown-path]
+StrictModeError: projection: "nope" is not a field of User [unknown-path]
+StrictModeError: sort: "nope" is not a field of User [unknown-path]
+```
+
+Сообщение называет место ввода один раз, а неизвестное поле — в кавычках. Полный путь лежит в `path`: `filter.nope`, `filter.$or.0.nope`, `$set.nope`, `projection.nope`, `sort.nope`. Неизвестное имя после `+` в проекции называется так же, с путём `projection.+nope`.
+
+Исправление — имя поля из класса. Если поле действительно нужно, добавьте его в схему. Подробнее — [Строгие пути](../../policies/strict-paths.mdx).
+
+### not-hidden
+
+Проекция содержит ключ `+имя` для поля, которое есть в схеме, но не скрыто. Ключ `+имя` возвращает в результат [скрытое поле](../schemas/prop.mdx#hidden); обычное поле и так приходит, поэтому для него ключ ничего бы не изменил, а намерение автора осталось бы непонятным: забыли отметить поле скрытым или ошиблись знаком. Компилятор такой ключ не принимает; в коде без типов или со словарём `Record<string, 0 | 1>` запрос останавливается до обращения к базе, `path` равен `projection.+name`:
+
+```text
+StrictModeError: projection: "+name" adds a Hidden field back, and "name" is not Hidden; select it without the "+" [not-hidden]
+```
+
+Исправление — выбрать поле без `+`: `select({ name: 1 })`. Если поле не должно уходить по умолчанию, отметьте его `hidden` в модели. Если имени после `+` нет в схеме вовсе, причина — `unknown-path`.
+
+### undefined
+
+`undefined` в значении фильтра или обновления запрещён: драйвер отправил бы его как `null`, и фильтр находил бы документы без поля, а `$set` записал бы `null`. В обычных вызовах построитель бросает `QueryError` (тексты получены запуском):
+
+```text
+QueryError: filter: undefined at "name" (use $exists: false / $unset; undefined is never a value)
+QueryError: update: undefined at "$set.age" (use $exists: false / $unset; undefined is never a value)
+```
+
+Исправление: не передавайте ключ вовсе, для «поля нет» используйте `$exists: false`, для удаления поля — `$unset`.
+
+### empty-filter
+
+Пустой фильтр в записи: `updateOne`, `updateMany`, `deleteOne`, `deleteMany`, `replaceOne`, `findOneAndUpdate`, `findOneAndDelete`, `findOneAndReplace`, а также такая операция внутри `bulkWrite`. Одна опечатка, приведшая к пустому фильтру, стёрла бы коллекцию или изменила произвольный документ. `path` равен `undefined`. Пустой фильтр в чтении разрешён.
+
+```text
+StrictModeError: deleteMany with an empty filter would affect every document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]
+```
+
+Текст называет вызванный метод и зависит от формы операции: у `updateMany` и `deleteMany` он говорит «would affect every document», а у `updateOne`, `deleteOne`, `replaceOne` и `findOneAnd*` — «would change or remove an arbitrary document» (затронут был бы один документ, но какой, не гарантирует база). Те же слова у ошибки компилятора. Для `deleteOne`:
+
+```text
+StrictModeError: deleteOne with an empty filter would change or remove an arbitrary document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]
+```
+
+Причина и исправление от формы не зависят.
+
+Исправление: передайте условие или, если «все документы» — намерение, `Filters.all()`. Литерал `{}` в `updateOne`, `updateMany`, `deleteOne`, `deleteMany` и `replaceOne` не компилируется, так что до этой ошибки доходит только фильтр, собравшийся пустым во время работы. У `findOneAnd*` литерал `{}` компилируется, и ошибка приходит только во время работы. Руководство: [Пустые фильтры](../../writes/empty-filters.mdx) и [Не стереть коллекцию пустым фильтром](../../policies/filters-and-limits.mdx).
+
+#### Filters.all
+
+`Filters.all()` — явное «все документы» для операций, которые отвергают пустой фильтр. Это настоящий фильтр `{ _id: { $exists: true } }`, истинный для каждого сохранённого документа: ничего особого в план не передаётся, а намерение видно в коде и в журнале команд. Возвращает замороженный объект.
+
+```ts twoslash
+import { Filters } from "@venloc/typemo";
+// ---cut---
+const all = Filters.all();
+//    ^?
+```
+
+Без аргумента типа результат — `AllDocumentsFilter`: простой объект, который подходит фильтру **любой** модели, поэтому один и тот же `Filters.all()` годится для `Users` и для `Orders`. С аргументом (`Filters.all<User>()`) результат типизируется как `Filter<User>`. Принимает ничего.
+
+<FullType>
+
+```ts
+type AllDocumentsFilter = { readonly _id: { readonly $exists: true } };
+
+class Filters {
+  static all(): AllDocumentsFilter;
+  static all<T extends { readonly _id?: unknown }>(): Filter<T>;
+}
+```
+
+</FullType>
+
+### empty-logical
+
+Пустой `$and`, `$or` или `$nor`. Сервер отвергает такой оператор, а «исправить» его, отбросив, значило бы найти все документы: список условий чаще всего собирается из данных, и пустой список выглядит как «условий нет». Построитель запросов в обычных вызовах бросает `QueryError`:
+
+```text
+QueryError: filter: $or must be a non-empty array (at "$or")
+```
+
+Проверяйте список до сборки фильтра: если условий нет, и вы хотите «все», скажите это `Filters.all()`, если «никого» — не делайте запрос.
+
+### empty-update
+
+Обновление, которое после приведения ничего не меняет: пустой объект, оператор без путей, конвейер без стадий. Оно не должно выглядеть как успех. Обычно это `QueryError` (тексты получены запуском):
+
+```text
+QueryError: update: an empty update changes nothing
+QueryError: update: operator "$set" is empty
+QueryError: an update pipeline needs at least one stage
+```
+
+### immutable
+
+Запись неизменяемого поля (опция [`immutable`](../schemas/prop.mdx) у поля) вне создания документа. Такое поле пишется только при создании, а при `upsert` — через `$setOnInsert`.
+
+```text
+StrictModeError: $set.email: "email" is immutable; it is written only when the document is created ($setOnInsert on upsert) [immutable]
+```
+
+Замена документа целиком (`replaceOne`, `findOneAndReplace`, `replaceOne` в `bulkWrite`) должна совпадать с сохранённым документом по каждому неизменяемому полю: то же значение, если поле есть, и ничего, если его нет. Сравнивает сервер в той же операции, поэтому ошибка приходит после обращения к нему, а документ не меняется. `path` называет поле (тексты получены запуском):
+
+```text
+StrictModeError: a replacement of Pinned changes the immutable field "region"; the document was not replaced. Carry the stored value [immutable]
+StrictModeError: a replacement of Pinned without the immutable field "code" would drop it from the stored document; the document was not replaced. Include the stored value, or update the other fields with $set [immutable]
+StrictModeError: a replacement of Pinned sets the immutable field "code", which the stored document does not have; the document was not replaced. An immutable field gets its value when the document is created [immutable]
+```
+
+Замена документа целиком не может нести `_id`: `_id` сохранённого документа нельзя поменять, даже на тот же самый. Запрещён любой `_id` в замене (`replaceOne`, `findOneAndReplace`), и ошибка приходит до отправки:
+
+```text
+StrictModeError: a replacement of Doc carries "_id": a replacement keeps the stored _id and cannot change it; leave "_id" out and select the document by _id in the filter [immutable]
+```
+
+Стадии обновления, которые переписывают документ целиком (`$replaceRoot`, `$replaceWith`, `$project`), на модели с неизменяемыми полями допускаются, если новый корень переносит каждое такое поле как есть (`createdAt: "$createdAt"`, `$mergeObjects` с корневым документом). Иначе ошибка называет потерянные поля:
+
+```text
+StrictModeError: update.0.$replaceWith: $replaceWith rewrites the whole document and would change or drop the immutable fields createdAt, owner; carry each unchanged (createdAt: "$createdAt") or use $set/$unset of the other fields [immutable]
+```
+
+### limit
+
+`limit`, не являющийся положительным целым числом. В драйвере `0` означает «без ограничения», а отрицательное число работает как своё модуль. Ноль легко получить из пустого параметра запроса и выгрузить всю коллекцию. Сообщение построителя (`QueryError`, получено запуском) печатает значение вместе с типом:
+
+```text
+QueryError: limit must be a positive integer, got 0 (number)
+QueryError: limit must be a positive integer, got "3" (string)
+QueryError: skip must be a non-negative integer, got -1 (number)
+```
+
+Чтобы не ограничивать выборку, не вызывайте `limit`.
+
+### sanitize
+
+Фильтр содержит оператор там, где ожидалось значение, или оператор, которого нет: подмена значения оператором (инъекция) и запрос, который сервер выполнял бы как JavaScript. Причина срабатывает и для проверки [`untrusted`](./soft-delete-and-untrusted.mdx#untrusted). Тексты получены запуском:
+
+```text
+StrictModeError: "$gt" is not a top-level filter operator (a field operator needs a field: { path: { $op: … } }) (at "filter.$gt") [sanitize]
+StrictModeError: "$nope" is not a query operator (at "filter.name.$nope") [sanitize]
+StrictModeError: an object mixes operators ($eq) and fields at "filter.name": neither a condition nor a value [sanitize]
+StrictModeError: "$where" runs JavaScript on the server and is not supported (at "filter.$where"): JavaScript code in a query runs with the rights of the database, cannot be checked against the schema, and turns injected input into executed code (Mongoose CVE-2025-23061, $where in populate); write the condition with query or aggregation operators ($expr) instead [sanitize]
+StrictModeError: untrusted value: "$ne" at "title.$ne" — an operator inside data from outside (query selector injection); validate the input and build the filter yourself [sanitize]
+StrictModeError: untrusted value: "$set" at "$set" — an operator inside data from outside would change what the update does (update operator injection); validate the input and build the update yourself [sanitize]
+StrictModeError: untrusted value: "+passwordHash" at "+passwordHash" — a "+path" key inside data from outside would select a Hidden field; validate the input and build the projection yourself [sanitize]
+```
+
+Три последних текста различаются местом, которое назвали вторым аргументом [`untrusted`](./soft-delete-and-untrusted.mdx#untrusted): фильтр, обновление, проекция.
+
+Исправление: постройте фильтр сами из проверенных значений. Руководство: [Недоверенный ввод](../../policies/untrusted-input.mdx).
+
+### tenant
+
+У операции модели с политикой [`tenant`](./schema-options.mdx#опция-tenant) нет тенанта, тенант пустой либо операция вышла бы за пределы тенанта. Тексты получены запуском (`path` есть у ошибок, касающихся поля тенанта). Каждый называет метод, который вы вызвали:
+
+```text
+StrictModeError: Order.find: Order is scoped by tenant ("tenantId") and the operation has no tenant; run it inside PolicyContext.run({ tenant }, …) or add .policy({ tenant }) to the query (cross-tenant work: .policy({ allTenants: true })) [tenant]
+StrictModeError: Order.create: Order is scoped by tenant ("tenantId") and the operation has no tenant; run it inside PolicyContext.run({ tenant }, …) or pass { policy: { tenant } } in the call's options (cross-tenant work: { policy: { allTenants: true } }) [tenant]
+StrictModeError: Order.create: the document is for another tenant (tenantId: globex) than the operation's (acme) [tenant]
+StrictModeError: PolicyContext.run: the tenant is empty (""); a tenant is a non-empty value, or allTenants: true for cross-tenant work [tenant]
+StrictModeError: create.policy: the tenant is empty (""); a tenant is a non-empty value, or allTenants: true for cross-tenant work [tenant]
+StrictModeError: Order.updateOne: $set of the tenant field ("tenantId") would move the document to another tenant or lose it [tenant]
+StrictModeError: Order.estimatedDocumentCount: estimatedDocumentCount reads the collection's metadata and would count every tenant; use countDocuments() (scoped by the tenant) [tenant]
+StrictModeError: Order.watch: a change stream of a tenant-scoped model cannot be scoped (a delete event has no document); watch inside PolicyContext.run({ allTenants: true }, () => Order.watch()) and filter the events yourself [tenant]
+```
+
+Исправление — задать тенанта: [`PolicyContext.run`](./policy-context.mdx#policycontextrun) или [`.policy({ tenant })`](../query/options.mdx#policy); для работы по всем тенантам — `allTenants: true`. Руководство: [Мультитенантность](../../policies/tenants.mdx). Подсказка в первом тексте называет форму вызова, которая есть у операции: у запроса это `.policy({ tenant })`, у записи (`create`, `insertOne`, `insertMany`, `bulkWrite`, `$save`) — параметры вызова `{ policy: { tenant } }`. Пустая строка, строка из пробелов и `null` как тенант отвергаются при открытии области и в `.policy()`, а не при первой операции. Пустой тенант в параметрах вызова называет метод, который вы вызвали: `create.policy`, `insertMany.policy`, `save.policy` (для `$save`), а не внутренний механизм записи. Для `$save` документа без тенанта в тексте стоит `Order.save`. У `watch` нет своих параметров `.policy`, поэтому подсказка называет область: `PolicyContext.run({ allTenants: true }, () => Order.watch())`.
+
+### soft-delete
+
+Операция, область которой политика мягкого удаления не может определить. Сейчас это `estimatedDocumentCount` без `includeDeleted`: метаданные коллекции считают и удалённые документы.
+
+```text
+StrictModeError: Post.estimatedDocumentCount: the collection's metadata counts soft-deleted documents too; use countDocuments() (or includeDeleted: true to count them all) [soft-delete]
+```
+
+Исправление: `countDocuments()` или `.policy({ includeDeleted: true })`. Руководство: [Мягкое удаление](../../policies/soft-delete.mdx).
+
+### transaction-option
+
+Операция внутри транзакции задаёт `readConcern`, `writeConcern`, `readPreference` (не `primary`) или собственный `timeoutMS`, когда он есть у транзакции. Внутри транзакции действуют настройки самой транзакции.
+
+```text
+StrictModeError: Account.find: readConcern "majority" inside a transaction — the transaction's own settings apply (set them on transaction()) [transaction-option]
+```
+
+Исправление: задайте настройку в вызове `transaction()`. Руководство: [Транзакции](../../transactions/transactions.mdx).
+
+### concurrent-session
+
+Две операции одновременно используют одну сессию. Сервер не поддерживает параллельные операции в одной сессии. Внутри транзакции нельзя ничего запускать параллельно, вне неё параллельно можно только читать.
+
+```text
+StrictModeError: Account.find: the session is in use by Account.countDocuments, which has not finished; operations on one session must run one after another — await each one; only reads may overlap, and only outside a transaction (MongoDB does not support concurrent operations on a session) [concurrent-session]
+```
+
+Исправление: дожидайтесь каждой операции до начала следующей. Руководство: [Сессии вручную](../../transactions/sessions.mdx).
+
+## Когда не подходит
+
+`reason` нужен, чтобы отличить ошибку вызывающего кода от ошибки ввода клиента. Не превращайте нарушения политики в общий ответ «попробуйте ещё раз»: повтор ничего не изменит, ошибку нужно исправить в вызове. Смягчить правило нельзя: нет опции, которая разрешает неизвестный путь, пустой фильтр или операцию без тенанта. Если вам действительно нужна операция вне правил, используйте [`client.unsafeDriver()`](../connection/typemo-client.mdx#clientunsafedriver), где защиты Typemo не действуют.

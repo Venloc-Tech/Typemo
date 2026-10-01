@@ -1,0 +1,310 @@
+---
+title: Обязательные поля, null и отсутствие значения
+description: "Как объявить поле обязательным или допускающим null и чем в MongoDB отличаются три состояния поля: значение, null и отсутствие"
+icon: CircleSlash
+---
+
+У поля документа в MongoDB есть три разных состояния: в нём лежит **значение**, в нём лежит **`null`** или его **нет вообще**. Для базы это три разных случая, и фильтры, индексы и проверки ведут себя в них по-разному. Typemo не смешивает эти состояния молча. Опция [`required`](../reference/schemas/prop.mdx#required) говорит, что поле обязано быть в документе, опция [`nullable`](../reference/schemas/prop.mdx#nullable) разрешает `null`, а `undefined` значением не считается никогда. Без `nullable` обязательное поле не бывает и `null`; вместе с `nullable` ключ обязателен, а `null` допустим.
+
+Если вы впервые работаете с MongoDB, вам стоит помнить, что она хранит документы как есть: если вы не записали поле, его нет, а `null` — это записанное значение «пусто». Читатель, который проверяет `user.nickname == null`, не отличит одно от другого, а база отличает.
+
+## Что предполагается
+
+Модель описана по руководству [Описать модель](./define-model.mdx). Примеры строят профиль пользователя сайта и добавляют в него по одному полю.
+
+## Быстрый путь
+
+Три поля показывают три состояния: обязательное, допускающее `null` и необязательное.
+
+```ts twoslash title="users/profile.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "profiles" })
+export class Profile extends Entity {
+  @Prop(() => String, { required: true }) // обязательное: есть и не null
+  login!: string;
+
+  @Prop(() => String, { nullable: true }) // может быть null
+  nickname?: string | null;
+
+  @Prop(() => String) // может отсутствовать
+  bio?: string;
+}
+
+const Profiles = client.connection.model(Profile);
+const profile = await Profiles.create({ login: "ann", nickname: null });
+console.log(profile.$toPlain());
+// → { _id: "…", login: "ann", nickname: null }
+```
+
+`bio` не передали, и в документе его нет. `nickname` передали как `null`, и он записан. Остальная страница разбирает каждый случай.
+
+## Сделать поле обязательным
+
+`required: true` говорит: без этого поля документ не сохранится, и `null` вместо значения на обычном поле тоже не принимается. Опция явная и не выводится из `?` в объявлении, потому что `?` описывает тип в TypeScript, а обязательность — правило для данных, и это два разных решения. Поэтому `login!: string` с `required: true` — обязательное поле, а `bio?: string` без `required` — необязательное. Компилятор проверяет вызов `create`: без обязательного поля код не скомпилируется.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "profiles" })
+class Profile extends Entity {
+  @Prop(() => String, { required: true }) login!: string;
+  @Prop(() => String) bio?: string;
+}
+const Profiles = client.connection.model(Profile);
+// ---cut---
+// @errors: 2769
+await Profiles.create({ bio: "hello" });
+```
+
+В коде без типов, например когда данные приходят из внешнего запроса, то же самое поймает библиотека во время работы и бросит [`ValidationError`](../reference/errors/data-errors.mdx#validationerror) с причиной `required`:
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "profiles" })
+class Profile extends Entity {
+  @Prop(() => String, { required: true }) login!: string;
+  @Prop(() => String) bio?: string;
+}
+const Profiles = client.connection.model(Profile);
+// ---cut---
+try {
+  await Profiles.create({ bio: "hello" } as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "login": the field is required [required]
+```
+
+## Разрешить null
+
+Без `nullable` значение `null` на поле не проходит: это не пустая строка и не отсутствие, а отдельное значение, и молча принять его за что-то другое было бы догадкой. Опция `nullable: true` объявляет, что `null` — законное значение поля. Тип поля при этом должен содержать `| null`, и компилятор проверяет это в обе стороны.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "profiles" })
+class Profile extends Entity {
+  @Prop(() => String, { required: true }) login!: string;
+  @Prop(() => String, { nullable: true }) nickname?: string | null;
+  @Prop(() => String) bio?: string;
+}
+const Profiles = client.connection.model(Profile);
+// ---cut---
+const withNull = await Profiles.create({ login: "a", nickname: null });
+const without = await Profiles.create({ login: "b" });
+console.log(withNull.nickname, without.nickname);
+// → null undefined
+try {
+  await Profiles.create({ login: "c", bio: null } as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to string failed at path "bio" for null: null is not allowed on a path that is not nullable [null]
+```
+
+Первый документ хранит `nickname: null`, у второго поля нет. Разница видна и в самой базе, и в результатах запросов: [lean-вид](../reference/query/reading.mdx#lean) отдаёт `null` для первого и не содержит ключа для второго. Ошибка на `bio` — [`CastError`](../reference/errors/data-errors.mdx#casterror) с причиной `null`.
+
+Если забыть `| null` в типе или, наоборот, добавить его без `nullable: true`, компилятор скажет об этом: `@Prop "nickname": "nullable" is set, but the field type has no "| null"` и `@Prop "nickname": the field type has "| null", add nullable: true`.
+
+## Требовать ключ и разрешить null
+
+Обе опции можно поставить на одно поле: `required: true` вместе с `nullable: true`. Тогда ключ в документе обязателен, а значением может быть и настоящее значение, и `null`: «мы спросили, ответа нет» отличается от «не спросили». Тип поля содержит `| null`, а чтение возвращает его без `undefined`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "contacts" })
+class Contact extends Entity {
+  @Prop(() => String, { required: true, nullable: true }) // [!code highlight]
+  phone!: string | null;
+}
+const Contacts = client.connection.model(Contact);
+const contact = await Contacts.create({ phone: null });
+const phone = contact.phone;
+//    ^?
+console.log(phone);
+// → null
+try {
+  await Contacts.create({} as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "phone": the field is required [required]
+try {
+  await Contacts.updateOne({ phone: null }, { $unset: { phone: 1 } } as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "phone": the field is required; $unset would remove it [required]
+```
+
+Без ключа документ не сохранится, а `$unset` такого поля запрещён: он убрал бы ключ, который обязан быть. Очистить значение можно записью `null`: `$set: { phone: null }` проходит. Присваивание `undefined` в загруженном документе тоже отвергается с той же ошибкой `required`, потому что на обычном `nullable`-поле оно означало бы `$unset`.
+
+## Почему `undefined` не значение
+
+`undefined` — это специальное значение JavaScript, и MongoDB его не хранит: драйвер либо пропускает такое поле, либо записывает `null`, в зависимости от настроек. Typemo не полагается ни на одно из этих поведений и отвергает `undefined` в данных сразу. Если поля нет, **не передавайте его**.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "profiles" })
+class Profile extends Entity {
+  @Prop(() => String, { required: true }) login!: string;
+  @Prop(() => String, { nullable: true }) nickname?: string | null;
+}
+const Profiles = client.connection.model(Profile);
+// ---cut---
+try {
+  await Profiles.create({ login: "ann", nickname: undefined } as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Cast to string | null failed at path "nickname" for undefined: undefined is never a value; omit the field instead [undefined]
+```
+
+Так опечатка вроде `nickname: user.nick` при отсутствующем `user.nick` не превращается в тихую запись `null` или в потерянное поле.
+
+## Проверить null и отсутствие в фильтре
+
+В фильтре `{ nickname: null }` MongoDB находит документы, где поле равно `null`, **и** документы, где поля нет: так работает сама база. Чтобы найти только отсутствующие поля, используйте `$exists: false`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "null_filters" })
+class Profile extends Entity {
+  @Prop(() => String, { required: true }) login!: string;
+  @Prop(() => String, { nullable: true }) nickname?: string | null;
+}
+const Profiles = client.connection.model(Profile);
+await Profiles.create({ login: "a", nickname: null });
+await Profiles.create({ login: "b" });
+await Profiles.create({ login: "c", nickname: "cc" });
+// ---cut---
+const nullOrMissing = await Profiles.find({ nickname: null }).sort({ login: 1 }).plain();
+console.log(nullOrMissing.map((p) => p.login));
+// → ["a", "b"]
+const missing = await Profiles.find({ nickname: { $exists: false } }).plain();
+console.log(missing.map((p) => p.login));
+// → ["b"]
+```
+
+Для поля без `nullable` фильтр `{ field: null }` не имеет смысла, и библиотека говорит об этом прямо: `Cast to string failed at path "bio" for null: null is not a value of this path (it is not nullable); an absent field is { $exists: false } [null]`. Так вы не получите пустой результат там, где ждали документы.
+
+## Убрать значение при обновлении
+
+В обновлении три способа «очистить» поле, и они значат разное. `$set` с `null` записывает `null` и разрешён только для `nullable`. `$unset` убирает поле из документа и запрещён для обязательных полей: документ перестал бы удовлетворять схеме. `$set` со `undefined` отвергается как в `create`.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "profiles" })
+class Profile extends Entity {
+  @Prop(() => String, { required: true }) login!: string;
+  @Prop(() => String, { nullable: true }) nickname?: string | null;
+  @Prop(() => String) bio?: string;
+}
+const Profiles = client.connection.model(Profile);
+await Profiles.create({ login: "eve", nickname: "e", bio: "hi" });
+// ---cut---
+await Profiles.updateOne({ login: "eve" }, { $set: { nickname: null } });
+await Profiles.updateOne({ login: "eve" }, { $unset: { bio: "" } });
+console.log(await Profiles.findOne({ login: "eve" }).lean());
+// → { _id: ObjectId("…"), login: "eve", nickname: null }
+try {
+  await Profiles.updateOne({ login: "eve" }, { $unset: { login: 1 } } as never);
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "login": the field is required; $unset would remove it [required]
+```
+
+В загруженном документе присваивание `undefined` полю трактуется как «убрать поле»: в изменениях появляется `$unset`, а не запись `null`. Подробности — в руководстве [Изменить и сохранить документ](../documents/change-and-save.mdx).
+
+## Как выбрать
+
+Задайте себе один вопрос: **что должен значить пустой результат для читателя данных?** Если «данные пока неизвестны» и вы хотите, чтобы поле отсутствовало, оставьте его необязательным без `nullable`. Если «мы точно знаем, что значения нет, и хотим это хранить» (например, пользователь явно отказался указывать телефон), используйте `nullable: true`. Если без значения документ не имеет смысла (логин, сумма, владелец), ставьте `required: true`. Если ключ обязан быть, но значением может быть «нет» (телефон, который пользователь явно не указал), ставьте обе опции. Признак для проверки: если вам понадобится отличать «не спросили» от «спросили, ответа нет», нужны оба состояния, значит, `nullable` необходим.
+
+## Когда это не нужно
+
+Значение, которое подставляется само, когда его не передали, обязательным делать не нужно: для него есть [`default`](./defaults.mdx). Проверка формата и границ значения — тоже не задача `required`: для неё есть [`min`, `max`, `match` и остальные опции](./validation.mdx). Сочетание `required: true` с `nullable: true` нужно, только когда отсутствие ключа недопустимо, а `null` несёт смысл; если отличать «не спросили» от «ответа нет» не нужно, хватит одной из двух опций.
+
+## Частые ошибки
+
+### Обязательное поле с `nullable` принимает `null`, но не отсутствие
+
+Поле объявлено `required: true, nullable: true`, а документ создают без него, и `create` падает. Причина в определении `required`: ключ обязан быть, `nullable` разрешает лишь значение `null`, а не отсутствие. Ошибка называет поле: `Validation failed: "phone": the field is required [required]`. Передайте `null` явно или уберите `required`, если поля может не быть.
+
+### Фильтр по `null` находит лишние документы
+
+Запрос `{ nickname: null }` вернул и тех, у кого поле пусто, и тех, у кого его нет. Причина — семантика самой MongoDB, описанная выше. Если нужны только настоящие `null`, добавьте условие `$exists: true`.
+
+### Значение `undefined` из необязательной переменной
+
+`create({ nickname: maybe })` падает с `undefined is never a value`. Причина — та же: `undefined` не значение. Соберите объект без ключа: `...(maybe === undefined ? {} : { nickname: maybe })`.
+
+## Полный пример
+
+Один файл собирает три состояния поля и три способа их изменить. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="users/profiles.service.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+// модель: обязательное, допускающее null и необязательное поле
+@Schema({ collection: "profiles" })
+class Profile extends Entity {
+  @Prop(() => String, { required: true }) login!: string;
+  @Prop(() => String, { nullable: true }) nickname?: string | null;
+  @Prop(() => String) bio?: string;
+}
+
+// код читателя: ошибка на границе приложения
+class __BadRequest__ extends Error {}
+
+// регистрация: необязательное поле не передаём, если его нет
+export const register = async (login: string, bio?: string) => {
+  const Profiles = client.connection.model(Profile);
+  try {
+    return await Profiles.create({ login, ...(bio === undefined ? {} : { bio }) });
+  } catch (error) {
+    throw new __BadRequest__((error as Error).message);
+  }
+};
+
+// пользователь отказался от псевдонима: null, а не удаление
+export const clearNickname = async (login: string) => {
+  const Profiles = client.connection.model(Profile);
+  await Profiles.updateOne({ login }, { $set: { nickname: null } });
+};
+
+await register("zed");
+await clearNickname("zed");
+const saved = await client.connection.model(Profile).findOne({ login: "zed" }).lean();
+console.log(saved?.nickname, saved?.bio);
+// → null undefined
+```
+
+<Callout type="migration">
+
+Не переносите привычку «`undefined` — то же, что нет значения». В Typemo три состояния разделены жёстко: `undefined` в данных — `CastError`, `null` проходит только на `nullable` поле, а `required` требует ключ и сам по себе `null` не пропускает: нужна пара `required` и `nullable`. Фильтр `{ field: null }` на поле без `nullable` — ошибка, а не тихий поиск по отсутствию.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Значения по умолчанию" href="./defaults.mdx">
+  Как подставить значение, когда поле не передали.
+</Card>
+<Card title="Валидация полей" href="./validation.mdx">
+  Границы, длина, форма и свои проверки значения.
+</Card>
+<Card title="Справочник: @Prop" href="../reference/schemas/prop.mdx">
+  Опции `required` и `nullable` и все ошибки согласования с типом.
+</Card>
+</Cards>

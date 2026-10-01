@@ -1,0 +1,403 @@
+---
+title: Выражения: строки
+description: "Строковые операторы fn: регистр, подстроки, обрезка, замена, регулярные выражения"
+icon: Type
+---
+
+На этой странице собраны строковые операторы каталога `fn`: регистр, длина, склейка, подстроки, обрезка, замена и регулярные выражения. Они работают внутри стадий конвейера, например в [`project`](./stages.mdx#project) или [`addFields`](./stages.mdx#addfields), и вычисляются сервером для каждой строки: `(f) => fn.toUpper(f.sku)`.
+
+Если вы только начинаете, сначала прочитайте руководство [Выражения](../../aggregation/expressions.mdx). Эта страница — справочник. Выражения пишутся только колбэком: сырой объект с `$expr` Typemo не принимает.
+
+Все примеры используют одну модель заказа магазина.
+
+```ts twoslash title="models/order.ts"
+import { Timestamp } from "mongodb";
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema()
+export class Line {
+  @Prop(() => String, { required: true })
+  sku!: string;
+
+  @Prop(() => Number, { required: true })
+  qty!: number;
+}
+
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  sku!: string;
+
+  @Prop(() => Number, { required: true })
+  price!: number;
+
+  @Prop(() => Number, { required: true })
+  quantity!: number;
+
+  @Prop(() => Number, { required: true })
+  delta!: number;
+
+  @Prop(() => Number, { required: true })
+  ratio!: number;
+
+  @Prop(() => Number)
+  discount?: number;
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+
+  @Prop(() => Date, { required: true })
+  shippedAt!: Date;
+
+  @Prop(() => Timestamp)
+  stamp?: Timestamp;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => [Number])
+  prices!: number[];
+
+  @Prop(() => [Line])
+  lines!: Line[];
+}
+```
+
+В коллекции один заказ: `title` — `"  Blue Pen  "` (с пробелами по краям), `sku` — `"PEN-001"`, `price` — 19.99, `quantity` — 3, `delta` — -5, `ratio` — 0.5, `placedAt` — 15 марта 2026, 10:30:45.123 UTC, `shippedAt` — 18 марта 2026, 08:00 UTC, `stamp` — временная метка с секундами 1700000000 и приращением 5, `tags` — `["new", "sale", "pen"]`, `prices` — `[30, 10, 20]`, `lines` — две строки (`pen`×2 и `ink`×1). Поля `discount` у заказа нет. Результаты в комментариях `// →` получены запуском на этих данных.
+
+---
+
+## Регистр, длина и склейка
+
+Базовые операции над строкой. У операторов разное поведение с `null`: `toUpper`, `toLower` и `substr*` превращают `null` в пустую строку, `concat`, `split` и `trim*` возвращают `null`, а `strLenCP` и `strLenBytes` на `null` падают, поэтому не принимают необязательное поле.
+
+Один запрос считает сразу все операторы группы:
+
+```ts twoslash
+import { Timestamp } from "mongodb";
+import { Entity, fn, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) quantity!: number;
+  @Prop(() => Number, { required: true }) delta!: number;
+  @Prop(() => Number, { required: true }) ratio!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+  @Prop(() => Date, { required: true }) shippedAt!: Date;
+  @Prop(() => Timestamp) stamp?: Timestamp;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Number]) prices!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const [row] = await Orders.aggregate((p) =>
+  p.project((f) => ({
+    toUpper: fn.toUpper(f.sku),
+    toLower: fn.toLower(f.sku),
+    strLenCP: fn.strLenCP(f.sku),
+    strLenBytes: fn.strLenBytes(f.sku),
+    concat: fn.concat(f.sku, "/", f.title),
+    split: fn.split(f.sku, "-"),
+    strcasecmp: fn.strcasecmp(f.sku, "pen-001"),
+    _id: 0,
+  })),
+);
+console.log(row);
+// → {toUpper: "PEN-001", toLower: "pen-001", strLenCP: 7, strLenBytes: 7, concat: "PEN-001/  Blue Pen  ", split: ["PEN", "001"], strcasecmp: 0}
+```
+
+Ниже каждый оператор описан отдельно.
+
+### fn.toUpper
+
+Верхний регистр. `fn.toUpper(s)`.
+
+Пример: `fn.toUpper(f.sku)` даёт `"PEN-001"`.
+
+### fn.toLower
+
+Нижний регистр. `fn.toLower(s)`.
+
+Пример: `fn.toLower(f.sku)` даёт `"pen-001"`.
+
+### fn.strLenCP
+
+Длина в кодовых точках Unicode. `fn.strLenCP(s)`.
+
+Пример: `fn.strLenCP(f.sku)` даёт `7`.
+
+### fn.strLenBytes
+
+Длина в байтах UTF-8. `fn.strLenBytes(s)`.
+
+Пример: `fn.strLenBytes(f.sku)` даёт `7`.
+
+### fn.concat
+
+Склейка двух и более строк. `fn.concat(a, b, …)`.
+
+Пример: `fn.concat(f.sku, "/", f.title)` даёт `"PEN-001/  Blue Pen  "`.
+
+### fn.split
+
+Разбивает по разделителю на массив строк. `fn.split(s, разделитель)`.
+
+Пример: `fn.split(f.sku, "-")` даёт `["PEN", "001"]`.
+
+### fn.strcasecmp
+
+Сравнение без учёта регистра: `-1`, `0` или `1`. `fn.strcasecmp(a, b)`.
+
+Пример: `fn.strcasecmp(f.sku, "pen-001")` даёт `0`.
+
+---
+
+## Подстроки и поиск
+
+Подстрока задаётся началом и длиной. Байтовые варианты (`substrBytes`, `indexOfBytes`) считают в байтах UTF-8 и на многобайтовых символах дают другой результат, чем кодовые (`substrCP`, `indexOfCP`).
+
+Один запрос считает сразу все операторы группы:
+
+```ts twoslash
+import { Timestamp } from "mongodb";
+import { Entity, fn, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) quantity!: number;
+  @Prop(() => Number, { required: true }) delta!: number;
+  @Prop(() => Number, { required: true }) ratio!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+  @Prop(() => Date, { required: true }) shippedAt!: Date;
+  @Prop(() => Timestamp) stamp?: Timestamp;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Number]) prices!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const [row] = await Orders.aggregate((p) =>
+  p.project((f) => ({
+    substrCP: fn.substrCP(f.sku, 0, 3),
+    substrBytes: fn.substrBytes(f.sku, 4, 3),
+    substr: fn.substr(f.sku, 0, 3),
+    indexOfCP: fn.indexOfCP(f.sku, "0"),
+    indexOfBytes: fn.indexOfBytes(f.sku, "-"),
+    _id: 0,
+  })),
+);
+console.log(row);
+// → {substrCP: "PEN", substrBytes: "001", substr: "PEN", indexOfCP: 4, indexOfBytes: 3}
+```
+
+Ниже каждый оператор описан отдельно.
+
+### fn.substrCP
+
+Подстрока по кодовым точкам. `fn.substrCP(s, начало, длина)`.
+
+Пример: `fn.substrCP(f.sku, 0, 3)` даёт `"PEN"`.
+
+### fn.substrBytes
+
+Подстрока по байтам. `fn.substrBytes(s, начало, длина)`.
+
+Пример: `fn.substrBytes(f.sku, 4, 3)` даёт `"001"`.
+
+### fn.substr
+
+Устаревшее имя `substrBytes`; в новом коде используйте [`substrBytes`](#fnsubstrbytes) или [`substrCP`](#fnsubstrcp). `fn.substr(s, начало, длина)`.
+
+Пример: `fn.substr(f.sku, 0, 3)` даёт `"PEN"`.
+
+### fn.indexOfCP
+
+Позиция подстроки в кодовых точках, `-1` если нет. `fn.indexOfCP(s, искомое, от?, до?)`.
+
+Пример: `fn.indexOfCP(f.sku, "0")` даёт `4`.
+
+### fn.indexOfBytes
+
+Позиция подстроки в байтах, `-1` если нет. `fn.indexOfBytes(s, искомое, от?, до?)`.
+
+Пример: `fn.indexOfBytes(f.sku, "-")` даёт `3`.
+
+---
+
+## Обрезка и замена
+
+Операторы принимают объект: `input` и остальные поля. Без `chars` обрезаются пробельные символы.
+
+Один запрос считает сразу все операторы группы:
+
+```ts twoslash
+import { Timestamp } from "mongodb";
+import { Entity, fn, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) quantity!: number;
+  @Prop(() => Number, { required: true }) delta!: number;
+  @Prop(() => Number, { required: true }) ratio!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+  @Prop(() => Date, { required: true }) shippedAt!: Date;
+  @Prop(() => Timestamp) stamp?: Timestamp;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Number]) prices!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const [row] = await Orders.aggregate((p) =>
+  p.project((f) => ({
+    trim: fn.trim({ input: f.title }),
+    ltrim: fn.ltrim({ input: f.title }),
+    rtrim: fn.rtrim({ input: f.title }),
+    replaceOne: fn.replaceOne({ input: f.sku, find: "0", replacement: "9" }),
+    replaceAll: fn.replaceAll({ input: f.sku, find: "0", replacement: "9" }),
+    _id: 0,
+  })),
+);
+console.log(row);
+// → {trim: "Blue Pen", ltrim: "Blue Pen  ", rtrim: "  Blue Pen", replaceOne: "PEN-901", replaceAll: "PEN-991"}
+```
+
+Ниже каждый оператор описан отдельно.
+
+### fn.trim
+
+Убирает символы с обоих концов. `fn.trim({ input, chars? })`.
+
+Пример: `fn.trim({ input: f.title })` даёт `"Blue Pen"`.
+
+### fn.ltrim
+
+Убирает символы в начале. `fn.ltrim({ input, chars? })`.
+
+Пример: `fn.ltrim({ input: f.title })` даёт `"Blue Pen  "`.
+
+### fn.rtrim
+
+Убирает символы в конце. `fn.rtrim({ input, chars? })`.
+
+Пример: `fn.rtrim({ input: f.title })` даёт `"  Blue Pen"`.
+
+### fn.replaceOne
+
+Заменяет первое вхождение. `fn.replaceOne({ input, find, replacement })`.
+
+Пример: `fn.replaceOne({ input: f.sku, find: "0", replacement: "9" })` даёт `"PEN-901"`.
+
+### fn.replaceAll
+
+Заменяет все вхождения. `fn.replaceAll({ input, find, replacement })`.
+
+Пример: `fn.replaceAll({ input: f.sku, find: "0", replacement: "9" })` даёт `"PEN-991"`.
+
+---
+
+## Регулярные выражения
+
+Три оператора принимают объект `{ input, regex, options? }`. `regex` — выражение `RegExp` или строка, `options` — флаги, например `"i"`. Индекс совпадения считается в кодовых точках.
+
+Один запрос считает сразу все операторы группы:
+
+```ts twoslash
+import { Timestamp } from "mongodb";
+import { Entity, fn, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) quantity!: number;
+  @Prop(() => Number, { required: true }) delta!: number;
+  @Prop(() => Number, { required: true }) ratio!: number;
+  @Prop(() => Number) discount?: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+  @Prop(() => Date, { required: true }) shippedAt!: Date;
+  @Prop(() => Timestamp) stamp?: Timestamp;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Number]) prices!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const [row] = await Orders.aggregate((p) =>
+  p.project((f) => ({
+    regexMatch: fn.regexMatch({ input: f.sku, regex: /^pen/, options: "i" }),
+    regexFind: fn.regexFind({ input: f.sku, regex: /[0-9]+/ }),
+    regexFindAll: fn.regexFindAll({ input: f.sku, regex: "[A-Z]" }),
+    _id: 0,
+  })),
+);
+console.log(row);
+// → {regexMatch: true, regexFind: {match: "001", idx: 4, captures: []}, regexFindAll: [{match: "P", idx: 0, captures: []}, {match: "E", idx: 1, captures: []}, {match: "N", idx: 2, captures: []}]}
+```
+
+Ниже каждый оператор описан отдельно.
+
+### fn.regexMatch
+
+Проверяет, подходит ли строка под шаблон. `fn.regexMatch({ input, regex, options? })`.
+
+Пример: `fn.regexMatch({ input: f.sku, regex: /^pen/, options: "i" })` даёт `true`.
+
+### fn.regexFind
+
+Первое совпадение: `{ match, idx, captures }` или `null`. `fn.regexFind({ input, regex, options? })`.
+
+Пример: `fn.regexFind({ input: f.sku, regex: /[0-9]+/ })` даёт `{match: "001", idx: 4, captures: []}`.
+
+### fn.regexFindAll
+
+Все совпадения по порядку. `fn.regexFindAll({ input, regex, options? })`.
+
+Пример: `fn.regexFindAll({ input: f.sku, regex: "[A-Z]" })` даёт `[{match: "P", idx: 0, captures: []}, {match: "E", idx: 1, captures: []}, {match: "N", idx: 2, captures: []}]`.
+
+## Особые случаи
+
+Три оператора принимают `chars`: `fn.trim({ input: f.sku, chars: "PEN-" })` убирает с обоих концов любые из перечисленных символов и даёт `"001"`. Символы задаются набором, а не подстрокой: порядок в `chars` не важен.
+
+Длину нельзя считать у отсутствующего поля: `strLenCP` и `strLenBytes` не принимают необязательное поле уже на этапе компиляции.
+
+## Когда не подходит
+
+Для поиска по подстроке в фильтре [`match`](./stages.mdx#match) достаточно оператора `$regex` фильтра, он использует индексы лучше, чем `fn.regexMatch`. Для полнотекстового поиска есть стадия [`search`](./stages.mdx#search).

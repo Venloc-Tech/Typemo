@@ -1,0 +1,298 @@
+---
+title: Фоновые задачи на изменениях
+description: "Как запустить обработчик, который реагирует на новые записи через подписку на изменения и продолжает с того же места после перезапуска"
+icon: Radio
+---
+
+Чтобы выполнять работу в ответ на записи в базу (отправить чек, обновить поиск, пересчитать отчёт), не опрашивайте коллекцию по таймеру: подпишитесь на изменения. **Подписка на изменения** (change stream) — это поток событий, который MongoDB присылает при каждой вставке, изменении и удалении в коллекции. Эта страница строит фоновый обработчик заказов, который отправляет чек на каждый новый заказ и после остановки продолжает ровно с того события, на котором остановился.
+
+Главная трудность фоновой задачи — перезапуск. Подписка видит только события, случившиеся после её открытия: всё, что записано, пока обработчик был выключен, без дополнительных мер потеряется. Решение — **маркер продолжения**: значение, по которому сервер возобновляет поток с нужного места. Обработчик сохраняет его после каждого обработанного события и передаёт при следующем запуске.
+
+## Что предполагается
+
+Клиент подключён по руководству [Подключиться к базе](../connection/connect.mdx), база `shop`, MongoDB работает как реплика-сет (подписки на одиночном `mongod` недоступны). Основы подписки разобраны в руководстве [Подписаться на изменения](../change-streams/watch.mdx). Отправка чека — ваш код (`__sendReceipt__`).
+
+## Быстрый путь
+
+[`Model.watch`](../reference/change-streams/watch.mdx#modelwatch) открывает поток, а цикл `for await` читает события. `await Model.watch()` возвращается, когда курсор уже открыт на сервере: запись сразу после него попадёт в поток, даже если вы начнёте читать позже.
+
+```ts twoslash
+import { type ChangeEvent, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+declare const __sendReceipt__: (orderNumber: string) => Promise<void>;
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) number!: string;
+  @Prop(() => Number, { required: true, min: 0 }) total!: number;
+}
+@Schema({ collection: "job_checkpoints" })
+class Checkpoint extends Entity {
+  @Prop(() => String, { required: true, unique: true }) name!: string;
+  @Prop(() => String, { required: true }) token!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.db().model(Order);
+const Checkpoints = client.db().model(Checkpoint);
+// ---cut---
+const stream = await Orders.watch((pipeline) => pipeline.match({ operationType: "insert" }));
+
+await Orders.create({ number: "A-1", total: 10 });
+
+const event = await stream.next();
+if (event.operationType === "insert") console.log(event.fullDocument.number);
+// → "A-1"
+await stream.close();
+```
+
+Остальная страница превращает этот фрагмент в долгоживущий обработчик: сохранение маркера, продолжение после перезапуска, остановка.
+
+## Описать модели
+
+Заказ — то, за чем мы следим. Контрольная точка хранит маркер под именем обработчика: у каждой фоновой задачи своя точка, поэтому имя уникально.
+
+```ts twoslash title="jobs/models.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  number!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  total!: number;
+}
+
+@Schema({ collection: "job_checkpoints" })
+export class Checkpoint extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  name!: string;
+
+  @Prop(() => String, { required: true })
+  token!: string;
+}
+```
+
+Маркер — обычный объект вида `{ _data: "…" }`. У Typemo нет поля для произвольного объекта, поэтому маркер хранится строкой JSON: `JSON.stringify` при сохранении и `JSON.parse` при чтении возвращают тот же объект.
+
+## Сохранять и читать контрольную точку
+
+Две функции: прочитать маркер (или `undefined` при первом запуске) и записать новый. Запись идёт через [`updateOne`](../reference/writes/writes.mdx#updateone) с `upsert`: первый вызов создаёт точку, следующие обновляют.
+
+```ts twoslash title="jobs/checkpoint.ts"
+import { type ChangeEvent, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+declare const __sendReceipt__: (orderNumber: string) => Promise<void>;
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) number!: string;
+  @Prop(() => Number, { required: true, min: 0 }) total!: number;
+}
+@Schema({ collection: "job_checkpoints" })
+class Checkpoint extends Entity {
+  @Prop(() => String, { required: true, unique: true }) name!: string;
+  @Prop(() => String, { required: true }) token!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.db().model(Order);
+const Checkpoints = client.db().model(Checkpoint);
+// ---cut---
+export const loadToken = async (name: string): Promise<unknown> => {
+  const checkpoint = await Checkpoints.findOne({ name }).plain();
+  return checkpoint === null ? undefined : JSON.parse(checkpoint.token);
+};
+
+export const saveToken = async (name: string, token: unknown): Promise<void> => {
+  await Checkpoints.updateOne({ name }, { $set: { token: JSON.stringify(token) } }, { upsert: true });
+};
+```
+
+## Запустить обработчик
+
+Обработчик открывает поток с сохранённого места, обрабатывает событие за событием и после каждого сохраняет маркер. При первом запуске маркера нет, и поток стартует с текущего момента. Опция [`resumeAfter`](../reference/change-streams/watch.mdx#modelwatchoptions) говорит серверу продолжить сразу после события с этим маркером.
+
+```ts twoslash title="jobs/receipts.ts"
+import { type ChangeEvent, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+declare const __sendReceipt__: (orderNumber: string) => Promise<void>;
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) number!: string;
+  @Prop(() => Number, { required: true, min: 0 }) total!: number;
+}
+@Schema({ collection: "job_checkpoints" })
+class Checkpoint extends Entity {
+  @Prop(() => String, { required: true, unique: true }) name!: string;
+  @Prop(() => String, { required: true }) token!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.db().model(Order);
+const Checkpoints = client.db().model(Checkpoint);
+const loadToken = async (name: string): Promise<unknown> => undefined;
+const saveToken = async (name: string, token: unknown): Promise<void> => {};
+// ---cut---
+export const runReceiptWorker = async (signal: AbortSignal): Promise<void> => {
+  const resumeAfter = await loadToken("receipts");
+  const stream = await Orders.watch(
+    (pipeline) => pipeline.match({ operationType: "insert" }),
+    resumeAfter === undefined ? {} : { resumeAfter },
+  );
+  signal.addEventListener("abort", () => void stream.close());
+
+  const process = async (event: ChangeEvent<Order>): Promise<void> => {
+    if (event.operationType !== "insert") return;
+    await __sendReceipt__(event.fullDocument.number);
+    await saveToken("receipts", stream.resumeToken);
+  };
+
+  for await (const event of stream) await process(event);
+};
+```
+
+Порядок в `process` осознанный: сначала работа, потом маркер. Если процесс упадёт между ними, после перезапуска событие придёт снова, и чек уйдёт дважды. Это гарантия «как минимум один раз». Наоборот (сначала маркер, потом работа) было бы «не более одного раза»: сбой между ними потерял бы чек. Для отправки чека дубль обычно терпимее потери, но обработчик всё равно должен быть **идемпотентным**: повторное событие не должно ломать результат (проверьте, что чек по этому заказу ещё не отправлен).
+
+Остановка — сигнал: `abort` закрывает поток, и цикл `for await` завершается без ошибки, поэтому `runReceiptWorker` возвращается сам.
+
+## Проверить перезапуск
+
+Проверка — то же, что происходит в жизни: остановить обработчик, записать заказы, пока он выключен, запустить снова. Ни один заказ не пропадает, и уже обработанные не повторяются.
+
+```ts twoslash title="jobs/receipts.test.ts"
+import { type ChangeEvent, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+declare const __sendReceipt__: (orderNumber: string) => Promise<void>;
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) number!: string;
+  @Prop(() => Number, { required: true, min: 0 }) total!: number;
+}
+@Schema({ collection: "job_checkpoints" })
+class Checkpoint extends Entity {
+  @Prop(() => String, { required: true, unique: true }) name!: string;
+  @Prop(() => String, { required: true }) token!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.db().model(Order);
+const Checkpoints = client.db().model(Checkpoint);
+const runReceiptWorker = async (signal: AbortSignal): Promise<void> => {};
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+// ---cut---
+const first = new AbortController();
+const running = runReceiptWorker(first.signal);
+await sleep(300);
+await Orders.create({ number: "A-1", total: 10 });
+await sleep(300);
+first.abort();
+await running;
+
+await Orders.create({ number: "A-2", total: 20 }); // written while the worker is stopped
+
+const second = new AbortController();
+const resumed = runReceiptWorker(second.signal);
+await sleep(300);
+second.abort();
+await resumed;
+// receipts sent: A-1, A-2 (each once)
+```
+
+Пауза в 300 миллисекунд после запуска нужна, чтобы обработчик успел прочитать маркер и открыть поток: до этого момента запись событием не станет. Второй запуск начал с сохранённого маркера и первым делом получил `A-2`, записанный в простое; `A-1` он не увидел повторно, потому что маркер уже стоял после него.
+
+## Как выбрать
+
+Спросите себя: **что хуже — потерять событие или обработать дважды?** Платёж или письмо, повтор которых страшен, требуют идемпотентной обработки и гарантии «как минимум один раз», как выше. Если событие можно потерять (обновление кеша, который и так протухнет), можно сохранять маркер до работы. Если реакция нужна только на записи через документ, хватит [хука документа](../hooks/document-hooks.mdx): он проще, но не видит `updateMany` и записи из других процессов.
+
+## Когда это не нужно
+
+Если работа не срочна и допускает задержку в минуты, периодический опрос по полю «обработано» проще и не требует реплика-сета. Если событие нужно только внутри одного процесса, который его сам вызвал, не нужна база как шина: вызовите функцию напрямую. Подписки на одиночном `mongod` не работают.
+
+## Частые ошибки
+
+### Заказ, записанный до первого запуска, не обработан
+
+Обработчик открывает поток с текущего момента, а маркера при первом запуске ещё нет. Заказ, записанный раньше (пока обработчик был выключен или ещё грузил маркер), события не породит: запуск показал, что такой заказ не попал в поток. Разберите накопленное отдельно, запросом по полю «чек не отправлен», а подписку используйте для того, что происходит после старта. Запись, которая идёт сразу после `await Orders.watch()`, не теряется: к этому моменту курсор уже открыт.
+
+### После перезапуска события пропали
+
+Если маркер не сохранён, поток стартует с текущего момента, и всё, что записано в простое, теряется. Храните маркер после каждого события, а не раз в час: чем реже вы его сохраняете, тем больше событий повторится после сбоя.
+
+### Обработчик завис при остановке
+
+Поток не закрыт: `for await` ждёт события. Закройте поток по сигналу остановки, как в `runReceiptWorker`: [`close`](../reference/change-streams/watch.mdx#close) завершает цикл без ошибки.
+
+## Полный пример
+
+```ts twoslash title="jobs/receipts.ts"
+import { type ChangeEvent, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+// your code: sends the receipt of an order
+declare const __sendReceipt__: (orderNumber: string) => Promise<void>;
+
+// jobs/models.ts
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  number!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  total!: number;
+}
+
+@Schema({ collection: "job_checkpoints" })
+export class Checkpoint extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  name!: string;
+
+  @Prop(() => String, { required: true })
+  token!: string;
+}
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.db().model(Order);
+const Checkpoints = client.db().model(Checkpoint);
+
+// jobs/checkpoint.ts: the resume token is kept as a JSON string
+export const loadToken = async (name: string): Promise<unknown> => {
+  const checkpoint = await Checkpoints.findOne({ name }).plain();
+  return checkpoint === null ? undefined : JSON.parse(checkpoint.token);
+};
+
+export const saveToken = async (name: string, token: unknown): Promise<void> => {
+  await Checkpoints.updateOne({ name }, { $set: { token: JSON.stringify(token) } }, { upsert: true });
+};
+
+// jobs/receipts.ts: at-least-once processing with a checkpoint after each event
+export const runReceiptWorker = async (signal: AbortSignal): Promise<void> => {
+  const resumeAfter = await loadToken("receipts");
+  const stream = await Orders.watch(
+    (pipeline) => pipeline.match({ operationType: "insert" }),
+    resumeAfter === undefined ? {} : { resumeAfter },
+  );
+  signal.addEventListener("abort", () => void stream.close());
+
+  const process = async (event: ChangeEvent<Order>): Promise<void> => {
+    if (event.operationType !== "insert") return;
+    await __sendReceipt__(event.fullDocument.number);
+    await saveToken("receipts", stream.resumeToken);
+  };
+
+  for await (const event of stream) await process(event);
+};
+```
+
+<Callout type="migration">
+
+В Mongoose `Model.watch()` тоже возвращает поток драйвера, но события приходят сырыми (`_id` как `ObjectId`, поля в именах базы), а скрытые поля нужно вычищать самому. Здесь события типизированы, документы приходят в кодовых именах, скрытые поля убраны, а `fullDocument` появляется в типе события вставки.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Подписаться на изменения" href="../change-streams/watch.mdx">
+  Фильтры событий, документ до и после, скрытые поля и остановка подписки.
+</Card>
+<Card title="Model.watch" href="../reference/change-streams/watch.mdx#modelwatch">
+  Все опции подписки и типы событий.
+</Card>
+<Card title="История изменений" href="./change-history.mdx">
+  Журнал аудита как альтернатива подписке, когда нужна история, а не реакция.
+</Card>
+<Card title="Кеширование ответов" href="./caching.mdx">
+  Сбрасывайте кеш по событию подписки.
+</Card>
+</Cards>

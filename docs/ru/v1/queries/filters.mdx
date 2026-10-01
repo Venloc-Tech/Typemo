@@ -1,0 +1,745 @@
+---
+title: Фильтры
+description: "Как записать условие поиска: сравнения, наборы значений, массивы, отсутствующие поля, текст и фильтр из пользовательского ввода"
+icon: Filter
+---
+
+**Фильтр** — это объект, который говорит базе, какие документы нужны: `{ price: { $gte: 20 } }`. Ключ фильтра — поле модели, значение — либо само значение поля, либо объект с **операторами**: ключами, которые начинаются с `$` и задают одно условие каждый. Typemo проверяет фильтр дважды: компилятор видит поля и типы, пока вы пишете код, а сам Typemo повторяет проверку перед отправкой запроса, потому что настоящий фильтр часто собирается из данных, которых компилятор не видит.
+
+Если вы впервые работаете с MongoDB, вам достаточно знать, что база не сообщает об опечатке в имени поля: она честно возвращает пустой результат. Typemo сообщает об этом ошибкой сразу, и большая часть страницы объясняет, где именно это спасает.
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель товара магазина. В ней есть числа, массив строк, необязательная дата, поле, которое может быть `null`, и массив вложенных документов:
+
+```ts twoslash title="products/product.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema()
+export class Variant {
+  @Prop(() => String, { required: true })
+  sku!: string;
+
+  @Prop(() => Number, { required: true })
+  qty!: number;
+}
+
+@Schema({ collection: "products" })
+export class Product extends Entity {
+  @Prop(() => String, { required: true })
+  name!: string;
+
+  @Prop(() => Number, { required: true })
+  price!: number;
+
+  @Prop(() => Number, { required: true })
+  stock!: number;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => Date)
+  released?: Date;
+
+  @Prop(() => String, { nullable: true })
+  note!: string | null;
+
+  @Prop(() => [Variant])
+  variants!: Variant[];
+}
+```
+
+В коллекции три товара. `Keyboard`: цена 50, на складе 10, теги `office` и `usb`, вышел 10 января 2025, `note` равен `null`, две вариации (`K-1` в количестве 4 и `K-2` в количестве 0). `Mouse`: цена 20, на складе 0, тег `usb`, вышел 1 июня 2025, `note` равен `"sale"`, одна вариация (`M-1`, 7 штук). `Monitor`: цена 300, на складе 3, тегов нет, даты выхода нет, `note` равен `null`, вариаций нет. Результаты в комментариях `// →` — имена найденных товаров по алфавиту.
+
+## Быстрый путь
+
+Три самых частых условия: равенство, диапазон и «одно из значений». Короткая запись — само значение, длинная — объект с оператором:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+const equal = await Products.find({ name: "Mouse" }).plain();
+// → Mouse
+
+const range = await Products.find({ price: { $gte: 20, $lt: 300 } }).sort({ name: 1 }).plain();
+// → Keyboard, Mouse
+
+const oneOf = await Products.find({ name: { $in: ["Mouse", "Monitor"] } }).sort({ name: 1 }).plain();
+// → Monitor, Mouse
+```
+
+Остальная страница разбирает каждое условие на реальных задачах. Полный перечень операторов с типами полей, к которым они применимы, — в справочнике [Операторы фильтра](../reference/query/filter-operators.mdx).
+
+## Сравнить значение
+
+Условие на одно поле записывается двумя способами, и они равнозначны. `{ price: 50 }` означает «`price` равно 50», то есть то же, что [`$eq`](../reference/query/filter-operators.mdx#eq). Для сравнений больше и меньше нужен объект операторов: [`$gt`, `$gte`, `$lt`, `$lte`](../reference/query/filter-operators.mdx#gt-gte-lt-lte). Несколько операторов в одном объекте работают вместе, как «и»: так записывается диапазон.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+const names = async (query: { plain(): PromiseLike<{ name: string }[]> }) =>
+  (await query.plain()).map((product) => product.name);
+
+console.log(await names(Products.find({ price: { $gte: 20, $lt: 300 } }).sort({ name: 1 })));
+// → ["Keyboard", "Mouse"]
+
+console.log(await names(Products.find({ released: { $gte: new Date("2025-03-01") } })));
+// → ["Mouse"]
+```
+
+Значение в условии должно быть того типа, который у поля: число для числа, `Date` для даты. Так сделано потому, что MongoDB сравнивает значения разных типов без ошибки, но результат никому не нужен: строка `"30"` не больше и не меньше числа 30, она просто другого типа. Typemo останавливает такой фильтр раньше базы, и об этом рассказано в разделе [Строка вместо числа](#строка-вместо-числа).
+
+Идентификаторы работают так же: в фильтре по `_id` можно передать строку, Typemo сама превратит её в `ObjectId`. Строка, которая не похожа на идентификатор, — [`CastError`](../reference/errors/data-errors.mdx#casterror).
+
+## Выбрать из набора значений
+
+Когда подходит любое из нескольких значений, используйте [`$in`](../reference/query/filter-operators.mdx#in), а когда не должно подходить ни одно из них — [`$nin`](../reference/query/filter-operators.mdx#nin). Это короткая запись длинной цепочки равенств: выбрать товары по списку имён или заказы по списку идентификаторов.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+const picked = await Products.find({ name: { $in: ["Mouse", "Monitor"] } }).sort({ name: 1 }).plain();
+// → ["Monitor", "Mouse"]
+
+const rest = await Products.find({ name: { $nin: ["Mouse"] } }).sort({ name: 1 }).plain();
+// → ["Keyboard", "Monitor"]
+```
+
+Операнд `$in` обязан быть массивом. Если такой фильтр пришёл во время работы, а не из вашего кода с типами, Typemo бросает `CastError`: `Cast to Array failed at path "price.$in" for 5 (number): $in takes an array [type]`.
+
+## Соединить условия
+
+Несколько ключей в одном фильтре работают как «и»: товары дороже 10 и с ненулевым остатком записываются просто двумя полями. Отдельный оператор нужен для «или» и для «ни одного из».
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+const both = await Products.find({ price: { $gt: 10 }, stock: { $gt: 0 } }).sort({ name: 1 }).plain();
+// → ["Keyboard", "Monitor"]
+
+const either = await Products.find({ $or: [{ price: { $lt: 30 } }, { stock: 3 }] })
+  .sort({ name: 1 })
+  .plain();
+// → ["Monitor", "Mouse"]
+
+const neither = await Products.find({ $nor: [{ price: { $lt: 30 } }, { stock: 3 }] }).plain();
+// → ["Keyboard"]
+```
+
+[`$or`](../reference/query/filter-operators.mdx#or) требует, чтобы выполнилось хотя бы одно условие списка, [`$nor`](../reference/query/filter-operators.mdx#nor) — чтобы не выполнилось ни одно. Оператор [`$and`](../reference/query/filter-operators.mdx#and) нужен редко: он пригождается, когда одно и то же поле или один и тот же оператор надо повторить дважды. [`$not`](../reference/query/filter-operators.mdx#not) меняет условие на обратное, но подходит и тем документам, у которых поля нет: `{ released: { $not: { $gt: date } } }` находит и `Keyboard`, и `Monitor`, у которого даты нет вообще. Если условие можно выразить обратным оператором, используйте его: `$lte` вместо `$not` с `$gt`.
+
+## Найти по массиву
+
+Поле-массив принимает всё, что принимает его элемент: условие выполняется, если ему подходит хотя бы один элемент. Так `{ tags: "usb" }` находит товары, в тегах которых есть `usb`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+const usb = await Products.find({ tags: "usb" }).sort({ name: 1 }).plain();
+// → ["Keyboard", "Mouse"]
+
+const both = await Products.find({ tags: { $all: ["usb", "office"] } }).plain();
+// → ["Keyboard"]
+
+const untagged = await Products.find({ tags: { $size: 0 } }).plain();
+// → ["Monitor"]
+```
+
+[`$all`](../reference/query/filter-operators.mdx#all) требует, чтобы в массиве были все перечисленные значения, в любом порядке. [`$size`](../reference/query/filter-operators.mdx#size) проверяет точную длину: условия «не меньше трёх тегов» через него записать нельзя, для них храните длину в отдельном поле.
+
+### Условие на один элемент массива вложенных документов
+
+У `Keyboard` две вариации: `K-1` в количестве 4 и `K-2` в количестве 0. Нужен товар, у которого есть вариация `K-1` с нулевым остатком. Такой вариации нет, но запись с двумя ключами её «находит»:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+const wrong = await Products.find({ "variants.sku": "K-1", "variants.qty": 0 }).plain();
+// → ["Keyboard"]
+
+const right = await Products.find({ variants: { $elemMatch: { sku: "K-1", qty: 0 } } }).plain();
+// → []
+```
+
+Условия по вложенным полям массива проверяются независимо: `sku` совпал у первого элемента, а `qty` — у второго, и товар подошёл. [`$elemMatch`](../reference/query/filter-operators.mdx#elemmatch) требует, чтобы **один и тот же** элемент удовлетворял всем условиям сразу. Всякий раз, когда вам нужны два условия про одну и ту же вложенную запись, нужен именно он.
+
+## Условие на вложенное поле
+
+Поле вложенного документа записывается через точку, как путь: `"variants.sku"`. Компилятор знает такие пути и подсказывает их в редакторе, а несуществующий путь не пропускает.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+const found = await Products.find({ "variants.sku": "M-1" }).plain();
+// → ["Mouse"]
+```
+
+Для массива вложенных документов условие по пути проверяет элементы по очереди, и достаточно одного подходящего. Для условий «вместе на одном элементе» нужен [`$elemMatch`](#условие-на-один-элемент-массива-вложенных-документов), о котором сказано выше.
+
+## Найти документы без поля или со значением null
+
+В MongoDB «поля нет» и «в поле лежит `null`» — разные состояния, и фильтры для них разные. Документы без поля находит [`$exists`](../reference/query/filter-operators.mdx#exists) со значением `false`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+const unreleased = await Products.find({ released: { $exists: false } }).plain();
+// → ["Monitor"]
+```
+
+Поле со значением `null` существует, поэтому `{ note: { $exists: true } }` вернёт все три товара. Чтобы найти именно `null`, сравните с `null` напрямую:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+const noNote = await Products.find({ note: null }).sort({ name: 1 }).plain();
+// → ["Keyboard", "Monitor"]
+```
+
+Сравнение с `null` разрешено только для полей, которые могут быть `null` (здесь это `note`). Для поля `released` фильтр `{ released: null }` не скомпилируется. Typemo так строг потому, что иначе в фильтре «поля нет» и «`null`» смешались бы, и вы нашли бы не то, что искали.
+
+## Найти по тексту
+
+Условие по строке в виде регулярного выражения записывает [`$regex`](../reference/query/filter-operators.mdx#regex): строкой-шаблоном или объектом `RegExp`. Флаги для строки-шаблона задаются в соседнем `$options`, а у `RegExp` они пишутся в самом выражении.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+const byPattern = await Products.find({ name: { $regex: "^m", $options: "i" } }).sort({ name: 1 }).plain();
+// → ["Monitor", "Mouse"]
+
+const byRegExp = await Products.find({ name: /^Mo/ }).sort({ name: 1 }).plain();
+// → ["Monitor", "Mouse"]
+```
+
+Когда шаблон составляет пользователь, экранируйте его: специальные символы в его строке станут частью выражения, и поиск по `.*` вернёт всю коллекцию.
+
+```ts twoslash title="products/products.service.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+export const findByName = (text: string) =>
+  Products.find({ name: { $regex: escapeRegExp(text), $options: "i" } }).plain();
+
+console.log((await findByName(".*")).length, (await findByName("mo")).length);
+// → 0 2
+```
+
+Поиск по началу строки (`^Mo`) может использовать индекс, а поиск по середине читает все значения поля. Для настоящего полнотекстового поиска регулярные выражения не подходят: см. [Полнотекстовый и векторный поиск](./text-and-vector-search.mdx).
+
+## Собрать фильтр из пользовательского ввода
+
+Чаще всего фильтр строится из параметров запроса: клиент выбирает тег, минимальную цену или часть названия. Каждый параметр необязателен, поэтому фильтр собирается по частям, и в него попадают только заданные условия. Для этого удобен [`.where(filter)`](../reference/query/conditions.mdx#wherefilter): он добавляет условия к запросу, не заменяя уже добавленные.
+
+```ts twoslash title="products/products.service.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+export const searchProducts = (params: { text?: string; minPrice?: number; tag?: string }) => {
+  let query = Products.find().sort({ name: 1 });
+  if (params.tag !== undefined) query = query.where({ tags: params.tag });
+  if (params.minPrice !== undefined) query = query.where({ price: { $gte: params.minPrice } });
+  if (params.text !== undefined) {
+    query = query.where({ name: { $regex: escapeRegExp(params.text), $options: "i" } });
+  }
+  return query.plain();
+};
+
+console.log((await searchProducts({ tag: "usb", minPrice: 30 })).map((product) => product.name));
+// → ["Keyboard"]
+console.log((await searchProducts({})).length);
+// → 3
+```
+
+Условия складываются через «и», а запрос без параметров возвращает все товары: пустой фильтр в чтении разрешён. Обратите внимание, что в `where` попадают уже проверенные значения (число, строка), а не сырой объект запроса.
+
+Причина в том, что сырой объект от клиента может содержать операторы. Тело запроса `{"name": {"$gt": ""}}` — допустимое условие для строкового поля, и если передать его в `find` целиком, оно выполнится и вернёт все товары:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+const body: unknown = JSON.parse('{"name":{"$gt":""}}');
+
+// неправильно: клиент решает, какие операторы будут в фильтре
+const all = await Products.find({ name: body as string }).plain();
+console.log(all.length);
+// → 3
+```
+
+Typemo ловит только явные нарушения: неизвестное поле, неизвестный оператор, `$where`, `undefined`, значение не того типа. Он не может знать, что `{ "$gt": "" }` пришёл от клиента, а не написан вами. Поэтому проверяйте ввод (типы, формат, диапазон) и собирайте фильтр в своём коде, как выше. Как дополнительную страховку оберните значение из запроса в [`untrusted`](../reference/policies/soft-delete-and-untrusted.mdx#untrusted): она отвергает любой ключ с `$` на любой глубине. Подробнее — в руководстве [Недоверенный ввод](../policies/untrusted-input.mdx).
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+import { untrusted } from "@venloc/typemo";
+
+const body: unknown = JSON.parse('{"$gt":""}');
+await Products.find({ name: untrusted(body) as string });
+// StrictModeError: untrusted value: "$gt" at "$gt" — an operator inside data from outside (query selector injection); validate the input and build the filter yourself [sanitize]
+```
+
+## Собрать фильтр по частям
+
+Не только пользовательский ввод, но и обычный код иногда добавляет условия по одному: одна функция ограничивает права, другая добавляет диапазон. Кроме `.where(filter)` у запроса есть цепочка на одном поле, [`.where("поле")`](../reference/query/conditions.mdx#wherepath), с методами вроде `gte` и `lt`:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+const query = Products.find().where("price").gte(20).lt(300).where("stock").gt(0);
+console.log(query.filter());
+// → { price: { $gte: 20, $lt: 300 }, stock: { $gt: 0 } }
+
+console.log((await query.plain()).map((product) => product.name));
+// → ["Keyboard"]
+```
+
+Запись читается лучше, чем вложенные объекты, когда границы диапазона приходят из разных мест. Кроме того, цепочка сужает тип результата: после `.where("role").in([...])` компилятор знает, что в результате поле `role` принимает только эти значения. Подробности и остальные методы цепочки — в справочнике [Условия цепочкой](../reference/query/conditions.mdx).
+
+## Как выбрать
+
+Задайте себе один вопрос: **откуда берётся условие?** Если вы пишете его в коде и оно фиксировано, пишите объектом: `{ price: { $gte: 20 } }` — самая короткая и самая ясная запись. Если условия добавляются по частям в разных местах, особенно из необязательных параметров, используйте [`.where(filter)`](../reference/query/conditions.mdx#wherefilter). Если вам важнее читаемость диапазона на одном поле или сужение типа результата, используйте [`.where("поле")`](../reference/query/conditions.mdx#wherepath).
+
+Если условие пришло от клиента целиком, не передавайте его в запрос как фильтр: разберите ввод и постройте фильтр сами.
+
+## Когда это не нужно
+
+Если вам нужен один документ по `_id`, фильтр не нужен: используйте [`findById`](../reference/query/reading.mdx#modelfindbyid), который принимает и строку из адреса. Если нужно только проверить, есть ли подходящий документ, используйте [`exists`](../reference/query/reading.mdx#modelexists), а если нужно число документов — [`countDocuments`](../reference/query/reading.mdx#modelcountdocuments). Для поиска по смыслу текста и по вектору фильтры не годятся: см. [Полнотекстовый и векторный поиск](./text-and-vector-search.mdx).
+
+## Частые ошибки
+
+### Строка вместо числа
+
+Число пришло из адреса запроса строкой, и вы передали его в фильтр как есть. Компилятор останавливает такой код:
+
+```ts twoslash
+// @errors: 2322
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+Products.find({ price: "30" });
+```
+
+Если фильтр собрался во время работы, Typemo не отправит его в базу и бросит `CastError`:
+
+```text
+CastError: Cast to number failed at path "price" for "30" (string): expected a number [type]
+```
+
+Причина в том, что MongoDB не считает строку `"30"` ни равной числу 30, ни больше его: запрос вернул бы пустой результат без единой ошибки. Переведите значение в число сами: `Number(params.price)`, и проверьте, что получилось не `NaN`.
+
+### `undefined` в фильтре
+
+Необязательный параметр не пришёл, и в фильтр попало `{ price: undefined }`. Компилятор такой код не пропускает; во время работы `find` бросает `QueryError`:
+
+```text
+QueryError: filter: undefined at "price" (use $exists: false / $unset; undefined is never a value)
+```
+
+Если бы Typemo молча превращал `undefined` в «условия нет», вы получили бы не тех пользователей, которых искали, а все документы. Добавляйте условие только при заданном параметре, как в функции `searchProducts` выше. Чтобы найти документы без поля, скажите об этом явно: `{ price: { $exists: false } }`.
+
+### Опечатка в имени поля
+
+Компилятор подчёркивает неизвестное поле; во время работы Typemo бросает `StrictModeError`:
+
+```ts twoslash
+// @errors: 2345
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+Products.find({ nope: 1 });
+```
+
+```text
+StrictModeError: filter: "nope" is not a field of Product [unknown-path]
+```
+
+MongoDB вернула бы пустой массив: поля `nope` нет ни у одного документа, значит, ни один не подошёл. Ошибку пришлось бы искать по странному поведению приложения.
+
+Компилятор видит только те ключи, которые написаны в коде или описаны в типе фильтра. Фильтр, собранный во время работы, например объект типа `Record<string, unknown>` (или `{ [key: string]: unknown }`) из разбора параметров, компилятор принимает целиком: ключей этого объекта он не знает. Так работают `find`, `findOne`, `countDocuments`, `exists` и записи с фильтром (`updateOne`, `updateMany`, `deleteOne`, `deleteMany`, `findOneAnd*`). Поэтому для такого фильтра опечатка в ключе и значение не того типа обнаруживаются только при запуске запроса, теми же `StrictModeError` и `CastError`, а до базы запрос всё равно не доходит. Чтобы компилятор помогал и здесь, собирайте фильтр частями через [`.where(filter)`](../reference/query/conditions.mdx#wherefilter) и литералы, как в разделе [Собрать фильтр из пользовательского ввода](#собрать-фильтр-из-пользовательского-ввода).
+
+### Два условия про один элемент проверяются на разных элементах
+
+Условия по вложенным полям массива вернули товар, у которого нет ни одной подходящей вариации. Причина и исправление описаны выше: используйте [`$elemMatch`](../reference/query/filter-operators.mdx#elemmatch), чтобы условия проверялись на одном и том же элементе.
+
+### Оператор не подходит к типу поля
+
+Регулярное выражение по числу не имеет смысла, и `Products.find({ price: { $regex: "5" } })` не скомпилируется. Во время работы Typemo бросает `StrictModeError`:
+
+```text
+StrictModeError: $regex applies to strings only (at "price.$regex") [sanitize]
+```
+
+Это сообщает о путанице типов раньше, чем она даст неверный результат. Для каждого оператора в справочнике [Операторы фильтра](../reference/query/filter-operators.mdx) указано, к каким полям он применим.
+
+## Полный пример
+
+Один сервис товаров: поиск по параметрам запроса, товары с вариацией нужного количества и список без даты выхода. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="products/products.service.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema()
+class Variant {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "products" })
+class Product extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => Number, { required: true }) price!: number;
+  @Prop(() => Number, { required: true }) stock!: number;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Date) released?: Date;
+  @Prop(() => String, { nullable: true }) note!: string | null;
+  @Prop(() => [Variant]) variants!: Variant[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Products = client.db().model(Product);
+// ---cut---
+import { CastError, StrictModeError } from "@venloc/typemo";
+
+// код читателя: ошибка на границе приложения
+class __BadRequest__ extends Error {}
+
+const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// поиск по необязательным параметрам запроса
+export const searchProducts = async (params: { text?: string; minPrice?: number; tag?: string }) => {
+  let query = Products.find().sort({ name: 1 });
+  if (params.tag !== undefined) query = query.where({ tags: params.tag });
+  if (params.minPrice !== undefined) query = query.where({ price: { $gte: params.minPrice } });
+  if (params.text !== undefined) {
+    query = query.where({ name: { $regex: escapeRegExp(params.text), $options: "i" } });
+  }
+  try {
+    return await query.plain();
+  } catch (error) {
+    // ошибки фильтра — это ошибки ввода клиента, а не сбой сервера
+    if (error instanceof CastError || error instanceof StrictModeError) {
+      throw new __BadRequest__("the search parameters are invalid");
+    }
+    throw error;
+  }
+};
+
+// у вариации этого товара есть нужный остаток
+export const withVariant = (sku: string, qty: number) =>
+  Products.find({ variants: { $elemMatch: { sku, qty } } }).plain();
+
+// товары без даты выхода
+export const unreleased = () => Products.find({ released: { $exists: false } }).plain();
+```
+
+<Callout type="migration">
+
+В Mongoose поле, которого нет в схеме, при `strictQuery` молча выбрасывалось из фильтра, а без него уходило в базу как есть. В Typemo неизвестное поле, неизвестный оператор, `undefined`, значение не того типа и `$where` всегда ошибка. Оператор из ввода клиента (`{ "$gt": "" }` вместо строки) Typemo сам не отвергает, если он допустим для поля: проверяйте ввод и при необходимости оборачивайте его в [`untrusted`](../reference/policies/soft-delete-and-untrusted.mdx#untrusted).
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Операторы фильтра" href="../reference/query/filter-operators.mdx">
+  Каждый оператор: к каким типам полей применим, что означает и какие ошибки бросает.
+</Card>
+<Card title="Условия цепочкой" href="../reference/query/conditions.mdx">
+  `.where`, `.and`, `.or`, `.merge` и методы цепочки поля, сужение типа результата.
+</Card>
+<Card title="Недоверенный ввод" href="../policies/untrusted-input.mdx">
+  Защита от инъекции операторов и правила проверки данных из запросов.
+</Card>
+<Card title="Выбор полей и тип результата" href="./projections.mdx">
+  Как вернуть только нужные поля и что при этом происходит с типом.
+</Card>
+<Card title="Сортировка и страницы" href="./sorting-and-pages.mdx">
+  Порядок документов, ограничение и постраничный вывод найденного.
+</Card>
+</Cards>

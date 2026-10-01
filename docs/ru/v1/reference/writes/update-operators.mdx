@@ -1,0 +1,1326 @@
+---
+title: Операторы обновления
+description: "Все операторы обновления и модификаторы: к каким полям применимы, что принимают, что делают и какие ошибки бросают"
+icon: Wrench
+---
+
+На этой странице описаны все операторы, которые принимают [`updateOne`](./writes.mdx#updateone), [`updateMany`](./writes.mdx#updatemany), [`findOneAndUpdate`](./writes.mdx#findoneandupdate) и [`findByIdAndUpdate`](./writes.mdx#findbyidandupdate), а также модификаторы `$each`, `$position`, `$slice` и `$sort` оператора `$push`. Для каждого указано, к каким полям он применим, какое значение принимает и что делает с документом.
+
+Если вы только начинаете, сначала прочитайте руководство [Операторы обновления](../../writes/update-operators.mdx). Эта страница — справочник.
+
+**Оператор обновления** — это ключ, который начинается с `$` и говорит базе, что сделать с полем: `$inc` прибавляет число, `$push` дописывает элемент в массив. Обновление — объект, в котором ключи первого уровня — операторы, а значения — объекты «путь: операнд». Работает это так, потому что база меняет документ на месте и атомарно: два параллельных `$inc` дадут в сумме оба прибавления, тогда как «прочитать, прибавить, записать» потеряло бы одно из них.
+
+Typemo проверяет обновление дважды. Компилятор знает поля модели и то, какие операторы к каким полям применимы, а во время работы Typemo приводит значения к типам схемы и запускает валидаторы полей. Кроме того, обновление отвергается целиком, если оно пусто (`{}` или оператор без путей), если один путь меняют два оператора (сервер отвечает ошибкой 40) или если в значении стоит `undefined`: `undefined` не бывает значением, для удаления поля есть `$unset`.
+
+Все примеры используют одну модель счёта и один исходный документ.
+
+```ts twoslash title="accounts/account.ts"
+import { type Defaulted, Entity, type Immutable, Prop, Schema, Spec } from "@venloc/typemo";
+
+@Schema()
+export class Line {
+  @Prop(() => String, { required: true })
+  sku!: string;
+
+  @Prop(() => Number, { required: true })
+  qty!: number;
+}
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  owner!: string;
+
+  @Prop(() => Number, { min: 0, default: 0 })
+  balance!: Defaulted<number>;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => String)
+  note?: string;
+
+  @Prop(() => String)
+  nickname?: string;
+
+  @Prop(() => String)
+  alias?: string;
+
+  @Prop(() => Date)
+  lastLogin?: Date;
+
+  @Prop(() => Number)
+  flags?: number;
+
+  @Prop(() => BigInt)
+  points?: bigint;
+
+  @Prop(() => [Number])
+  scores!: number[];
+
+  @Prop(() => [Line])
+  lines!: Line[];
+
+  @Prop(() => Spec.map(Number))
+  counters?: Map<string, number>;
+
+  @Prop(() => String, { immutable: true })
+  region?: Immutable<string>;
+}
+```
+
+Исходный документ, с которого начинается каждый пример: `title: "Main"`, `owner: "alice"`, `balance: 10`, `tags: ["a", "b"]`, `nickname: "al"`, `points: 10n`, `flags: 1`, `scores: [5, 3]`, `lines: [{ sku: "x", qty: 1 }, { sku: "y", qty: 5 }]`, `counters: { logins: 1 }`. Результат в комментарии `// →` — то, что лежит в базе после обновления.
+
+Приведём общее правило для операндов. `ObjectId` и `UUID` принимают строку, `int64` (`bigint`) — десятичную строку, в том числе в `$inc`, `$mul`, `$min` и `$max`. Число вместо строки `"5"` в `$inc` для поля-числа не принимается.
+
+---
+
+## $set
+
+`$set` записывает значения в поля. Это самый частый оператор: сменить владельца, записать заметку, обновить вложенное поле. Путь может быть вложенным через точку (`"lines.0.qty"`) и указывать на запись `Map` (`"counters.logins"`).
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $set: { owner: "bob", "counters.logins": 5 } });
+// → owner: "bob", counters: { logins: 5 }
+```
+
+<Params>
+<Param name="paths" type="{ [path]: value }">
+
+Пути записи и новые значения. Значение приводится к типу поля и проходит его валидаторы (`min`, `enum`, собственные). Встроенный документ проверяется целиком, вместе с `required` внутри. `null` принимается только для полей, которые объявлены `nullable`. Путь `_id` менять нельзя.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$set?: SetFields<T, false, Loose>
+// SetFields<T>: { [P in WritePaths<T>]?: InputOf<WriteValue<T, P>> }, без "_id"
+```
+
+</FullType>
+
+### Ошибки
+
+Неизвестный путь, значение не того типа и нарушение валидатора останавливаются до отправки:
+
+```text
+StrictModeError: $set: "nope" is not a field of Account [unknown-path]
+CastError: Cast to number failed at path "$set.balance" for "abc" (string): expected a number [type]
+ValidationError: Validation failed: "balance": must be at least 0 [min]
+CastError: Cast to string failed at path "$set.nickname" for null: null is not allowed on a path that is not nullable [null]
+StrictModeError: $set._id: "_id" is immutable; it is written only when the document is created ($setOnInsert on upsert) [immutable]
+```
+
+Значение `undefined` отвергает сам разбор обновления. Такое значение легко получить из необязательного параметра, а драйвер записал бы вместо него `null`:
+
+```text
+QueryError: update: undefined at "$set.nickname" (use $exists: false / $unset; undefined is never a value)
+```
+
+Путь через массив без индекса и без позиционного знака отвергается: сервер такое не выполняет.
+
+```text
+StrictModeError: $set.lines.qty: "lines.qty": "qty" goes through the array "lines" without an index or a positional token ($, $[], $[id]) — the server refuses it (code 28) [unknown-path]
+```
+
+### Когда не подходит
+
+Чтобы прибавить число, а не записать его, используйте [`$inc`](#inc). Чтобы удалить поле, [`$unset`](#unset). Чтобы заменить документ целиком, [`replaceOne`](./writes.mdx#replaceone). Руководство: [Операторы обновления](../../writes/update-operators.mdx).
+
+---
+
+## $setOnInsert
+
+`$setOnInsert` записывает значения **только тогда, когда `upsert` вставил новый документ**. Если документ уже был, оператор ничего не делает. Он нужен для начальных значений, которые не должны затирать существующие данные: дата создания, стартовый баланс, значения полей с `Immutable`.
+
+Это единственное место, где поле с `Immutable` можно записать: такое поле пишется при создании документа и после этого не меняется.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne(
+  { title: "Fresh" },
+  { $set: { owner: "carol" }, $setOnInsert: { balance: 100, region: "eu" } },
+  { upsert: true },
+);
+// → вставлен документ: owner: "carol", balance: 100, region: "eu"
+```
+
+<Params>
+<Param name="paths" type="{ [path]: value }">
+
+Те же пути и значения, что у [`$set`](#set), но допускаются и поля с `Immutable`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$setOnInsert?: SetFields<T, true, Loose>
+```
+
+</FullType>
+
+### Ошибки
+
+Запись поля с `Immutable` любым другим оператором отвергается:
+
+```text
+StrictModeError: $set.region: "region" is immutable; it is written only when the document is created ($setOnInsert on upsert) [immutable]
+StrictModeError: $unset.region: "region" is immutable; it is written only when the document is created ($setOnInsert on upsert) [immutable]
+```
+
+### Когда не подходит
+
+Без `upsert` оператор бесполезен. Для значений, которые нужно записывать всегда, — [`$set`](#set). Про `upsert` — [опция `upsert`](./writes.mdx#upsert).
+
+---
+
+## $unset
+
+`$unset` удаляет поля из документа. Он нужен, когда значение исчезает, а не становится пустым: убрать заметку, очистить прозвище. Значение в операнде не важно, принимаются `""`, `1` и `true`.
+
+Удалять можно только **необязательные** поля (`?:`): обязательное поле после удаления нарушило бы схему.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $unset: { nickname: "" } });
+// → поле nickname удалено
+```
+
+<Params>
+<Param name="paths" type={'{ [path]: "" | 1 | true }'}>
+
+Пути необязательных полей. Путь обязательного поля и путь элемента массива компилятор не принимает.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$unset?: { [P in UnsetPaths<T>]?: "" | 1 | true } & LooseEntries<T, Loose>
+```
+
+</FullType>
+
+### Ошибки
+
+Если обязательное поле всё же удаляется (типы обойдены), Typemo останавливает обновление:
+
+```text
+ValidationError: Validation failed: "title": the field is required; $unset would remove it [required]
+```
+
+### Когда не подходит
+
+Чтобы записать `null`, используйте [`$set`](#set) на поле с `nullable`. Чтобы убрать элемент из массива, [`$pull`](#pull) или [`$pop`](#pop).
+
+---
+
+## $inc
+
+`$inc` прибавляет число к числовому полю (отрицательное вычитает). Он нужен для счётчиков и балансов: операция атомарна, поэтому одновременные прибавления не теряются.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $inc: { balance: 5, points: "3" } });
+// → balance: 15, points: 13n
+```
+
+<Params>
+<Param name="paths" type="{ [path]: number | bigint | Int64String | Decimal128 }">
+
+Пути числовых полей и числа **того же вида**, что поле: для `number` — число, для `bigint` (int64) — `bigint` или его десятичная строка, для `Decimal128` — `Decimal128`. Строка вместо числа для поля-числа — `CastError`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$inc?: { [P in NumericPaths<T>]?: NumericOperand<NonNullable<WriteValue<T, P>>> } & LooseEntries<T, Loose>
+```
+
+</FullType>
+
+### Границы `min` и `max`
+
+Если у поля есть `min` или `max`, результат `$inc` зависит от значения в базе, поэтому проверить его заранее нельзя. Typemo делает обновление **условным**: в фильтр добавляется условие, которое сервер проверяет на хранимом значении. Результат вне диапазона не записывается никогда, и вы получаете `ValidationError`, в тексте которого есть хранимое значение и итог:
+
+```text
+ValidationError: Validation failed: "balance": $inc -1000 on 10 gives -990, below the minimum 0; nothing was written [min]
+```
+
+Если документа нет вовсе, ошибки нет: обычный результат `matchedCount: 0`. Ограничения: с `upsert` такое обновление отвергается (сервер вставил бы новый документ), в `bulkWrite` тоже, а путь через массив (`$`, `$[]`, `$[id]`, индекс) не защищается. В `updateMany` документы вне диапазона находятся до записи, и тогда не записывается ничего.
+
+### Ошибки
+
+```text
+StrictModeError: $inc does not apply to this field (at "$inc.owner") [sanitize]
+CastError: Cast to number failed at path "$inc.balance" for "1" (string): expected a number [type]
+```
+
+### Когда не подходит
+
+Чтобы умножить, [`$mul`](#mul). Чтобы записать значение, [`$set`](#set). Чтобы поднять значение до порога, [`$max`](#max).
+
+---
+
+## $mul
+
+`$mul` умножает числовое поле на число. Типы полей и операндов те же, что у [`$inc`](#inc).
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $mul: { balance: 3 } });
+// → balance: 30
+```
+
+<Params>
+<Param name="paths" type="{ [path]: number | bigint | Int64String | Decimal128 }">
+
+Пути числовых полей и множители того же вида. Защита `min` и `max` действует так же, как у [`$inc`](#inc).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$mul?: { [P in NumericPaths<T>]?: NumericOperand<NonNullable<WriteValue<T, P>>> } & LooseEntries<T, Loose>
+```
+
+</FullType>
+
+### Когда не подходит
+
+Чтобы прибавить, [`$inc`](#inc).
+
+---
+
+## $min
+
+`$min` понижает поле до значения, если значение **меньше** текущего. Он нужен для «наименьшего из виденных»: самая ранняя дата, минимальная цена.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $min: { balance: 4 } });
+// → balance: 4 (было 10)
+await Accounts.updateOne({ title: "Main" }, { $min: { balance: 40 } });
+// → balance остаётся 4
+```
+
+<Params>
+<Param name="paths" type="{ [path]: value }">
+
+Пути упорядочиваемых полей (числа, строки, даты) и значение того же типа. Проверяется само значение: результат — либо оно, либо уже хранимое значение.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$min?: { [P in OrderablePaths<T>]?: CompareOf<NonNullable<WriteValue<T, P>>> } & LooseEntries<T, Loose>
+```
+
+</FullType>
+
+### Когда не подходит
+
+Чтобы поднять поле до значения, [`$max`](#max). Чтобы записать безусловно, [`$set`](#set).
+
+---
+
+## $max
+
+`$max` повышает поле до значения, если значение **больше** текущего. Симметричен [`$min`](#min).
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $max: { points: 100n } });
+// → points: 100n (было 10n)
+```
+
+<Params>
+<Param name="paths" type="{ [path]: value }">
+
+Пути упорядочиваемых полей и значение того же типа.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$max?: { [P in OrderablePaths<T>]?: CompareOf<NonNullable<WriteValue<T, P>>> } & LooseEntries<T, Loose>
+```
+
+</FullType>
+
+### Когда не подходит
+
+Чтобы понизить, [`$min`](#min).
+
+---
+
+## $currentDate
+
+`$currentDate` записывает текущее время **сервера**. Оно нужно, когда важно, чтобы все записи получили время из одного источника, а не с часов приложений.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $currentDate: { lastLogin: true } });
+// → lastLogin: время сервера
+```
+
+<Params>
+<Param name="paths" type={'{ [path]: true | { : "date" } | { : "timestamp" } }'}>
+
+Пути полей `Date` (`true` или `{ $type: "date" }`) и `Timestamp` (`{ $type: "timestamp" }`).
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$currentDate?: {
+  [P in CurrentDatePaths<T>]?: NonNullable<WriteValue<T, P>> extends Date
+    ? true | { readonly $type: "date" }
+    : { readonly $type: "timestamp" };
+} & LooseEntries<T, Loose>
+```
+
+</FullType>
+
+### Когда не подходит
+
+Если время нужно с часов приложения, запишите его через [`$set`](#set). Для `createdAt` и `updatedAt` есть базовый класс `Timestamped`: он ведёт их сам, и `updatedAt` двигается при любой записи, даже если поля не изменились: `$addToSet` значения, которое в массиве уже есть, у такой модели даёт `modifiedCount: 1`.
+
+---
+
+## $rename
+
+`$rename` переименовывает поле внутри документа: значение переезжает под новое имя, старое поле пропадает. Он нужен при миграции данных.
+
+Источник и приёмник должны быть **необязательными** полями **одного типа**. Позиционные пути не допускаются.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $rename: { nickname: "alias" } });
+// → alias: "al", поля nickname больше нет
+```
+
+<Params>
+<Param name="paths" type="{ [oldPath]: newPath }">
+
+Путь источника и путь приёмника строкой.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$rename?: { [P in RenamePaths<T>]?: RenameTarget<T, P> }
+```
+
+</FullType>
+
+### Ошибки
+
+Приёмник обязан быть путём:
+
+```text
+QueryError: update: $rename "nickname" needs a target path
+```
+
+### Когда не подходит
+
+Переименовать поле у **всех** документов при изменении схемы можно [`updateMany`](./writes.mdx#updatemany) с `Filters.all<Account>()`; само имя поля в схеме задаётся в `@Prop`, а не в обновлении.
+
+---
+
+## $push
+
+`$push` добавляет элемент в **конец массива**. Если нужно добавить несколько элементов сразу, вставить в позицию, отсортировать или обрезать массив, элемент заменяется объектом с `$each` и модификаторами: [`$each`](#each), [`$position`](#position), [`$slice`](#slice), [`$sort`](#sort).
+
+Оператор применим только к полям-массивам. Дубликаты не отсекаются: для уникальных элементов нужен [`$addToSet`](#addtoset).
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $push: { tags: "c" } });
+// → tags: ["a", "b", "c"]
+```
+
+<Params>
+<Param name="paths" type="{ [path]: element | { $each, $position?, $slice?, $sort? } }">
+
+Путь массива и элемент, который приводится к типу элемента массива и проходит его валидаторы. Для массивов поддокументов элемент — объект, проверяемый целиком.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$push?: { [P in ArrayPaths<T>]?: PushOperand<ElementAt<T, P>> } & LooseEntries<T, Loose>
+
+type PushOperand<E> =
+  | InputOf<E>
+  | {
+      readonly $each: readonly InputOf<E>[];
+      readonly $position?: number;
+      readonly $slice?: number;
+      readonly $sort?: PushSort<E>;
+    };
+```
+
+</FullType>
+
+### Ошибки
+
+```text
+CastError: Cast to number failed at path "$push.scores" for "x" (string): expected a number [type]
+StrictModeError: $push applies to arrays (at "$push.owner") [sanitize]
+ValidationError: Validation failed: "lines.+0.qty": the field is required [required]
+```
+
+Последняя ошибка — элемент-поддокумент без обязательного поля `qty`: `+0` означает первый из добавляемых элементов.
+
+### Когда не подходит
+
+Для уникальных элементов — [`$addToSet`](#addtoset). Чтобы заменить массив целиком, [`$set`](#set).
+
+---
+
+## $each
+
+`$each` — модификатор `$push` и `$addToSet`: он превращает операнд в **список** добавляемых элементов. Нужен, чтобы добавить сразу несколько элементов и использовать остальные модификаторы. В `$addToSet` разрешён только `$each`, без остальных.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $addToSet: { tags: { $each: ["a", "c"] } } });
+// → tags: ["a", "b", "c"]
+```
+
+<Params>
+<Param name="$each" type="readonly E[]" required>
+
+Список элементов. Каждый приводится и проверяется как отдельный элемент.
+
+</Param>
+</Params>
+
+---
+
+## $position
+
+`$position` — модификатор `$push`: индекс, с которого вставляются элементы `$each`. Без него элементы добавляются в конец.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $push: { scores: { $each: [9], $position: 1 } } });
+// → scores: [5, 9, 3]
+```
+
+<Params>
+<Param name="$position" type="number">
+
+Индекс вставки. Работает только вместе с `$each`.
+
+</Param>
+</Params>
+
+---
+
+## $slice
+
+`$slice` — модификатор `$push`: обрезает массив **после** добавления. Положительное число оставляет первые N элементов, отрицательное — последние N. Нужен для ограниченных списков: «последние 10 событий».
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $push: { scores: { $each: [9, 1], $slice: -2 } } });
+// → scores: [9, 1]
+```
+
+<Params>
+<Param name="$slice" type="number">
+
+Сколько элементов оставить: положительное — с начала, отрицательное — с конца, `0` — очистить массив.
+
+</Param>
+</Params>
+
+---
+
+## $sort
+
+`$sort` — модификатор `$push`: сортирует массив после добавления. Для массива чисел или строк значение — `1` (по возрастанию) или `-1` (по убыванию). Для массива поддокументов это объект, поля которого — поля элемента: `{ qty: 1 }`.
+
+Когда сочетаются `$sort` и `$slice`, сначала выполняется сортировка, потом обрезка: так можно держать «наибольшие три».
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne(
+  { title: "Main" },
+  { $push: { scores: { $each: [9, 1], $position: 1, $sort: -1, $slice: 3 } } },
+);
+// → scores: [9, 5, 3]
+```
+
+<Params>
+<Param name="$sort" type="1 | -1 | { [field]: 1 | -1 }">
+
+Направление сортировки элементов или полей поддокументов.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+type PushSort<E> = true extends IsPlainObject<E> ? { readonly [K in keyof LeanOf<E>]?: 1 | -1 } : 1 | -1;
+```
+
+</FullType>
+
+---
+
+## $addToSet
+
+`$addToSet` добавляет элемент в массив, **только если его там ещё нет**. Он нужен для множеств: теги, роли, подписчики. Для нескольких элементов используется `$each`.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $addToSet: { tags: "a" } });
+// → tags: ["a", "b"] (без изменений)
+await Accounts.updateOne({ title: "Main" }, { $addToSet: { tags: "c" } });
+// → tags: ["a", "b", "c"]
+```
+
+<Params>
+<Param name="paths" type="{ [path]: element | { $each: element[] } }">
+
+Путь массива и элемент или `$each` со списком.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$addToSet?: { [P in ArrayPaths<T>]?: AddToSetOperand<ElementAt<T, P>> } & LooseEntries<T, Loose>
+```
+
+</FullType>
+
+### Когда не подходит
+
+Если дубликаты допустимы или порядок важен, [`$push`](#push).
+
+---
+
+## $pull
+
+`$pull` удаляет из массива **все элементы, подходящие под условие**. Для массива чисел или строк условие — значение или оператор (`{ $lt: 4 }`, `{ $in: [...] }`); для массива поддокументов — фильтр по полям элемента; для сравнения целого элемента есть `$in`, `$nin`, `$eq`, `$ne`.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $pull: { lines: { qty: { $lt: 3 } } } });
+// → lines: [{ sku: "y", qty: 5 }]
+```
+
+<Params>
+<Param name="paths" type="{ [path]: condition }">
+
+Путь массива и условие для его элементов.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$pull?: { [P in ArrayPaths<T>]?: PullOperand<NonNullable<ElementAt<T, P>>> } & LooseEntries<T, Loose>
+```
+
+</FullType>
+
+### Другие формы
+
+Простые значения: `{ $pull: { tags: "a" } }` даёт `tags: ["b"]`, `{ $pull: { scores: { $lt: 4 } } }` даёт `scores: [5]`, `{ $pull: { tags: { $in: ["a", "b"] } } }` даёт пустой массив.
+
+### Когда не подходит
+
+Чтобы убрать первый или последний элемент, [`$pop`](#pop). Чтобы убрать конкретные значения списком, [`$pullAll`](#pullall).
+
+---
+
+## $pullAll
+
+`$pullAll` удаляет из массива все элементы, равные любому значению из списка. Это `$pull` для случая «убрать именно эти значения».
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $pullAll: { scores: [3, 5] } });
+// → scores: []
+```
+
+<Params>
+<Param name="paths" type="{ [path]: element[] }">
+
+Путь массива и список значений, которые нужно убрать.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$pullAll?: { [P in ArrayPaths<T>]?: readonly InputOf<ElementAt<T, P>>[] } & LooseEntries<T, Loose>
+```
+
+</FullType>
+
+### Когда не подходит
+
+Если убирать нужно по условию, а не по равенству, [`$pull`](#pull).
+
+---
+
+## $pop
+
+`$pop` убирает из массива **один** элемент: последний (`1`) или первый (`-1`). Он нужен для очередей и стеков.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $pop: { scores: 1 } });
+// → scores: [5]
+await Accounts.updateOne({ title: "Main" }, { $pop: { scores: -1 } });
+// → scores: [3] (на исходном документе)
+```
+
+<Params>
+<Param name="paths" type="{ [path]: 1 | -1 }">
+
+`1` — убрать последний элемент, `-1` — первый.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$pop?: { [P in ArrayPaths<T>]?: 1 | -1 } & LooseEntries<T, Loose>
+```
+
+</FullType>
+
+### Ошибки
+
+```text
+CastError: Cast to 1 | -1 failed at path "$pop.scores" for 2 (number): $pop takes 1 (last) or -1 (first) [type]
+```
+
+### Когда не подходит
+
+Чтобы убрать элементы по условию, [`$pull`](#pull).
+
+---
+
+## $bit
+
+`$bit` выполняет побитовую операцию над целым полем: `and`, `or` или `xor`. Он нужен для флагов, упакованных в одно число.
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $bit: { flags: { or: 4 } } });
+// → flags: 5 (было 1)
+```
+
+<Params>
+<Param name="paths" type="{ [path]: { and: n } | { or: n } | { xor: n } }">
+
+Путь целого поля (`number` или `bigint`) и **одна** операция с целым значением.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+$bit?: { [P in IntegerPaths<T>]?: BitOperand<NonNullable<WriteValue<T, P>>> } & LooseEntries<T, Loose>
+
+type BitOperand<V> = { readonly and: V } | { readonly or: V } | { readonly xor: V };
+```
+
+</FullType>
+
+### Ошибки
+
+```text
+CastError: Cast to and | or | xor failed at path "$bit.flags.not" for an object: $bit operation [type]
+```
+
+### Когда не подходит
+
+Для обычных чисел, не флагов, используйте [`$inc`](#inc) и [`$set`](#set).
+
+---
+
+## Позиционные пути
+
+Когда поле лежит внутри элемента массива, путь нужно дополнить указанием **какие** элементы менять. Без этого путь «через массив» сервер не выполняет. Есть четыре способа: индекс (`"scores.0"`), позиционный знак `$` (первый элемент, найденный **фильтром**), `$[]` (все элементы) и `$[имя]` (элементы, выбранные условием `arrayFilters`).
+
+```ts twoslash
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema()
+class Line {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true }) qty!: number;
+}
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+  @Prop(() => String) nickname?: string;
+  @Prop(() => String) alias?: string;
+  @Prop(() => Date) lastLogin?: Date;
+  @Prop(() => Number) flags?: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [Number]) scores!: number[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Spec.map(Number)) counters?: Map<string, number>;
+  @Prop(() => String, { immutable: true }) region?: Immutable<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+await Accounts.updateOne({ title: "Main" }, { $inc: { "lines.$[].qty": 1 } });
+// → lines: [{ sku: "x", qty: 2 }, { sku: "y", qty: 6 }]
+
+await Accounts.updateOne(
+  { title: "Main" },
+  { $set: { "lines.$[l].qty": 0 } },
+  { arrayFilters: [{ "l.sku": "y" }] },
+);
+// → lines: [{ sku: "x", qty: 1 }, { sku: "y", qty: 0 }]
+```
+
+Позиционный знак `$` берёт элемент, который нашёл фильтр по тому же массиву, поэтому в фильтре должно быть условие на этот массив: на сам массив или на путь ниже него (`lines.sku`), на верхнем уровне фильтра или внутри `$and`, `$or`, `$nor`. Без условия сервер отвергает обновление, как только находит документ, а Typemo ловит это раньше, до отправки:
+
+```text
+QueryError: $set: "lines.$.qty" uses the positional $ of the array "lines", but the filter has no condition on "lines"; the server would refuse the update once a document matches. Add a condition on "lines" to the filter, or use $[] (every element) or $[id] with arrayFilters
+```
+
+Знаки `$[]` и `$[имя]` условия в фильтре не требуют.
+
+Правила `arrayFilters` (каждому `$[имя]` свой фильтр, лишних фильтров нет, конвейер их не принимает) описаны в [опции `arrayFilters`](./writes.mdx#arrayfilters). Компилятор проверяет фильтры по элементу массива: для `lines.$[l].qty` доступны `l.sku` и `l.qty`.
+
+---
+
+## Одинаковый путь у двух операторов
+
+Один путь нельзя менять двумя операторами: сервер отвергает такое обновление (код 40), а Typemo находит это раньше, ещё при разборе:
+
+```text
+QueryError: update: "balance" is changed by $inc and $set (server code 40)
+```
+
+Остальные ошибки разбора обновления:
+
+```text
+QueryError: update: an empty update changes nothing
+QueryError: update: operator "$set" is empty
+QueryError: update: unknown operator "$foo"
+QueryError: update: "note" is not an update operator (write { $set: { … } })
+```
+
+Оператор, который здесь не описан, не поддерживается: список принимаемых операторов состоит из `$set`, `$setOnInsert`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`, `$push`, `$addToSet`, `$pull`, `$pullAll`, `$pop` и `$bit`.

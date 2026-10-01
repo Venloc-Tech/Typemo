@@ -1,0 +1,236 @@
+---
+title: Поиск и план запроса
+description: "textScore для оценки релевантности полнотекстового поиска и explain для плана выполнения запроса"
+icon: ScanSearch
+---
+
+Две вещи, которые нужны, когда запрос уже написан, но результат не тот или работает медленно. [`.textScore`](#textscore) добавляет к строкам оценку релевантности при полнотекстовом поиске: насколько каждая строка подошла под искомые слова. [`.explain`](#explain) не возвращает документы, а показывает, как база собирается выполнять запрос: каким индексом, сколько документов просмотрит. Оба метода есть у строителя запроса, который вернул [`find`](./reading.mdx#modelfind).
+
+Если вы только начинаете, сначала прочитайте руководства [Полнотекстовый и векторный поиск](../../queries/text-and-vector-search.mdx) и [Производительность запросов](../../queries/performance.mdx). Эта страница — справочник.
+
+Все примеры используют одну модель статьи. У неё два индекса: текстовый по заголовку и тексту (для полнотекстового поиска) и обычный по числу просмотров.
+
+```ts twoslash title="models/article.ts"
+import { Entity, Index, Prop, Schema } from "@venloc/typemo";
+
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+export class Article extends Entity {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => String, { required: true })
+  body!: string;
+
+  @Prop(() => Number, { required: true })
+  views!: number;
+}
+```
+
+В коллекции три статьи. «Typed queries» (в тексте «queries in mongodb», 5 просмотров), «Mongo tips» (в тексте слова «typed» три раза и «queries», 50 просмотров) и «Cooking» (текст «pasta», 500 просмотров). Индексы созданы [синхронизацией](../../collections/index-sync.mdx).
+
+---
+
+## .textScore
+
+Полнотекстовый поиск — это фильтр [`$text`](./filter-operators.mdx#text) по текстовому индексу: `{ $text: { $search: "typed queries" } }` находит статьи, в которых есть эти слова. Но сам `$text` не говорит, какая статья подошла лучше. `.textScore` добавляет к каждой строке число, оценку релевантности: чем больше, тем лучше строка подошла.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(Article);
+// ---cut---
+const query = Articles.find({ $text: { $search: "typed queries" } }).textScore().sort({ title: 1 }).plain();
+const found = await query;
+//    ^?
+console.log(found.map((article) => [article.title, article.score]));
+// → [["Mongo tips", 2.15625], ["Typed queries", 2.25]]
+```
+
+Оценка зависит от данных и версии сервера, поэтому сравнивайте значения между собой, а не с числами из документации. Поле `score` появляется в строке и в её типе: без вызова `.textScore` его нет.
+
+<Returns type="QueryBuilder">
+
+Строитель, в строки которого добавлено числовое поле. В типе результата это `number`. Поле присутствует в документе, lean- и plain-строке. Если запрос ограничен [`.select`](./reading.mdx#select), поле оценки всё равно добавляется. После вызова имя поля — известный ключ [`.sort`](./reading.mdx#sort) и [`.select`](./reading.mdx#select), см. [сортировку по оценке](#сортировка-по-оценке).
+
+</Returns>
+
+<Params>
+<Param name="name" type="string" default="&quot;score&quot;">
+
+Имя поля с оценкой. Не может быть пустым, содержать точку или начинаться с `$`: иначе `QueryError` с текстом `textScore: invalid field name "a.b"`.
+
+</Param>
+<Param name="options.sort" type="boolean" default="false">
+
+Отсортировать строки по убыванию оценки, лучшие первыми: в запрос уходит сортировка `{ <name>: { $meta: "textScore" } }`. Оценка добавляется после ключей, переданных в `.sort`; если `.sort` уже называет поле оценки, второй раз оно не добавляется.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+textScore<const Name extends string = "score">(
+  name?: Name,
+  options?: { readonly sort?: boolean },
+): QueryBuilder<T, Op, S, E, Form, Found, N & { readonly [K in Name]: number }, X>
+```
+
+</FullType>
+
+### Без $text
+
+`.textScore` требует, чтобы в фильтре был `$text`: оценку считает текстовый поиск, и без него считать нечего. Компилятор этого не проверяет, а сервер отказывает. Typemo бросает [`ServerError`](../errors/server-errors.mdx#servererror) с сообщением сервера:
+
+```text
+ServerError: query requires text score metadata, but it is not available (code 40218 Location40218)
+```
+
+### Сортировка по оценке
+
+Опция `{ sort: true }` сортирует строки по убыванию оценки на сервере: Typemo отправляет сортировку `{ score: { $meta: "textScore" } }`. Поэтому [`.limit`](./reading.mdx#limit) после неё оставляет лучшие строки, а не произвольные:
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(Article);
+// ---cut---
+const best = await Articles.find({ $text: { $search: "typed queries" } }).textScore("score", { sort: true }).limit(1).plain();
+console.log(best.map((article) => [article.title, article.score]));
+// → [["Typed queries", 2.25]]
+```
+
+Поле оценки можно назвать и в обычной [`.sort`](./reading.mdx#sort): `.sort({ score: -1 })` превращается в ту же сортировку `$meta`, но стоит на своём месте среди ключей. Так `.sort({ score: -1, views: 1 })` упорядочивает по оценке, а при равной оценке — по просмотрам. Направление у оценки одно, `-1`: база ранжирует совпадения от лучшего, обратного порядка у неё нет. Поэтому `.sort({ score: 1 })` — ошибка компиляции `Type '1' is not assignable to type 'ScoreDirection | undefined'`, а без типов — `QueryError` при вызове:
+
+```text
+QueryError: sort: "score" is the text score, which sorts from the best match only: use -1 (or textScore("score", { sort: true }))
+```
+
+В [`.select`](./reading.mdx#select) поле оценки тоже известно: `.select({ title: 1, score: 1 })` после `.textScore()` компилируется и оставляет в строке `_id`, `title` и `score`. До вызова `.textScore` такого поля нет, и `.sort({ score: -1 })` или `.select({ score: 1 })` не компилируются, как любое неизвестное поле.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(Article);
+// ---cut---
+const rows = await Articles.find({ $text: { $search: "typed queries" } }).textScore().select({ title: 1, score: 1 }).sort({ score: -1 }).plain();
+//    ^?
+```
+
+### Когда `.textScore` не подходит
+
+Если нужен поиск не по словам, а по смыслу, используйте векторный поиск в [агрегациях](../aggregation/stages.mdx). Если нужны возможности, которых нет у `$text`, используйте поисковые индексы и стадию `$search` там же.
+
+---
+
+## .explain
+
+`.explain` показывает план запроса вместо самого запроса: какой индекс выберет база и, по желанию, сколько документов и ключей она просмотрит на самом деле. Он нужен, когда запрос медленный: по плану видно, читает ли база всю коллекцию или идёт по индексу. Документы при этом не возвращаются.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(Article);
+// ---cut---
+const plan = await Articles.find({ views: { $gt: 10 } }).explain();
+console.log(plan.queryPlanner);
+// → { …, winningPlan: { stage: "FETCH", inputStage: { stage: "IXSCAN", indexName: "views_1", … } } }
+```
+
+<Returns type="Promise<ExplainResult>">
+
+Ответ сервера как есть: `ExplainResult` — это `Readonly<Record<string, unknown>>`, форма которого зависит от версии сервера и уровня подробности. Typemo его не разбирает, поэтому поля вроде `queryPlanner` и `executionStats` читаются без подсказок типов. Ваш строитель остаётся нетронутым: после `.explain` тот же запрос можно выполнить обычным `await`.
+
+</Returns>
+
+<Params>
+<Param name="verbosity" type="ExplainVerbosity" default="&quot;queryPlanner&quot;">
+
+Насколько подробно объяснять: `"queryPlanner"` — только план, без выполнения; `"executionStats"` — план и статистика настоящего выполнения; `"allPlansExecution"` — ещё и статистика планов, которые база пробовала и отвергла. Другое значение (возможно только без типов) — [`QueryError`](../errors/query-errors.mdx#queryerror) до обращения к базе, как у остальных настроек запроса. Для `"nope"`: `explain: the verbosity is "queryPlanner", "executionStats" or "allPlansExecution" (got "nope")`.
+
+</Param>
+</Params>
+
+<FullType>
+
+```ts
+explain(
+  this: OnlyFor<Op, FindOperation, "explain() applies to find() and findOne()">,
+  verbosity?: ExplainVerbosity,
+): Promise<ExplainResult>
+
+type ExplainResult = Readonly<Record<string, unknown>>
+type ExplainVerbosity = "queryPlanner" | "executionStats" | "allPlansExecution"
+```
+
+</FullType>
+
+### Что показывает план
+
+Запрос по числу просмотров идёт по индексу `views_1`: сначала `IXSCAN` находит подходящие ключи, затем `FETCH` читает документы. Запрос по полю без индекса делает `COLLSCAN`, то есть просматривает всю коллекцию.
+
+```ts twoslash
+import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Index({ title: "text", body: "text" })
+@Index({ views: 1 })
+@Schema({ collection: "articles" })
+class Article extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => String, { required: true }) body!: string;
+  @Prop(() => Number, { required: true }) views!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Articles = client.db().model(Article);
+// ---cut---
+const indexed = await Articles.find({ views: { $gt: 10 } }).explain("executionStats");
+console.log(indexed.executionStats);
+// → { nReturned: 2, totalKeysExamined: 2, totalDocsExamined: 2, executionTimeMillis: …, … }
+
+const scanned = await Articles.find({ body: "pasta" }).explain("executionStats");
+console.log(scanned.queryPlanner);
+// → { …, winningPlan: { stage: "COLLSCAN", filter: { body: { $eq: "pasta" } }, … } }
+```
+
+Для хорошего запроса `totalDocsExamined` близко к `nReturned`. Во втором запросе база просмотрела все три статьи ради одной: на трёх документах это незаметно, а на миллионе стало бы проблемой. Тогда добавьте индекс на поле фильтра.
+
+### Только find и findOne
+
+`.explain` есть у запросов [`find`](./reading.mdx#modelfind), [`findOne`](./reading.mdx#modelfindone) и [`findById`](./reading.mdx#modelfindbyid). У запросов значений вроде [`countDocuments`](./reading.mdx#modelcountdocuments) его нет, а у запросов «найти и изменить» метод не компилируется. Если вызов пришёл из кода без типов, Typemo бросает `QueryError` с текстом `explain applies to find() and findOne(), not findOneAndUpdate()`.
+
+### Когда `.explain` не подходит
+
+`.explain` отвечает на вопрос «как база выполняет запрос», но не «почему он медленный в приложении»: время запроса в вашем коде включает сеть и построение результата. Чтобы находить реальные запросы работающего приложения, используйте [`.comment`](./options.mdx#comment) и профилировщик, а также [события наблюдаемости](../observability/events.mdx). Чтобы заставить базу использовать определённый индекс, используйте [`.hint`](./options.mdx#hint).

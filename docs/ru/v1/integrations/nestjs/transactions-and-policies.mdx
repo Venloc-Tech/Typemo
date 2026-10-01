@@ -1,0 +1,358 @@
+---
+title: Транзакции и политики в запросе
+description: "@Transactional на методах сервиса, тенант и актор из HTTP-запроса через PolicyInterceptor и межтенантный доступ @AllTenants в NestJS"
+icon: ShieldCheck
+---
+
+Транзакция и контекст политик в Typemo не передаются параметрами: операция сама находит транзакцию и тенанта текущего асинхронного вызова. В приложении NestJS это значит, что транзакцию объявляют декоратором `@Transactional()` на методе, а тенанта и актора кладёт в контекст перехватчик `PolicyInterceptor` — один раз для всех обработчиков. Если вы ещё не знакомы с этими механизмами ядра, сначала прочитайте [Транзакции](../../transactions/index.mdx) и [Контекст политик](../../policies/policy-context.mdx).
+
+## Что предполагается
+
+Приложение из руководства [Подключить Typemo к NestJS](./setup.mdx) на реплика-сете MongoDB (транзакции на отдельном `mongod` не работают). Модели — счёт и заказ организации; поле `tenantId` заказа помечено тенантом:
+
+```ts twoslash title="orders/order.ts"
+import { Entity, Prop, Schema, Tenant, type TenantField } from "@venloc/typemo";
+
+@Schema({ collection: "orders", tenant: true })
+export class Order extends Entity {
+  @Prop(() => String)
+  @Tenant()
+  tenantId!: TenantField<string>;
+
+  @Prop(() => String, { required: true })
+  number!: string;
+}
+```
+
+## Быстрый путь
+
+Транзакция — декоратор на методе сервиса; тенант — перехватчик на всё приложение:
+
+```ts twoslash title="main.ts"
+import { Injectable, Module } from "@nestjs/common";
+import { NestFactory } from "@nestjs/core";
+import { Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, PolicyInterceptor, Transactional } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+@Module({})
+class AppModule {}
+// ---cut---
+@Injectable()
+export class TransfersService {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+
+  @Transactional()
+  async transfer(from: Account["_id"], to: Account["_id"], amount: number): Promise<void> {
+    await this.accounts.updateOne({ _id: from }, { $inc: { balance: -amount } });
+    await this.accounts.updateOne({ _id: to }, { $inc: { balance: amount } });
+  }
+}
+
+const app = await NestFactory.create(AppModule);
+app.useGlobalInterceptors(new PolicyInterceptor({ tenant: (request) => request.headers["x-tenant"] }));
+```
+
+Остальная страница разбирает каждую часть на задачах.
+
+## Перевести деньги в транзакции
+
+Ситуация: перевод меняет два счёта, и половина перевода хуже, чем никакого. [`@Transactional()`](../../reference/integrations/nestjs.mdx#transactional) выполняет метод в транзакции клиента: каждая операция внутри — и в методах, которые он вызывает, — входит в неё сама. Транзакция фиксируется, когда промис метода выполнился, и откатывается, когда он отклонён.
+
+Метод обязан быть асинхронным: синхронный метод с декоратором не компилируется, потому что транзакция асинхронна по природе. Ошибка внутри метода доходит до вызвавшего как есть. Запуск метода, который создал счёт и затем бросил ошибку, вернул эту ошибку, и счёта в базе не осталось.
+
+Модели двух баз одного клиента (`forFeature(…, { db })`) входят в одну транзакцию: запуск записи в основную базу и в архив с ошибкой в конце откатил обе.
+
+## Пережить повтор
+
+Ситуация: сервер прервал транзакцию временной ошибкой (конфликт записи, смена первичного узла). Ядро повторяет транзакцию целиком — **метод выполняется ещё раз**. Запуск с отказом первой вставки выполнил метод дважды и зафиксировал результат один раз.
+
+Поэтому метод должен быть безопасен для повтора: читайте документы внутри метода и меняйте суммы атомарными операторами (`$inc`), как в быстром пути. Документ, загруженный **до** вызова и изменённый арифметикой внутри (`account.balance -= 10`), при повторе получит изменение дважды — подробности в [`client.transaction`](../../reference/connection/typemo-client.mdx#clienttransaction).
+
+## Вызвать транзакционный метод из другого
+
+Ситуация: метод «записать проводку» вызывают и сам по себе, и из метода «перевести», который уже открыл транзакцию. Транзакции в MongoDB не вкладываются, поэтому без опции такой вызов — ошибка ядра. Опция `join: true` в [`@Transactional`](../../reference/integrations/nestjs.mdx#transactional) говорит: если транзакция этого клиента уже открыта, выполниться в ней; если нет — открыть свою.
+
+```ts twoslash title="ledger/ledger.service.ts"
+import { Injectable } from "@nestjs/common";
+import { Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, Transactional } from "@venloc/typemo-nestjs";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+// ---cut---
+@Injectable()
+export class LedgerService {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+
+  @Transactional({ join: true })
+  async entry(title: string): Promise<void> {
+    await this.accounts.create({ title, balance: 1 });
+  }
+
+  @Transactional()
+  async pair(title: string): Promise<number> {
+    await this.entry(title);
+    await this.entry(title);
+    return this.accounts.countDocuments({ title });
+  }
+}
+```
+
+Присоединившийся метод не фиксирует и не откатывает транзакцию сам: это делает тот, кто её открыл. Поэтому ошибка внутри `entry` уходит наружу, и вся транзакция `pair` откатывается — запуск с ошибкой во втором `entry` не оставил в базе ни одной записи. При временной ошибке сервера повторяется вся внешняя транзакция, и присоединившийся метод выполняется заново вместе с ней.
+
+Внутри транзакции **другого** клиента `join` не открывает вторую транзакцию молча, а бросает ошибку: запись в другом клиенте не откатилась бы вместе с внешней транзакцией.
+
+```text
+ConfigurationError: @Transactional({ join: true }): LedgerService.entry was called inside a transaction of another client; it joins only a transaction of client "default"
+```
+
+Опции транзакции (`timeoutMS`, `readConcern`) с `join` не задаются: они принадлежат внешней транзакции, и компилятор это не пропустит.
+
+## Транзакция другого клиента
+
+Ситуация: в приложении два клиента, и транзакция нужна во втором. Опция `client` называет его, а остальные опции — опции транзакции ядра:
+
+```ts twoslash title="billing/billing.service.ts"
+import { Injectable } from "@nestjs/common";
+import { Transactional } from "@venloc/typemo-nestjs";
+// ---cut---
+@Injectable()
+export class BillingService {
+  @Transactional({ client: "billing", timeoutMS: 5000 })
+  async charge(): Promise<void> {}
+}
+```
+
+Неизвестное имя — ошибка при вызове, а не транзакция «где-нибудь»:
+
+```text
+ConfigurationError: @Transactional(): no TypemoClient named "billing" in this application (TypemoModule.forRoot(uri, { name: "billing" }))
+```
+
+## Транзакция на обработчике маршрута
+
+Ситуация: обработчик сам делает две записи, и выносить их в сервис не хочется. Декоратор ставится и на метод контроллера, в любом порядке с `@Post()`: метаданные маршрута переносятся на обёртку. Запуск `POST /accounts/pair`, где обработчик создал счёт и упал перед вторым, вернул 500, а счёта в базе не осталось.
+
+## Тенант из запроса
+
+Ситуация: приложение обслуживает несколько организаций, и каждый запрос должен видеть только данные своей. [`PolicyInterceptor`](../../reference/integrations/nestjs.mdx#policyinterceptor) выполняет каждый обработчик внутри [`PolicyContext.run`](../../reference/policies/policy-context.mdx#policycontextrun) с тенантом из запроса:
+
+```ts twoslash title="main.ts"
+import { Module } from "@nestjs/common";
+import { NestFactory } from "@nestjs/core";
+import { PolicyInterceptor } from "@venloc/typemo-nestjs";
+@Module({})
+class AppModule {}
+// ---cut---
+const app = await NestFactory.create(AppModule);
+app.useGlobalInterceptors(
+  new PolicyInterceptor({
+    tenant: (request) => request.headers["x-tenant"],
+    actor: (request) => request.headers["x-user"],
+  }),
+);
+```
+
+Сервисы ничего не знают о тенанте: `Orders.find()` в сервисе сам получает фильтр организации, а `Orders.create` сам ставит `tenantId`. Контекст живёт всю асинхронную цепочку обработчика: после `await`, в потоке `Observable`, который возвращает обработчик. Запуск 20 одновременных запросов двух организаций: каждый ответ содержал только заказы своей.
+
+Если тенант лежит не в заголовке, а в пользователе, которого положила аутентификация, объявите свой тип запроса:
+
+```ts twoslash title="main.ts"
+import { PolicyInterceptor } from "@venloc/typemo-nestjs";
+// ---cut---
+interface AuthRequest {
+  readonly headers: Readonly<Record<string, string | undefined>>;
+  readonly user: { readonly orgId: string; readonly id: string };
+}
+
+const interceptor = new PolicyInterceptor<AuthRequest>({
+  tenant: (request) => request.user.orgId,
+  actor: (request) => request.user.id,
+});
+```
+
+Резолвер синхронный: контекст открывается до вызова обработчика. Достаньте тенанта раньше — в guard или middleware аутентификации.
+
+## Запрос без тенанта
+
+Ситуация: заголовка нет. Резолвер вернул `undefined`, тенант не задан, и тенантная модель отвергает операцию ошибкой ядра [`StrictModeError`](../../reference/errors/data-errors.mdx#strictmodeerror) с причиной `tenant`. С [`TypemoExceptionFilter`](./http.mdx) клиент получает ответ:
+
+```json
+{ "statusCode": 400, "error": "Bad Request", "message": "Not allowed", "reason": "tenant" }
+```
+
+Тишины нет: запрос без организации не превращается в запрос по всем организациям. Модели без тенантной политики работают и без тенанта.
+
+## Межтенантный доступ
+
+Ситуация: административный маршрут должен видеть всех. [`@AllTenants()`](../../reference/integrations/nestjs.mdx#alltenants) на обработчике или контроллере заменяет тенанта запроса на `allTenants: true`:
+
+```ts twoslash title="admin/admin.controller.ts"
+import { Controller, Get } from "@nestjs/common";
+import { Entity, type Model, Prop, Schema, Tenant, type TenantField } from "@venloc/typemo";
+import { AllTenants, InjectModel } from "@venloc/typemo-nestjs";
+@Schema({ collection: "orders", tenant: true })
+class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+}
+// ---cut---
+@Controller("admin/orders")
+export class AdminOrdersController {
+  constructor(@InjectModel(Order) private readonly orders: Model<Order>) {}
+
+  @AllTenants()
+  @Get()
+  async all() {
+    return (await this.orders.find().sort({ number: 1 }).plain()).map((order) => `${order.tenantId}:${order.number}`);
+  }
+}
+```
+
+Запуск: заказы `A-1`, `A-2` организации `acme` и `G-1` организации `globex` вернулись как `["acme:A-1", "acme:A-2", "globex:G-1"]`. Межтенантный доступ — явное решение на маршруте, а не пустой заголовок.
+
+## Как выбрать: декоратор или `client.transaction`
+
+Спросите себя: вся ли работа метода должна быть в транзакции? Если да — `@Transactional()`: граница транзакции видна в объявлении метода. Если транзакция нужна части метода (сначала прочитать, потом записать атомарно, потом отправить письмо вне транзакции), внедрите клиента через [`@InjectClient`](../../reference/integrations/nestjs.mdx#injectclient) и вызовите [`client.transaction`](../../reference/connection/typemo-client.mdx#clienttransaction) вокруг этой части.
+
+## Когда это не нужно
+
+Одна операция записи атомарна сама по себе: транзакция вокруг одного `updateOne` ничего не добавляет. Приложению с одной организацией перехватчик политик не нужен. Вне HTTP (очереди, задачи по расписанию) перехватчик не работает: открывайте контекст сами через `PolicyContext.run`.
+
+## Частые ошибки
+
+### Transactions do not nest
+
+Метод с `@Transactional()` вызвал другой метод с `@Transactional()`:
+
+```text
+ConfigurationError: transaction(): transactions do not nest (already inside a transaction of this client)
+```
+
+В MongoDB нет вложенных транзакций. Пометьте внутренний метод `@Transactional({ join: true })` — он выполнится во внешней транзакции, а вызванный сам по себе откроет свою (раздел [Вызвать транзакционный метод из другого](#вызвать-транзакционный-метод-из-другого)).
+
+### Метод отказывается выполняться вне приложения
+
+```text
+ConfigurationError: @Transactional(): AccountsService.openTwo was called on an object no Nest application with TypemoModule has registered; it works on the providers and controllers of such an application
+```
+
+Объект создан через `new` в обход Nest, и приложение не связало его со своим клиентом. Берите сервис из контейнера (`moduleRef.get`), а в модульном тесте добавьте [`provideClientMock`](./testing.mdx).
+
+### PolicyInterceptor works in HTTP handlers only
+
+Перехватчик подключён к микросервису или шлюзу WebSocket. Там открывайте контекст сами.
+
+## Полный пример
+
+Сервис переводов с транзакцией и контроллер заказов организации; перехватчик и фильтр подключены в `main.ts`.
+
+```ts twoslash title="main.ts"
+import { Body, Controller, Get, Injectable, Module, Post } from "@nestjs/common";
+import { NestFactory } from "@nestjs/core";
+import { Entity, type Model, Prop, Schema, Tenant, type TenantField } from "@venloc/typemo";
+import {
+  AllTenants,
+  InjectModel,
+  PolicyInterceptor,
+  Transactional,
+  TypemoExceptionFilter,
+  TypemoModule,
+} from "@venloc/typemo-nestjs";
+
+// модели
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+
+@Schema({ collection: "orders", tenant: true })
+export class Order extends Entity {
+  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
+  @Prop(() => String, { required: true }) number!: string;
+}
+
+// перевод в транзакции
+@Injectable()
+export class TransfersService {
+  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
+
+  @Transactional()
+  async transfer(from: Account["_id"], to: Account["_id"], amount: number): Promise<void> {
+    await this.accounts.updateOne({ _id: from }, { $inc: { balance: -amount } });
+    await this.accounts.updateOne({ _id: to }, { $inc: { balance: amount } });
+  }
+}
+
+// заказы организации из запроса
+@Controller("orders")
+export class OrdersController {
+  constructor(@InjectModel(Order) private readonly orders: Model<Order>) {}
+
+  @Post()
+  async create(@Body() body: { readonly number: string }) {
+    return (await this.orders.create({ number: body.number })).$toPlain();
+  }
+
+  @Get()
+  async list() {
+    return (await this.orders.find().sort({ number: 1 }).plain()).map((order) => order.number);
+  }
+
+  @AllTenants()
+  @Get("all")
+  async all() {
+    return (await this.orders.find().plain()).length;
+  }
+}
+
+@Module({
+  imports: [
+    TypemoModule.forRoot("mongodb://localhost:27017", { dbName: "bank", sync: "init" }),
+    TypemoModule.forFeature([Account, Order]),
+  ],
+  controllers: [OrdersController],
+  providers: [TransfersService],
+})
+export class AppModule {}
+
+const app = await NestFactory.create(AppModule);
+app.useGlobalFilters(new TypemoExceptionFilter());
+app.useGlobalInterceptors(
+  new PolicyInterceptor({
+    tenant: (request) => request.headers["x-tenant"],
+    actor: (request) => request.headers["x-user"],
+  }),
+);
+await app.listen(3000);
+```
+
+<Callout type="migration" title="Если вы пришли из @nestjs/mongoose">
+
+`connection.transaction(async (session) => …)` с передачей `session` в каждую операцию заменяется на `@Transactional()` без сессии: операции находят транзакцию сами. Тенанта в Mongoose не было вовсе: фильтр организации дописывали в каждый запрос руками.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Ошибки, id и тело запроса" href="./http.mdx">
+  Как ошибки транзакций и политик превращаются в ответы HTTP.
+</Card>
+<Card title="Тенанты без Nest" href="../../policies/tenants.mdx">
+  Как устроена тенантная политика и что она проверяет.
+</Card>
+<Card title="Транзакции без Nest" href="../../transactions/index.mdx">
+  Повторы, откат участников и ограничения транзакций MongoDB.
+</Card>
+<Card title="Справочник: @Transactional" href="../../reference/integrations/nestjs.mdx#transactional">
+  Опции, привязка к приложению и ошибки.
+</Card>
+</Cards>

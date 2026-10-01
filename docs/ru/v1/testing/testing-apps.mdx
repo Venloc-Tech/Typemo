@@ -1,0 +1,154 @@
+---
+title: Тестировать приложение
+description: "Тестовая база, фабрики тестовых данных и проверка индексов в тестах приложения на Typemo"
+icon: FlaskConical
+---
+
+Тест приложения на Typemo работает с настоящей MongoDB: ошибки приведения типов, уникальные индексы, транзакции и планы запросов на подделке не воспроизвести. Пакет даёт две вещи, которые делают такие тесты короткими: **фабрики** тестовых данных и **проверки индекса**, которые роняют тест, когда запрос перестал использовать индекс. Всё лежит в отдельном входе `@venloc/typemo/testing`; сервер для тестов вы поднимаете сами.
+
+## Что предполагается
+
+Примеры используют модель счёта и тест-раннер `bun:test`; с другим раннером код тот же. Тестовая база — отдельная база (не рабочая), адрес которой приложение берёт из настройки. Если тестам нужны транзакции или подписка на изменения, база должна быть реплика-сетом.
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true })
+  balance!: number;
+}
+```
+
+## Быстрый путь
+
+Опишите фабрику один раз и создавайте данные в тесте одной строкой:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+import { defineFactory } from "@venloc/typemo/testing";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank-test" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const accountFactory = defineFactory(Accounts, (n) => ({ title: `Account ${n}`, balance: 100 }));
+
+const rich = await accountFactory.create({ balance: 1_000_000 });
+// → документ со title "Account 1" и balance 1000000
+```
+
+Остальная страница разбирает подготовку базы, фабрики и проверку индексов.
+
+## Подготовить чистую базу для теста
+
+Ситуация: каждый тест должен видеть только свои данные. Самое надёжное — отдельная база на набор тестов и очистка коллекций между тестами. Пустой фильтр в [`deleteMany`](../reference/writes/writes.mdx#deletemany) запрещён: одна опечатка в рабочем коде удалила бы всю коллекцию. В тесте «удалить всё» — как раз то, что нужно, и это записывается явно через [`Filters.all()`](../reference/policies/violations.mdx#filtersall). Пересоздать базу целиком можно и средствами драйвера ([доступ к драйверу](../connection/driver-access.mdx)).
+
+```ts title="accounts/accounts.test.ts"
+import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
+import { Filters, TypemoClient } from "@venloc/typemo";
+import { Account } from "./account.ts";
+
+let client: TypemoClient;
+
+beforeAll(async () => {
+  client = await TypemoClient.connect(process.env.TEST_MONGO_URI ?? "mongodb://localhost:27017", { dbName: "bank-test" });
+  await client.db().model(Account).syncIndexes();
+});
+
+beforeEach(async () => {
+  await client.db().model(Account).deleteMany(Filters.all());
+});
+
+afterAll(async () => {
+  await client.close();
+});
+```
+
+`syncIndexes` создаёт индексы из схемы: без них тест уникальности и проверки плана ничего не докажут. Клиент закрывайте в `afterAll`, иначе раннер не завершится.
+
+## Создавать данные фабриками
+
+Ситуация: тесту нужно три счёта, а важно в них одно поле. Фабрика берёт значения по умолчанию из функции от номера (1, 2, …), поэтому уникальный `title` не конфликтует, а в тесте вы переопределяете только нужное.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+import { defineFactory } from "@venloc/typemo/testing";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank-test" });
+const Accounts = client.db().model(Account);
+const accountFactory = defineFactory(Accounts, (n) => ({ title: `Account ${n}`, balance: 100 }));
+// ---cut---
+const draft = accountFactory.build({ balance: 5 });
+// → { title: "Account 1", balance: 5 }   (данные, без сохранения)
+
+const three = await accountFactory.createMany(3, (n) => ({ balance: n * 10 }));
+// → три сохранённых счёта: Account 2, 3, 4 с balance 20, 30, 40
+```
+
+`build` только собирает данные, `create` ещё и сохраняет. Счётчик общий: второй вызов получает номер 2. Между тестами вызывайте `accountFactory.reset()`, если номера не должны зависеть от порядка запуска. Фабрика проверяется компилятором: переименуете `balance` в модели, и она перестанет компилироваться, а не тест упадёт в неожиданном месте. Подробности — [`defineFactory`](../reference/testing/testing.mdx#definefactory) и [`Factory`](../reference/testing/testing.mdx#factory).
+
+## Проверить, что запрос использует индекс
+
+Ситуация: переименовали поле или поменяли фильтр, и запрос молча начал читать всю коллекцию. [`expectIndexScan`](../reference/testing/testing.mdx#expectindexscan) выполняет `explain` и бросает [`IndexUsageError`](../reference/testing/testing.mdx#indexusageerror), если индекс не используется.
+
+```ts title="accounts/accounts.test.ts"
+import { expectIndexScan } from "@venloc/typemo/testing";
+
+test("поиск счёта по названию идёт по индексу", async () => {
+  const Accounts = client.db().model(Account);
+  await expectIndexScan(Accounts.find({ title: "Account 1" }), { index: "title_1", maxDocsExamined: 1 });
+});
+```
+
+Тот же тест для поля без индекса упал с `the query is not served by an index: it scans the whole collection (COLLSCAN). plan: COLLSCAN; examined 3 documents, returned 3`. Если индекса нет намеренно, зафиксируйте это [`expectCollScan`](../reference/testing/testing.mdx#expectcollscan): тест сломается, когда кто-нибудь добавит индекс или запрос изменится. Сырой отчёт о плане даёт [`explainIndexUsage`](../reference/testing/testing.mdx#explainindexusage). Как читать план и выбирать индекс, — в руководстве [Скорость запросов](../queries/performance.mdx#проверить-индекс-в-тесте).
+
+## Как выбрать
+
+Один вопрос: **что должно сломать тест?** Если неверные данные в запросе, достаточно обычных проверок результата. Если запрос обязан оставаться быстрым, добавьте `expectIndexScan` с `maxDocsExamined`. Если вам важен конкретный индекс, задайте `index`.
+
+## Когда это не нужно
+
+Не пишите `expectIndexScan` на каждый запрос: малая коллекция в тесте даёт любой план, и проверка нужна только там, где скорость — часть обещания приложения. Проверки выполняют лишний `explain`, поэтому для рабочего кода они не предназначены.
+
+## Частые ошибки
+
+### Тест уникальности проходит, хотя индекса нет
+
+Индексы создаются `syncIndexes`, а не автоматически при подключении. Вызовите его в `beforeAll`, иначе дубликат вставится без ошибки.
+
+### `count must be a non-negative integer`
+
+`buildMany` и `createMany` принимают только целое неотрицательное число: `TypemoError: defineFactory: count must be a non-negative integer, got -1`. Передавайте число документов, а не длину, которая может стать отрицательной.
+
+### `covered: true` не проходит у запроса по индексу
+
+`expectIndexScan(query, { covered: true })` падает с `it is not covered by the index (it fetches documents)`, если сервер прочитал хотя бы один документ. `findById` и `find` по уникальному полю читают документ целиком, даже когда индекс уже нашёл его. Покрытым запрос становится, когда `select` просит только поля индекса и без `_id`: например, `Accounts.find({ title: { $gte: "A" } }).select({ title: 1, _id: 0 })` даёт `covered: true` и `docsExamined: 0`. Подробнее — в справочнике, [`explainIndexUsage`](../reference/testing/testing.mdx#explainindexusage).
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник testing" href="../reference/testing/testing.mdx">
+  Все функции, типы и тексты ошибок.
+</Card>
+<Card title="Тесты типов своих моделей" href="./type-tests.mdx">
+  Как проверить, что типы модели и ответов такие, как задумано.
+</Card>
+<Card title="Скорость запросов" href="../queries/performance.mdx">
+  План запроса, индексы и `explain`.
+</Card>
+</Cards>

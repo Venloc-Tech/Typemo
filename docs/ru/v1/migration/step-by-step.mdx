@@ -1,0 +1,186 @@
+---
+title: Пошаговая миграция
+description: "Как переносить приложение с Mongoose на Typemo коллекция за коллекцией, пока обе библиотеки работают с одной базой"
+icon: Footprints
+---
+
+Переносить приложение целиком за один релиз не нужно: обе библиотеки читают и пишут одни и те же документы MongoDB, поэтому можно описывать класс Typemo для одной коллекции за раз, а Mongoose оставлять для остальных. Страница показывает порядок, в котором это безопасно, и места, где две библиотеки мешают друг другу.
+
+Почему совместная работа возможна: Typemo хранит данные в обычном формате MongoDB и использует тот же драйвер и те же классы `ObjectId`, что Mongoose. Ни одна из библиотек не добавляет в документы скрытой служебной разметки. Проверено запуском: документ, созданный Mongoose с метками времени, Typemo прочитал, изменил и сохранил, а Mongoose прочитал результат без потерь; и наоборот.
+
+## Что предполагается
+
+Приложение на Mongoose 9, модель поста `Post` в коллекции `posts` с метками времени, MongoDB доступна обеим библиотекам. Примеры используют блог; Mongoose-часть показана только там, где важна разница.
+
+<Steps>
+<Step>
+
+### Подготовьте проект
+
+Установите пакеты и включите декораторы в `tsconfig`, как описано в [Быстром старте](../getting-started/quick-start.mdx). Для декораторов ядра нужен только флаг `experimentalDecorators`. Пакет `reflect-metadata` ставить и подключать (`import "reflect-metadata"`) не нужно: ядро хранит свои метаданные само. Флаг `emitDecoratorMetadata` тоже не нужен, потому что Typemo не читает `design:type`, и тип поля всегда называется явно, `@Prop(() => String)`. Если ваш проект на Mongoose уже включает эти флаги для других библиотек, оставьте их: Typemo они не мешают. Если же в проекте нет других декораторов, возможно, вам подойдёт [пакет TC39-декораторов](../decorators-tc39/tc39.mdx) без `experimentalDecorators`. Typemo требует последние версии MongoDB, драйвера `mongodb` и `bson`: если ваш Mongoose использует другой драйвер, обновите его первым, иначе классы `ObjectId` окажутся разными. Затем подключите клиент рядом с существующим подключением Mongoose. Подробнее о подключении — в руководстве [Подключиться к базе](../connection/connect.mdx).
+
+</Step>
+<Step>
+
+### Опишите класс поверх существующей коллекции
+
+Название коллекции задайте явно: Mongoose выводит его из имени модели с множественным числом, а Typemo хранит ровно то, что написано в [`collection`](../reference/schemas/schema.mdx#collection). Служебные поля добавляйте теми же базовыми классами, которые повторяют опции Mongoose: [`Timestamped`](../reference/schemas/base-classes.mdx#timestamped) вместо `timestamps: true`, [`Versioned`](../reference/schemas/base-classes.mdx#versioned) вместо `__v`.
+
+```ts twoslash title="posts/post.ts"
+import { Entity, Prop, Schema, Timestamped, TypemoClient, Versioned } from "@venloc/typemo";
+
+@Schema({ collection: "posts" })
+export class Post extends Timestamped(Versioned(Entity)) {
+  @Prop(() => String, { required: true })
+  title!: string;
+
+  @Prop(() => Number)
+  views?: number;
+
+  @Prop(() => [String])
+  tags!: string[];
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Posts = client.db().model(Post);
+```
+
+Что произошло. Класс описывает форму документа так, как её создавал Mongoose. Пустой массив для `tags` объявлять не нужно: поле-массив без `default` и без `required` у Typemo, как и у Mongoose, начинается с `[]`, а документ, прочитанный из базы без этого ключа, тоже отдаёт `[]`. Код, который читает `post.tags.length`, продолжает работать на старых и новых документах.
+
+Если у документов Mongoose собственный тип `_id` (строка-код, число, `UUID`), не объявляйте `_id` в классе вручную: базовый класс [`EntityWithId`](../reference/schemas/base-classes.mdx#entitywithid) задаёт его тип одной строкой.
+
+```ts twoslash title="countries/country.ts"
+import { EntityWithId, Prop, Schema, TypemoClient } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+// ---cut---
+@Schema({ collection: "countries" })
+export class Country extends EntityWithId(() => String) {
+  @Prop(() => String, { required: true })
+  name!: string;
+}
+
+const Countries = client.db().model(Country);
+const france = await Countries.findById("FR").orFail().lean();
+console.log(france._id);
+// → FR
+```
+
+`_id` из `EntityWithId` неизменяем, а при `create` без `default` обязателен: `Validation failed: "_id": the field is required [required]`. `findById`, ссылки и `populate` на такой модели работают со строкой. Подробнее и про `UUID` или числовой счётчик — в руководстве [Задать свой тип _id](../schemas/custom-ids.mdx).
+
+Поля, которые есть в базе, но не описаны в классе (например, старое `legacy`), Typemo при чтении и сохранении документа не трогает: они остаются в базе. Строже он только с поддокументами, см. [`UnknownFieldsError`](../reference/errors/data-errors.mdx#unknownfieldserror).
+
+</Step>
+<Step>
+
+### Не создавайте индексы вслепую
+
+Typemo не создаёт индексы при старте, а [`syncIndexes`](../reference/collections/model-indexes.mdx#modelsyncindexes) удаляет те, которых нет в классе. Если Mongoose или DBA создали в коллекции индексы, о которых класс не знает, синхронизация их удалит. Сначала посмотрите план:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "blog" });
+const Posts = client.db().model(Post);
+// ---cut---
+const plan = await Posts.syncIndexes({ dryRun: true });
+console.log(plan.toDrop, plan.dryRun);
+// → ["legacy_1"] true
+```
+
+В этом запуске в коллекции был индекс `legacy_1`, которого нет в классе, и `dryRun` показал, что он был бы удалён, ничего не изменив. Перенесите такие индексы в класс декораторами [`@Index`](../reference/schemas/index-decorators.mdx#index) или опциями [`@Prop`](../reference/schemas/prop.mdx#index) и только потом запускайте синхронизацию по-настоящему.
+
+</Step>
+<Step>
+
+### Замените плагины политиками
+
+Если в Mongoose вы ограничивали данные организации плагином или хуком, в Typemo это политика схемы, и её поле помечается декоратором [`@Tenant()`](../reference/schemas/field-markers.mdx#tenant) рядом с `@Prop`. Без пометки схема с опцией `tenant` не соберётся: `ConfigurationError: Order: the tenant field "tenantId" must be marked @Tenant() (declare it @Prop(...) @Tenant() tenantId!: TenantField<T>)`. Мягкое удаление и аудит включаются опциями `softDelete` и `audit`, а не плагинами.
+
+```ts twoslash title="orders/order.ts"
+import { Entity, Prop, Schema, Tenant, type TenantField } from "@venloc/typemo";
+
+@Schema({ collection: "orders", tenant: true })
+export class Order extends Entity {
+  @Prop(() => String)
+  @Tenant()
+  tenantId!: TenantField<string>;
+
+  @Prop(() => String, { required: true })
+  number!: string;
+}
+```
+
+Пока коллекция работает из двух библиотек, помните: политика тенанта действует только на запросах Typemo, а запросы Mongoose её не видят. Не переводите на тенанта часть кода одной коллекции: переносите коллекцию целиком, подробнее об этом — в разделе о двух библиотеках ниже. Как открыть область тенанта на запрос, показано в руководстве [Разделить данные организаций](../policies/tenants.mdx) и в рецепте [Многотенантное приложение](../recipes/multi-tenant.mdx).
+
+</Step>
+<Step>
+
+### Переключайте чтение, потом запись
+
+Начните с запросов на чтение: они не меняют данные, и различия видны сразу (неизвестное поле в фильтре, `undefined`, строка вместо числа). Затем переведите записи модели: `create`, `updateOne`, `findOneAndUpdate`. Не меняйте одну и ту же коллекцию из обеих библиотек в одном сценарии без нужды: хуки и плагины одной не срабатывают на записях другой (см. ниже).
+
+Таблица замен по каждому методу — в [Соответствии API](../reference/migration/api-mapping.mdx), различия в поведении с причинами — в [Отличиях в поведении](./behavior-differences.mdx), а то, чего нет совсем, — в [Чего нет в Typemo](./missing-features.mdx).
+
+</Step>
+<Step>
+
+### Уберите Mongoose из коллекции
+
+Когда все обращения к коллекции идут через Typemo, удалите Mongoose-модель и схему. Когда последняя модель переведена, удалите пакет `mongoose` и глобальное подключение.
+
+</Step>
+</Steps>
+
+## Как жить с двумя библиотеками одновременно
+
+Пока переход не закончен, у одной коллекции два «хозяина», и правила каждого действуют только внутри своей библиотеки.
+
+Политики не общие. Тенант, мягкое удаление и аудит действуют только на операциях Typemo: запрос Mongoose к той же коллекции их не видит и вернёт чужие данные или удалённые документы. Поэтому коллекцию с политиками переносите целиком, а не по методам.
+
+Хуки и плагины не общие. Хук `pre("save")` Mongoose не срабатывает на записи Typemo, и наоборот. Если хук поддерживает инвариант (например, нормализует адрес), пока вы переносите коллекцию, держите запись через одну библиотеку или продублируйте хук в классе Typemo декоратором [`@Pre`](../reference/hooks/pre-post.mdx#pre).
+
+Проверки значений тоже разные. Mongoose при записи приводит `"42"` к числу, Typemo отклоняет. Данные, которые пишет Mongoose, всегда соответствуют его схеме; данные, которые пишет Typemo, соответствуют классу. Если схемы разошлись, читающая сторона получит то, что лежит в базе: Typemo при чтении значения не проверяет, а приводит к типу схемы только Mongoose.
+
+Транзакции не переносятся между библиотеками: сессия Mongoose и транзакция [`client.transaction`](../reference/connection/typemo-client.mdx#clienttransaction) независимы. Записи в одной транзакции делайте одной библиотекой.
+
+## Как выбрать, с какой коллекции начать
+
+Задайте себе вопрос: что будет, если эта коллекция станет вести себя строже? Начинайте с коллекции с простой схемой, где мало хуков и нет `Mixed`, и с данными, которые вы контролируете: так первые ошибки строгости покажут, где в приложении вы полагались на молчаливое приведение. Последними переносите коллекции с плагинами, дискриминаторами и `Mixed`: для них нужны новые решения, а не замена метода.
+
+## Когда переносить не нужно
+
+Если приложение стабильно работает, схема почти не меняется и тип документа вас не беспокоит, перенос не окупится: вы заплатите временем за строгость, которая вам не нужна. Также не переносите то, что зависит от `Mixed` и `strict: false`, пока не решите, как описывать такие данные. Подробнее о цене — в руководстве [Зачем переходить](./why.mdx).
+
+## Частые ошибки
+
+### После запуска синхронизации пропал индекс
+
+`syncIndexes` привёл индексы точно к классу и удалил лишние. Восстановите индекс, объявите его в классе и повторите `syncIndexes`; в следующий раз запускайте с `dryRun: true`.
+
+### Ошибка `ConfigurationError` про тенанта при создании модели
+
+Схема с опцией `tenant` не знает, какое поле заполнять. Добавьте `@Tenant()` рядом с `@Prop` на поле типа `TenantField<T>`, как в шаге про политики.
+
+### `create` отвергает документ без `_id`
+
+Модель на `EntityWithId` без `default` требует идентификатор: `Validation failed: "_id": the field is required [required]`. В Mongoose такой документ тоже не сохранялся без `_id` (`MongooseError: document must have an _id before saving`). Передайте `_id` или задайте `default` фабрике, как описано в [Свой тип _id](../schemas/custom-ids.mdx).
+
+### Ошибка при сохранении документа, созданного Mongoose
+
+Поддокумент содержит поле, которого нет в классе: Typemo не стирает его молча и бросает [`UnknownFieldsError`](../reference/errors/data-errors.mdx#unknownfieldserror). Добавьте поле в класс или согласитесь на потерю осознанно, как описано в [Неизвестных полях](../documents/unknown-fields.mdx).
+
+## Что дальше
+
+<Cards>
+<Card title="Соответствие API" href="../reference/migration/api-mapping.mdx">
+  Найти замену каждому методу и опции Mongoose.
+</Card>
+<Card title="Отличия в поведении" href="./behavior-differences.mdx">
+  Что изменится в работающем коде и почему.
+</Card>
+<Card title="Зачем переходить" href="./why.mdx">
+  Что вы получаете и чего это стоит.
+</Card>
+</Cards>

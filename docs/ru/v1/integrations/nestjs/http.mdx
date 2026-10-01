@@ -1,0 +1,305 @@
+---
+title: Ошибки, id и тело запроса
+description: "TypemoExceptionFilter, ParseIdPipe и ValidateBodyPipe: ответы HTTP на ошибки базы, id из адреса и проверка тела схемой сущности в NestJS"
+icon: Globe
+---
+
+На границе HTTP приложению нужны три вещи: превратить ошибку базы в понятный ответ, разобрать id из адреса и проверить тело запроса до записи. Пакет даёт для них фильтр `TypemoExceptionFilter` и пайпы `ParseIdPipe` и `ValidateBodyPipe`. Все три работают в HTTP-контексте Express.
+
+## Что предполагается
+
+Приложение из руководства [Подключить Typemo к NestJS](./setup.mdx). Модель пользователя растёт по ходу страницы; в начале у неё два поля:
+
+```ts twoslash title="users/user.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  email!: string;
+
+  @Prop(() => String, { required: true, minLength: 2 })
+  name!: string;
+}
+```
+
+## Быстрый путь
+
+Фильтр подключается один раз, пайпы — на параметрах обработчика:
+
+```ts twoslash title="users/users.controller.ts"
+import { Body, Controller, Get, Param, Post } from "@nestjs/common";
+import { type CreateInput, Entity, type IdOf, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, ParseIdPipe, ValidateBodyPipe } from "@venloc/typemo-nestjs";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true, unique: true }) email!: string;
+  @Prop(() => String, { required: true, minLength: 2 }) name!: string;
+}
+// ---cut---
+@Controller("users")
+export class UsersController {
+  constructor(@InjectModel(User) private readonly users: Model<User>) {}
+
+  @Post()
+  async create(@Body(ValidateBodyPipe.for(User)) body: CreateInput<User>) {
+    return (await this.users.create(body)).$toPlain();
+  }
+
+  @Get(":id")
+  get(@Param("id", ParseIdPipe.for(User)) id: IdOf<User>) {
+    return this.users.findById(id).orFail().plain();
+  }
+}
+
+// main.ts: app.useGlobalFilters(new TypemoExceptionFilter());
+```
+
+Остальная страница разбирает каждую часть на задачах.
+
+## Ответить на ошибку базы
+
+Ситуация: запись нарушила уникальный индекс, документ не найден, база не ответила вовремя — и клиенту нужен понятный статус, а не 500 с текстом сервера. [`TypemoExceptionFilter`](../../reference/integrations/nestjs.mdx#typemoexceptionfilter) определяет вид ошибки через [`ErrorClassifier.classify`](../../reference/errors/hierarchy.mdx#classify) и отвечает так же, как отвечают ошибки самого Nest: `statusCode`, `error`, `message` и поля вида.
+
+```ts twoslash title="main.ts"
+import { Module } from "@nestjs/common";
+import { NestFactory } from "@nestjs/core";
+import { TypemoExceptionFilter } from "@venloc/typemo-nestjs";
+@Module({})
+class AppModule {}
+// ---cut---
+const app = await NestFactory.create(AppModule);
+app.useGlobalFilters(new TypemoExceptionFilter());
+```
+
+Второй пользователь с тем же email получает 409 с **именами** полей ключа:
+
+```json
+{ "statusCode": 409, "error": "Conflict", "message": "Duplicate value", "fields": ["email"] }
+```
+
+Значения в ответ не попадают: поле ключа может быть скрытым или `sensitive`, а адрес почты чужого пользователя — не то, что стоит возвращать тому, кто его угадывает. `orFail()`, который ничего не нашёл, — 404 `{ "message": "Not found" }`, истёкший `timeoutMS` — 504, недоступная база — 503, всё нераспознанное — 500 без текста сервера: в нём бывают адреса узлов и фрагменты данных. Полная таблица видов и статусов — в справочнике фильтра.
+
+Ошибки «сырого» драйвера (через `client.unsafeDriver()`) фильтр классифицирует так же: дубликат `_id`, вставленный напрямую драйвером, тоже 409. Ответы 500 фильтр пишет в лог Nest с текстом ошибки, чтобы причину можно было найти.
+
+## Свой формат ответа
+
+Ситуация: у API принят свой формат ошибок. Унаследуйте фильтр и переопределите [`toResponse`](../../reference/integrations/nestjs.mdx#toresponse) для нужных видов:
+
+```ts twoslash title="errors/api-exception.filter.ts"
+import type { ErrorClassification } from "@venloc/typemo";
+import { TypemoExceptionFilter, type TypemoHttpResponse } from "@venloc/typemo-nestjs";
+// ---cut---
+export class ApiExceptionFilter extends TypemoExceptionFilter {
+  override toResponse(error: unknown, classification: ErrorClassification): TypemoHttpResponse {
+    if (classification.kind === "duplicate-key") return { status: 409, body: { code: "ALREADY_EXISTS" } };
+    return super.toResponse(error, classification);
+  }
+}
+```
+
+Фильтр ловит только ошибки Typemo и драйвера: `NotFoundException` и другие ошибки Nest, как и ваши собственные, обрабатываются как обычно.
+
+## Разобрать id из адреса
+
+Ситуация: маршрут `GET /users/:id`, и в адрес может прийти что угодно. [`ParseIdPipe.for(User)`](../../reference/integrations/nestjs.mdx#parseidpipe) превращает строку в `_id` модели или отвечает 400:
+
+```text
+GET /users/not-an-id
+→ 400 { "message": "Invalid id: expected ObjectId (not a 24-character hex string)" }
+```
+
+Пайп знает тип `_id` модели: `ObjectId`, `UUID`, строка ([`EntityWithId`](../../reference/schemas/base-classes.mdx#entitywithid)) или число. Для числового `_id` он разбирает цифры строго: `"42"` даёт `42`, а `"42abc"` — 400 `Invalid id: expected number (expected a number)`, а не 42, как дал бы `parseInt`. Тип параметра — [`IdOf<User>`](../../reference/values/form-types.mdx#вспомогательные-типы), тот же, что принимает `findById`.
+
+## Проверить тело запроса схемой
+
+Ситуация: `POST /users` принимает JSON, и его нужно проверить до записи. [`ValidateBodyPipe.for(User)`](../../reference/integrations/nestjs.mdx#validatebodypipe) проверяет тело самой сущностью — типы, `required`, длины, `min` и `max`, `enum`, валидаторы, — поэтому отдельный класс DTO, который пришлось бы держать в согласии с сущностью, не нужен. Добавим модели возраст и роль:
+
+```ts twoslash title="users/user.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+// ---cut---
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  email!: string;
+
+  @Prop(() => String, { required: true, minLength: 2 })
+  name!: string;
+
+  @Prop(() => Number, { min: 0, max: 150 }) // [!code ++]
+  age?: number; // [!code ++]
+
+  @Prop(() => String, { enum: ["user", "admin"] as const }) // [!code ++]
+  role?: "user" | "admin"; // [!code ++]
+}
+```
+
+Тело `{ "email": "bob@x.io", "name": "B", "age": 200, "role": "root" }` получает один ответ 422 со всеми ошибками сразу:
+
+```json
+{
+  "statusCode": 422,
+  "error": "Unprocessable Entity",
+  "message": "Validation failed",
+  "errors": {
+    "name": "must be at least 2 characters long",
+    "age": "must be at most 150",
+    "role": "must be one of \"user\", \"admin\""
+  }
+}
+```
+
+Результат пайпа — приведённые поля, которые были присланы, без умолчаний: их добавит `create`. Тип параметра — [`CreateInput<User>`](../../reference/writes/input-types.mdx#createinput).
+
+## Неизвестные и запрещённые поля
+
+Ситуация: клиент прислал поле, которого у сущности нет, или поле, которое ему задавать нельзя. Неизвестное поле — 422 по умолчанию: `{ "nickname": "not a field of User" }`. Опечатка (`emial`) не пропадает молча, а клиент сразу узнаёт, что поле не принято. Если API должно терпеть лишние поля, включите `dropUnknown: true` — они будут выброшены.
+
+Поле, которое клиенту задавать нельзя (роль, владелец), исключите опцией `omit`:
+
+```ts twoslash title="users/users.controller.ts"
+import { Body, Controller, Post } from "@nestjs/common";
+import { type CreateInput, Entity, type Model, Prop, Schema } from "@venloc/typemo";
+import { InjectModel, ValidateBodyPipe } from "@venloc/typemo-nestjs";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true, unique: true }) email!: string;
+  @Prop(() => String, { required: true, minLength: 2 }) name!: string;
+  @Prop(() => String, { enum: ["user", "admin"] as const }) role?: "user" | "admin";
+}
+// ---cut---
+@Controller("signup")
+export class SignupController {
+  constructor(@InjectModel(User) private readonly users: Model<User>) {}
+
+  @Post()
+  async signUp(@Body(ValidateBodyPipe.for(User, { omit: ["role"] })) body: CreateInput<User>) {
+    return (await this.users.create({ ...body, role: "user" })).$toPlain();
+  }
+}
+```
+
+`role` в теле — 422 `{ "role": "not allowed here" }`. `pick` делает обратное: принимает только перечисленные поля. Имена в `pick` и `omit` проверяет компилятор.
+
+Строка вместо числа (`"age": "30"`) — тоже 422: ядро не приводит строки к числам. В JSON число приходит числом, а `"30"` в числовом поле — признак ошибки клиента.
+
+## Частичное обновление
+
+Ситуация: `PATCH /users/:id` с одним полем. `partial: true` проверяет только присланные поля, и обязательное поле может отсутствовать:
+
+```ts twoslash title="users/users.controller.ts"
+import { Body, Controller, Param, Patch } from "@nestjs/common";
+import { Entity, type IdOf, type Model, Prop, Schema, type UpdateInput } from "@venloc/typemo";
+import { InjectModel, ParseIdPipe, ValidateBodyPipe } from "@venloc/typemo-nestjs";
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true, unique: true }) email!: string;
+  @Prop(() => String, { required: true, minLength: 2 }) name!: string;
+  @Prop(() => Number, { min: 0, max: 150 }) age?: number;
+}
+// ---cut---
+@Controller("users")
+export class UsersController {
+  constructor(@InjectModel(User) private readonly users: Model<User>) {}
+
+  @Patch(":id")
+  update(
+    @Param("id", ParseIdPipe.for(User)) id: IdOf<User>,
+    @Body(ValidateBodyPipe.for(User, { partial: true })) body: UpdateInput<User>,
+  ) {
+    return this.users.findByIdAndUpdate(id, { $set: body }).orFail().plain();
+  }
+}
+```
+
+Тип тела обновления — [`UpdateInput<User>`](../../reference/writes/input-types.mdx#updateinput): в нём нет `_id` и неизменяемых полей, и его принимает `$set`. Пайп отвергает их и при работе: `{ "_id": …, "createdAt": … }` в теле `PATCH` даёт 422 `"cannot be changed"`. `{ "age": -1 }` — 422 `{ "age": "must be at least 0" }`.
+
+## Как выбрать: ValidateBodyPipe или свой DTO
+
+Спросите себя: совпадает ли тело запроса с документом? Если тело — это поля сущности (создание, изменение), `ValidateBodyPipe` проверяет его той же схемой, что и запись, и правила не разойдутся. Если тело — другая форма (команда «перевести 100 со счёта A на счёт B», вложенный запрос поиска), это не документ: опишите DTO своим валидатором. Typemo-модель реализует Standard Schema, поэтому валидаторы, понимающие её, могут проверять и документы.
+
+## Когда это не нужно
+
+Обработчику, который принимает id и сразу отдаёт его в `findById`, `ParseIdPipe` всё равно полезен: без него неверный id стал бы ошибкой приведения внутри запроса (400 от фильтра с `path: "_id"`), а не понятным ответом о параметре. Фильтр не нужен приложению, у которого свой общий обработчик ошибок: используйте в нём `ErrorClassifier.classify` напрямую.
+
+## Частые ошибки
+
+### Ответ 500 вместо 409 или 422
+
+Фильтр не подключён: ошибка дошла до обработчика Nest по умолчанию. Добавьте `app.useGlobalFilters(new TypemoExceptionFilter())` или `{ provide: APP_FILTER, useClass: TypemoExceptionFilter }`.
+
+### Неизвестное поле в теле без пайпа даёт 400
+
+Без `ValidateBodyPipe` тело уходит прямо в `create`, и ядро отвергает неизвестное поле ошибкой приведения — фильтр отвечает 400 `{ "message": "Invalid value", "path": "nickname" }`. Проверка тела пайпом даёт 422 со всеми ошибками разом.
+
+### PATCH отвергает createdAt
+
+Метки времени ведёт ядро, клиент их не меняет: `partial` отвечает `"cannot be changed"`. Уберите поле из тела или включите `dropUnknown`.
+
+## Полный пример
+
+Контроллер пользователей: создание без роли, чтение по id, частичное обновление; фильтр подключён в `main.ts`.
+
+```ts twoslash title="users/users.controller.ts"
+import { Body, Controller, Get, Param, Patch, Post } from "@nestjs/common";
+import { type CreateInput, Entity, type IdOf, type Model, Prop, Schema, type UpdateInput } from "@venloc/typemo";
+import { InjectModel, ParseIdPipe, ValidateBodyPipe } from "@venloc/typemo-nestjs";
+
+// модель
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, unique: true }) email!: string;
+  @Prop(() => String, { required: true, minLength: 2 }) name!: string;
+  @Prop(() => Number, { min: 0, max: 150 }) age?: number;
+  @Prop(() => String, { enum: ["user", "admin"] as const }) role?: "user" | "admin";
+}
+
+@Controller("users")
+export class UsersController {
+  constructor(@InjectModel(User) private readonly users: Model<User>) {}
+
+  // создание: роль задаёт сервер
+  @Post()
+  async create(@Body(ValidateBodyPipe.for(User, { omit: ["role"] })) body: CreateInput<User>) {
+    return (await this.users.create({ ...body, role: "user" })).$toPlain();
+  }
+
+  // чтение: неверный id — 400, отсутствующий — 404
+  @Get(":id")
+  get(@Param("id", ParseIdPipe.for(User)) id: IdOf<User>) {
+    return this.users.findById(id).orFail().plain();
+  }
+
+  // частичное обновление
+  @Patch(":id")
+  update(
+    @Param("id", ParseIdPipe.for(User)) id: IdOf<User>,
+    @Body(ValidateBodyPipe.for(User, { partial: true, omit: ["role"] })) body: UpdateInput<User>,
+  ) {
+    return this.users.findByIdAndUpdate(id, { $set: body }).orFail().plain();
+  }
+}
+```
+
+<Callout type="migration" title="Если вы пришли из @nestjs/mongoose">
+
+`ParseObjectIdPipe` → `ParseIdPipe.for(Entity)`: он понимает любой тип `_id`, а не только `ObjectId`. Фильтра ошибок в `@nestjs/mongoose` нет — ошибка уникального индекса там доходит до клиента как 500. DTO с `class-validator` для полей сущности заменяет `ValidateBodyPipe`.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Справочник: фильтр и пайпы" href="../../reference/integrations/nestjs.mdx#typemoexceptionfilter">
+  Все виды ошибок со статусами, опции пайпов и тексты ошибок.
+</Card>
+<Card title="Обработка ошибок без Nest" href="../../errors/handling.mdx">
+  Классы ошибок Typemo и их классификация.
+</Card>
+<Card title="REST API на NestJS" href="../../recipes/nestjs-rest-api.mdx">
+  Всё вместе: модуль, сервис, контроллер, ошибки и тесты.
+</Card>
+<Card title="Тесты Nest-приложения" href="./testing.mdx">
+  Как проверить ответы на ошибки в e2e-тесте.
+</Card>
+</Cards>

@@ -1,0 +1,176 @@
+# history.yaml: записи без теста с `Hnnn` в названии (этап 10)
+
+Читает `scripts/history-coverage.ts` (строки `- Hnnn: причина`). Покрытые записи здесь не перечисляются: их находит скрипт по названиям тестов. Категории причин:
+- **n/a** — в Typemo нет такого API или механизма (решение в скобках): грабля не может повториться;
+- **поведение** — поведение проверяется тестом, который не называет запись (файл указан);
+- **нет теста** — запись актуальна, теста нет (риск низкий; кандидат на следующий этап).
+
+- H002: n/a — сеттеров уровня пути нет; Map-поле принимает объект или Map и приводит значения (F5, D8)
+- H003: n/a — шаблонов сообщений `{MODEL}` нет; `CastError` несёт путь и причину структурно (D6)
+- H004: n/a — публичного `clone()` с seen-map нет; `populate({ clone: true })` копирует документы из базы (циклов в BSON нет)
+- H006: n/a — пропуска хуков на вызов нет (M4, D9)
+- H007: n/a — offset-пагинации с общим count нет; keyset-пагинация (`keysetPage`, 9.10)
+- H010: n/a — `strict`/`strictQuery` нет: строгость одна и всегда включена (D8, D9)
+- H012: n/a — `Schema.remove(path)` нет: схема — класс, скомпилированная схема неизменяема (G7)
+- H013: n/a — `Schema.clone()` нет (схема — класс)
+- H025: поведение — `bulkSave` новых документов пишет `__v: 0` как `save` (runtime/document/versioning.test.ts «new and changed documents in ONE ordered write»)
+- H028: нет теста — `optimisticConcurrency` при частичной проекции (сохранение частично загруженного документа ограничено 7A; отдельного теста нет)
+- H034: n/a — `validateSync` нет; Union выбирает член type guard'ом или дискриминатором, ровно один (F7, L1-11)
+- H035: n/a — клонирования документов с общими массивами нет; копия (`populate clone`) гидрируется заново
+- H037: нет теста — валидатору передаётся полное значение (обрезки для сообщения нет в коде), отдельного теста нет
+- H041: n/a — query helpers и default options схемы нет
+- H043: поведение — `insertOne` не-объекта: `CastError`/`QueryError` (runtime/model/inserts.test.ts, unit/steps)
+- H044: n/a — сеттеров нет; дефолты при upsert — `$setOnInsert` (runtime/query/updates.test.ts)
+- H045: n/a — внутреннего `deepEqual` для Set нет; сравнение значений — BSON/`equals`
+- H046: поведение — Union и поддокументы в union валидируются (unit/bson union-caster, L1-11)
+- H047: n/a — буферизации и своего heartbeat нет (I2, D2)
+- H048: поведение — неподдерживаемый оператор на числовом поле — `StrictModeError`/`CastError` с путём (unit/steps/filter-cast.test.ts)
+- H049: n/a — глобальных опций `mongoose.set` нет
+- H050: n/a — строковых проекций нет (объектные `select`, D28)
+- H051: нет теста — `sort` в `bulkWrite.updateOne/replaceOne` (опция драйвера 6+) в Typemo не заведена; ни подтверждено, ни отвергнуто тестом
+- H052: нет теста — `arrayFilters` с глубокими путями встроенных дискриминаторов
+- H055: n/a — `pathsToSave` нет
+- H058: n/a — пропуска хуков на вызов нет (M4)
+- H061: n/a — опций `strict`/`strictQuery`/`id` нет
+- H062: поведение — UUID в `toJSON` — строка (F8, runtime/document JSON-формы)
+- H066: n/a — `clone()` документа нет; родитель поддокумента — одна ссылка (7.3)
+- H067: нет теста — документ из `cursor()` в транзакции и его `$save` (сессия документа из запроса есть, отдельного теста курсора нет)
+- H068: поведение — `hydrate()` вложенных массивов схемы (runtime/document, ported/collections)
+- H070: нет теста — валидация поддокументов Map, загруженных из базы, при `save`
+- H072: n/a — опции `timestamps` у `insertMany` нет (D13: `Timestamped`)
+- H073: n/a — pre-хуки не получают опций `save` (контекст — документ)
+- H075: n/a — документные хуки получают документ, не опции/update (D27)
+- H076: нет теста — `enum` из TS-enum (числового с обратным маппингом)
+- H093: n/a — callback-хуков нет, только async (D27)
+- H094: n/a — UUID — `bson.UUID` с первого дня (B1)
+- H097: поведение — плюрализация без `viruss` (unit/schema/naming.test.ts)
+- H102: нет теста — `$deleteOne` документа с `shardKey` в фильтре (для `save` тест есть: runtime/document/versioning.test.ts)
+- H104: нет теста — относительные/абсолютные пути в Map поддокументов (`$markModified`, валидация)
+- H106: n/a — Mixed нет (D8)
+- H107: n/a — `$clone()` документа нет
+- H110: поведение — `ValidationError` со всеми путями, без зависания (runtime/document/validation)
+- H113: нет теста — Map примитивов с `required: true` при `save`
+- H117: n/a — `set(nested, obj, { merge })` нет; `$set` заменяет значение целиком
+- H119: нет теста — Map из Map, валидация глубоких Map поддокументов, update-валидаторы под single nested
+- H120: нет теста — текст `VersionError` про default-пути
+- H121: n/a — строгость фильтра и update одна (D8)
+- H122: поведение — `bulkSave` — одна подготовка и одна запись, без повторного каста (runtime/document/versioning.test.ts)
+- H123: нет теста — `arrayFilters` под `arrayFilters` со встроенными дискриминаторами
+- H125: n/a — `minimize` выключен всегда (D25)
+- H128: нет теста — число вызовов валидатора пути в массиве поддокументов под поддокументом
+- H130: нет теста — поля дискриминатора после `hidden`-поля в проекции
+- H136: n/a — `trusted`-символа нет; события инструментирования редактируются (L8, redaction)
+- H138: n/a — `overwriteDiscriminatorKey` нет: ключ дискриминатора неизменяем (L4, M1)
+- H141: n/a — буферизации нет (I2)
+- H142: нет теста — `hydrate()` глубоко вложенных populated-документов
+- H143: нет теста — дефолты не применяются к путям `map.$*` (Map без дефолтов у ключей)
+- H144: n/a — `strict: false` нет; `undefined` — всегда ошибка (D8)
+- H147: n/a — статического `Model.validate()` нет
+- H150: нет теста — `$save` при `null`-результате `updateOne`
+- H153: n/a — своего heartbeat нет, состояние — из событий топологии драйвера (6.1)
+- H157: n/a — своих сообщений для E11000 нет: `DuplicateKeyError` с `keyPattern`/`keyValue` (6.11)
+- H159: n/a — `overwriteDiscriminatorKey` нет (ключ неизменяем)
+- H160: поведение — `arrayFilters` в `bulkWrite` проходят каст (unit/steps/update-cast.test.ts)
+- H163: n/a — `strict` нет; `immutable` пишется только в `$setOnInsert` при upsert (runtime/query/updates.test.ts)
+- H165: поведение — ошибки индексов собираются (`IndexSyncError`), без unhandled (runtime/mechanisms/index-sync.test.ts)
+- H166: нет теста — `null` глубоко вложенному поддокументу и очистка изменённых подпутей
+- H170: n/a — `readyState` нет; `state` из событий топологии
+- H173: нет теста — производительность `save` 10 уровней поддокументов (бенчмарка нет)
+- H175: n/a — `set(..., { merge })` нет
+- H176: n/a — getters нет (геттеры класса — нативные)
+- H177: поведение — закрытый курсор завершает `for await` без драйверной ошибки (unit/cursor/typed-cursor.test.ts)
+- H180: нет теста — `this` в функции `required` поддокумента под nested
+- H185: нет теста — присваивание поддокумента того же значения и дефолты
+- H186: нет теста — post `deleteOne` поддокумента при `pull` + `save` (хуки удаления поддокумента не реализованы, отчёт 9A)
+- H188: n/a — `validateModifiedOnly` нет (валидация по изменённым путям всегда, D25)
+- H189: нет теста — `$elemMatch` по массиву примитивов в `bulkWrite`
+- H190: нет теста — `$pull` по схеме встроенного дискриминатора
+- H192: нет теста — pre `validate` на 5-уровневом поддокументе
+- H193: нет теста — `bulkSave` с `shardKey` в фильтре (для одиночного `save` тест есть)
+- H194: n/a — опции `transform` у `toObject` нет (K3: типизированный трансформ)
+- H197: поведение — пути `dbName` переводятся до строгой проверки (runtime/steps/steps-on-server.test.ts, unit/steps/db-names.test.ts)
+- H198: n/a — минимизации update нет (`$unset` пишет пользователь, D10)
+- H199: n/a — виртуала `id` нет (L2-11)
+- H202: n/a — `$clone` нет
+- H205: n/a — `toObject.versionKey` нет; `__v` ставит ядро (D13)
+- H207: n/a — присваивание spread-документа: поля документа — собственные значения класса, служебного `$__`/`_doc` нет
+- H208: n/a — `SchemaType.set('validate')` нет
+- H209: поведение — `CastError` update несёт полный путь (unit/steps/update-cast.test.ts)
+- H212: поведение — `$elemMatch` внутри `$and`/`$or`/`$not` проходит каст (unit/steps/filter-cast.test.ts)
+- H218: n/a — legacy API (`count`, `findOneAndRemove`, `rawResult`, `overwrite`) не переносится (D7)
+- H301: поведение — `orFail` у update — по `matchedCount`, не `modifiedCount` (runtime/model/writes.test.ts «orFail: nothing matched»)
+- H303: n/a — строкового `select` нет; смешанная проекция типизирована (H4, 5A)
+- H305: n/a — сеттера `id` нет
+- H306: нет теста — документ как значение фильтра (каст по схеме поддокумента)
+- H314: n/a — опции `writeConcern` у схемы нет; `writeConcern` вызова доходит до сервера (для аудита — до транзакции: runtime/mechanisms/audit-transaction.test.ts)
+- H315: нет теста — производительность путей валидации Map поддокументов
+- H318: n/a — запроса без модели нет (билдер всегда от модели)
+- H319: n/a — query-level `strict` нет
+- H320: n/a — `optimisticConcurrency` по подмножеству путей нет (открытый вопрос 07a)
+- H324: нет теста — update-пайплайн и `timestamps` вложенных схем (`Timestamped` поддокументов)
+- H325: поведение — `dbName`-алиасы в фильтре переводятся (unit/steps/db-names.test.ts, runtime/steps)
+- H327: нет теста — `insertMany` и `timestamps` поддокументов (`Timestamped` поддокумента)
+- H331: поведение — фильтр `findOneAndUpdate` проходит каст (runtime/model/writes.test.ts, unit/steps/filter-cast.test.ts)
+- H332: n/a — `removeVirtual()` нет
+- H333: n/a — `transform()` запроса нет (трансформ populate — H6)
+- H334: нет теста — `updatedAt` при пустой замене `replaceOne` (J5: служебные поля ставит ядро; пустая замена отдельно не проверена)
+- H335: n/a — `virtual('sub.v')` нет (виртуалы — геттеры класса)
+- H336: n/a — `validateSync(paths)` нет
+- H338: нет теста — исключение ключа дискриминатора из проекции (`{ __t: 0 }`)
+- H339: нет теста — изменения из `pre('save')` в `bulkSave` (для `save` тест есть, D25)
+- H340: n/a — глобального `setDefaultsOnInsert` нет (дефолты при upsert всегда, `$setOnInsert`)
+- H342: n/a — getters массивов нет
+- H343: нет теста — дефолты при upsert с пустым update не затирают поля фильтра
+- H344: нет теста — `__v` у `bulkWrite.insertOne`/upsert
+- H345: n/a — у документа нет свойства `collection` (методы с `$`), путь `collection` разрешён
+- H346: нет теста — `bulkSave` базовой моделью изменений в путях дискриминатора
+- H348: нет теста — разные значения ключа дискриминатора в `$or`
+- H351: нет теста — массив строк под массивом поддокументов с `arrayFilters`
+- H353: поведение — `push` приводит элемент один раз (runtime/collections, быстрый путь K11)
+- H355: нет теста — update-валидаторы на single nested с числовыми путями
+- H405: поведение — `$set` поддокумента заменяет его целиком, одна семантика (runtime/collections/subdocument.test.ts)
+- H407: поведение — валидаторы получают id, не populated-документ (populate отдельно от данных, L6)
+- H408: n/a — сеттеров нет; функции `default` без аргументов (D26)
+- H410: n/a — `autoIndex`/`autoCreate` нет (M8: явный `connection.init()`)
+- H411: нет теста — порядок ключей важен при сравнении поддокументов/индексов (сравнение индексов — канонизация 9B)
+- H412: n/a — `exists()` возвращает `boolean` осознанно (id — через `findOne().select({ _id: 1 })`)
+- H416: n/a — `storeSubdocumentValidationError` нет; ошибки поддокумента — в `ValidationError` корня по полным путям
+- H418: n/a — `useNestedStrict` нет (строгость одна)
+- H422: нет теста — зарезервированные имена полей (`$`-методы документа не пересекаются с полями, H474 — тест этапа 10)
+- H423: поведение — одна ссылка на родителя (7.3, runtime/collections/subdocument.test.ts)
+- H424: n/a — пустая запись (problem «—»)
+- H425: n/a — `autoCreate`/`autoIndex` нет (M8)
+- H429: нет теста — `$isModified` при присваивании вложенному boolean того же значения
+- H430: нет теста — новые дефолты в single nested поддокументах существующего документа
+- H431: нет теста — `$elemMatch` с контекстом дискриминатора
+- H434: n/a — `mergeHooks`/`mergePlugins` нет; плагины дискриминатора — от корня (L7A)
+- H435: нет теста — `arrayFilters` и встроенные дискриминаторы
+- H439: поведение — `eachAsync` с `parallel`/`batchSize` не меняет пакет (unit/cursor/typed-cursor.test.ts)
+- H442: n/a — ключ дискриминатора неизменяем
+- H443: n/a — `strict`/`strictQuery` нет
+- H447: нет теста — порядок `createdAt`/`updatedAt` поддокументов при `findOneAndUpdate`
+- H448: нет теста — `$inc` на неустановленном поле (J4-проверка диапазона есть)
+- H449: нет теста — `pull()` поддокумента без `_id` сравнивает по значению
+- H451: поведение — вход пользователя не мутируется (test/guards/*/no-mutation.test.ts)
+- H452: n/a — `Model.init()` нет; `connection.init()` явный и повторяемый (M8)
+- H453: n/a — виртуалы — нативные геттеры класса, значений на документе не хранят
+- H454: поведение — `$set` не мутирует вход (guards/document/no-mutation.test.ts)
+- H455: нет теста — `$toObject()` документа, ссылающегося на себя (populate самого себя)
+- H456: поведение — `undefined` — ошибка, `null` — только nullable (D8, L1-5, L1-6)
+- H459: нет теста — порядок `markModified` в методах массивов (журнал коллекций K4)
+- H461: n/a — «другая копия модуля»: классы BSON берутся у драйвера (F6), схема — класс
+- H467: нет теста — `w: 0` при `$save` (результата нет)
+- H468: n/a — Mixed нет
+- H469: n/a — `versionKey` во вложенном пути нет (`Versioned`, D13)
+- H470: нет теста — `ObjectId`-проверка строк (каст — только 24 hex, L1; отдельного теста на 12-символьные строки нет)
+- H475: нет теста — исключение в функции `required`
+- H477: нет теста — повторная валидация после ошибки в pre `validate`
+- H478: n/a — flatten dotted paths нет
+- H479: n/a — `flattenMaps` нет: `toJSON` Map → объект всегда
+- H482: поведение — `$set` элементов Map поддокументов (runtime/collections/typed-map.test.ts)
+- H483: n/a — предупреждений через `console.warn` нет, ошибки (D8)
+- H484: нет теста — подпути массивов с символами вроде `a-b`
+- H505: нет теста — `required` у массива и `[]`
+- H509: n/a — каст в конвейере при выполнении, после построения плана и до хуков (3.3), отдельной грабли нет
+- H514: n/a — ошибка не хранится в документе
+- H515: поведение — `Immutable`/`immutable: true` (runtime/model/pipeline-e2e.test.ts, runtime/document/subdocument-id.test.ts)

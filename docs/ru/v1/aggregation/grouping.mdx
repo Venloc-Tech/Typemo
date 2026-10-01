@@ -1,0 +1,414 @@
+---
+title: Группировка и отчёты
+description: "Как сгруппировать документы, посчитать суммы и средние, разложить значения по диапазонам и подсчитать повторы"
+icon: ChartColumn
+---
+
+Отчёт почти всегда отвечает на вопрос «сколько» по группам: сколько потратил каждый клиент, сколько заказов пришло за месяц, сколько заказов в каждом диапазоне сумм. В агрегации это делает стадия [`group`](../reference/aggregation/stages.mdx#group): она собирает документы с одинаковым ключом в одну строку и считает по группе значения **аккумуляторами** — функциями, которые сворачивают много значений в одно (`fn.sum`, `fn.avg`, `fn.count`). Для типовых отчётов есть короткие стадии: [`bucket`](../reference/aggregation/stages.mdx#bucket) и [`bucketAuto`](../reference/aggregation/stages.mdx#bucketauto) раскладывают значения по диапазонам, [`sortByCount`](../reference/aggregation/stages.mdx#sortbycount) считает повторы, [`count`](../reference/aggregation/stages.mdx#count) — строки.
+
+Компилятор следит, чтобы в группировке остались только аккумуляторы, и выводит тип каждой строки отчёта. Поэтому `spent` ниже — `number`, а не «что-то из базы».
+
+## Что предполагается
+
+Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx), запуск агрегации из руководства [Первая агрегация](first-aggregation.mdx) и модель заказа. Коллекция `orders` содержит пять заказов: `alice` — 120 и 80 (оба оплачены, в январе и феврале), `bob` — 50 (оплачен, февраль) и 200 (отменён, март), `carol` — 30 (новый, март).
+
+```ts twoslash title="orders/order.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+export class Order extends Entity {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => String, { required: true })
+  status!: string;
+
+  @Prop(() => Number, { required: true })
+  total!: number;
+
+  @Prop(() => Date, { required: true })
+  placedAt!: Date;
+}
+```
+
+## Быстрый путь
+
+`_id` группировки — то, по чему группируем; остальные поля — аккумуляторы:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+const query = Orders.aggregate((p) =>
+  p
+    .group((f) => ({ _id: f.customer, orders: fn.count(), spent: fn.sum(f.total) }))
+    .sort({ _id: 1 }),
+);
+const rows = await query;
+//    ^?
+// → [{ _id: "alice", orders: 2, spent: 200 }, { _id: "bob", orders: 2, spent: 250 }, { _id: "carol", orders: 1, spent: 30 }]
+```
+
+Для диапазонов сумм — `bucket`, для подсчёта повторов — `sortByCount`. Дальше страница разбирает каждый случай.
+
+## Посчитать по группам
+
+Допустим, менеджеру нужна сводка по клиентам: число заказов, сумма, среднее и самый крупный заказ. `_id` — ключ группы, и эта запись обязательна: без неё компилятор не примет стадию. Все остальные поля — аккумуляторы.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+const query = Orders.aggregate((p) =>
+  p
+    .group((f) => ({
+      _id: f.customer,
+      orders: fn.count(),
+      spent: fn.sum(f.total),
+      average: fn.avg(f.total),
+      biggest: fn.max(f.total),
+    }))
+    .sort({ _id: 1 }),
+);
+const rows = await query;
+//    ^?
+// → [{ _id: "alice", orders: 2, spent: 200, average: 100, biggest: 120 }, { _id: "bob", orders: 2, spent: 250, average: 125, biggest: 200 }, …]
+```
+
+Обратите внимание на тип: после `group` строка — это только `_id` и ваши аккумуляторы, `placedAt` и `status` в ней больше нет. Аккумуляторы перечислены в справочнике [Аккумуляторы](../reference/aggregation/accumulators.mdx).
+
+## Сгруппировать по нескольким полям и по дате
+
+Ключ группы может быть составным объектом или вычисленным значением. Составной ключ нужен, когда одного поля мало: клиент и статус вместе. А чтобы посчитать выручку по месяцам, ключ вычисляется из даты через [`fn.dateToString`](../reference/aggregation/expr-date.mdx#fndatetostring).
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+const query = Orders.aggregate((p) =>
+  p
+    .group((f) => ({
+      _id: fn.dateToString({ date: f.placedAt, format: "%Y-%m" }),
+      revenue: fn.sum(f.total),
+    }))
+    .sort({ _id: 1 }),
+);
+const rows = await query;
+//    ^?
+// → [{ _id: "2026-01", revenue: 120 }, { _id: "2026-02", revenue: 130 }, { _id: "2026-03", revenue: 230 }]
+```
+
+Для составного ключа напишите `_id: { customer: f.customer, status: f.status }`: результат — строки вида `{ _id: { customer: "bob", status: "paid" }, n: 1 }`. Чтобы отсортировать по части такого ключа, пишите путь: `.sort({ "_id.customer": 1 })`.
+
+## Посчитать всё одной строкой
+
+Когда группа одна на весь набор, ключ — `null`. Так считают итоги: общая выручка, число заказов.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+const totals = await Orders.aggregate((p) =>
+  p.group((f) => ({ _id: null, revenue: fn.sum(f.total), orders: fn.count() })),
+);
+// → [{ _id: null, revenue: 480, orders: 5 }]
+```
+
+Если документов нет вообще, группа не создаётся, и вы получаете пустой массив, а не строку с нулями. Это поведение сервера: учитывайте его при показе итогов.
+
+## Собрать значения в список
+
+Аккумуляторы бывают не только числовые. [`fn.push`](../reference/aggregation/accumulators.mdx#fnpush) собирает значения группы в массив, [`fn.addToSet`](../reference/aggregation/accumulators.mdx#fnaddtoset) делает то же без повторов. [`fn.first`](../reference/aggregation/accumulators.mdx#fnfirst) и [`fn.last`](../reference/aggregation/accumulators.mdx#fnlast) берут первое и последнее значение, но «первое» определяется порядком документов на входе, поэтому перед ними ставят [`sort`](../reference/aggregation/stages.mdx#sort). Если порядок нужен внутри самой группировки, есть [`fn.top`](../reference/aggregation/accumulators.mdx#fntop) со своим `sortBy`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+const query = Orders.aggregate((p) =>
+  p
+    .group((f) => ({
+      _id: f.customer,
+      totals: fn.push(f.total),
+      best: fn.top({ output: f.total, sortBy: [[f.total, -1]] }),
+    }))
+    .sort({ _id: 1 }),
+);
+const rows = await query;
+//    ^?
+// → [{ _id: "alice", totals: [120, 80], best: 120 }, { _id: "bob", totals: [50, 200], best: 200 }, …]
+```
+
+Порядок элементов в `push` совпадает с порядком документов на входе, а у `addToSet` порядка нет вообще: не рассчитывайте на него. В `sortBy` ссылки на поля берутся из `f`, а не строками: так путь проверяется компилятором.
+
+## Разложить по диапазонам
+
+Чтобы понять, много ли в магазине крупных заказов, значения раскладывают по **корзинам**: диапазонам с заданными границами. [`bucket`](../reference/aggregation/stages.mdx#bucket) принимает выражение `groupBy`, границы `boundaries` (нижняя граница включается, верхняя нет) и, по желанию, значение `default` для тех, кто не попал в диапазоны. В `_id` каждой строки — нижняя граница корзины.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+const query = Orders.aggregate((p) =>
+  p.bucket({
+    groupBy: (f) => f.total,
+    boundaries: [0, 50, 100, 500],
+    default: "other",
+    output: (f) => ({ orders: fn.count(), sum: fn.sum(f.total) }),
+  }),
+);
+const rows = await query;
+//    ^?
+// → [{ _id: 0, orders: 1, sum: 30 }, { _id: 50, orders: 2, sum: 130 }, { _id: 100, orders: 2, sum: 320 }]
+```
+
+Границы возрастают, а их тип совпадает с типом `groupBy`: строки вместо чисел компилятор не примет. Без `default` сервер отвергает документы, которые не попали ни в один диапазон (`ServerError: $switch could not find a matching branch for an input, and no default was specified. (code 7158303 Location7158303)`), поэтому если значения не ограничены, `default` нужен. А если границы вы не знаете и просто хотите разделить значения на равные по наполнению корзины, используйте [`bucketAuto`](../reference/aggregation/stages.mdx#bucketauto): вы задаёте число корзин, сервер выбирает границы сам. `_id` тогда — объект `{ min, max }`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) =>
+  p.bucketAuto({ groupBy: (f) => f.total, buckets: 2, output: () => ({ orders: fn.count() }) }),
+);
+// → [{ _id: { min: 30, max: 120 }, orders: 3 }, { _id: { min: 120, max: 200 }, orders: 2 }]
+```
+
+## Подсчитать повторы
+
+Чтобы узнать, какой статус встречается чаще всего, не нужен целый `group` с сортировкой. [`sortByCount`](../reference/aggregation/stages.mdx#sortbycount) делает всё сразу: группирует по выражению, считает и сортирует по убыванию счётчика. Строка — это `{ _id, count }`.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) => p.sortByCount((f) => f.status));
+// → [{ _id: "paid", count: 3 }, { _id: "cancelled", count: 1 }, { _id: "new", count: 1 }]
+```
+
+Порядок групп с одинаковым счётчиком (`cancelled` и `new` здесь) не определён: если он важен, добавьте [`sort`](../reference/aggregation/stages.mdx#sort) по второму полю. Чтобы посчитать число строк на входе, есть стадия [`count`](../reference/aggregation/stages.mdx#count), которой вы даёте имя поля результата:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+const rows = await Orders.aggregate((p) => p.match({ status: "paid" }).count("paidOrders"));
+//    ^?
+// → [{ paidOrders: 3 }]
+```
+
+Для одного числа без последующих стадий проще [`countDocuments`](../reference/query/reading.mdx#modelcountdocuments).
+
+## Как выбрать
+
+Задайте вопрос: какой ключ у результата? Если ключ — значение поля или вычисление (клиент, месяц, статус), нужен `group`. Если ключ — диапазон значения, берите `bucket` (границы известны) или `bucketAuto` (нужны равные части). Если нужно лишь число повторов каждого значения, хватит `sortByCount`. Если нужно одно число на весь набор, ключ `null` в `group`.
+
+## Когда это не нужно
+
+Для одного счётчика по фильтру используйте [`countDocuments`](../reference/query/reading.mdx#modelcountdocuments), для уникальных значений поля — [`distinct`](../reference/query/reading.mdx#modeldistinct): они не строят конвейер. Если отчёт нужен постоянно и считается долго, сохраните его результат: [материализованное представление или `$out`](output.mdx).
+
+## Частые ошибки
+
+### Вычисление вместо аккумулятора
+
+В `group` каждое поле, кроме `_id`, должно быть аккумулятором. Обычная функция вроде `fn.add` считает по одному документу и здесь не годится. Компилятор называет причину прямо в ошибке.
+
+```ts twoslash
+// @errors: 2741
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+await Orders.aggregate((p) => p.group((f) => ({ _id: f.customer, plusOne: fn.add(f.total, 1) })));
+```
+
+Текст ошибки: `Property 'error' is missing in type '{ readonly _id: …; readonly plusOne: Expr<number>; }' but required in type 'PathError<"$group field \"plusOne\" needs an accumulator (fn.sum, fn.avg, fn.push, fn.first, fn.count, ...)">'`. Нужная часть — в конце: имя поля (`plusOne`), стадия и список подходящих аккумуляторов. Оберните значение в аккумулятор: `fn.sum(fn.add(f.total, 1))`. То же правило действует для `output` стадий `bucket` и `bucketAuto`. Обратное тоже верно: `fn.push`, `fn.count` и другие чисто аккумуляторные операторы в `project` и `addFields` не скомпилируются.
+
+### Забыт `_id`
+
+Ключ группы обязателен: даже когда группа одна, пишется `_id: null`. Без него стадия не скомпилируется: `Property '_id' is missing in type '{ readonly spent: DualExpr<number>; }' but required in type '{ readonly _id: unknown; }'`.
+
+```ts twoslash
+// @errors: 2741
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+await Orders.aggregate((p) => p.group((f) => ({ spent: fn.sum(f.total) })));
+```
+
+### После группировки нужные поля пропали
+
+После `group` в строке остаются только `_id` и аккумуляторы. Если следующая стадия читает `status`, а вы его не сохранили, компилятор скажет, что поля нет. Добавьте нужное поле в группировку аккумулятором (`fn.first(f.status)`) или сделайте его частью ключа.
+
+## Полный пример
+
+```ts twoslash title="reports/sales.ts"
+import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
+
+@Schema({ collection: "orders" })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => Date, { required: true }) placedAt!: Date;
+}
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
+const Orders = client.connection.model(Order);
+// ---cut---
+// 1. Сводка по клиентам оплаченных заказов.
+export const spendingByCustomer = () =>
+  Orders.aggregate((p) =>
+    p
+      .match({ status: "paid" })
+      .group((f) => ({ _id: f.customer, orders: fn.count(), spent: fn.sum(f.total) }))
+      .sort({ spent: "descending" }),
+  ).plain();
+
+// 2. Выручка по месяцам.
+export const revenueByMonth = () =>
+  Orders.aggregate((p) =>
+    p
+      .group((f) => ({
+        _id: fn.dateToString({ date: f.placedAt, format: "%Y-%m" }),
+        revenue: fn.sum(f.total),
+      }))
+      .sort({ _id: 1 }),
+  ).plain();
+
+// 3. Распределение заказов по диапазонам сумм.
+export const ordersBySize = () =>
+  Orders.aggregate((p) =>
+    p.bucket({
+      groupBy: (f) => f.total,
+      boundaries: [0, 50, 100, 500],
+      default: "other",
+      output: () => ({ orders: fn.count() }),
+    }),
+  ).plain();
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Соединения" href="./joins.mdx">
+  Присоединить к отчёту данные из другой коллекции.
+</Card>
+<Card title="Несколько отчётов за один запрос" href="./facets.mdx">
+  Посчитать сводку и диапазоны за один проход по данным.
+</Card>
+<Card title="Оконные функции" href="./windows.mdx">
+  Нарастающие итоги и рейтинги без потери отдельных строк.
+</Card>
+<Card title="Справочник: аккумуляторы" href="../reference/aggregation/accumulators.mdx">
+  Все аккумуляторы с типами и краевыми случаями.
+</Card>
+</Cards>

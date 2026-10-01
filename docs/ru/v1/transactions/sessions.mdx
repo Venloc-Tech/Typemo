@@ -1,0 +1,280 @@
+---
+title: Сессии вручную
+description: "Как самому открыть сессию, запустить в ней транзакцию, передать её операциям и документам и не забыть закрыть"
+icon: KeyRound
+---
+
+Чтобы управлять транзакцией самому, откройте сессию через [`client.startSession`](../reference/transactions/transactions.mdx#startsession) и передавайте её операциям через [`.session()`](../reference/query/options.mdx#session). **Сессия** — это контекст на стороне сервера, в котором идут связанные операции; транзакция — одна из вещей, которые в ней можно запустить. В большинстве случаев вам это не нужно: [`client.transaction`](../reference/transactions/transactions.mdx#transaction) делает всё сама. Ручная сессия нужна тогда, когда фиксацией управляет ваш код: например, вы совмещаете несколько мест, каждое из которых получает сессию как аргумент, либо пользуетесь возможностями драйвера, которые `transaction` не оборачивает.
+
+Цена ручного управления в том, что за вами три обязанности, которые `transaction` берёт на себя: передавать сессию в каждую операцию, закрывать её и выполнять операции по одной. Забытая сессия тихо превращает операцию в запись вне транзакции. Страница показывает, как этого не допустить.
+
+Если вы только начинаете, сначала прочитайте руководство [Транзакции](./transactions.mdx): оно решает задачу проще.
+
+## Что предполагается
+
+Примеры используют подключённый клиент из файла `db/client.ts` и модель счёта из `accounts/account.ts`. В базе два счёта: `Main` с балансом 100 и `Savings` с балансом 50.
+
+```ts twoslash title="db/client.ts"
+import { TypemoClient } from "@venloc/typemo";
+
+export const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+```
+
+```ts twoslash title="accounts/account.ts"
+import { Entity, Prop, Schema } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+export class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  balance!: number;
+}
+```
+
+## Быстрый путь
+
+Откройте сессию, запустите в ней транзакцию средствами драйвера, передавайте сессию операциям и закройте её в `finally`. Метод `withTransaction` драйвера сам фиксирует транзакцию и повторяет её при временных сбоях:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const session = await client.startSession();
+try {
+  await session.withTransaction(async () => {
+    await Accounts.create({ title: "Manual", balance: 1 }, { session });
+  });
+} finally {
+  await session.endSession();
+}
+```
+
+В запуске запись `Manual` оказалась в коллекции после фиксации. Остальная страница разбирает, как передавать сессию, как управлять фиксацией вручную и какие правила действуют.
+
+## Передать сессию операции
+
+Сессия передаётся операции через [`.session()`](../reference/query/options.mdx#session) у запросов и через опцию `session` у записей. Для явной сессии авто-присоединения нет: операция без сессии выполняется вне транзакции, даже если вы открыли её в соседней строке.
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const session = await client.startSession();
+try {
+  session.startTransaction();
+  const account = await Accounts.findOne({ title: "Main" }).session(session).orFail();
+  await Accounts.updateOne({ title: "Savings" }, { $inc: { balance: 10 } }).session(session);
+  await Accounts.create({ title: "Extra", balance: 5 }, { session });
+  await session.commitTransaction();
+} finally {
+  await session.endSession();
+}
+```
+
+Запись в этом примере фиксируется вручную: `startTransaction`, затем операции, затем `commitTransaction`. Если что-то пошло не так, вызовите `abortTransaction` в блоке `catch`: без этого транзакция остаётся открытой, пока сервер сам её не закроет.
+
+Пока транзакция не зафиксирована, её изменения видны только внутри неё. В запуске внутри транзакции баланс счёта был 60, а снаружи ещё 100; после фиксации снаружи стало 60. При `abortTransaction` изменения откатываются: запись `Extra` внутри транзакции существовала (счёт 1), а снаружи её не было (0), а после отката её нет и снаружи (0).
+
+## Документ, загруженный в сессии
+
+Документ, загруженный с сессией, запоминает её: [`$save`](../reference/documents/document-api.mdx#save) использует ту же сессию без вашего участия. Это удобно: `save` не нужно передавать сессию второй раз. Прочитать сессию документа можно через [`$session`](../reference/documents/document-api.mdx#session), а установить или сбросить — тем же методом с аргументом:
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+const session = await client.startSession();
+try {
+  session.startTransaction();
+  const main = await Accounts.findOne({ title: "Main" }).session(session).orFail();
+  console.log(main.$session() === session);
+  // → true
+
+  main.balance = 60;
+  await main.$save();
+  await session.commitTransaction();
+
+  main.$session(null);
+  console.log(main.$session());
+  // → undefined
+} finally {
+  await session.endSession();
+}
+```
+
+После завершения сессии сбросьте её у документа (`$session(null)`), если продолжаете им пользоваться: сохранение в закрытой сессии закончится ошибкой [`DriverError`](../reference/errors/configuration-errors.mdx#drivererror) с текстом `Use of expired sessions is not permitted`.
+
+## Выйти из транзакции осознанно
+
+Внутри [`client.transaction`](../reference/transactions/transactions.mdx#transaction) операция может понадобиться вне транзакции: например, запись в журнал, которая должна остаться, даже если транзакция откатится. Для этого передайте `session(null)` (у записей — `{ session: null }`):
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+// ---cut---
+await client
+  .transaction(async () => {
+    await Accounts.updateOne({ title: "Savings" }, { $inc: { balance: 100 } }).session(null);
+    throw new Error("abort");
+  })
+  .catch(() => undefined);
+```
+
+Транзакция откатилась, а запись с `session(null)` осталась: в запуске баланс `Savings` после этого вырос на 100 (стал 150). Это осознанное исключение, и пользоваться им нужно только тогда, когда вы действительно хотите, чтобы запись пережила откат.
+
+## Правила одновременных операций
+
+Одна сессия не умеет выполнять несколько записей одновременно. Библиотека не отправляет такую попытку на сервер, а отказывает сама ошибкой [`StrictModeError`](../reference/errors/data-errors.mdx#strictmodeerror) с причиной `concurrent-session`. Причина в том, что сервер реагирует по-разному, но одинаково плохо (по измерениям авторов библиотеки, в запуске здесь не воспроизводилось): внутри транзакции он отвечает ошибкой конфликта, а вне транзакции параллельные записи одной сессии принимает, но часть из них молча не записывает. Тихая потеря данных хуже отказа, поэтому отказывает библиотека.
+
+Правила таковы. Внутри транзакции операции выполняются по одной. В сессии без транзакции одновременно можно выполнять любое число **чтений**, а запись — только в одиночку. В запуске два чтения в одной сессии прошли (`countDocuments` и `find`), а две записи одновременно и запись рядом с чтением были отвергнуты:
+
+```text
+StrictModeError: Account.updateOne: the session is in use by Account.updateOne, which has not finished; operations on one session must run one after another — await each one; only reads may overlap, and only outside a transaction (MongoDB does not support concurrent operations on a session) [concurrent-session]
+```
+
+Отвергнутая операция не отправляется на сервер, поэтому сессия после такой ошибки остаётся рабочей. Пишите `await` перед каждой операцией, и правило вас не коснётся.
+
+## Настройки чтения и записи
+
+Уровни чтения и подтверждения записи для транзакции задаются при её запуске, а не у операций: `session.startTransaction({ readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } })`. Операция внутри транзакции со своим `readConcern`, `writeConcern`, `readPreference` (кроме `primary`) или `timeoutMS` получает `StrictModeError` с причиной `transaction-option`. Это касается и транзакции, которую вы открыли вручную: в запуске `find().session(session).readConcern("majority")` внутри такой транзакции завершился ошибкой:
+
+```text
+StrictModeError: Account.find: readConcern "majority" inside a transaction — the transaction's own settings apply (set them on transaction()) [transaction-option]
+```
+
+Сервер не позволяет переопределить настройки транзакции отдельной операцией, а драйвер молча отбросил бы их. Библиотека сообщает об этом сразу. Вне транзакции, в сессии без транзакции, эти опции у операций разрешены.
+
+## Как выбрать
+
+Задайте себе один вопрос: **нужно ли мне самому решать, когда зафиксировать транзакцию?** Если нет, используйте [`client.transaction`](../reference/transactions/transactions.mdx#transaction): она передаёт сессию сама, повторяет функцию при временных сбоях, откатывает состояние документов и закрывает сессию. Если да, например фиксация зависит от ответа внешней системы или вы совмещаете несколько мест кода, откройте сессию сами и берите на себя передачу сессии и закрытие.
+
+## Когда это не нужно
+
+Ручная сессия не нужна для одной записи, для чтения без транзакции и для обычной транзакции в несколько записей. Она нужна редко: чаще всего её используют по привычке из Mongoose, где иначе было нельзя. Если вы открываете сессию только ради `startTransaction` и `commitTransaction` вокруг обычных операций, замените всё на `client.transaction`.
+
+## Частые ошибки
+
+### Запись осталась после отката
+
+Вы открыли транзакцию и забыли передать сессию в одну из операций. Она выполнилась вне транзакции и осталась после отката. В запуске запись `Forgot` без сессии пережила `abortTransaction` (в коллекции нашёлся 1 документ):
+
+```ts twoslash
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+const session = await client.startSession();
+session.startTransaction();
+// ---cut---
+// неправильно: сессия не передана, запись вне транзакции
+await Accounts.create({ title: "Forgot", balance: 1 });
+
+// правильно: запись в той же сессии
+await Accounts.create({ title: "Kept", balance: 1 }, { session });
+```
+
+Явная сессия автоматически не присоединяется: только `client.transaction` присоединяет операции сама. Если вы не хотите следить за каждым вызовом, используйте её.
+
+### Сессия не закрыта
+
+Сессия открыта, но `endSession` не вызван (например, при исключении). Она остаётся открытой на сервере. Закрывайте сессию в `finally`: она закрывается и при ошибке. Проверка `session.hasEnded` покажет, закрыта ли она.
+
+### Параллельные записи в одной сессии
+
+`Promise.all` из двух записей в одну сессию отвергается с `concurrent-session`. Запускайте записи по очереди с `await`.
+
+## Полный пример
+
+Один файл собирает всё вместе: ручная сессия с фиксацией и откатом, документ, загруженный в сессии, и закрытие сессии. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="accounts/manual-transfer.ts"
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true })
+  title!: string;
+
+  @Prop(() => Number, { required: true, min: 0 })
+  balance!: number;
+}
+
+declare const __askBank__: () => Promise<boolean>;
+
+const client = await TypemoClient.connect("mongodb://localhost:27017/app");
+const Accounts = client.connection.model(Account);
+
+// перевод, фиксацию которого решает внешняя система
+export const transferWithApproval = async (from: string, to: string, amount: number): Promise<boolean> => {
+  const session = await client.startSession();
+  try {
+    session.startTransaction();
+
+    // документ запоминает сессию: $save пишет в ту же транзакцию
+    const source = await Accounts.findOne({ title: from }).session(session).orFail();
+    source.balance = source.balance - amount;
+    await source.$save();
+    await Accounts.updateOne({ title: to }, { $inc: { balance: amount } }).session(session);
+
+    // фиксацию решает ответ банка
+    if (await __askBank__()) {
+      await session.commitTransaction();
+      return true;
+    }
+    await session.abortTransaction();
+    return false;
+  } catch (error) {
+    if (session.inTransaction()) await session.abortTransaction();
+    throw error;
+  } finally {
+    await session.endSession();
+  }
+};
+```
+
+## Что дальше
+
+<Cards>
+<Card title="Транзакции" href="./transactions.mdx">
+  Способ проще: `client.transaction` сама передаёт сессию, повторяет функцию и закрывает сессию.
+</Card>
+<Card title="Справочник транзакций" href="../reference/transactions/transactions.mdx">
+  Аргументы `startSession`, `transaction`, настройки и `TransactionScope`.
+</Card>
+<Card title="Опции запроса" href="../reference/query/options.mdx">
+  Метод `.session()` и остальные опции запроса.
+</Card>
+<Card title="Доступ к драйверу" href="../connection/driver-access.mdx">
+  Как вызывать драйвер напрямую и передавать ему сессию транзакции.
+</Card>
+</Cards>

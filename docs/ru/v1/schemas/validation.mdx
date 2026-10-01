@@ -1,0 +1,343 @@
+---
+title: Проверять значения полей
+description: "Как ограничить значения полей: границы, длину, набор значений, формат и свои проверки, включая проверку при обновлении и разбор ошибки"
+icon: ShieldCheck
+---
+
+Схема Typemo проверяет значения полей на двух уровнях. Сначала библиотека приводит значение к типу поля и отвергает то, что к типу не подходит: строку вместо числа, неверный идентификатор. Затем она применяет **правила** из опций поля: [`min`](../reference/schemas/prop.mdx#min), [`maxLength`](../reference/schemas/prop.mdx#maxlength), [`enum`](../reference/schemas/prop.mdx#enum), [`match`](../reference/schemas/prop.mdx#match) и свою функцию [`validate`](../reference/schemas/prop.mdx#validate). Так недопустимое значение не доходит до базы: MongoDB сама не проверяет ничего, пока вы не заведёте валидатор коллекции.
+
+Нарушение правила — [`ValidationError`](../reference/errors/data-errors.mdx#validationerror). Значение неподходящего типа — [`CastError`](../reference/errors/data-errors.mdx#casterror). Это разные ошибки, и различие полезно: первая говорит «значение правильного типа, но недопустимое», вторая — «это вообще не тот тип». Порядок такой: значение, которое не приводится, даёт одну `CastError` на поле, и правила этого поля уже не проверяются, а недопустимые значения собираются в одну `ValidationError`.
+
+## Что предполагается
+
+Модель описана по руководству [Описать модель](./define-model.mdx). Примеры строят модель пользователя, которого регистрируют на сайте, и добавляют в неё правила по одному.
+
+## Быстрый путь
+
+Правила указываются в опциях `@Prop`. Нарушенное правило останавливает `create`, а текст ошибки называет поле и причину:
+
+```ts twoslash title="users/user.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "users" })
+export class User extends Entity {
+  @Prop(() => String, { required: true, minLength: 3, maxLength: 12 })
+  login!: string;
+
+  @Prop(() => Number, { min: 18, max: 120 })
+  age?: number;
+}
+
+const Users = client.connection.model(User);
+try {
+  await Users.create({ login: "ab", age: 7 });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "login": must be at least 3 characters long [minLength]; "age": must be at least 18 [min]
+```
+
+Библиотека нашла обе проблемы сразу и назвала их в одном сообщении, в порядке полей схемы: чинить по одной, перезапуская запрос, не придётся. Остальная страница разбирает правила по ситуациям.
+
+## Ограничить число или дату
+
+`min` и `max` — нижняя и верхняя границы. Они работают для `Number`, `Types.Int32`, `Types.Double`, `BigInt` и `Date`, и граница должна быть значением того же типа, что поле. Обе границы включаются в допустимый диапазон.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "people" })
+class Person extends Entity {
+  @Prop(() => Number, { min: 18, max: 120 }) // [!code highlight]
+  age?: number;
+  @Prop(() => Date, { min: new Date("2020-01-01") }) // [!code highlight]
+  registered?: Date;
+}
+const People = client.connection.model(Person);
+try {
+  await People.create({ age: 200, registered: new Date("2019-01-01") });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "age": must be at most 120 [max]; "registered": must be at least 2020-01-01T00:00:00.000Z [min]
+```
+
+`min` больше `max` — ошибка описания, а не данных: она бросается при получении модели как `ConfigurationError: Person.age: "min" is greater than "max"`.
+
+## Ограничить строку
+
+Длину строки задают [`minLength`](../reference/schemas/prop.mdx#minlength) и [`maxLength`](../reference/schemas/prop.mdx#maxlength), форму — [`match`](../reference/schemas/prop.mdx#match) с регулярным выражением, набор допустимых значений — [`enum`](../reference/schemas/prop.mdx#enum). Для `enum` тип поля объявляется объединением этих же значений, чтобы компилятор тоже знал их.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true, match: /^[a-z0-9_]+$/ }) // [!code highlight]
+  login!: string;
+  @Prop(() => String, { enum: ["user", "admin"] as const, default: "user" }) // [!code highlight]
+  role!: Defaulted<"user" | "admin">;
+}
+const Users = client.connection.model(User);
+try {
+  await Users.create({ login: "a b c", role: "root" as never });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "login": must match /^[a-z0-9_]+$/ [match]; "role": must be one of "user", "admin" [enum]
+```
+
+У регулярного выражения нельзя ставить флаги `g` и `y`: такое выражение помнит позицию последнего поиска (`lastIndex`), и одна и та же проверка давала бы разные ответы на одно значение. Библиотека отклоняет их при получении модели.
+
+## Привести строку к нужному виду
+
+Опции [`trim`](../reference/schemas/prop.mdx#trim), [`lowercase`](../reference/schemas/prop.mdx#lowercase) и [`uppercase`](../reference/schemas/prop.mdx#uppercase) не проверяют, а преобразуют строку при присваивании. Они выполняются **до** проверок длины и формы, поэтому пробелы по краям не считаются символами, а регистр не мешает `match`. Так удобно нормализовать логин или код валюты, а не отвергать ввод из-за регистра.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true, trim: true, lowercase: true, minLength: 3, match: /^[a-z0-9_]+$/ })
+  login!: string;
+  @Prop(() => String, { uppercase: true, minLength: 3, maxLength: 3 })
+  country?: string;
+}
+const Users = client.connection.model(User);
+const user = await Users.create({ login: "  Ann_1 ", country: "pln" });
+console.log(user.login, user.country);
+// → ann_1 PLN
+try {
+  await Users.create({ login: "  ab  " });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "login": must be at least 3 characters long [minLength]
+```
+
+`lowercase` и `uppercase` вместе на одном поле — ошибка описания: `"lowercase" and "uppercase" together`.
+
+## Написать свою проверку
+
+Если встроенных правил не хватает, передайте в [`validate`](../reference/schemas/prop.mdx#validate) функцию. Она получает значение и возвращает `true`, если всё в порядке, или строку с текстом ошибки. Функция может быть асинхронной: так можно спросить у внешней системы, занят ли логин. Можно передать и список функций: выполнятся **все**, и в ошибке будут все сообщения.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+const taken = new Set(["root"]); // код читателя: занятые логины
+
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) login!: string;
+
+  @Prop(() => String, {
+    validate: [
+      (value) => value.includes("@") || "must contain @", // [!code highlight]
+      (value) => value.endsWith(".com") || "must end with .com", // [!code highlight]
+    ],
+  })
+  email?: string;
+
+  @Prop(() => String, {
+    validate: async (value, context) => { // [!code highlight]
+      await Promise.resolve();
+      return !taken.has(value) || `"${value}" is taken (${context.kind}:${context.operation})`;
+    },
+  })
+  handle?: string;
+}
+const Users = client.connection.model(User);
+try {
+  await Users.create({ login: "abc", email: "nope", handle: "root" });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "email": must contain @ [validator]; "email": must end with .com [validator]; "handle": "root" is taken (document:save) [validator]
+```
+
+Второй аргумент, `context`, говорит, где запущена проверка: для целого документа это `document:save`, для значения из обновления — например `update:updateOne`. Так одна функция может вести себя по-разному при создании и при обновлении. Пустые значения проверка не получает: `null` и отсутствующее поле — дело [`required`](./required-and-null.mdx) и `nullable`.
+
+## Проверить обновление
+
+Правила применяются и к записи через обновление, а не только к `create`. [`updateOne`](../reference/writes/writes.mdx#updateone), [`updateMany`](../reference/writes/writes.mdx#updatemany), [`findOneAndUpdate`](../reference/writes/writes.mdx#findoneandupdate) и [`replaceOne`](../reference/writes/writes.mdx#replaceone) проверяют значения до отправки в базу, а `trim` и `lowercase` там тоже работают. Даже для `$inc` библиотека считает результат и проверяет его: значение, которое вышло бы за границы, останавливается.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true, trim: true, lowercase: true, minLength: 3 }) login!: string;
+  @Prop(() => Number, { min: 18, max: 120 }) age?: number;
+}
+const Users = client.connection.model(User);
+await Users.create({ login: "ann", age: 20 });
+// ---cut---
+try {
+  await Users.updateOne({ login: "ann" }, { $set: { age: 5 } });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "age": must be at least 18 [min]
+try {
+  await Users.updateOne({ login: "ann" }, { $inc: { age: 200 } });
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "age": $inc 200 on 20 gives 220, above the maximum 120; nothing was written [max]
+await Users.updateOne({ login: "ann" }, { $set: { login: "  NEWANN " } });
+console.log((await Users.findOne({ login: "newann" }).plain())?.login);
+// → newann
+```
+
+Проверка идёт до обращения к базе, поэтому нарушивший правила запрос ничего не меняет. То же верно для [`insertMany`](../reference/writes/writes.mdx#insertmany): если хотя бы один документ не проходит, не записывается ни один. Фильтры правилами `min`, `enum` и другими не проверяются: фильтр только приводится по типу поля, потому что искать можно и значение, которое записать нельзя.
+
+## Проверить загруженный документ
+
+У загруженного документа изменённые поля проверяются при [`$save`](../reference/documents/document-api.mdx#save), а без записи — методом [`$validate`](../reference/documents/document-api.mdx#validate). Так форму можно проверить, не обращаясь к базе. Простое присваивание (`user.age = "x"`) значение сразу не приводит: приведение выполняется на ближайшем `$validate()` или `$save()`, и неподходящий тип даёт `CastError` раньше любых правил, а в базу ничего не уходит. Методы документа, такие как `$set`, и `create` приводят значение сразу. [`Model.validate`](../reference/documents/model-document-methods.mdx#modelvalidate) работает иначе и собирает все проблемы: ошибка приведения попадает в `issues` с причиной `cast`. Подробнее — в руководстве [Проверить документ](../documents/validation.mdx).
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true }) login!: string;
+  @Prop(() => Number, { min: 18, max: 120 }) age?: number;
+}
+const Users = client.connection.model(User);
+await Users.create({ login: "ann", age: 20 });
+// ---cut---
+const user = await Users.findOne({ login: "ann" }).orFail();
+user.age = 3;
+try {
+  await user.$validate();
+} catch (error) {
+  console.log((error as Error).message);
+}
+// → Validation failed: "age": must be at least 18 [min]
+```
+
+## Разобрать ошибку
+
+`ValidationError` собирает все проблемы в поле `issues`: у каждой есть `path` (путь к полю, разбитый на части), `reason` (причина) и `message`. Свойство `errors` группирует их по пути. Причины: `required`, `min`, `max`, `minLength`, `maxLength`, `enum`, `match`, `validator`. Это удобно, когда нужно показать пользователю ошибку рядом с нужным полем формы.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true, minLength: 3 }) login!: string;
+  @Prop(() => Number, { min: 18 }) age?: number;
+}
+const Users = client.connection.model(User);
+// ---cut---
+import { ValidationError } from "@venloc/typemo";
+
+try {
+  await Users.create({ login: "a", age: 3 });
+} catch (error) {
+  if (error instanceof ValidationError) {
+    console.log(error.issues.map((issue) => `${issue.path.join(".")}:${issue.reason}`));
+    // → ["login:minLength", "age:min"]
+    console.log(Object.keys(error.errors));
+    // → ["login", "age"]
+  }
+}
+```
+
+Проблемы идут в порядке полей схемы, а не в порядке ключей в вашем запросе: сначала `login`, потом `age`, как они объявлены в классе. Внутри вложенных объектов и массивов путь длиннее: `lines.0.qty`, см. [Массивы](./arrays.mdx).
+
+## Как выбрать
+
+Задайте себе один вопрос: **можно ли выразить правило значением, а не кодом?** Границы, длина, набор значений и форма — это опции: они видны в описании, работают одинаково при создании и обновлении и проверяются при сборке модели. Свою функцию `validate` берите, когда правило зависит от внешнего мира (уникальность в другой системе, проверка контрольной суммы) или от контекста операции. Уникальность значения внутри коллекции проверять функцией не нужно: для неё есть [`unique`](../reference/schemas/prop.mdx#unique), и гарантию даёт сервер.
+
+## Когда это не нужно
+
+Правила `@Prop` работают на стороне приложения: другая программа, которая пишет в ту же коллекцию напрямую, их обойдёт. Если нужна защита на стороне сервера, задайте валидатор коллекции: [JSON Schema и Standard Schema](./json-and-standard-schema.mdx) и опция [`validator`](../reference/schemas/schema.mdx#validator) в `@Schema`. Проверять произвольные данные без коллекции, например тело запроса, можно через [`Model.validate`](../reference/documents/model-document-methods.mdx#modelvalidate). Совпадение значения с другим полем документа `@Prop` не проверяет: правила видят одно поле.
+
+## Частые ошибки
+
+### Проверка не сработала, хотя значение неверное
+
+`create({ age: "20" })` даёт `CastError`, а не `ValidationError`: сначала значение приводится к типу, и строка числом не становится. Если вы ловите только `ValidationError`, ошибка типа пройдёт мимо. Ловите оба класса или их общего родителя, см. [Иерархию ошибок](../reference/errors/hierarchy.mdx).
+
+### Функция `validate` не вызывается для `null`
+
+Пустое значение в `validate` не попадает: `null` и отсутствие поля решаются опциями `required` и `nullable`, а не вашей функцией. Если поле обязано быть непустым, добавьте `required: true`.
+
+### `trim` не работает на значении из фильтра
+
+`find({ login: "  ann " })` не находит `ann`: `trim` и `lowercase` преобразуют записываемое значение, а фильтр приводится только по типу. Нормализуйте строку перед поиском сами.
+
+## Полный пример
+
+Один файл собирает модель с разными правилами, регистрацию с разбором ошибки и обновление. Код читателя, которого нет в Typemo, помечен `__…__`.
+
+```ts twoslash title="users/users.service.ts"
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, Virtual, type Computed, type Defaulted, type Hidden, type Immutable, type Ref, type VirtualRef } from "@venloc/typemo";
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+// ---cut---
+import { ValidationError } from "@venloc/typemo";
+
+// модель: приведение, границы, набор и своя проверка
+@Schema({ collection: "users" })
+class User extends Entity {
+  @Prop(() => String, { required: true, trim: true, lowercase: true, minLength: 3, maxLength: 12, match: /^[a-z0-9_]+$/ })
+  login!: string;
+  @Prop(() => Number, { min: 18, max: 120 }) age?: number;
+  @Prop(() => String, { enum: ["user", "admin"] as const, default: "user" }) role!: Defaulted<"user" | "admin">;
+  @Prop(() => String, { validate: (value) => value.includes("@") || "must contain @" }) email?: string;
+}
+
+// код читателя: ошибка на границе приложения с полями формы
+class __BadRequest__ extends Error {
+  constructor(readonly fields: string[]) {
+    super("invalid form");
+  }
+}
+
+// регистрация: ошибки проверки превращаем в ошибку формы
+export const register = async (login: string, age: number, email: string) => {
+  const Users = client.connection.model(User);
+  try {
+    return await Users.create({ login, age, email });
+  } catch (error) {
+    if (error instanceof ValidationError) throw new __BadRequest__(Object.keys(error.errors));
+    throw error;
+  }
+}
+
+const created = await register("  Ann ", 30, "ann@example.com");
+console.log(created.login);
+// → ann
+try {
+  await register("a", 5, "nope");
+} catch (error) {
+  console.log((error as __BadRequest__).fields);
+}
+// → ["login", "age", "email"]
+```
+
+<Callout type="migration">
+
+Опции `min`, `max`, `minLength`, `maxLength`, `enum`, `match`, `trim`, `lowercase`, `uppercase` и `validate` знакомы по Mongoose. Отличие в том, что в Typemo правила проверяются и при обновлении (`updateOne`, `updateMany`, `findOneAndUpdate`, `replaceOne`) без флага `runValidators`, а функция `validate` возвращает `true` или текст ошибки. Типы «не тот тип» и «не то значение» — разные ошибки: `CastError` и `ValidationError`.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Вложенные объекты и поддокументы" href="./nested-and-subdocuments.mdx">
+  Как правила работают внутри вложенных структур и как выглядят пути ошибок.
+</Card>
+<Card title="Проверить документ" href="../documents/validation.mdx">
+  `$validate`, разбор ошибки и проверка данных без документа.
+</Card>
+<Card title="Справочник: @Prop" href="../reference/schemas/prop.mdx">
+  Каждая опция проверки с точным текстом ошибки и правилами сборки.
+</Card>
+</Cards>

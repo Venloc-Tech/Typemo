@@ -1,0 +1,385 @@
+---
+title: Отдать документ клиенту
+description: "Как превратить документ в обычные данные: чем отличаются $toObject, $toPlain и $toJSON, как скрыть поля и замаскировать значения"
+icon: Send
+---
+
+Чтобы отдать документ клиенту или положить его в кеш, превратите его в обычные данные: [`$toPlain()`](../reference/documents/document-api.mdx#toplain) для ответа API, [`$toJSON()`](../reference/documents/document-api.mdx#tojson) для строгого JSON, [`$toObject()`](../reference/documents/document-api.mdx#toobject) для работы с данными внутри приложения. Все три возвращают копию, не связанную с документом.
+
+Сам гидратированный документ отдавать нельзя не только потому, что у него есть служебные методы. В нём лежат значения MongoDB, которых нет в JSON: идентификаторы `ObjectId`, целые int64 (`bigint`), `Decimal128`, байты. Если отправить их как есть, `bigint` сломает `JSON.stringify`, а `ObjectId` превратится во что-то неожиданное. Три метода решают эту задачу по-разному: каждый выбирает, какие типы превратить в строки, а какие оставить.
+
+## Что предполагается
+
+Примеры используют счёт `Invoice`: покупатель, дата выдачи, баллы в int64, теги, Map сборов, скрытая заметка, скидка с функцией `get` и вычисляемое поле `label`. Подключение — как в руководстве [Подключиться к базе](../connection/connect.mdx).
+
+```ts twoslash title="models/invoice.ts"
+import { type Computed, Entity, type Hidden, Prop, Schema, Spec, Versioned } from "@venloc/typemo";
+
+@Schema({ collection: "invoices" })
+export class Invoice extends Versioned(Entity) {
+  @Prop(() => String, { required: true })
+  customer!: string;
+
+  @Prop(() => Date)
+  issuedAt?: Date;
+
+  @Prop(() => BigInt)
+  points?: bigint;
+
+  @Prop(() => [String])
+  tags!: string[];
+
+  @Prop(() => Spec.map(Number))
+  fees?: Map<string, number>;
+
+  @Prop(() => String, { hidden: true })
+  note?: Hidden<string>;
+
+  @Prop(() => Number, { get: (value: number) => Math.round(value) })
+  discount?: number;
+
+  get label(): Computed<string> {
+    return `${this.customer}#${this.tags.length}` as Computed<string>;
+  }
+}
+```
+
+В базе один счёт: покупатель `alice`, выдан `2026-01-02T03:04:05Z`, 9007199254740993 баллов (на единицу больше границы точных чисел JavaScript), тег `gift`, сбор `delivery` на 5, заметка `call first`, скидка 2,6.
+
+## Быстрый путь
+
+```ts twoslash
+import { type Computed, Entity, type Hidden, Mask, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ collection: "invoices" })
+class Invoice extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Date) issuedAt?: Date;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+  @Prop(() => Number, { get: (value: number) => Math.round(value) }) discount?: number;
+  get label(): Computed<string> {
+    return `${this.customer}#${this.tags.length}` as Computed<string>;
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Invoices = client.db().model(Invoice);
+const invoice = await Invoices.findOne({ customer: "alice" }).orFail();
+// ---cut---
+const plain = invoice.$toPlain(); // для ответа API и кеша
+const json = invoice.$toJSON(); // строгий JSON
+const data = invoice.$toObject(); // данные с типами MongoDB
+console.log(typeof plain.points, typeof json.issuedAt, typeof data.points);
+// → "string" "string" "bigint"
+```
+
+`JSON.stringify(invoice)` вызывает [`$toJSON`](../reference/documents/document-api.mdx#tojson) сам, так что документ можно отдать напрямую. Остальная страница объясняет, чем формы отличаются и как этим пользоваться.
+
+## Отдать данные в ответе API
+
+Для ответа клиенту выбирайте [`$toPlain`](../reference/documents/document-api.mdx#toplain). Идентификаторы, int64, `Decimal128` и UUID становятся строками, а родные типы JavaScript (`Date`, `Map`) остаются. Поэтому результат безопасно отдавать в `JSON.stringify`: `bigint` в нём не встретится, а число баллов не потеряет точности.
+
+```ts twoslash
+import { type Computed, Entity, type Hidden, Mask, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ collection: "invoices" })
+class Invoice extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Date) issuedAt?: Date;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+  @Prop(() => Number, { get: (value: number) => Math.round(value) }) discount?: number;
+  get label(): Computed<string> {
+    return `${this.customer}#${this.tags.length}` as Computed<string>;
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Invoices = client.db().model(Invoice);
+const invoice = await Invoices.findOne({ customer: "alice" }).orFail();
+// ---cut---
+const plain = invoice.$toPlain();
+//    ^?
+console.log(typeof plain._id, plain.points, plain.issuedAt instanceof Date, plain.fees instanceof Map);
+// → "string" "9007199254740993" true true
+```
+
+Обратите внимание: `points` превратился в строку `"9007199254740993"`, а не в число. Число больше 2⁵³ в JavaScript хранится неточно, и клиент получил бы другое значение без всякой ошибки. Строка сохраняет значение точно, и Typemo принимает её обратно в `create`, `update` и фильтрах.
+
+Если нужен именно JSON, где нет ни `Date`, ни `Map`, используйте [`$toJSON`](../reference/documents/document-api.mdx#tojson): дата становится ISO-строкой, Map — обычным объектом.
+
+```ts twoslash
+import { type Computed, Entity, type Hidden, Mask, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ collection: "invoices" })
+class Invoice extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Date) issuedAt?: Date;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+  @Prop(() => Number, { get: (value: number) => Math.round(value) }) discount?: number;
+  get label(): Computed<string> {
+    return `${this.customer}#${this.tags.length}` as Computed<string>;
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Invoices = client.db().model(Invoice);
+const invoice = await Invoices.findOne({ customer: "alice" }).orFail();
+// ---cut---
+const json = invoice.$toJSON();
+//    ^?
+console.log(json.issuedAt, json.fees);
+// → "2026-01-02T03:04:05.000Z" { delivery: 5 }
+```
+
+Типы каждого значения в каждой форме показывает таблица (она строится из кода библиотеки):
+
+<ValueForms types={["objectId", "long", "decimal128", "date", "map"]} forms={["hydrated", "object", "plain", "json"]} />
+
+## Работать с данными внутри приложения
+
+[`$toObject`](../reference/documents/document-api.mdx#toobject) возвращает значения MongoDB такими, какие они есть: `ObjectId` остаётся `ObjectId`, int64 — `bigint`, Map — `Map`. Это удобно, когда данные остаются внутри приложения (сравнить, отправить в другую операцию с базой). Отдавать такой результат в `JSON.stringify` нельзя:
+
+```text
+TypeError: JSON.stringify cannot serialize BigInt.
+```
+
+Вместо этого возьмите [`$toPlain`](../reference/documents/document-api.mdx#toplain) или [`$toJSON`](../reference/documents/document-api.mdx#tojson).
+
+### Вывести документ в консоль
+
+`console.log` и `util.inspect` показывают гидратированный документ и поддокумент читаемо: имя класса и данные, как их отдал бы `$toObject`, без служебного содержимого (родителя, журнала изменений). Скрытые поля (`hidden`) в такой вывод не попадают, даже если загружены, поэтому документ безопасно печатать в журнал. Это работает только при выводе: создание, чтение и сохранение документа от этого не замедляются.
+
+```ts twoslash
+import { Entity, Prop, Schema, Spec, TypemoClient, type Hidden } from "@venloc/typemo";
+@Schema({ collection: "invoices" })
+class Invoice extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Invoices = client.db().model(Invoice);
+// ---cut---
+const invoice = await Invoices.create({ customer: "alice", tags: ["gift"], fees: new Map([["ship", 5]]), note: "secret" });
+console.log(invoice);
+// → Invoice { _id: new ObjectId("…"), customer: "alice", tags: ["gift"], fees: Map(1) { "ship" => 5 } }
+```
+
+Поле `note` в выводе нет, хотя документ его хранит. Подробности о скрытых полях — в разделе [Не отдать скрытые поля](#не-отдать-скрытые-поля).
+
+## Не отдать скрытые поля
+
+Поля с `hidden` — заметка в примере — не должны попадать к клиенту, поэтому [`$toPlain`](../reference/documents/document-api.mdx#toplain) и [`$toJSON`](../reference/documents/document-api.mdx#tojson) по умолчанию их не включают. [`$toObject`](../reference/documents/document-api.mdx#toobject) включает: он предназначен для внутренней работы. Скрытое поле, к тому же, часто не загружено вовсе: по умолчанию запрос его не читает, и вы включаете его в выборку явно.
+
+```ts twoslash
+import { type Computed, Entity, type Hidden, Mask, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ collection: "invoices" })
+class Invoice extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Date) issuedAt?: Date;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+  @Prop(() => Number, { get: (value: number) => Math.round(value) }) discount?: number;
+  get label(): Computed<string> {
+    return `${this.customer}#${this.tags.length}` as Computed<string>;
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Invoices = client.db().model(Invoice);
+const invoice = await Invoices.findOne({ customer: "alice" }).select({ "+note": true }).orFail();
+// ---cut---
+console.log("note" in invoice.$toPlain(), "note" in invoice.$toObject());
+// → false true
+
+console.log(invoice.$toPlain({ hidden: true }).note);
+// → "call first"
+```
+
+Опция `hidden` действует на любой глубине: в поддокументах, массивах и Map поддокументов.
+
+## Добавить вычисляемые поля и применить get
+
+Вычисляемые поля класса (геттеры `Computed`) в результат не входят, пока вы не попросите: `virtuals: true`. Функции `get` полей применяются только с `getters: true`.
+
+```ts twoslash
+import { type Computed, Entity, type Hidden, Mask, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ collection: "invoices" })
+class Invoice extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Date) issuedAt?: Date;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+  @Prop(() => Number, { get: (value: number) => Math.round(value) }) discount?: number;
+  get label(): Computed<string> {
+    return `${this.customer}#${this.tags.length}` as Computed<string>;
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Invoices = client.db().model(Invoice);
+const invoice = await Invoices.findOne({ customer: "alice" }).orFail();
+// ---cut---
+console.log(invoice.$toPlain({ virtuals: true }).label, "label" in invoice.$toPlain());
+// → "alice#1" false
+
+console.log(invoice.$toObject().discount, invoice.$toObject({ getters: true }).discount);
+// → 2.6 3
+```
+
+## Замаскировать значения
+
+Чтобы отдать часть значения, а не убрать поле целиком, используйте опцию `mask`: ключи — пути результата, значения — `"mask"` (подставится `"?"`) или готовая маска из [`Mask`](../reference/query/masks.mdx#mask). Документ и следующий `$save` маска не затрагивает: она применяется к копии.
+
+```ts twoslash
+import { type Computed, Entity, type Hidden, Mask, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ collection: "invoices" })
+class Invoice extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Date) issuedAt?: Date;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+  @Prop(() => Number, { get: (value: number) => Math.round(value) }) discount?: number;
+  get label(): Computed<string> {
+    return `${this.customer}#${this.tags.length}` as Computed<string>;
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Invoices = client.db().model(Invoice);
+const invoice = await Invoices.findOne({ customer: "alice" }).orFail();
+// ---cut---
+const masked = invoice.$toPlain({ mask: { customer: Mask.initials(), points: "mask" } });
+console.log(masked.customer, masked.points, invoice.customer);
+// → "a." "?" "alice"
+```
+
+Маска, названная неверно, компилятором отвергается. В коде без типов путь, которого нет в результате, тоже не проходит: метод бросает ошибку, а не оставляет значение незамаскированным.
+
+## Превратить результат во что-то своё
+
+Опция `transform` принимает функцию, и её результат становится результатом метода. Применяется после маски.
+
+```ts twoslash
+import { type Computed, Entity, type Hidden, Mask, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ collection: "invoices" })
+class Invoice extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Date) issuedAt?: Date;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+  @Prop(() => Number, { get: (value: number) => Math.round(value) }) discount?: number;
+  get label(): Computed<string> {
+    return `${this.customer}#${this.tags.length}` as Computed<string>;
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Invoices = client.db().model(Invoice);
+const invoice = await Invoices.findOne({ customer: "alice" }).orFail();
+// ---cut---
+const summary = invoice.$toJSON({ transform: (json) => `${json.customer}: ${json.tags.length} tag(s)` });
+console.log(summary);
+// → "alice: 1 tag(s)"
+```
+
+## Как выбрать
+
+Задайте себе один вопрос: **куда попадут данные после метода?** Если за пределы приложения (ответ API, сообщение в очередь, кеш) — `$toPlain` или `$toJSON`: у них нет `bigint`, а скрытые поля выключены. Между ними выбирайте по тому, что вы отдаёте: `$toPlain` оставляет даты и Map, `$toJSON` даёт всё строго по правилам JSON. Если данные остаются в приложении и вы будете с ними работать (сравнивать `ObjectId`, считать в `bigint`) — `$toObject`.
+
+## Когда это не нужно
+
+Если документ вам нужен только для ответа, а изменять вы его не будете, не загружайте его вовсе: [`.plain()`](../reference/query/reading.mdx#plain) у запроса возвращает готовую plain-форму без создания документа, а [`.lean()`](../reference/query/reading.mdx#lean) — строки драйвера. Так быстрее, и скрытые поля не читаются из базы совсем.
+
+## Частые ошибки
+
+### `JSON.stringify` падает на больших числах
+
+Если вы отдали в `JSON.stringify` результат `$toObject`, в нём `bigint`:
+
+```text
+TypeError: JSON.stringify cannot serialize BigInt.
+```
+
+Исправление: используйте [`$toPlain`](../reference/documents/document-api.mdx#toplain) или [`$toJSON`](../reference/documents/document-api.mdx#tojson), либо `JSON.stringify(document)`.
+
+### В ответе нет скрытого поля, хотя оно нужно
+
+`$toPlain` и `$toJSON` не включают `hidden`-поля. Если вам нужна заметка, передайте `{ hidden: true }` и убедитесь, что поле загружено (`select({ "+note": true })`): не загруженного поля нет ни в одной форме.
+
+### `$toJSON` отказывает на `NaN`
+
+Числа `NaN` и `Infinity` Typemo в поле не запишет (`CastError: Cast to number failed at path "ratio" for NaN (number): NaN and Infinity are not allowed [finite]`), но другая программа могла записать их в базу. Прочитанные, они остаются числами в lean, plain и `$toPlain`. А вот JSON их не знает, поэтому `$toJSON()` и `JSON.stringify(document)` отвечают ошибкой, а не молчаливым `null`:
+
+```text
+CastError: Cast to JSON number failed at path "ratio" for NaN (number): JSON has no NaN or Infinity [json]
+```
+
+Само по себе сохранённое `NaN` документ не «изменяет»: сравнение с прочитанным значением считает `NaN` равным `NaN`, поэтому `$isModified()` остаётся `false`, а `$getChanges()` пуст (см. [Изменения и сохранение](./change-and-save.mdx)).
+
+Учтите и обратную сторону: `JSON.stringify(document.$toPlain())` не откажет, а превратит `NaN` в `null`. Если такие данные возможны, проверяйте поле до сериализации или мигрируйте данные.
+
+### Маска отвергнута: такого пути нет
+
+`mask: { nope: "mask" }` в коде без типов не маскирует ничего, поэтому метод отвечает ошибкой, а не отдаёт значение как есть: `StrictModeError: mask: "nope" is not a path of Invoice's rows, so it would mask nothing; name a field of the rows [unknown-path]`. В коде с проверкой типов компилятор отклоняет такой путь раньше.
+
+## Полный пример
+
+```ts twoslash title="invoices/invoices.service.ts"
+import { type Computed, Entity, type Hidden, Mask, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ collection: "invoices" })
+class Invoice extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => Date) issuedAt?: Date;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+  @Prop(() => Number, { get: (value: number) => Math.round(value) }) discount?: number;
+  get label(): Computed<string> {
+    return `${this.customer}#${this.tags.length}` as Computed<string>;
+  }
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Invoices = client.db().model(Invoice);
+// ---cut---
+export const getInvoiceForClient = async (customer: string) => {
+  const invoice = await Invoices.findOne({ customer }).orFail();
+  return invoice.$toJSON({ virtuals: true, mask: { customer: Mask.initials() } });
+};
+
+export const getInvoiceForAdmin = async (customer: string) => {
+  const invoice = await Invoices.findOne({ customer }).select({ "+note": true }).orFail();
+  return invoice.$toPlain({ hidden: true, virtuals: true });
+};
+```
+
+## Если вы пришли из Mongoose
+
+<Callout type="migration">
+
+`doc.toObject()` и `doc.toJSON()` называются `$toObject()` и `$toJSON()`; добавилась `$toPlain()` — форма, где значения MongoDB превращены в строки, а `Date` и `Map` остались. Настроек сериализации на уровне схемы (`toJSON: { virtuals: true }`) нет: опции передаются при каждом вызове. Скрытые поля исключаются из `$toJSON` и `$toPlain` по умолчанию.
+
+</Callout>
+
+## Что дальше
+
+<Cards>
+<Card title="Формы значений" href="../reference/values/value-forms.mdx">
+  Таблица: как выглядит каждый тип MongoDB в документе, lean, plain и JSON.
+</Card>
+<Card title="Маски ответа" href="../queries/response-masks.mdx">
+  Все готовые маски и как применять их к запросам.
+</Card>
+<Card title="API документа" href="../reference/documents/document-api.mdx">
+  Все опции сериализации и их типы.
+</Card>
+</Cards>
