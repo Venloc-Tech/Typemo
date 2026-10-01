@@ -16,6 +16,7 @@ export type {
   HiddenKeys,
   HydratedDoc,
   HydratedDocWith,
+  NewDocument,
   SavableDocument,
   SaveOptions,
   SerializeOptions,
@@ -23,5 +24,6 @@ export type {
   ToObjectOptions,
   ToObjectResult,
   ToPlainResult,
+  UnsavedDocument,
 } from "./document-types.ts";
 export { unknownFieldsOf } from "./unknown-fields.ts";

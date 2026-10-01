@@ -11,7 +11,7 @@
  *   plans: `queryPlan`, `inputStage(s)`, `$cursor`).
  */
 
-import type { HydratedDoc } from "../document/document-types.ts";
+import type { NewDocument } from "../document/document-types.ts";
 import { TypemoError, type TypemoErrorOptions } from "../errors/typemo-error.ts";
 import type { CreateInput } from "../types/document-forms.ts";
 
@@ -51,7 +51,7 @@ export interface FactoryModel<T> {
    * @param doc - The data of the document.
    * @returns The saved document.
    */
-  create(doc: NoInfer<CreateInput<T>>): Promise<HydratedDoc<NoInfer<T>>>;
+  create(doc: NoInfer<CreateInput<T>>): Promise<NewDocument<T>>;
 }
 
 /**
@@ -86,7 +86,7 @@ export interface Factory<T> {
    * @param overrides - Fields to change, or a function of the sequence number.
    * @returns The saved document.
    */
-  create(overrides?: FactoryOverrides<T>): Promise<HydratedDoc<T>>;
+  create(overrides?: FactoryOverrides<T>): Promise<NewDocument<T>>;
   /**
    * Builds and saves `count` documents one after the other (sequence numbers and `_id`s follow the order).
    *
@@ -95,7 +95,7 @@ export interface Factory<T> {
    * @returns The saved documents.
    * @throws {TypemoError} When `count` is not a non-negative integer.
    */
-  createMany(count: number, overrides?: FactoryOverrides<T>): Promise<HydratedDoc<T>[]>;
+  createMany(count: number, overrides?: FactoryOverrides<T>): Promise<NewDocument<T>[]>;
   /** Puts the sequence back to the start. */
   reset(): void;
 }
@@ -145,7 +145,7 @@ export const defineFactory = <T extends object>(
       Array.from({ length: count(many) }, () => build(overrides)),
     create: (overrides?: FactoryOverrides<T>) => model.create(build(overrides)),
     createMany: async (many: number, overrides?: FactoryOverrides<T>) => {
-      const created: HydratedDoc<T>[] = [];
+      const created: NewDocument<T>[] = [];
       for (let index = 0; index < count(many); index++) created.push(await model.create(build(overrides)));
       return created;
     },

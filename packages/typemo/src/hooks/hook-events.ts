@@ -1,12 +1,12 @@
 import type { ClientSession } from "mongodb";
 import type { PipelineStage } from "../aggregate/pipeline/aggregate-plan.ts";
 import type { Subdocument } from "../document/collections/hydrated-types.ts";
-import type { DocumentOf, ShownFields } from "../document/document-types.ts";
+import type { NewDocument } from "../document/document-types.ts";
 import type { BulkWriteResult } from "../model/bulk-write.ts";
 import type { PolicyValues } from "../policies/policy-context.ts";
 import type { IdOf, Lean } from "../types/document-forms.ts";
 import type { Filter } from "../types/filter.ts";
-import type { KeptHiddenKeys, Projection, Sort } from "../types/projection.ts";
+import type { Projection, Sort } from "../types/projection.ts";
 import type { DeleteResult, UpdateResult } from "../types/result.ts";
 import type { Update } from "../types/update.ts";
 
@@ -337,7 +337,7 @@ export interface OperationHookContext<T, E extends OperationHookEvent = Operatio
  * type Root = HookDocument<User>; // HydratedDocWith<User, { password?: string }>
  * ```
  */
-export type HookDocument<T> = DocumentOf<T, ShownFields<T, KeptHiddenKeys<object, T>>>;
+export type HookDocument<T> = NewDocument<T>;
 
 /**
  * `this` of a hook for event `E` on entity `T`: for document events the hydrated document or, when the class is

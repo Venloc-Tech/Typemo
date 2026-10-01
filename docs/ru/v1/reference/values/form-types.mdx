@@ -16,7 +16,7 @@ icon: Braces
 
 ## HydratedDoc
 
-`HydratedDoc<T>` — тип документа, который вы получаете после обычного чтения: экземпляр модели `T` с типизированными коллекциями (массивы, поддокументы, карты) и методами с префиксом `$` (`$save`, `$set`, `$toPlain`). Скрытых полей в нём нет, как нет их и в ответе обычного чтения. Тот же тип возвращают `new()` и `create()`, поэтому параметр `HydratedDoc<T>` принимает документ из любого из этих мест. Это единственная форма, у которой есть методы и которая знает, что изменено. Все остальные формы — данные без методов. Тип `Output<T>` — то же самое под другим именем.
+`HydratedDoc<T>` — тип документа, который вы получаете после обычного чтения: экземпляр модели `T` с типизированными коллекциями (массивы, поддокументы, карты) и методами с префиксом `$` (`$save`, `$set`, `$toPlain`). Скрытых полей в нём нет, как нет их и в ответе обычного чтения. Документ, сделанный из ваших данных, скрытые поля сохраняет: после `create()`, `insertOne()` и `insertMany()` это [`NewDocument<T>`](#newdocument), после `new()` — [`UnsavedDocument<T>`](#unsaveddocument). Параметр `HydratedDoc<T>` принимает документ из любого из этих мест. Это единственная форма, у которой есть методы и которая знает, что изменено. Все остальные формы — данные без методов. Тип `Output<T>` — то же самое под другим именем.
 
 ```ts twoslash
 import { Binary, Decimal128, UUID } from "mongodb";
@@ -91,6 +91,79 @@ const dynamic = await Readings.findOne({ label: "r1" }).select(fields).orFail();
 ```
 
 Тип пишут в сигнатуре так же, как он показан в подсказке, но чаще его выводят из запроса: `Awaited<ReturnType<typeof read>>`.
+
+## NewDocument
+
+`NewDocument<T>` — тип документа, который вы сделали сами и записали: его возвращают [`create`](../writes/writes.mdx#create), [`insertOne`](../writes/writes.mdx#insertone) и [`insertMany`](../writes/writes.mdx#insertmany), его же получает хук документа. В отличие от чтения, по дороге ничего не отброшено: значения, которые вы передали, в памяти, поэтому скрытые поля в типе есть. У модели со скрытыми полями подсказка показывает `HydratedDocWith<Reading, { secret?: string }>`, у модели без них — просто `HydratedDoc<Reading>`. `$toObject()` скрытые поля включает, `$toPlain()` и `$toJSON()` — нет, как у любого документа.
+
+Документ этого типа подходит туда, где ждут `HydratedDoc<T>`. Имя нужно, когда вы пишете тип результата своей функции, которая создаёт документ.
+
+```ts twoslash
+import { Binary, Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, Spec, TypemoClient, Types, type Hidden, type Vector } from "@venloc/typemo";
+@Schema({ collection: "readings" })
+class Reading extends Entity {
+  @Prop(() => String, { required: true }) label!: string;
+  @Prop(() => Types.Double) ratio?: number;
+  @Prop(() => Types.Int32) count?: number;
+  @Prop(() => BigInt) total?: bigint;
+  @Prop(() => Types.Decimal128) price?: Decimal128;
+  @Prop(() => Boolean) ok?: boolean;
+  @Prop(() => Date) at?: Date;
+  @Prop(() => Spec.binary({ subtype: 0 })) blob?: Binary;
+  @Prop(() => Types.UUID) uid?: UUID;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) vec?: Vector;
+  @Prop(() => RegExp) re?: RegExp;
+  @Prop(() => Types.Timestamp) ts?: InstanceType<typeof Types.Timestamp>;
+  @Prop(() => Spec.map(BigInt)) scores?: Map<string, bigint>;
+  @Prop(() => String, { hidden: true }) secret?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "sensors" });
+const Readings = client.db().model(Reading);
+// ---cut---
+import type { NewDocument } from "@venloc/typemo";
+const register = async (label: string, secret: string): Promise<NewDocument<Reading>> =>
+  Readings.create({ label, secret });
+const created = await register("r1", "s1");
+//    ^?
+console.log(created.secret);
+// → "s1"
+```
+
+## UnsavedDocument
+
+`UnsavedDocument<T>` — тип документа из [`Model.new`](../documents/model-document-methods.mdx#modelnew), который ещё не сохранён. Он такой же, как [`NewDocument<T>`](#newdocument), но без значений первой записи: `createdAt` и `updatedAt` (класс `Timestamped`) и `__v` (класс `Versioned`) появляются только при `$save`, поэтому до него они необязательные. `_id` и значения по умолчанию есть сразу. `$save()` возвращает тот же документ, типизированный как сохранённый: эти поля уже обязательные.
+
+```ts twoslash
+import { Binary, Decimal128, UUID } from "mongodb";
+import { Entity, Prop, Schema, Spec, Timestamped, TypemoClient, Types, type Hidden, type Vector } from "@venloc/typemo";
+@Schema({ collection: "readings" })
+class Reading extends Timestamped(Entity) {
+  @Prop(() => String, { required: true }) label!: string;
+  @Prop(() => Types.Double) ratio?: number;
+  @Prop(() => Types.Int32) count?: number;
+  @Prop(() => BigInt) total?: bigint;
+  @Prop(() => Types.Decimal128) price?: Decimal128;
+  @Prop(() => Boolean) ok?: boolean;
+  @Prop(() => Date) at?: Date;
+  @Prop(() => Spec.binary({ subtype: 0 })) blob?: Binary;
+  @Prop(() => Types.UUID) uid?: UUID;
+  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) vec?: Vector;
+  @Prop(() => RegExp) re?: RegExp;
+  @Prop(() => Types.Timestamp) ts?: InstanceType<typeof Types.Timestamp>;
+  @Prop(() => Spec.map(BigInt)) scores?: Map<string, bigint>;
+  @Prop(() => String, { hidden: true }) secret?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "sensors" });
+const Readings = client.db().model(Reading);
+// ---cut---
+const fresh = Readings.new({ label: "r1" });
+const at = fresh.createdAt;
+//    ^?
+const saved = await fresh.$save();
+const savedAt = saved.createdAt;
+//    ^?
+```
 
 ## Lean
 

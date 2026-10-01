@@ -14,6 +14,7 @@ import {
   ErrorClassifier,
   fn,
   type HydratedDoc,
+  type HydratedDocWith,
   type InstrumentationEvent,
   type Model,
   type ModelChangeStream,
@@ -41,10 +42,35 @@ expectTypeOf(People.entity).toEqualTypeOf<Model<Person>["entity"]>();
 
 // ---- inserts: the created document (hydrated), CreateInput checked --------------------------------
 const created = People.create({ name: "A", email: "a", tags: [], pets: [], lastSeen: null });
-expectTypeOf(created).toEqualTypeOf<Promise<HydratedDoc<Person>>>(); /* the hydrated document type */
+/* the created document: made from your input, so its Hidden field is listed */
+expectTypeOf(created).toEqualTypeOf<Promise<HydratedDocWith<Person, { secret?: string }>>>();
 const many = People.create([{ name: "A", email: "a", tags: [], pets: [], lastSeen: null }]);
-expectTypeOf(many).toEqualTypeOf<Promise<HydratedDoc<Person>[]>>();
-expectTypeOf(People.insertMany([], { ordered: false })).toEqualTypeOf<Promise<HydratedDoc<Person>[]>>();
+expectTypeOf(many).toEqualTypeOf<Promise<HydratedDocWith<Person, { secret?: string }>[]>>();
+expectTypeOf(People.insertMany([], { ordered: false })).toEqualTypeOf<
+  Promise<HydratedDocWith<Person, { secret?: string }>[]>
+>();
+expectTypeOf(People.insertOne({ name: "A", email: "a", tags: [], pets: [], lastSeen: null })).toEqualTypeOf<
+  Promise<HydratedDocWith<Person, { secret?: string }>>
+>();
+expectTypeOf(People.new({ name: "A", email: "a", tags: [], pets: [], lastSeen: null })).toEqualTypeOf<
+  HydratedDocWith<Person, { secret?: string }>
+>();
+
+// ---- the Hidden field of a created document: readable, kept by $toObject, left out of $toPlain/$toJSON ----
+declare const createdPerson: Awaited<typeof created>;
+expectTypeOf(createdPerson.secret).toEqualTypeOf<string | undefined>();
+expectTypeOf(createdPerson.$toObject().secret).toEqualTypeOf<string | undefined>();
+// @ts-expect-error $toPlain() leaves Hidden fields out, also for a created document
+createdPerson.$toPlain().secret;
+// @ts-expect-error $toJSON() leaves Hidden fields out, also for a created document
+createdPerson.$toJSON().secret;
+expectTypeOf(createdPerson.$toPlain({ hidden: true }).secret).toEqualTypeOf<string | undefined>();
+/* a created document still goes where a read one is taken */
+const takesPerson = (person: HydratedDoc<Person>): string => person.name;
+takesPerson(createdPerson);
+// @ts-expect-error a read still leaves the Hidden field out: only the documents made from input list it
+(await People.findOne({ name: "A" }).orFail()).secret;
+
 // @ts-expect-error `email` is required in the create input
 People.create({ name: "A", tags: [], pets: [], lastSeen: null });
 // @ts-expect-error an unknown field in the create input

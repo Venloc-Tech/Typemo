@@ -1,6 +1,6 @@
 /*
  * The two names of a hydrated document: `HydratedDoc<T>` is the default read of `T` (no `Hidden` fields; what
- * reads, `new()` and `create()` give), `HydratedDocWith<T, P>` a document whose fields `P` differ from it
+ * reads give; `new()` and `create()` keep the Hidden fields), `HydratedDocWith<T, P>` a document whose fields `P` differ from it
  * (populated paths, `+hidden` fields, narrowed fields). The second argument lists the fields as they read; the
  * document behind it (inputs, immutability, `Hidden`, the serializations, `$depopulate`) is rebuilt from the class.
  */
@@ -32,7 +32,8 @@ takesCompany(read);
 // @ts-expect-error — `secret` is Hidden: not part of the default read
 read.secret;
 declare const CompanyModel: Model<Company>;
-expectTypeOf(CompanyModel.new({ name: "a" })).toEqualTypeOf<HydratedDoc<Company>>();
+/* new() is made from your input, not read: the Hidden field is listed */
+expectTypeOf(CompanyModel.new({ name: "a" })).toEqualTypeOf<HydratedDocWith<Company, { secret?: string }>>();
 
 // ---- +hidden: the field is listed, the serializations keep it only on request ---------------------------------
 declare const withSecret: Awaited<ReturnType<typeof readSecret>>;

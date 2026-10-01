@@ -37,8 +37,25 @@ order.tags = ["x"];
 
 // ---- results of the model are hydrated documents; lean stays plain ------------------------------------------
 const created = Orders.create({ customer: "a", tags: [], lines: [] });
-expectTypeOf(created).toEqualTypeOf<Promise<HydratedDoc<Order>>>();
-expectTypeOf(Orders.new({ customer: "a", tags: [], lines: [] })).toEqualTypeOf<HydratedDoc<Order>>();
+/* a document made from your input keeps its Hidden fields: the values passed are in memory */
+expectTypeOf(created).toEqualTypeOf<Promise<HydratedDocWith<Order, { secret?: string }>>>();
+/* new(): not saved yet, so the fields of the first write (timestamps, version) are optional until $save */
+const fresh = Orders.new({ customer: "a", tags: [], lines: [] });
+expectTypeOf(fresh).toEqualTypeOf<
+  HydratedDocWith<Order, { secret?: string; createdAt?: Date; updatedAt?: Date; __v?: number }>
+>();
+expectTypeOf(fresh.createdAt).toEqualTypeOf<Date | undefined>();
+/* after $save the document is typed as saved: the first write set them */
+const saved = await fresh.$save();
+expectTypeOf(saved).toEqualTypeOf<HydratedDocWith<Order, { secret?: string }>>();
+expectTypeOf(saved.createdAt).toEqualTypeOf<Date>();
+expectTypeOf(saved.__v).toEqualTypeOf<number>();
+/* a saved or read document keeps its own type on $save */
+expectTypeOf(await order.$save()).toEqualTypeOf<typeof order>();
+// @ts-expect-error createdAt is Immutable: an update may not set it
+void order.$updateOne({ $set: { createdAt: new Date() } });
+// @ts-expect-error createdAt stays Immutable on an unsaved document too (optional, markers kept)
+void fresh.$updateOne({ $set: { createdAt: new Date() } });
 // @ts-expect-error `customer` is required in the input of new()
 Orders.new({ tags: [], lines: [] });
 const found = Orders.findById(order._id).orFail();

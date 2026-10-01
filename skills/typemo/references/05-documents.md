@@ -225,6 +225,8 @@ console.log(plain.customer, internal.note, withVirtuals.title, masked.customer, 
 
 Options (`ToObjectOptions`, per call, no schema-level defaults): `getters` (apply field `get`), `virtuals`, `hidden`, `mask`, `transform`. `console.log(doc)` / `util.inspect` print the class name and data like `$toObject` without internals; Hidden fields are never printed, even when loaded.
 
+A document made from your input keeps the Hidden values you passed, and its type lists them: `create()` / `insertOne()` / `insertMany()` give `NewDocument<T>` (`HydratedDocWith<Order, { note?: string }>`), so `created.note` compiles without `+note`. `new()` gives `UnsavedDocument<T>`: the same, plus `createdAt` / `updatedAt` / `__v` optional until the first `$save` (whose result is typed as saved). A read leaves Hidden fields out unless selected. `$toPlain()` / `$toJSON()` leave them out for all.
+
 ## Unknown fields in stored data
 
 Stored fields that the schema does not know survive normal edits (exact-path writes). A save that rewrites a whole subdocument that has such fields (after `reverse`, `sort`, `splice`, `clear`, `replace`, `$set` of the subdocument) is refused:

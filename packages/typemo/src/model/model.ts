@@ -24,7 +24,13 @@ import {
 import type { Connection } from "../connection/connection.ts";
 import { ConnectionInternals } from "../connection/connection-internals.ts";
 import { DocumentSave } from "../document/document-save.ts";
-import type { HydratedDoc, SavableDocument, SaveOptions } from "../document/document-types.ts";
+import type {
+  HydratedDoc,
+  NewDocument,
+  SavableDocument,
+  SaveOptions,
+  UnsavedDocument,
+} from "../document/document-types.ts";
 import { Documents } from "../document/documents.ts";
 import { ConfigurationError } from "../errors/configuration-error.ts";
 import { QueryError } from "../errors/query-error.ts";
@@ -463,11 +469,11 @@ export class Model<T extends object> extends ModelOperations<T> {
    * `$save()` inserts it. The hydrated counterpart of Mongoose's `new Model(data)`.
    *
    * @param doc - The initial data.
-   * @returns The new, unsaved hydrated document.
+   * @returns The new, unsaved hydrated document. Its `Hidden` fields are in its type: the values you passed are in memory (`$toPlain()` still leaves them out); `createdAt` / `updatedAt` / `__v` are optional: the first `$save` sets them.
    * @throws {CastError} When a field cannot be cast or an unknown key is given.
    */
-  new(doc: CreateInput<T>): HydratedDoc<T> {
-    return Documents.create(this.connection, this.#compiled, doc) as HydratedDoc<T>;
+  new(doc: CreateInput<T>): UnsavedDocument<T> {
+    return Documents.create(this.connection, this.#compiled, doc) as UnsavedDocument<T>;
   }
 
   /**
@@ -476,12 +482,12 @@ export class Model<T extends object> extends ModelOperations<T> {
    *
    * @param doc - One document, or a list of documents.
    * @param options - Session, timeout, comment, write concern and policy.
-   * @returns The saved document, or the saved documents in input order.
+   * @returns The saved document, or the saved documents in input order. Its `Hidden` fields are in its type: the values you passed are in memory (`$toPlain()` still leaves them out).
    * @throws {ValidationError} When a document is invalid.
    * @throws {CastError} When building a document fails; the failure is reported as the write's failure, with events.
    */
-  create(doc: CreateInput<T>, options?: WriteOptions): Promise<HydratedDoc<T>>;
-  create(docs: readonly CreateInput<T>[], options?: WriteOptions): Promise<HydratedDoc<T>[]>;
+  create(doc: CreateInput<T>, options?: WriteOptions): Promise<NewDocument<T>>;
+  create(docs: readonly CreateInput<T>[], options?: WriteOptions): Promise<NewDocument<T>[]>;
   async create(input: unknown, options?: WriteOptions): Promise<unknown> {
     return this.#create(input, options, "create");
   }
@@ -493,7 +499,7 @@ export class Model<T extends object> extends ModelOperations<T> {
    * @param input - One document, or a list of documents.
    * @param options - Session, timeout, comment, write concern and policy.
    * @param method - The method the user called.
-   * @returns The saved document, or the saved documents in input order.
+   * @returns The saved document, or the saved documents in input order. Its `Hidden` fields are in its type: the values you passed are in memory (`$toPlain()` still leaves them out).
    */
   async #create(input: unknown, options: WriteOptions | undefined, method: "create" | "insertOne"): Promise<unknown> {
     const save: SaveOptions = {
@@ -550,14 +556,14 @@ export class Model<T extends object> extends ModelOperations<T> {
    *
    * @param doc - The document to insert.
    * @param options - Session, timeout, comment, write concern and policy.
-   * @returns The inserted document.
+   * @returns The inserted document. Its `Hidden` fields are in its type: the values you passed are in memory (`$toPlain()` still leaves them out).
    * @throws {QueryError} When `doc` is not a plain object.
    * @throws {ValidationError} When the document is invalid.
    * @throws {DuplicateKeyError} When a unique index is violated.
    */
-  async insertOne(doc: CreateInput<T>, options?: WriteOptions): Promise<HydratedDoc<T>> {
+  async insertOne(doc: CreateInput<T>, options?: WriteOptions): Promise<NewDocument<T>> {
     document(doc, "insertOne");
-    return this.#create(doc, options, "insertOne") as Promise<HydratedDoc<T>>;
+    return this.#create(doc, options, "insertOne") as Promise<NewDocument<T>>;
   }
 
   /**
@@ -570,11 +576,11 @@ export class Model<T extends object> extends ModelOperations<T> {
    *
    * @param docs - The documents to insert.
    * @param options - `ordered` plus the write options.
-   * @returns The inserted documents.
+   * @returns The inserted documents. Its `Hidden` fields are in its type: the values you passed are in memory (`$toPlain()` still leaves them out).
    * @throws {QueryError} When `docs` is not a list or an item is not a plain object.
    * @throws {BulkWriteError} When any document fails.
    */
-  async insertMany(docs: readonly CreateInput<T>[], options?: InsertManyOptions): Promise<HydratedDoc<T>[]> {
+  async insertMany(docs: readonly CreateInput<T>[], options?: InsertManyOptions): Promise<NewDocument<T>[]> {
     if (!Array.isArray(docs)) throw new QueryError("insertMany: a list of documents");
     const inputs = docs.map((doc, index) => document(doc, `insertMany[${index}]`));
     const save: SaveOptions = {
@@ -588,7 +594,7 @@ export class Model<T extends object> extends ModelOperations<T> {
       options?.ordered !== false,
       save,
       planOptions(options),
-    )) as HydratedDoc<T>[];
+    )) as NewDocument<T>[];
   }
 
   /**

@@ -14,22 +14,7 @@ import type { Simplify } from "./type-utils.ts";
  *                                       └─ hydrated: ─────────────────── ApplyPopulate(…, false) ─┴─ ApplyNarrow
  *
  * A hydrated result is `HydratedDoc<Entity>`, or `HydratedDocWith<Entity, { …the fields that differ }>` (typed
- * collections and `import type { Binary, Timestamp } from "mongodb";
-import type { ToPlainResult } from "../document/document-types.ts";
-import type { DiscriminatorsKey, DiscriminatorsOf } from "./markers.ts";
-import type { ApplyNarrow } from "./narrow.ts";
-import type { ApplyPopulate, HydratedResult, LeanBase, PopulationEntry } from "./populate.ts";
-import type { ApplyProjection } from "./projection.ts";
-import type { Simplify } from "./type-utils.ts";
-
-/*
- * The result automaton: the type of a result follows the whole chain — projection, populate, lean,
- * orFail, narrowing.
- *
- *   entity T ── ApplyProjection<T, S> ──┬─ lean: LeanBase (lean FIRST) ── ApplyPopulate(…, true) ─┐
- *                                       └─ hydrated: ─────────────────── ApplyPopulate(…, false) ─┴─ ApplyNarrow
- *
--methods; see `HydratedResult`). A plain
+ * collections and `$`-methods; see `HydratedResult`). A plain
  * result (`.plain()`) is the plain form of that same shape — exactly what `$toPlain()` of the hydrated
  * document returns (`ToPlainResult`), with its `Hidden` fields only for `.plain({ hidden: true })`.
  *

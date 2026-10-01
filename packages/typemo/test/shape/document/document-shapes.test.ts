@@ -8,7 +8,8 @@ import { ModelLifecycle } from "../../fixtures/model/model-lifecycle.ts";
 /*
  * The types of `$toObject()`/`$toJSON()` (and their options) and of `lean()` against the shape of what they really
  * return for a document read from the server — Map as `Map` in `$toObject`, a record in JSON and lean; the JSON
- * forms of the BSON scalars.
+ * forms of the BSON scalars. A document made from input (`create`, `insertMany`, `new`) keeps the `Hidden` values it
+ * was given, in its type as in memory.
  */
 
 const t = ModelLifecycle.useTypemo("doc_shape");
@@ -57,6 +58,13 @@ describe("shape: document forms vs what they return", () => {
     ["jsonOptions", "$toJSON({ virtuals })", () => ops.jsonOptions()],
     ["transformed", "$toObject({ transform }): the transform's result", () => ops.transformed()],
     ["lean", "lean(): the driver's plain data", () => ops.lean()],
+    ["createdField", "create(): the Hidden value given is on the document", () => ops.createdField()],
+    ["createdObject", "create() then $toObject(): Hidden kept", () => ops.createdObject()],
+    ["createdPlain", "create() then $toPlain(): Hidden out", () => ops.createdPlain()],
+    ["createdJson", "create() then $toJSON(): Hidden out", () => ops.createdJson()],
+    ["insertedObject", "insertMany() then $toObject(): Hidden kept", () => ops.insertedObject()],
+    ["newObject", "new() then $toObject(): Hidden kept, no timestamps or version yet", () => ops.newObject()],
+    ["newSavedObject", "new().$save() then $toObject(): timestamps and version set", () => ops.newSavedObject()],
   ];
   for (const [name, what, run] of rows) {
     test(`${name}: ${what}`, async () => {

@@ -14,16 +14,16 @@ declare const id: ObjectId;
 `;
 
 describe("hover of model results", () => {
-  test("create returns the entity", () => {
+  test("create returns the entity, with the Hidden field it was given", () => {
     expectHover(
       `${HEAD}const doc = await People.create({ name: "A", email: "a", tags: [], pets: [], lastSeen: null });\n//    ^?`,
       { dir: FIXTURES },
-    ).toBe("const doc: HydratedDoc<Person>"); /* the hydrated document type */
+    ).toBe("const doc: HydratedDocWith<Person, { secret?: string; }>"); /* made from input: Hidden listed */
   });
 
-  test("insertMany returns entities", () => {
+  test("insertMany returns entities, with their Hidden fields", () => {
     expectHover(`${HEAD}const docs = await People.insertMany([]);\n//    ^?`, { dir: FIXTURES }).toBe(
-      "const docs: HydratedDoc<Person>[]",
+      "const docs: HydratedDocWith<Person, { secret?: string; }>[]",
     );
   });
 

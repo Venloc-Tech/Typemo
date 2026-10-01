@@ -49,13 +49,30 @@ describe("hover of hydrated documents", () => {
     }).toBe('const order: HydratedDoc<Omit<Order, "tags">>');
   });
 
-  test("model.new() and create()", () => {
+  test("model.new(): Hidden listed; timestamps and version optional until the first save", () => {
     expectHover(`${HEAD}const order = Orders.new({ customer: "a", tags: [], lines: [] });\n//    ^?`, {
       dir: FIXTURES,
-    }).toBe("const order: HydratedDoc<Order>");
+    }).toBe(
+      "const order: HydratedDocWith<Order, { secret?: string; createdAt?: Date; updatedAt?: Date; __v?: number; }>",
+    );
+    expectHover(`${HEAD}const order = await Orders.new({ customer: "a", tags: [], lines: [] }).$save();\n//    ^?`, {
+      dir: FIXTURES,
+    }).toBe("const order: HydratedDocWith<Order, { secret?: string; }>");
+  });
+
+  test("create() and insertOne(): made from input, so the Hidden field is listed (the values passed are there)", () => {
     expectHover(`${HEAD}const orders = await Orders.create([{ customer: "a", tags: [], lines: [] }]);\n//    ^?`, {
       dir: FIXTURES,
-    }).toBe("const orders: HydratedDoc<Order>[]");
+    }).toBe("const orders: HydratedDocWith<Order, { secret?: string; }>[]");
+    expectHover(`${HEAD}const order = await Orders.insertOne({ customer: "a", tags: [], lines: [] });\n//    ^?`, {
+      dir: FIXTURES,
+    }).toBe("const order: HydratedDocWith<Order, { secret?: string; }>");
+  });
+
+  test("model.create() of an entity without Hidden fields: still the short HydratedDoc<Entity>", () => {
+    expectHover(`${HEAD}const doc = await Plains.create({ name: "a" });\n//    ^?`, { dir: FIXTURES }).toBe(
+      "const doc: HydratedDoc<PlainDoc>",
+    );
   });
 
   test("the collections by name", () => {

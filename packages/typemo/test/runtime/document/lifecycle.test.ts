@@ -46,7 +46,8 @@ describe("a new document", () => {
   test("save inserts it once: timestamps and __v = 0 from the core; then it is not new", async () => {
     const order = Orders.new({ customer: "ann", tags: ["a"], lines: [{ sku: "x", qty: 1 }], code: "ABC" });
     expect(SetterLog.calls).toBe(1);
-    expect(await order.$save()).toBe(order);
+    /* the same instance; its type after $save is the saved one (timestamps and __v no longer optional) */
+    expect<object>(await order.$save()).toBe(order);
     expect(SetterLog.calls).toBe(1); /* the setter ran once */
     expect(order.$isNew()).toBe(false);
     expect(order.__v).toBe(0);

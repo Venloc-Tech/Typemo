@@ -2,6 +2,7 @@ import type { ClientSession } from "mongodb";
 import type { IsPlainObject } from "../bson/opaque-value.ts";
 import type { PolicyValues } from "../policies/policy-context.ts";
 import type { ApplyMask, MaskSpecCheck } from "../query/response-mask.ts";
+import type { TimestampFields, VersionFields } from "../schema/entity/base-classes.ts";
 import type { IdOf, JsonOf, ObjectForm, ObjectFormOf, Plain, PlainJson, PlainOf } from "../types/document-forms.ts";
 import type { IsHidden, IsVirtualValue, RefModel, Unbranded, VirtualRefModel } from "../types/markers.ts";
 import type { WriteValue } from "../types/paths.ts";
@@ -18,7 +19,7 @@ import type {
   PopulateObjectSpec,
   PopulatePathHint,
 } from "../types/populate.ts";
-import type { DefaultView } from "../types/projection.ts";
+import type { DefaultView, KeptHiddenKeys } from "../types/projection.ts";
 import type { DeleteResult, UpdateResult } from "../types/result.ts";
 import type { DataKeys } from "../types/schema-paths.ts";
 import type { Dec, Simplify } from "../types/type-utils.ts";
@@ -27,36 +28,7 @@ import type { FieldInput, HydratedField, HydratedFields } from "./collections/hy
 
 /*
  * The type of a hydrated document: the entity's own members with the typed collections for its data fields,
- * plus a small set of `import type { ClientSession } from "mongodb";
-import type { IsPlainObject } from "../bson/opaque-value.ts";
-import type { PolicyValues } from "../policies/policy-context.ts";
-import type { ApplyMask, MaskSpecCheck } from "../query/response-mask.ts";
-import type { IdOf, JsonOf, ObjectForm, ObjectFormOf, Plain, PlainJson, PlainOf } from "../types/document-forms.ts";
-import type { IsHidden, IsVirtualValue, RefModel, Unbranded, VirtualRefModel } from "../types/markers.ts";
-import type { WriteValue } from "../types/paths.ts";
-import type {
-  AnyPopulatedField,
-  ApplyPopulate,
-  Depopulated,
-  PopulateArgument,
-  PopulateArgumentEntries,
-  PopulatedField,
-  PopulatedKeys,
-  PopulatedOriginalOf,
-  PopulatedValueOf,
-  PopulateObjectSpec,
-  PopulatePathHint,
-} from "../types/populate.ts";
-import type { DefaultView } from "../types/projection.ts";
-import type { DeleteResult, UpdateResult } from "../types/result.ts";
-import type { DataKeys } from "../types/schema-paths.ts";
-import type { Dec, Simplify } from "../types/type-utils.ts";
-import type { Update, UpdateCheck } from "../types/update.ts";
-import type { FieldInput, HydratedField, HydratedFields } from "./collections/hydrated-types.ts";
-
-/*
- * The type of a hydrated document: the entity's own members with the typed collections for its data fields,
--methods in one interface, so the hover reads `HydratedDoc<User>` and the methods are
+ * plus a small set of `$`-methods in one interface, so the hover reads `HydratedDoc<User>` and the methods are
  * resolved only when used. A document whose fields differ from the default read (populated paths, `+hidden` fields,
  * narrowed fields) reads `HydratedDocWith<Post, { author: HydratedDoc<Person> | null }>`: the class by name and only
  * the differing fields, never the computed shape with its markers (the shape is rebuilt from these two parts). `lean()`, `$toObject()`, `$toPlain()` and `$toJSON()` are data (`Lean`, `ObjectForm`,
@@ -431,12 +403,13 @@ export interface DocumentMethods<in out T, in out B = T, in out P = Record<never
    * ```
    *
    * @param options - Session, timeout and policy of the write.
-   * @returns This document.
+   * @returns This document. Typed as saved: for a document from `Model.new()` ({@link UnsavedDocument}) the fields of
+   * the first write (`createdAt`, `updatedAt`, `__v`) are no longer optional, the save has set them.
    * @throws {CastError} When a directly assigned value cannot be cast (nothing is sent).
    * @throws {ValidationError} When the document is invalid.
    * @throws {UnknownFieldsError} When the save would drop stored fields unknown to the schema.
    */
-  $save(options?: SaveOptions): Promise<this>;
+  $save(options?: SaveOptions): Promise<SavedDocument<this, B, P>>;
   /**
    * Deletes the document by `_id`.
    *
@@ -675,17 +648,25 @@ type ShownTransformed<V> = [Exclude<PopulatedElement<V>, null | undefined>] exte
 type SameField<A, B> = [A] extends [Unbranded<B>] ? ([Unbranded<B>] extends [A] ? true : false) : false;
 
 /**
- * A stored field kept by a shown value `V` that is the field itself (a `+hidden` field, a field known to exist): the
- * declared type with its markers, so `Hidden`, `Immutable` and the inputs keep working; a narrowed field is `V`.
+ * A stored field kept by a shown value `V` that is the field itself (a `+hidden` field, a field known to exist, a
+ * field not written yet): the declared type with its markers, so `Hidden`, `Immutable` and the inputs keep working;
+ * a narrowed field is `V`.
  *
  * @example
  * ```ts
  * type A = KeptField<Hidden<string> | undefined, string | undefined>; // Hidden<string> | undefined
  * type B = KeptField<"a" | "b", "a">; // "a"
+ * type C = KeptField<Immutable<Date>, Date | undefined>; // Immutable<Date> | undefined (an unsaved createdAt)
  * ```
  */
 type KeptField<F, V> =
-  SameField<V, F> extends true ? F : SameField<V, Exclude<F, undefined>> extends true ? Exclude<F, undefined> : V;
+  SameField<V, F> extends true
+    ? F
+    : SameField<V, Exclude<F, undefined>> extends true
+      ? Exclude<F, undefined>
+      : SameField<Exclude<V, undefined>, F> extends true
+        ? F | undefined
+        : V;
 
 /**
  * `true` for a stored field that populate fills: a reference (or an array of them), a Map of references, a populate
@@ -872,8 +853,9 @@ export type HydratedDocWith<T, P> = HydratedFields<DocumentShape<T, P>> & Docume
 
 /**
  * A hydrated document of `T` as a read gives it by default: the entity instance without its `Hidden` fields, with
- * typed collections, plus {@link DocumentMethods}. Reads, `new()` and `create()` give this type; a document whose
- * fields differ (populated, `+hidden`, narrowed) is a {@link HydratedDocWith}.
+ * typed collections, plus {@link DocumentMethods}. Reads give this type; a document made from your own input keeps
+ * its `Hidden` fields ({@link NewDocument} from `create()`, `insertOne()`, `insertMany()`; {@link UnsavedDocument}
+ * from `new()`), and a document whose fields differ (populated, `+hidden`, narrowed) is a {@link HydratedDocWith}.
  *
  * @example
  * ```ts
@@ -881,3 +863,71 @@ export type HydratedDocWith<T, P> = HydratedFields<DocumentShape<T, P>> & Docume
  * ```
  */
 export type HydratedDoc<T> = HydratedDocWith<T, Record<never, never>>;
+
+/**
+ * A hydrated document of `T` made from your own input and written (`create()`, `insertOne()`, `insertMany()`, the
+ * document of a document hook): the class's own fields, `Hidden` ones included (`new()` gives the unsaved
+ * {@link UnsavedDocument}). Unlike a read, nothing was left out
+ * on the way: the values you passed are in memory, so the type lists them. `$toObject()` keeps them,
+ * `$toPlain()` and `$toJSON()` leave them out as for any document. `HydratedDocWith<User, { passwordHash?: string }>`
+ * for a class with `Hidden` fields, `HydratedDoc<User>` otherwise.
+ *
+ * @example
+ * ```ts
+ * const user = await Users.create({ name: "Ann", passwordHash: "h1" });
+ * user.passwordHash; // string | undefined: the value passed to create
+ * ```
+ */
+export type NewDocument<T> = DocumentOf<T, ShownFields<T, KeptHiddenKeys<object, T>>>;
+
+/**
+ * The service fields a document gets from its first write: the timestamps of `Timestamped` and the version of
+ * `Versioned`. A class that declares a field of the same name itself does not match (its type has no markers).
+ *
+ * @example
+ * ```ts
+ * type K = WriteTimeKeys<Order>; // "createdAt" | "updatedAt" | "__v" for Versioned(Timestamped(Entity))
+ * ```
+ */
+type WriteTimeKeys<T> =
+  | (T extends TimestampFields ? "createdAt" | "updatedAt" : never)
+  | (T extends VersionFields ? "__v" : never);
+
+/**
+ * What `$save()` resolves to: the document itself, typed as saved. Only a document from `Model.new()` changes: the
+ * fields of the first write leave its second argument (they are set now), so `createdAt` / `updatedAt` / `__v` are
+ * no longer optional. Any other document stays `D`.
+ *
+ * @example
+ * ```ts
+ * const order = await Orders.new({ customer: "Ann" }).$save();
+ * order.createdAt; // Date
+ * ```
+ */
+type SavedDocument<D, B, P> = [WriteTimeKeys<B> & keyof P] extends [never]
+  ? D
+  : DocumentOf<B, Simplify<Omit<P, WriteTimeKeys<B>>>>;
+
+/**
+ * A document of `T` made by `Model.new()` and not saved yet: like {@link NewDocument} (its `Hidden` fields listed),
+ * and without the values of the first write — `createdAt` / `updatedAt` (`Timestamped`) and `__v` (`Versioned`) are
+ * `undefined` until `$save`, so they read as optional. Everything else (`_id`, defaults) is there from `new()`.
+ *
+ * @example
+ * ```ts
+ * class Note extends Timestamped(Entity) {
+ *   text!: string;
+ * }
+ * declare const Notes: Model<Note>;
+ * const note = Notes.new({ text: "hi" });
+ * note.createdAt; // Date | undefined: set by $save
+ * ```
+ */
+export type UnsavedDocument<T> = DocumentOf<
+  T,
+  Simplify<
+    ShownFields<T, KeptHiddenKeys<object, T>> & {
+      [K in WriteTimeKeys<T> & keyof T]?: ShownField<T[K]>;
+    }
+  >
+>;
