@@ -9,12 +9,14 @@ import { BsonTypeTable } from "../../src/index.ts";
  * (`bun run forms:table`). A row added or a form changed in the table without regenerating the guide fails here.
  */
 
-/* The guide is local working material (not in the repository): the guard runs where the guide is present. */
+/*
+ * The guide is local working material (not in the repository): the guard is defined only where the guide is present,
+ * like the other tests of local pages (no skipped test waiting for nothing).
+ */
 const GUIDE = resolve(import.meta.dir, "../../../../from-mongoose-to-typemo/guides/value-forms.md");
 
-describe.skipIf(!existsSync(GUIDE))(
-  "guards: from-mongoose-to-typemo/guides/value-forms.md follows BsonTypeTable",
-  () => {
+if (existsSync(GUIDE))
+  describe("guards: from-mongoose-to-typemo/guides/value-forms.md follows BsonTypeTable", () => {
     test("the generated table of the guide is current (run `bun run forms:table`)", () => {
       const current = ValueFormsTable.current();
       expect(ValueFormsTable.apply(current)).toBe(current);
@@ -31,5 +33,4 @@ describe.skipIf(!existsSync(GUIDE))(
     test("a guide without the markers is an error, not a silent no-op", () => {
       expect(() => ValueFormsTable.apply("# no table here")).toThrow(/markers/);
     });
-  },
-);
+  });
