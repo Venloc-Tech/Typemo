@@ -5,12 +5,12 @@ class Account extends Entity {
 
   @Pre("document.deleteOne")
   beforeDelete(this: Account): void {
-    console.log(`удаляем ${this.title}`);
+    console.log(`deleting ${this.title}`);
   }
 
   @Post("document.deleteOne")
   afterDelete(this: Account, result: DeleteResult): void {
-    console.log(`удалено: ${result.deletedCount}`);
+    console.log(`deleted: ${result.deletedCount}`);
   }
 }
 const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
@@ -18,5 +18,5 @@ const Accounts = client.db().model(Account);
 // ---cut---
 const account = await Accounts.findOne({ title: "Main" }).orFail();
 await account.$deleteOne();
-// → удаляем Main
-// → удалено: 1
+// → deleting Main
+// → deleted: 1

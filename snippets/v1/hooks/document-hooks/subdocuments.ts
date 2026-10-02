@@ -5,11 +5,11 @@ class Line {
 
   @Pre("document.save")
   preSave(this: HookThis<"document.save", Line>): void {
-    console.log(`  проводка ${this.note}: pre, новая: ${this.$isNew()}, корень: ${this.$isRoot()}`);
+    console.log(`  entry ${this.note}: pre, new: ${this.$isNew()}, root: ${this.$isRoot()}`);
   }
   @Post("document.save")
   postSave(this: Line): void {
-    console.log(`  проводка ${this.note}: post`);
+    console.log(`  entry ${this.note}: post`);
   }
 }
 
@@ -20,20 +20,20 @@ class Account extends Entity {
 
   @Pre("document.save")
   preSave(this: Account): void {
-    console.log("счёт: pre");
+    console.log("account: pre");
   }
   @Post("document.save")
   postSave(this: Account): void {
-    console.log("счёт: post");
+    console.log("account: post");
   }
 }
 const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
 const Accounts = client.db().model(Account);
 // ---cut---
 await Accounts.create({ title: "Main", lines: [{ note: "a" }, { note: "b" }] });
-// → счёт: pre
-// →   проводка a: pre, новая: true, корень: false
-// →   проводка b: pre, новая: true, корень: false
-// →   проводка a: post
-// →   проводка b: post
-// → счёт: post
+// → account: pre
+// →   entry a: pre, new: true, root: false
+// →   entry b: pre, new: true, root: false
+// →   entry a: post
+// →   entry b: post
+// → account: post

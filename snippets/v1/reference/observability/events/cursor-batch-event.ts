@@ -1,6 +1,6 @@
 import type { CursorBatchEvent } from "@venloc/typemo";
 // ---cut---
 const onBatch = (event: CursorBatchEvent): void => {
-  console.log(`пачка ${event.batch}: ${event.size} документов`);
+  console.log(`batch ${event.batch}: ${event.size} documents`);
 };
-// → "пачка 0: 2 документа"
+// → "batch 0: 2 documents"

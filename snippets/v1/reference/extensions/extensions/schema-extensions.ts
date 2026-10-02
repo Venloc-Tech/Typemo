@@ -5,5 +5,5 @@ declare module "@venloc/typemo" {
   }
 }
 // ---cut---
-@Schema({ collection: "accounts", ext: { label: { title: "Счета" } } })
+@Schema({ collection: "accounts", ext: { label: { title: "Accounts" } } })
 export class Account extends Entity {}

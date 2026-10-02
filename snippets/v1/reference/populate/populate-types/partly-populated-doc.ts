@@ -34,7 +34,7 @@ const Comments = client.db().model(Comment);
 // ---cut---
 import { type AnyPopulationDoc, isPopulated, type PartlyPopulatedDoc } from "@venloc/typemo";
 
-const signature = (post: PartlyPopulatedDoc<Post, "author">): string => `— ${post.author?.name ?? "аноним"}`;
+const signature = (post: PartlyPopulatedDoc<Post, "author">): string => `— ${post.author?.name ?? "anonymous"}`;
 
 const greet = (post: AnyPopulationDoc<Post>): string => (isPopulated(post, "author") ? signature(post) : "—");
 

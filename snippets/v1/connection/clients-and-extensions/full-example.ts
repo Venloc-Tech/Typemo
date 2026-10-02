@@ -8,7 +8,7 @@ declare module "@venloc/typemo" {
 
 @Schema({ collection: "accounts" })
 class Account extends Entity {
-  @Prop(() => String, { required: true, ext: { label: { text: "Название" } } })
+  @Prop(() => String, { required: true, ext: { label: { text: "Name" } } })
   title!: string;
 
   @Prop(() => String, { required: true })
@@ -16,7 +16,7 @@ class Account extends Entity {
 }
 
 // 1. global plugins and extensions: before the first model of any client
-Typemo.plugin({ name: "log-compiled", apply: (builder) => console.log("схема", builder.target.name) });
+Typemo.plugin({ name: "log-compiled", apply: (builder) => console.log("schema", builder.target.name) });
 Typemo.use({
   name: "label",
   validateProp: (value) => {

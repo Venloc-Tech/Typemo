@@ -16,7 +16,7 @@ export const clearNotes = async (owner?: string, title?: string) => {
   if (owner !== undefined) filter.owner = owner;
   if (title !== undefined) filter.title = title;
   if (Object.keys(filter).length === 0) {
-    throw new Error("укажите, чьи заметки очистить");
+    throw new Error("specify whose notes to clear");
   }
   return Accounts.updateMany(filter, { $unset: { note: "" } });
 };

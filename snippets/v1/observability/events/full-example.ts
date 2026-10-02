@@ -17,17 +17,17 @@ const monitoring = client.instrument({
     switch (event.type) {
       case "operation.end":
         // slow operations
-        if (event.durationMS > SLOW_MS) console.warn(`медленно: ${event.model ?? event.database}.${event.operation}`);
+        if (event.durationMS > SLOW_MS) console.warn(`slow: ${event.model ?? event.database}.${event.operation}`);
         break;
       case "operation.error":
         // failed operations: the step and the kind of failure
-        console.error(`${event.operation}: ${event.classification.name}, шаг ${event.failedStep}`);
+        console.error(`${event.operation}: ${event.classification.name}, step ${event.failedStep}`);
         break;
       case "transaction.retry":
-        console.warn(`повтор транзакции ${event.transactionId}`);
+        console.warn(`transaction retry ${event.transactionId}`);
         break;
       case "driver.command.failed":
-        console.error(`команда ${event.commandName} упала на ${event.address}`);
+        console.error(`command ${event.commandName} failed on ${event.address}`);
         break;
     }
   },

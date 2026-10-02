@@ -35,7 +35,7 @@ const Comments = client.db().model(Comment);
 export const loadPost = (title: string) => Posts.findOne({ title }).populate("author").orFail();
 export type LoadedPost = Awaited<ReturnType<typeof loadPost>>;
 
-export const subject = (post: LoadedPost) => `${post.title} by ${post.author?.name ?? "аноним"}`;
+export const subject = (post: LoadedPost) => `${post.title} by ${post.author?.name ?? "anonymous"}`;
 
 console.log(subject(await loadPost("Hello")));
 // → "Hello by Alice"

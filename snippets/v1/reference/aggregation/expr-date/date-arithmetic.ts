@@ -34,4 +34,4 @@ const [row] = await Orders.aggregate((p) =>
   })),
 );
 console.log(row);
-// → {dateAdd: new Date("2026-03-22T10: 30: 45.123Z"), dateSubtract: new Date("2026-02-15T10: 30: 45.123Z"), dateDiff: 3n, dateTrunc: new Date("2026-03-01T00: 00: 00.000Z")}
+// → {dateAdd: new Date("2026-03-22T10:30:45.123Z"), dateSubtract: new Date("2026-02-15T10:30:45.123Z"), dateDiff: 3n, dateTrunc: new Date("2026-03-01T00:00:00.000Z")}

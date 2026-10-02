@@ -12,11 +12,11 @@ class Account extends Entity {
   @Post("query.find")
   finish(this: OperationHookContext<Account, "query.find">, result: readonly unknown[]): void {
     const startedAt = this.locals.get("startedAt") as number;
-    console.log(`${this.model}.${this.operation}: ${result.length} документов за ${Math.round(performance.now() - startedAt)} мс`);
+    console.log(`${this.model}.${this.operation}: ${result.length} documents in ${Math.round(performance.now() - startedAt)} ms`);
   }
 }
 const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
 const Accounts = client.db().model(Account);
 // ---cut---
 await Accounts.find({ owner: "alice" });
-// → Account.find: 2 документов за … мс
+// → Account.find: 2 documents in … ms

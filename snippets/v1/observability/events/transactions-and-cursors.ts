@@ -3,7 +3,7 @@ const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName:
 // ---cut---
 client.instrument({
   handle: (event) => {
-    if (event.type === "transaction.retry") console.warn(`повтор транзакции ${event.transactionId}, попытка ${event.attempt}`);
-    if (event.type === "transaction.abort") console.error(`откат транзакции ${event.transactionId}`);
+    if (event.type === "transaction.retry") console.warn(`transaction retry ${event.transactionId}, attempt ${event.attempt}`);
+    if (event.type === "transaction.abort") console.error(`transaction abort ${event.transactionId}`);
   },
 });

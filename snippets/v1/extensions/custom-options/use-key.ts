@@ -8,11 +8,11 @@ declare module "@venloc/typemo" {
   }
 }
 // ---cut---
-@Schema({ collection: "accounts", ext: { label: { title: "Счета" } } })
+@Schema({ collection: "accounts", ext: { label: { title: "Accounts" } } })
 export class Account extends Entity {
-  @Prop(() => String, { required: true, ext: { label: { text: "Название" } } })
+  @Prop(() => String, { required: true, ext: { label: { text: "Name" } } })
   title!: string;
 
-  @Prop(() => Number, { default: 0, ext: { label: { text: "Баланс", format: (value) => value.toFixed(2) } } }) // [!code ++]
+  @Prop(() => Number, { default: 0, ext: { label: { text: "Balance", format: (value) => value.toFixed(2) } } }) // [!code ++]
   balance!: Defaulted<number>; // [!code ++]
 }

@@ -39,17 +39,17 @@ export const loadPost = (title: string) => Posts.findOne({ title }).populate("au
 export type LoadedPost = Awaited<ReturnType<typeof loadPost>>;
 
 export const subject = (post: LoadedPost) =>
-  `${post.title} by ${isPresent(post.author) ? post.author.name : "аноним"}`;
+  `${post.title} by ${isPresent(post.author) ? post.author.name : "anonymous"}`;
 
 // a post in any state: a signature if the author is loaded
 export const footer = (post: AnyPopulationDoc<Post>): string =>
-  isPopulated(post, "author") ? `— ${post.author?.name ?? "аноним"}` : "";
+  isPopulated(post, "author") ? `— ${post.author?.name ?? "anonymous"}` : "";
 
 // other code loaded the relation; here it is required and gets the exact type
 export const signature = async (post: HydratedDoc<Post>) => {
   await post.$populate("author");
   const loaded = post.$assertPopulated("author");
-  return `— ${loaded.author?.name ?? "аноним"}`;
+  return `— ${loaded.author?.name ?? "anonymous"}`;
 };
 
 // branching without an error (after `signature` the author of `bare` is loaded)

@@ -3,7 +3,7 @@ const audit: SchemaPlugin = {
   name: "audit-log",
   apply: (builder) => {
     builder.addHook("pre", "query.find", function () {
-      console.log("чтение товаров");
+      console.log("reading products");
     });
   },
 };

@@ -38,8 +38,8 @@ await Users.deleteOne({ name: "Bob" });
 
 const show = async (title: string): Promise<string> => {
   const post = await Posts.findOne({ title }).populate("author").orFail();
-  return isPresent(post.author) ? post.author.name : "автор удалён";
+  return isPresent(post.author) ? post.author.name : "author deleted";
 };
 
 console.log(await show("Hello"), await show("Bob's"));
-// → "Alice" "автор удалён"
+// → "Alice" "author deleted"

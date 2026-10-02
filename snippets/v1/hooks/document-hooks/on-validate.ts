@@ -5,17 +5,17 @@ class Account extends Entity {
 
   @Pre("document.validate")
   beforeValidate(this: Account): void {
-    console.log("проверка началась");
+    console.log("validation started");
   }
 
   @PostError("document.validate")
   validationFailed(this: Account, error: unknown): void {
-    console.log("проверка не прошла:", error instanceof Error ? error.name : error);
+    console.log("validation failed:", error instanceof Error ? error.name : error);
   }
 }
 const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
 const Accounts = client.db().model(Account);
 // ---cut---
 await Accounts.create({ title: "ab" }).catch(() => undefined);
-// → проверка началась
-// → проверка не прошла: ValidationError
+// → validation started
+// → validation failed: ValidationError

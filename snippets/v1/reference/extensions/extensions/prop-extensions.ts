@@ -9,7 +9,7 @@ declare module "@venloc/typemo" {
 export class Account extends Entity {
   @Prop(() => Number, {
     default: 0,
-    ext: { label: { text: "Баланс", format: (value) => value.toFixed(2) } },
+    ext: { label: { text: "Balance", format: (value) => value.toFixed(2) } },
   })
   balance!: Defaulted<number>;
 }

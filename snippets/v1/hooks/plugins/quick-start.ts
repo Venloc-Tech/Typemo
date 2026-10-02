@@ -4,7 +4,7 @@ export const readLog: SchemaPlugin = {
   name: "read-log",
   apply: (builder) => {
     builder.addHook("post", "query.find", function () {
-      console.log(`прочитан список ${builder.target.name}`);
+      console.log(`read list ${builder.target.name}`);
     });
   },
 };

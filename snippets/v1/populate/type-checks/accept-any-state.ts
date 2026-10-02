@@ -35,7 +35,7 @@ const Comments = client.db().model(Comment);
 import { type AnyPopulationDoc, isPopulated } from "@venloc/typemo";
 
 export const signature = (post: AnyPopulationDoc<Post>): string =>
-  isPopulated(post, "author") ? `— ${post.author?.name ?? "аноним"}` : "—";
+  isPopulated(post, "author") ? `— ${post.author?.name ?? "anonymous"}` : "—";
 
 const bare = await Posts.findOne({ title: "Hello" }).orFail();
 const loaded = await Posts.findOne({ title: "Hello" }).populate("author").orFail();

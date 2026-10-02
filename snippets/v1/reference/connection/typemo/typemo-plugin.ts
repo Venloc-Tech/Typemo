@@ -3,6 +3,6 @@ import { Typemo } from "@venloc/typemo";
 Typemo.plugin({
   name: "log-compiled-models",
   apply: (builder) => {
-    console.log("схема", builder.target.name);
+    console.log("schema", builder.target.name);
   },
 });

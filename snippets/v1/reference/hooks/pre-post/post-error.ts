@@ -7,6 +7,6 @@ export class Account extends Entity {
 
   @PostError("document.save")
   reportFailure(this: Account, error: unknown): void {
-    console.error(`не удалось сохранить ${this.title}:`, error instanceof Error ? error.message : error);
+    console.error(`failed to save ${this.title}:`, error instanceof Error ? error.message : error);
   }
 }

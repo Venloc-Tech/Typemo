@@ -10,7 +10,7 @@ client.instrument({
   poolEvents: true,
   handle: (event) => {
     if (event.type === "driver.command.succeeded") {
-      console.log(`${event.commandName} на ${event.address}: ${event.durationMS} мс`);
+      console.log(`${event.commandName} on ${event.address}: ${event.durationMS} ms`);
     }
     if (event.type === "driver.pool") console.log(event.name);
   },

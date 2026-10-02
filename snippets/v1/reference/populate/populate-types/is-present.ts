@@ -35,7 +35,7 @@ const Comments = client.db().model(Comment);
 import { isPresent } from "@venloc/typemo";
 
 const post = await Posts.findOne({ title: "Hello" }).populate("author").orFail();
-console.log(isPresent(post.author) ? post.author.name : "автор удалён");
+console.log(isPresent(post.author) ? post.author.name : "author deleted");
 // → "Alice"
 
 const authors = [post.author, null].filter(isPresent);

@@ -12,11 +12,11 @@ export class Account extends Entity {
 
   @Post("document.save")
   logSaved(this: Account): void {
-    console.log(`сохранён счёт ${this.title}`);
+    console.log(`saved account ${this.title}`);
   }
 
   @PostError("document.save")
   logFailed(this: Account, error: unknown): void {
-    console.error(`счёт ${this.title} не сохранён:`, error);
+    console.error(`account ${this.title} not saved:`, error);
   }
 }

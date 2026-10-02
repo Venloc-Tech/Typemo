@@ -6,16 +6,16 @@ class Account extends Entity {
   @Pre("document.save")
   audit(this: HookThis<"document.save", Account>): void {
     if (!this.$isModified()) return;
-    console.log("изменения будут записаны");
+    console.log("changes will be written");
   }
 }
 const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
 const Accounts = client.db().model(Account);
 // ---cut---
 const account = await Accounts.create({ title: "Main" });
-// → изменения будут записаны
+// → changes will be written
 await account.$save();
 // unchanged: the hook ran but returned at once
 account.note = "checked";
 await account.$save();
-// → изменения будут записаны
+// → changes will be written

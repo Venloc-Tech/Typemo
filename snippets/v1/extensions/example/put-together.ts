@@ -18,10 +18,10 @@ const label: TypemoExtension<"label"> = {
 
 @Schema({ collection: "accounts" })
 class Account extends Entity {
-  @Prop(() => String, { required: true, ext: { label: { text: "Название" } } })
+  @Prop(() => String, { required: true, ext: { label: { text: "Name" } } })
   title!: string;
 
-  @Prop(() => Number, { default: 0, ext: { label: { text: "Баланс", format: (value) => value.toFixed(2) } } })
+  @Prop(() => Number, { default: 0, ext: { label: { text: "Balance", format: (value) => value.toFixed(2) } } })
   balance!: Defaulted<number>;
 
   @Prop(() => String, { required: true })
@@ -47,4 +47,4 @@ const table = columns(Accounts.schema);
 for (const row of await Accounts.find().plain()) {
   console.log(table.map((column) => `${column.header}: ${column.format((row as Record<string, unknown>)[column.path])}`).join(" | "));
 }
-// → Название: Main | Баланс: 12.50
+// → Name: Main | Balance: 12.50

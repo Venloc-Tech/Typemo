@@ -5,7 +5,7 @@ client.instrument({
   handle: (event) => {
     if (event.type === "operation.error") {
       const { kind, name, retryable } = event.classification;
-      console.error(`${event.operation}: ${name} (${kind}), шаг ${event.failedStep}, повтор: ${retryable}`);
+      console.error(`${event.operation}: ${name} (${kind}), step ${event.failedStep}, retryable: ${retryable}`);
     }
   },
 });

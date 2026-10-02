@@ -11,7 +11,7 @@ export const tools: SchemaPlugin<undefined, typeof statics> = {
   name: "tools",
   apply: (builder) => {
     builder.addHook("post", "query.find", function () {
-      console.log(`прочитан список ${builder.target.name}`);
+      console.log(`read list ${builder.target.name}`);
     });
   },
   statics,
@@ -28,6 +28,6 @@ const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName:
 const Accounts = client.db().model(Account);
 
 await Accounts.create({ title: "Main" });
-await Accounts.find(); // → прочитан список Account
+await Accounts.find(); // → read list Account
 console.log(await Accounts.statics(tools).byTitle("Main"));
 // → 1

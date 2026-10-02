@@ -5,12 +5,12 @@ class Account extends Entity {
 
   @Post("document.init")
   afterRead(this: Account): void {
-    console.log(`прочитан счёт ${this.title}`);
+    console.log(`read account ${this.title}`);
   }
 }
 const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
 const Accounts = client.db().model(Account);
 // ---cut---
 await Accounts.findOne({ title: "Main" });
-// → прочитан счёт Main
+// → read account Main
 await Accounts.findOne({ title: "Main" }).lean();

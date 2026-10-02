@@ -12,12 +12,12 @@ const Accounts = client.db().model(Account);
 const subscription = client.instrument({
   handle: (event) => {
     if (event.type === "operation.end") {
-      console.log(`${event.model ?? event.database}.${event.operation}: ${event.documentCount} шт.`);
+      console.log(`${event.model ?? event.database}.${event.operation}: ${event.documentCount} pcs`);
     }
   },
 });
 
 await Accounts.find({ balance: { $gt: 50 } }).plain();
-// → "Account.find: 1 шт."
+// → "Account.find: 1 pcs"
 
 subscription.unsubscribe();

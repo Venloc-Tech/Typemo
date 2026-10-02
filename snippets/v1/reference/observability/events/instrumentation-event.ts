@@ -3,11 +3,11 @@ import type { InstrumentationEvent } from "@venloc/typemo";
 const describe = (event: InstrumentationEvent): string => {
   switch (event.type) {
     case "operation.start":
-      return `${event.operation} начата`;
+      return `${event.operation} started`;
     case "operation.end":
-      return `${event.operation}: ${event.durationMS} мс`;
+      return `${event.operation}: ${event.durationMS} ms`;
     case "operation.error":
-      return `${event.operation} упала на шаге ${event.failedStep}`;
+      return `${event.operation} failed at step ${event.failedStep}`;
     default:
       return event.type;
   }

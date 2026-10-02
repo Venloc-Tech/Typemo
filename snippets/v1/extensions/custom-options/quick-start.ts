@@ -15,6 +15,6 @@ Typemo.use({
 
 @Schema({ collection: "accounts" })
 export class Account extends Entity {
-  @Prop(() => String, { required: true, ext: { label: { text: "Название" } } })
+  @Prop(() => String, { required: true, ext: { label: { text: "Name" } } })
   title!: string;
 }

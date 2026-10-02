@@ -7,6 +7,6 @@ export class Account extends Entity {
 
   @Post("query.deleteMany")
   logDeleted(this: OperationHookContext<Account, "query.deleteMany">, result: { readonly deletedCount: number | null }): void {
-    console.log(`удалено счетов: ${result.deletedCount}`);
+    console.log(`accounts deleted: ${result.deletedCount}`);
   }
 }

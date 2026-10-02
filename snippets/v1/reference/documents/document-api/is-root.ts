@@ -7,10 +7,10 @@ class Line extends Entity {
   @Pre("document.save")
   report(this: HookThis<"document.save", Line>): void {
     if (this.$isRoot()) {
-      console.log("корень", JSON.stringify(this.$getChanges()));
+      console.log("root", JSON.stringify(this.$getChanges()));
       return;
     }
-    console.log("поддокумент", this.$fullPath());
+    console.log("subdocument", this.$fullPath());
   }
 }
 @Schema({ collection: "orders" })

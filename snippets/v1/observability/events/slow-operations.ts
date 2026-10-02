@@ -6,7 +6,7 @@ const SLOW_MS = 100;
 client.instrument({
   handle: (event) => {
     if (event.type === "operation.end" && event.durationMS > SLOW_MS) {
-      console.warn(`медленно: ${event.model ?? event.database}.${event.operation}, ${Math.round(event.durationMS)} мс`);
+      console.warn(`slow: ${event.model ?? event.database}.${event.operation}, ${Math.round(event.durationMS)} ms`);
     }
   },
 });
