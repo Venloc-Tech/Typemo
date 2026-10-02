@@ -16,26 +16,7 @@ icon: ListTree
 
 Уникальный номер счёта и индекс по владельцу задаются опциями [`@Prop`](../reference/schemas/prop.mdx#unique), а составной индекс — через [`@Index`](../reference/schemas/index-decorators.mdx#index).
 
-```ts twoslash title="accounts/account.ts"
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-// ---cut---
-@Index({ owner: 1, opened: -1 }) // [!code ++]
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) // [!code highlight]
-  number!: string;
-  @Prop(() => String, { index: true }) // [!code highlight]
-  owner?: string;
-  @Prop(() => Date)
-  opened?: Date;
-}
-
-const Accounts = client.db().model(Account);
-const report = await client.connection.init();
-console.log(report.created);
-// → ["collection accounts", "index accounts.number_1", "index accounts.owner_1", "index accounts.owner_1_opened_-1"]
-```
+<Snippet id="schemas/indexes/quick-start" title="accounts/account.ts" twoslash />
 
 Отчёт `init()` перечисляет всё, что создано, — сначала коллекцию, потом каждый индекс. Ниже разберём каждый вид индекса на реальных задачах.
 
@@ -43,18 +24,7 @@ console.log(report.created);
 
 Опция [`index`](../reference/schemas/prop.mdx#index) создаёт индекс по одному полю. `true` или `1` — по возрастанию, `-1` — по убыванию, `"hashed"` — хешированный. Чтобы увидеть, что Typemo собирается создать, не трогая базу, спросите описание схемы. [`Accounts.schema.describe()`](../reference/schemas/schema-info.mdx#describe) вернёт индексы в том виде, в каком они попадут на сервер.
 
-```ts twoslash title="accounts/account.ts"
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { index: true }) owner?: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Accounts = client.db().model(Account);
-// ---cut---
-console.log(Accounts.schema.describe().indexes);
-// → [{ keys: { owner: 1 }, options: {} }]
-```
+<Snippet id="schemas/indexes/one-index-per-field" title="accounts/account.ts" twoslash />
 
 Имя индексу сервер даёт сам по ключам, здесь это `owner_1`. Индекс по `_id` объявлять нельзя, сервер и так строит его уникальным.
 
@@ -64,24 +34,7 @@ console.log(Accounts.schema.describe().indexes);
 
 Дело в устройстве MongoDB. Документ без поля индексируется как `null`, и второй такой документ нарушил бы уникальность. Typemo откажет сразу при описании модели, чтобы вы не наткнулись на это в продакшене.
 
-```ts twoslash title="accounts/accounts.service.ts"
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) number!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Accounts = client.db().model(Account);
-await client.connection.init();
-// ---cut---
-await Accounts.create({ number: "1" });
-try {
-  await Accounts.create({ number: "1" });
-} catch (error) {
-  console.log((error as Error).message);
-}
-// → duplicate key on number_1: { number: "1" } (code 11000 DuplicateKey)
-```
+<Snippet id="schemas/indexes/prevent-duplicates" title="accounts/accounts.service.ts" twoslash />
 
 Если поле необязательное и уникальным должно быть только заполненное значение, добавьте [`sparse: true`](../reference/schemas/prop.mdx#sparse). В индекс попадут только документы, где поле есть. На поле с `nullable: true` уникальность запрещена совсем. Значения `null` конфликтуют даже в разреженном индексе, и тут нужен частичный индекс из следующего раздела. Модель не соберётся — `Account.nick: "unique" on a nullable field — null values collide even in a sparse index; use a partial @Index`.
 
@@ -89,68 +42,19 @@ try {
 
 Почта должна быть уникальной среди действующих счетов, а у закрытых может повторяться. Для этого нужен **частичный индекс**. В него входят только документы, подходящие под условие `partialFilterExpression`. Условие сверяется с классом при компиляции, так что опечатка в имени поля не пройдёт.
 
-```ts twoslash title="accounts/account.ts"
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-// ---cut---
-@Index({ email: 1 }, { unique: true, partialFilterExpression: { active: true }, name: "email_active" }) // [!code highlight]
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String) email?: string;
-  @Prop(() => Boolean) active?: boolean;
-}
-
-const Accounts = client.db().model(Account);
-await client.connection.init();
-await Accounts.create({ email: "a@x", active: true });
-const inactive = await Accounts.create({ email: "a@x", active: false });
-// закрытый счёт с той же почтой записался: индекс его не видит
-
-try {
-  await Accounts.create({ email: "a@x", active: true });
-} catch (error) {
-  console.log((error as Error).message);
-}
-// → duplicate key on email_active: { email: "a@x" } (code 11000 DuplicateKey)
-```
+<Snippet id="schemas/indexes/partial-unique" title="accounts/account.ts" twoslash />
 
 ## Автоматически удалять старые документы [#expire-documents]
 
 [`expires`](../reference/schemas/prop.mdx#expires) на поле типа `Date` создаёт TTL-индекс. MongoDB сама удалит документ, когда с даты в поле пройдёт заданное число секунд. Так чистят сессии, коды подтверждения, временные счета. Сервер проверяет TTL примерно раз в минуту, так что документ исчезает не мгновенно. Для условий сложнее одного поля берите [`expireAfterSeconds`](../reference/schemas/index-decorators.mdx#expire-after-seconds) в `@Index`.
 
-```ts twoslash title="accounts/session.ts"
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-// ---cut---
-@Schema({ collection: "sessions" })
-class Session extends Entity {
-  @Prop(() => Date, { expires: 3600 }) // [!code highlight]
-  lastSeen?: Date;
-}
-
-const Sessions = client.db().model(Session);
-console.log(Sessions.schema.describe().indexes);
-// → [{ keys: { lastSeen: 1 }, options: { expireAfterSeconds: 3600 } }]
-```
+<Snippet id="schemas/indexes/expire-documents" title="accounts/session.ts" twoslash />
 
 ## Полнотекстовый поиск [#full-text-search]
 
 Текстовый индекс позволяет искать слова в строках. В коллекции он может быть **только один**, поэтому поля с [`text: true`](../reference/schemas/prop.mdx#text) собираются в один индекс. Если нужны веса полей или язык, опишите индекс через `@Index` с `weights`, а `text: true` на поля не ставьте. Сочетать их нельзя.
 
-```ts twoslash title="accounts/account.ts"
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-// ---cut---
-@Index({ title: "text", note: "text" }, { weights: { title: 5 }, name: "search" }) // [!code highlight]
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String) title?: string;
-  @Prop(() => String) note?: string;
-}
-const Accounts = client.db().model(Account);
-console.log(Accounts.schema.describe().indexes);
-// → [{ keys: { title: "text", note: "text" }, options: { weights: { title: 5 }, name: "search" } }]
-```
+<Snippet id="schemas/indexes/full-text-search" title="accounts/account.ts" twoslash />
 
 Как искать по такому индексу, рассказывает руководство [Текстовый и векторный поиск](../queries/text-and-vector-search.mdx). Сервер хранит ключи текстового индекса как `_fts` и `_ftsx` и не пишет в описание вес по умолчанию (1), если его не задали. Typemo учитывает это при сравнении с базой. Повторный `connection.init()` на модели с текстовым индексом ничего не создаёт и не падает, отчёт второго вызова пуст (`created` — `[]`, `inSync` — `true`).
 
@@ -183,9 +87,7 @@ console.log(Accounts.schema.describe().indexes);
 
 **`unique` без `required`.** Опцию отвергают при создании модели. Документы без поля индексируются как `null`, и второй такой документ нарушил бы уникальность.
 
-```text
-ConfigurationError: Account.passport: "unique" on a field that is not required — every document without it is indexed as null and the second one fails (E11000); add required: true, sparse: true or use a partial @Index
-```
+<Snippet id="schemas/indexes/troubleshooting" />
 
 Добавьте `required: true` или `sparse: true` либо используйте частичный `@Index`.
 
@@ -197,36 +99,7 @@ ConfigurationError: Account.passport: "unique" on a field that is not required �
 
 Всё вместе в одном файле — модель со всеми видами индексов и их создание при старте.
 
-```ts twoslash title="accounts/account.ts"
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-
-@Index({ owner: 1, opened: -1 })
-@Index({ email: 1 }, { unique: true, partialFilterExpression: { active: true }, name: "email_active" })
-@Index({ closedAt: 1 }, { expireAfterSeconds: 60, name: "closed_ttl" })
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  // номер: уникален и обязателен
-  @Prop(() => String, { required: true, unique: true })
-  number!: string;
-
-  // владелец: часто ищем
-  @Prop(() => String, { index: true })
-  owner?: string;
-
-  @Prop(() => Date) opened?: Date;
-  @Prop(() => String) email?: string;
-  @Prop(() => Boolean) active?: boolean;
-  @Prop(() => Date) closedAt?: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-client.connection.model(Account);
-
-// старт приложения: создаём недостающие индексы
-const report = await client.connection.init();
-console.log(report.created);
-// → ["collection accounts", "index accounts.number_1", "index accounts.owner_1", "index accounts.owner_1_opened_-1", "index accounts.email_active", "index accounts.closed_ttl"]
-```
+<Snippet id="schemas/indexes/full-example" title="accounts/account.ts" twoslash />
 
 <Callout type="migration">
 

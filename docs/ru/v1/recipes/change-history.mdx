@@ -18,30 +18,7 @@ icon: History
 
 Включите `audit: true` в схеме и оберните запись в [`PolicyContext.run`](../reference/policies/policy-context.mdx#policy-context.run) с актором. Запись счёта оставит строку журнала в коллекции `accounts_audit`.
 
-```ts twoslash
-import { ObjectId } from "mongodb";
-import { type AuditEntry, type Defaulted, Entity, PolicyContext, Post, Prop, Schema, TypemoClient } from "@venloc/typemo";
-declare const __publish__: (event: { type: string; title: string }) => void;
-@Schema({ collection: "accounts", audit: true })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
-  @Prop(() => String, { sensitive: "mask" }) card?: string;
-  @Post("document.save")
-  announce(this: Account): void {
-    __publish__({ type: "account.saved", title: this.title });
-  }
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
-const Accounts = client.db().model(Account);
-const asActor = <R>(userId: string, work: () => R): R => PolicyContext.run({ actor: userId }, work);
-// ---cut---
-const account = await asActor("user-1", () => Accounts.create({ title: "Main", card: "5500000000000004" }));
-
-const trail = client.unsafeDriver().db("bank").collection("accounts_audit");
-console.log(await trail.countDocuments({ actor: "user-1" }));
-// → 1
-```
+<Snippet id="recipes/change-history/quick-start" twoslash />
 
 Ниже покажем, как прочитать историю одного счёта, пересказать её человеку и разослать события.
 
@@ -49,31 +26,13 @@ console.log(await trail.countDocuments({ actor: "user-1" }));
 
 У счёта есть название, баланс и номер карты. Карта помечена `sensitive: "mask"`, и журнал запишет её как `?`, а не настоящий номер. Так доступ к истории не раскрывает секретов.
 
-```ts twoslash title="accounts/account.ts"
-import { type Defaulted, Entity, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "accounts", audit: true })
-export class Account extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  @Prop(() => Number, { min: 0, default: 0 })
-  balance!: Defaulted<number>;
-
-  @Prop(() => String, { sensitive: "mask" })
-  card?: string;
-}
-```
+<Snippet id="recipes/change-history/define-model" title="accounts/account.ts" twoslash />
 
 ## Записывать от имени пользователя [#write-as-user]
 
 Журнал берёт актора из контекста политик. Без него в строке не будет `actor`, и не узнать, кто менял. Контекст один раз открывает слой обработки запроса, как в рецепте [Многотенантное приложение](./multi-tenant.mdx). Здесь этот слой — функция `asActor`.
 
-```ts twoslash title="http/as-actor.ts"
-import { PolicyContext } from "@venloc/typemo";
-// ---cut---
-export const asActor = <R>(userId: string, work: () => R): R => PolicyContext.run({ actor: userId }, work);
-```
+<Snippet id="recipes/change-history/write-as-user" title="http/as-actor.ts" twoslash />
 
 Дальше все записи идут внутри неё. Обратите внимание, контекст берётся в момент **построения** операции. Поэтому `asActor("u2", () => doc.$save())` работает, а строитель, созданный заранее вне `asActor`, актора не получит.
 
@@ -85,33 +44,7 @@ export const asActor = <R>(userId: string, work: () => R): R => PolicyContext.ru
 - `filter._id.$in` содержит его — это запись сразу по нескольким счетам, о ней раздел про `updateMany` ниже.
 - `documents._id` равен ему — это создание.
 
-```ts twoslash title="accounts/history.ts"
-import { ObjectId } from "mongodb";
-import { type AuditEntry, type Defaulted, Entity, PolicyContext, Post, Prop, Schema, TypemoClient } from "@venloc/typemo";
-declare const __publish__: (event: { type: string; title: string }) => void;
-@Schema({ collection: "accounts", audit: true })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
-  @Prop(() => String, { sensitive: "mask" }) card?: string;
-  @Post("document.save")
-  announce(this: Account): void {
-    __publish__({ type: "account.saved", title: this.title });
-  }
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
-const Accounts = client.db().model(Account);
-const asActor = <R>(userId: string, work: () => R): R => PolicyContext.run({ actor: userId }, work);
-// ---cut---
-export const historyOf = async (id: string) => {
-  const trail = client.unsafeDriver().db("bank").collection<AuditEntry>("accounts_audit");
-  const oid = new ObjectId(id);
-  return trail
-    .find({ $or: [{ "filter._id": oid }, { "filter._id.$in": oid }, { "documents._id": oid }] })
-    .sort({ _id: 1 })
-    .toArray();
-};
-```
+<Snippet id="recipes/change-history/account-history" title="accounts/history.ts" twoslash />
 
 Сортировка по `_id` строки журнала даёт порядок записей. Пусть счёт `Main` создал `u1`, потом `u2` сохранил документ с новым балансом, а `u3` прибавил 5 оператором `$inc`. `historyOf` вернёт три строки с операциями `insertOne`, `updateOne`, `updateOne` и акторами `u1`, `u2`, `u3`. Запись через `$save` помечена в журнале `document: true`, а прямое обновление — `document: false`.
 
@@ -119,24 +52,7 @@ export const historyOf = async (id: string) => {
 
 Пользователю нужна строка вроде «u3 увеличил balance», а не сырая запись журнала. Оператор и поле берутся из `update`. Журнал хранит значения, уже приведённые к типам схемы, а секреты — замаскированными.
 
-```ts twoslash title="accounts/history.ts"
-import { type AuditEntry } from "@venloc/typemo";
-// ---cut---
-export const describeEntry = (entry: AuditEntry): { at: Date; actor: unknown; what: string } => {
-  const what = (() => {
-    if (entry.operation === "insertOne") return "created";
-    if (entry.operation === "deleteOne" || entry.operation === "deleteMany") return "deleted";
-    const update = entry.update;
-    if (update === undefined || Array.isArray(update)) return entry.operation;
-    return Object.entries(update)
-      .flatMap(([operator, fields]) =>
-        typeof fields === "object" && fields !== null ? Object.keys(fields).map((field) => `${operator} ${field}`) : [],
-      )
-      .join(", ");
-  })();
-  return { at: entry.at, actor: entry.actor, what };
-};
-```
+<Snippet id="recipes/change-history/explain-history" title="accounts/history.ts" twoslash />
 
 Для трёх записей выше получится `created`, `$set balance`, `$inc balance`. Номер карты здесь не появится ни в каком виде, кроме `?`.
 
@@ -144,21 +60,7 @@ export const describeEntry = (entry: AuditEntry): { at: Date; actor: unknown; wh
 
 Журнал отвечает на вопрос «что было», а событие — на вопрос «что произошло только что». Это может быть уведомление клиенту, обновление кеша или письмо. Хук документа [`@Post`](../reference/hooks/pre-post.mdx#post) на событие `document.save` вызывается после записи документа. Отправить событие — уже ваш код (`__publish__`).
 
-```ts twoslash title="accounts/account.ts"
-import { Entity, Post, Prop, Schema } from "@venloc/typemo";
-declare const __publish__: (event: { type: string; title: string }) => void;
-// ---cut---
-@Schema({ collection: "accounts", audit: true })
-export class Account extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  @Post("document.save")
-  announce(this: Account): void {
-    __publish__({ type: "account.saved", title: this.title });
-  }
-}
-```
+<Snippet id="recipes/change-history/emit-on-save" title="accounts/account.ts" twoslash />
 
 Хук срабатывает на `create` и `$save`, то есть когда запись идёт через документ. `updateOne` и `updateMany` хуки документа не вызывают. Их изменение останется в журнале, но события не породит. Если событие нужно и для них, берите [подписку на изменения](./change-stream-jobs.mdx). Она видит любую запись, откуда бы та ни пришла.
 
@@ -179,25 +81,7 @@ export class Account extends Entity {
 
 **В истории нет записей `updateMany`.** `updateMany` с фильтром по названию не хранит `_id` счетов. Журнал записал условие, а не список задетых документов. `historyOf` по `_id` такую строку не найдёт, и в истории отдельного счёта этой записи не окажется. Прочитайте идентификаторы в транзакции и пишите уже по ним. Тогда строка журнала назовёт `_id`, и `historyOf` её увидит.
 
-```ts twoslash title="accounts/accounts.service.ts"
-import { type Defaulted, Entity, PolicyContext, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts", audit: true })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
-const Accounts = client.db().model(Account);
-const asActor = <R>(userId: string, work: () => R): R => PolicyContext.run({ actor: userId }, work);
-// ---cut---
-export const setBalanceByTitle = (userId: string, title: string, balance: number) =>
-  asActor(userId, () =>
-    client.transaction(async () => {
-      const rows = await Accounts.find({ title }).select({ _id: 1 }).lean();
-      await Accounts.updateMany({ _id: { $in: rows.map((row) => row._id) } }, { $set: { balance } });
-    }),
-  );
-```
+<Snippet id="recipes/change-history/troubleshooting" title="accounts/accounts.service.ts" twoslash />
 
 Транзакция нужна, чтобы чтение идентификаторов и запись по ним видели одно состояние базы. Строка журнала такой записи называет `filter: { _id: { $in: [...] } }` со всеми идентификаторами, и `historyOf` находит её по `filter._id.$in`. Почему журнал хранит условие, рассказано в руководстве [Аудит](../policies/audit.mdx#document-history).
 
@@ -207,80 +91,7 @@ export const setBalanceByTitle = (userId: string, title: string, balance: number
 
 ## Полный пример [#full-example]
 
-```ts twoslash title="accounts/accounts.service.ts"
-import { ObjectId } from "mongodb";
-import {
-  type AuditEntry,
-  type Defaulted,
-  Entity,
-  PolicyContext,
-  Post,
-  Prop,
-  Schema,
-  TypemoClient,
-} from "@venloc/typemo";
-
-// your code: sends an event to the rest of the application
-declare const __publish__: (event: { type: string; title: string }) => void;
-
-// accounts/account.ts
-@Schema({ collection: "accounts", audit: true })
-export class Account extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  @Prop(() => Number, { min: 0, default: 0 })
-  balance!: Defaulted<number>;
-
-  @Prop(() => String, { sensitive: "mask" })
-  card?: string;
-
-  @Post("document.save")
-  announce(this: Account): void {
-    __publish__({ type: "account.saved", title: this.title });
-  }
-}
-
-export const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
-const Accounts = client.db().model(Account);
-
-// http/as-actor.ts: the actor of every write of a request
-export const asActor = <R>(userId: string, work: () => R): R => PolicyContext.run({ actor: userId }, work);
-
-// writes
-export const openAccount = (userId: string, title: string, card: string) =>
-  asActor(userId, () => Accounts.create({ title, card }));
-
-export const deposit = (userId: string, id: string, amount: number) =>
-  asActor(userId, () => Accounts.updateOne({ _id: id }, { $inc: { balance: amount } }).orFail());
-
-// history of one account, oldest first
-export const historyOf = async (id: string) => {
-  const trail = client.unsafeDriver().db("bank").collection<AuditEntry>("accounts_audit");
-  const oid = new ObjectId(id);
-  const entries = await trail
-    .find({ $or: [{ "filter._id": oid }, { "filter._id.$in": oid }, { "documents._id": oid }] })
-    .sort({ _id: 1 })
-    .toArray();
-  return entries.map(describeEntry);
-};
-
-// one line of the history for a person
-export const describeEntry = (entry: AuditEntry): { at: Date; actor: unknown; what: string } => {
-  const what = (() => {
-    if (entry.operation === "insertOne") return "created";
-    if (entry.operation === "deleteOne" || entry.operation === "deleteMany") return "deleted";
-    const update = entry.update;
-    if (update === undefined || Array.isArray(update)) return entry.operation;
-    return Object.entries(update)
-      .flatMap(([operator, fields]) =>
-        typeof fields === "object" && fields !== null ? Object.keys(fields).map((field) => `${operator} ${field}`) : [],
-      )
-      .join(", ");
-  })();
-  return { at: entry.at, actor: entry.actor, what };
-};
-```
+<Snippet id="recipes/change-history/full-example" title="accounts/accounts.service.ts" twoslash />
 
 <Callout type="migration">
 

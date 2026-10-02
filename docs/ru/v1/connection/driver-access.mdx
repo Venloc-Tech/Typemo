@@ -14,24 +14,13 @@ Typemo оборачивает не весь драйвер MongoDB. Команд
 
 Подключённый клиент из файла `db/client.ts` и модель счёта из `accounts/account.ts`. Модель будет расти по ходу страницы. Сначала в ней два поля, потом появятся скрытый PIN и мягкое удаление.
 
-```ts twoslash title="db/client.ts"
-import { TypemoClient } from "@venloc/typemo";
-
-export const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-```
+<Snippet id="connection/driver-access/prerequisites" title="db/client.ts" twoslash />
 
 ## Быстрый путь [#quick-start]
 
 [`client.unsafeDriver`](../reference/connection/typemo-client.mdx#client.unsafe-driver) возвращает драйверный `MongoClient`. Через него можно, например, отправить серверу проверку связи, которой у моделей нет.
 
-```ts twoslash
-import { TypemoClient } from "@venloc/typemo";
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-// ---cut---
-const pong = await client.unsafeDriver().db("admin").command({ ping: 1 });
-console.log(pong.ok);
-// → 1
-```
+<Snippet id="connection/driver-access/quick-start" twoslash />
 
 Метод каждый раз возвращает один и тот же объект, хранить его в переменной не нужно. Дальше — что вы теряете и как понять, что драйвер вам правда нужен.
 
@@ -39,15 +28,7 @@ console.log(pong.ok);
 
 Команды сервера вроде `ping`, `buildInfo` или управления пользователями работают на уровне базы и ни к одной модели не относятся. Модели их не выражают, так что здесь драйвер — единственный путь. И потерь почти нет, ведь команда не трогает данные ваших моделей.
 
-```ts twoslash title="db/health.ts"
-import { TypemoClient } from "@venloc/typemo";
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-// ---cut---
-export const serverVersion = async (): Promise<string> => {
-  const info = await client.unsafeDriver().db("admin").command({ buildInfo: 1 });
-  return String(info.version);
-};
-```
+<Snippet id="connection/driver-access/admin-command" title="db/health.ts" twoslash />
 
 Драйвер работает через то же подключение и тот же пул, что и модели. Отдельный клиент для этого не нужен.
 
@@ -55,40 +36,11 @@ export const serverVersion = async (): Promise<string> => {
 
 Иногда нужно увидеть данные такими, как они лежат в базе, — при отладке, миграции или разборе странного случая. Драйвер вернёт документ без слоя Typemo. Разницу проще показать на примере. Пусть в модели есть скрытое поле `pin`, которое Typemo наружу не отдаёт.
 
-```ts twoslash title="accounts/account.ts"
-import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "accounts" })
-export class Account extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  @Prop(() => String, { required: true })
-  owner!: string;
-
-  @Prop(() => String, { hidden: true })
-  pin?: Hidden<string>;
-}
-```
+<Snippet id="connection/driver-access/read-raw-collection" title="accounts/account.ts" twoslash />
 
 Через модель скрытое поле в результат `.plain()` не попадёт, а драйвер вернёт документ целиком. Возьмём запись `{ title: "Main", owner: "alice", pin: "1234" }`. У результата модели ключи `_id`, `title` и `owner`, а у документа из драйвера ещё и `pin` со значением `"1234"`. Отличается и идентификатор. В драйвере `_id` — объект `ObjectId`, а в результатах модели это строка.
 
-```ts twoslash title="accounts/inspect.ts"
-import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-// ---cut---
-const Accounts = client.connection.model(Account);
-const viaModel = await Accounts.findOne({ owner: "alice" }).plain();
-//    ^?
-const viaDriver = await client.unsafeDriver().db("app").collection("accounts").findOne({ owner: "alice" });
-//    ^?
-```
+<Snippet id="connection/driver-access/read-raw-collection-2" title="accounts/inspect.ts" twoslash />
 
 Всё, что бережёт данные, здесь не работает. Скрытые поля, маски `sensitive` и аудит не помогут, и секрет увидит любой код, у которого есть `MongoClient`. Не передавайте его туда, где нужны только данные моделей.
 
@@ -98,69 +50,15 @@ const viaDriver = await client.unsafeDriver().db("app").collection("accounts").f
 
 **Мягкое удаление перестаёт работать.** Добавим модели опцию `softDelete` и поле `deletedAt`. После `deleteOne` через модель документ помечен удалённым, и модель его больше не видит. А драйвер видит запись как раньше.
 
-```ts twoslash title="accounts/account.ts"
-import { Entity, type Hidden, Prop, Schema } from "@venloc/typemo";
+<Snippet id="connection/driver-access/what-you-lose" title="accounts/account.ts" twoslash />
 
-@Schema({ collection: "accounts", softDelete: true }) // [!code highlight]
-export class Account extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  @Prop(() => String, { required: true })
-  owner!: string;
-
-  @Prop(() => String, { hidden: true })
-  pin?: Hidden<string>;
-
-  @Prop(() => Date, { nullable: true }) // [!code ++]
-  deletedAt?: Date | null; // [!code ++]
-}
-```
-
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts", softDelete: true })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-  @Prop(() => Date, { nullable: true }) deletedAt?: Date | null;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-const raw = client.unsafeDriver().db("app").collection("accounts");
-// ---cut---
-await Accounts.deleteOne({ title: "Main" });
-console.log(await Accounts.countDocuments(), await raw.countDocuments());
-// → 0 1
-```
+<Snippet id="connection/driver-access/what-you-lose-2" twoslash />
 
 **Проверки данных не срабатывают.** Драйвер запишет документ с числом в поле `title`, и модель по умолчанию прочитает его как есть. Чтение не сверяет каждый документ со схемой. Данные, записанные через модель, уже проверены при записи, а сверка стоила бы времени на каждом чтении. Запись через модель упала бы с ошибкой, но запись мимо неё проверить некому.
 
 Чтобы такой документ не попал в код под чужим типом, включите **строгое чтение**. Это вызов [`.validateReads()`](../reference/query/options.mdx#validate-reads) в запросе или опция клиента [`validateReads`](../reference/connection/typemo-client.mdx#validate-reads).
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-const raw = client.unsafeDriver().db("app").collection("accounts");
-// ---cut---
-await raw.insertOne({ title: 5, owner: "bob" });
-
-console.log(await Accounts.find({ owner: "bob" }).plain());
-// → [{ _id: "…", title: 5, owner: "bob" }]
-
-try {
-  await Accounts.find({ owner: "bob" }).validateReads().plain();
-} catch (error) {
-  console.log((error as Error).message);
-}
-// → Cast to string failed at path "title" for 5 (number): the stored value does not match the schema of Account (a document read from the database, checked by validateReads) [type]
-```
+<Snippet id="connection/driver-access/what-you-lose-3" twoslash />
 
 Первое чтение вернуло `title: 5`, хотя у поля тип `string`. Второе сверило документ со схемой и остановилось на `title` с ошибкой [`CastError`](../reference/errors/data-errors.mdx#cast-error).
 
@@ -196,28 +94,7 @@ try {
 
 Скрипт проверки окружения. Он отправляет команду через драйвер, считает документы через модель и закрывает клиент.
 
-```ts twoslash title="scripts/check-environment.ts"
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  @Prop(() => String, { required: true })
-  owner!: string;
-}
-
-await using client = await TypemoClient.connect("mongodb://localhost:27017/app");
-
-// сервер: команда мимо моделей, через драйвер
-const info = await client.unsafeDriver().db("admin").command({ buildInfo: 1 });
-console.log("MongoDB", String(info.version));
-
-// данные: только через модель, чтобы действовали политики
-const total = await client.connection.model(Account).countDocuments();
-console.log("accounts:", total);
-```
+<Snippet id="connection/driver-access/full-example" title="scripts/check-environment.ts" twoslash />
 
 <Callout type="migration">
 

@@ -16,53 +16,13 @@ Typemo строит конвейер методами, а не сырыми об
 - Один отменённый заказ `bob`.
 - Один новый заказ `carol`.
 
-```ts twoslash title="orders/order.ts"
-import { Entity, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-export class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true })
-  status!: string;
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-```
+<Snippet id="aggregation/facets/prerequisites" title="orders/order.ts" twoslash />
 
 ## Быстрый путь [#quick-start]
 
 Чтобы посчитать, сколько потратил каждый клиент, передайте в [`Orders.aggregate`](../reference/aggregation/pipeline.mdx#model.aggregate) функцию. Она получает пустой строитель и добавляет стадии — отбор [`match`](../reference/aggregation/stages.mdx#match), группировку [`group`](../reference/aggregation/stages.mdx#group) и сортировку [`sort`](../reference/aggregation/stages.mdx#sort).
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-const query = Orders.aggregate((p) =>
-  p
-    .match({ status: "paid" })
-    .group((f) => ({ _id: f.customer, spent: fn.sum(f.total) }))
-    .sort({ spent: "descending" }),
-);
-const rows = await query;
-//    ^?
-// → [{ _id: "alice", spent: 200 }, { _id: "bob", spent: 50 }]
-```
+<Snippet id="aggregation/first-aggregation/quick-start" twoslash />
 
 Если строки уйдут клиенту как JSON, добавьте [`.plain()`](../reference/aggregation/pipeline.mdx#plain), и идентификаторы станут строками. Если строк много, читайте их по одной через [`.cursor()`](../reference/aggregation/pipeline.mdx#cursor). А если конвейер собирают в одном месте, а запускают в другом, соберите план через [`Pipeline.from(...).plan()`](../reference/aggregation/pipeline.mdx#pipeline.from) и передайте его в `aggregate`. Ниже разберём каждый вариант.
 
@@ -70,36 +30,7 @@ const rows = await query;
 
 Допустим, нужен отчёт «сколько заказов и на какую сумму принёс каждый оплативший клиент». В конвейере три стадии, и после каждой тип строки меняется. Чтобы это увидеть, соберём конвейер по частям. [`Pipeline.from`](../reference/aggregation/pipeline.mdx#pipeline.from) создаёт пустой строитель над сущностью, а тип `RowOf` достаёт из строителя тип его строки.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-const all = Pipeline.from(Order);
-type AllRow = RowOf<typeof all>;
-//   ^?
-
-const paid = all.match({ status: "paid" });
-type PaidRow = RowOf<typeof paid>;
-//   ^?
-
-const perCustomer = paid.group((f) => ({
-  _id: f.customer,
-  orders: fn.count(),
-  spent: fn.sum(f.total),
-}));
-type CustomerRow = RowOf<typeof perCustomer>;
-//   ^?
-```
+<Snippet id="aggregation/first-aggregation/build-pipeline" twoslash />
 
 `match` только отбирает документы, и форма строки не меняется, это всё ещё заказ. `group` собирает строки заново. В результате остались только `_id` (клиент), `orders` и `spent`, а `placedAt` и `status` пропали, и в следующих стадиях компилятор к ним не пустит.
 
@@ -111,33 +42,7 @@ type CustomerRow = RowOf<typeof perCustomer>;
 
 Передайте строитель в `Model.aggregate` целиком. Запрос ленивый и, как остальные запросы Typemo, уходит в базу на `await`.
 
-```ts twoslash title="orders/orders.service.ts"
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-export const spentByCustomer = async () => {
-  const query = Orders.aggregate((p) =>
-    p
-      .match({ status: "paid" })
-      .group((f) => ({ _id: f.customer, orders: fn.count(), spent: fn.sum(f.total) }))
-      .sort({ spent: "descending" }),
-  );
-  const rows = await query;
-  //    ^?
-  // → [{ _id: "alice", orders: 2, spent: 200 }, { _id: "bob", orders: 1, spent: 50 }]
-  return rows;
-};
-```
+<Snippet id="aggregation/first-aggregation/run-and-get-rows" title="orders/orders.service.ts" twoslash />
 
 Слово `descending` в `sort` вместо `-1` выбрано намеренно. Число легко перепутать, а слово понятно без справочника. В стадию оно всё равно уходит как `-1`.
 
@@ -147,28 +52,7 @@ export const spentByCustomer = async () => {
 
 Строки без `.plain()` содержат значения драйвера, и `_id` документа там — `ObjectId`, а не строка. Внутри приложения это удобно. Но чтобы отправить строку как JSON, нужны обычные объекты, где идентификаторы, `int64` и `Decimal128` записаны строками. [`.plain()`](../reference/aggregation/pipeline.mdx#plain) делает это и в типе, и в значениях.
 
-```ts twoslash title="orders/orders.service.ts"
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-export const firstPaidOrder = async () => {
-  const query = Orders.aggregate((p) => p.match({ status: "paid" }).limit(1)).plain();
-  const rows = await query;
-  //    ^?
-  // → [{ _id: "6abd2bee…", customer: "alice", status: "paid", total: 120, placedAt: 2026-01-05T00:00:00.000Z }]
-  return rows;
-};
-```
+<Snippet id="aggregation/first-aggregation/send-rows" title="orders/orders.service.ts" twoslash />
 
 Даты остаются датами, `JSON.stringify` сам превратит их в строки. Схемы результата у агрегации нет — форму строки задаёт конвейер, а не класс. Поэтому `.plain()` здесь работает только по таблице типов BSON. Отдельного `.lean()`, как у [`find`](../reference/query/reading.mdx#model.find), у агрегации нет. Строка без `.plain()` — это и есть значения драйвера.
 
@@ -176,30 +60,7 @@ export const firstPaidOrder = async () => {
 
 Если результат большой, например выгрузка отчёта или экспорт, не загружайте все строки в память. [`.cursor()`](../reference/aggregation/pipeline.mdx#cursor) возвращает **курсор** — асинхронный итератор, который берёт строки из базы пачками и отдаёт по одной.
 
-```ts twoslash title="orders/export.ts"
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-export const exportSpent = async (write: (line: string) => void) => {
-  const query = Orders.aggregate((p) =>
-    p.group((f) => ({ _id: f.customer, spent: fn.sum(f.total) })).sort({ _id: 1 }),
-  );
-  for await (const row of query.batchSize(2).cursor()) {
-    write(`${row._id}: ${row.spent}`);
-    // → "alice: 200", "bob: 250", "carol: 30"
-  }
-};
-```
+<Snippet id="aggregation/first-aggregation/read-row-by-row" title="orders/export.ts" twoslash />
 
 [`.batchSize(2)`](../reference/aggregation/pipeline.mdx#batch-size) говорит, сколько строк сервер присылает за раз. Все настройки запроса — [`.session`](../reference/aggregation/pipeline.mdx#session), [`.policy`](../reference/aggregation/pipeline.mdx#policy), [`.comment`](../reference/aggregation/pipeline.mdx#comment), [`.timeoutMS`](../reference/aggregation/pipeline.mdx#timeout-ms) и остальные — возвращают новый запрос, и ставить их можно в любом порядке.
 
@@ -207,24 +68,7 @@ export const exportSpent = async (write: (line: string) => void) => {
 
 Если агрегация тормозит, спросите сервер, как он её выполняет. [`.explain()`](../reference/aggregation/pipeline.mdx#explain) не запускает конвейер, а возвращает описание плана.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-const plan = await Orders.aggregate((p) => p.match({ status: "paid" })).explain("executionStats");
-console.log(Object.keys(plan).slice(0, 3));
-// → ["explainVersion", "queryPlanner", "executionStats"]
-```
+<Snippet id="aggregation/first-aggregation/show-plan" twoslash />
 
 Подробность задаётся уровнем — `"queryPlanner"` по умолчанию, `"executionStats"` или `"allPlansExecution"`. Выбранный план есть уже в `"queryPlanner"`. `"executionStats"` добавляет фактические счётчики, и ради них сервер выполняет запрос на самом деле.
 
@@ -232,29 +76,7 @@ console.log(Object.keys(plan).slice(0, 3));
 
 Бывает, что конвейер строят в одном модуле, а запускают в другом. Скажем, отчёт описан в `reports/spending.ts`, а вызывают его несколько сервисов. Для этого [`Pipeline.from`](../reference/aggregation/pipeline.mdx#pipeline.from) принимает сущность, а [`.plan()`](../reference/aggregation/pipeline.mdx#pipeline.from) замораживает конвейер в **план**, который `aggregate` берёт вместо колбэка.
 
-```ts twoslash title="reports/spending.ts"
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-export const topPaid = Pipeline.from(Order)
-  .match({ status: "paid" })
-  .sort({ total: "descending" })
-  .limit(2)
-  .plan();
-
-export const runTopPaid = async () => Orders.aggregate(topPaid);
-//           ^?
-```
+<Snippet id="aggregation/first-aggregation/prebuild-plan" title="reports/spending.ts" twoslash />
 
 План — обычный замороженный объект с источником (имя коллекции и сущность), стадиями и опциями. Он привязан к коллекции. План от `Pipeline.from(Order)` не подойдёт модели другой коллекции, и `aggregate` бросит [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configuration-error) ещё до обращения к базе.
 
@@ -277,99 +99,25 @@ export const runTopPaid = async () => Orders.aggregate(topPaid);
 
 **Опечатка в имени поля.** Стадия читает поле, которого в текущей строке нет, и компилятор сразу её останавливает.
 
-```ts twoslash
-// @errors: 2551
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-await Orders.aggregate((p) => p.group((f) => ({ _id: f.custmer, spent: fn.sum(f.total) })));
-```
+<Snippet id="aggregation/first-aggregation/troubleshooting" twoslash />
 
 Компилятор предложит ближайшее имя (`Did you mean 'customer'?`) и покажет одну ошибку. Опечатка в ключе группы не тянет за собой вторую, про аккумуляторы. Так же он ответит на опечатку в аргументе аккумулятора, например `fn.sum(f.totl)`. Чаще всего ошибка всплывает после `group` — строка уже другая, а следующая стадия всё ещё обращается к полям заказа. Наведите курсор на `f` и посмотрите, какие поля остались.
 
 **Сумма — не аккумулятор.** В `group` каждое поле, кроме `_id`, должно быть **аккумулятором** — функцией, которая сворачивает много документов в одно значение, вроде `fn.sum`, `fn.avg` или `fn.count`. Обычное вычисление над одним документом, например `fn.add`, сюда не подходит.
 
-```ts twoslash
-// @errors: 2741
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-await Orders.aggregate((p) => p.group((f) => ({ _id: f.customer, doubled: fn.add(f.total, 1) })));
-```
+<Snippet id="aggregation/first-aggregation/troubleshooting-2" twoslash />
 
 Компилятор назовёт поле и причину в тексте `PathError` — `$group field "doubled" needs an accumulator (fn.sum, fn.avg, fn.push, fn.first, fn.count, ...)`. Замените вычисление аккумулятором, а формулу над строкой вынесите в отдельную стадию [`addFields`](../reference/aggregation/stages.mdx#add-fields) до или после `group`.
 
 **План без стадий.** `plan()` замораживает конвейер, а пустой конвейер ничего не делает. Поэтому метод есть только у строителя, где уже есть хотя бы одна стадия.
 
-```ts twoslash
-// @errors: 2684
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-Pipeline.from(Order).plan();
-```
+<Snippet id="aggregation/first-aggregation/troubleshooting-3" twoslash />
 
 Добавьте стадию перед `.plan()`.
 
 ## Полный пример [#full-example]
 
-```ts twoslash title="reports/spending.ts"
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-// 1. Отчёт: клиенты, которые платили, от самого щедрого.
-export const spendingReport = Pipeline.from(Order)
-  .match({ status: "paid" })
-  .group((f) => ({ _id: f.customer, orders: fn.count(), spent: fn.sum(f.total) }))
-  .sort({ spent: "descending" })
-  .plan();
-
-// 2. Для API: строки как JSON.
-export const spendingForApi = () => Orders.aggregate(spendingReport).plain();
-
-// 3. Для выгрузки: по одной строке.
-export const streamSpending = () => Orders.aggregate(spendingReport).batchSize(100).cursor();
-```
+<Snippet id="aggregation/first-aggregation/full-example" title="reports/spending.ts" twoslash />
 
 ## Что дальше [#next-steps]
 

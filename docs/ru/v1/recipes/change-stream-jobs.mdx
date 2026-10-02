@@ -19,32 +19,7 @@ icon: Radio
 
 [`Model.watch`](../reference/change-streams/watch.mdx#model.watch) открывает поток, а цикл `for await` читает события. `await Model.watch()` возвращается, когда курсор уже открыт на сервере. Запись сразу после него попадёт в поток, даже если читать вы начнёте позже.
 
-```ts twoslash
-import { type ChangeEvent, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-declare const __sendReceipt__: (orderNumber: string) => Promise<void>;
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) number!: string;
-  @Prop(() => Number, { required: true, min: 0 }) total!: number;
-}
-@Schema({ collection: "job_checkpoints" })
-class Checkpoint extends Entity {
-  @Prop(() => String, { required: true, unique: true }) name!: string;
-  @Prop(() => String, { required: true }) token!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.db().model(Order);
-const Checkpoints = client.db().model(Checkpoint);
-// ---cut---
-const stream = await Orders.watch((pipeline) => pipeline.match({ operationType: "insert" }));
-
-await Orders.create({ number: "A-1", total: 10 });
-
-const event = await stream.next();
-if (event.operationType === "insert") console.log(event.fullDocument.number);
-// → "A-1"
-await stream.close();
-```
+<Snippet id="recipes/change-stream-jobs/quick-start" twoslash />
 
 Дальше превратим этот фрагмент в долгоживущий обработчик — с сохранением маркера, продолжением после перезапуска и остановкой.
 
@@ -52,27 +27,7 @@ await stream.close();
 
 Заказ — это то, за чем мы следим. Контрольная точка хранит маркер под именем обработчика. У каждой фоновой задачи своя точка, поэтому имя уникально.
 
-```ts twoslash title="jobs/models.ts"
-import { Entity, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-export class Order extends Entity {
-  @Prop(() => String, { required: true })
-  number!: string;
-
-  @Prop(() => Number, { required: true, min: 0 })
-  total!: number;
-}
-
-@Schema({ collection: "job_checkpoints" })
-export class Checkpoint extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  name!: string;
-
-  @Prop(() => String, { required: true })
-  token!: string;
-}
-```
+<Snippet id="recipes/change-stream-jobs/define-models" title="jobs/models.ts" twoslash />
 
 Маркер — обычный объект вида `{ _data: "…" }`. Поля для произвольного объекта в Typemo нет, поэтому маркер хранится строкой JSON. `JSON.stringify` при сохранении и `JSON.parse` при чтении вернут тот же объект.
 
@@ -80,73 +35,13 @@ export class Checkpoint extends Entity {
 
 Функций две. Одна читает маркер или возвращает `undefined` при первом запуске, другая записывает новый. Запись идёт через [`updateOne`](../reference/writes/writes.mdx#update-one) с `upsert`, так что первый вызов создаёт точку, а следующие её обновляют.
 
-```ts twoslash title="jobs/checkpoint.ts"
-import { type ChangeEvent, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-declare const __sendReceipt__: (orderNumber: string) => Promise<void>;
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) number!: string;
-  @Prop(() => Number, { required: true, min: 0 }) total!: number;
-}
-@Schema({ collection: "job_checkpoints" })
-class Checkpoint extends Entity {
-  @Prop(() => String, { required: true, unique: true }) name!: string;
-  @Prop(() => String, { required: true }) token!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.db().model(Order);
-const Checkpoints = client.db().model(Checkpoint);
-// ---cut---
-export const loadToken = async (name: string): Promise<unknown> => {
-  const checkpoint = await Checkpoints.findOne({ name }).plain();
-  return checkpoint === null ? undefined : JSON.parse(checkpoint.token);
-};
-
-export const saveToken = async (name: string, token: unknown): Promise<void> => {
-  await Checkpoints.updateOne({ name }, { $set: { token: JSON.stringify(token) } }, { upsert: true });
-};
-```
+<Snippet id="recipes/change-stream-jobs/checkpoint" title="jobs/checkpoint.ts" twoslash />
 
 ## Запустить обработчик [#run-handler]
 
 Обработчик открывает поток с сохранённого места, обрабатывает событие за событием и после каждого сохраняет маркер. При первом запуске маркера нет, и поток стартует с текущего момента. Опция [`resumeAfter`](../reference/change-streams/watch.mdx#model-watch-options) велит серверу продолжить сразу после события с этим маркером.
 
-```ts twoslash title="jobs/receipts.ts"
-import { type ChangeEvent, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-declare const __sendReceipt__: (orderNumber: string) => Promise<void>;
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) number!: string;
-  @Prop(() => Number, { required: true, min: 0 }) total!: number;
-}
-@Schema({ collection: "job_checkpoints" })
-class Checkpoint extends Entity {
-  @Prop(() => String, { required: true, unique: true }) name!: string;
-  @Prop(() => String, { required: true }) token!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.db().model(Order);
-const Checkpoints = client.db().model(Checkpoint);
-const loadToken = async (name: string): Promise<unknown> => undefined;
-const saveToken = async (name: string, token: unknown): Promise<void> => {};
-// ---cut---
-export const runReceiptWorker = async (signal: AbortSignal): Promise<void> => {
-  const resumeAfter = await loadToken("receipts");
-  const stream = await Orders.watch(
-    (pipeline) => pipeline.match({ operationType: "insert" }),
-    resumeAfter === undefined ? {} : { resumeAfter },
-  );
-  signal.addEventListener("abort", () => void stream.close());
-
-  const process = async (event: ChangeEvent<Order>): Promise<void> => {
-    if (event.operationType !== "insert") return;
-    await __sendReceipt__(event.fullDocument.number);
-    await saveToken("receipts", stream.resumeToken);
-  };
-
-  for await (const event of stream) await process(event);
-};
-```
+<Snippet id="recipes/change-stream-jobs/run-handler" title="jobs/receipts.ts" twoslash />
 
 Порядок в `process` выбран сознательно — сначала работа, потом маркер. Если процесс упадёт между ними, после перезапуска событие придёт снова, и чек уйдёт дважды. Это гарантия «как минимум один раз». В обратном порядке, сначала маркер, а потом работа, получилось бы «не более одного раза», и сбой между ними потерял бы чек.
 
@@ -158,42 +53,7 @@ export const runReceiptWorker = async (signal: AbortSignal): Promise<void> => {
 
 Проверяем ровно то, что бывает в жизни. Останавливаем обработчик, пишем заказы, пока он выключен, и запускаем снова. Ни один заказ не пропал, а уже обработанные не повторились.
 
-```ts twoslash title="jobs/receipts.test.ts"
-import { type ChangeEvent, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-declare const __sendReceipt__: (orderNumber: string) => Promise<void>;
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) number!: string;
-  @Prop(() => Number, { required: true, min: 0 }) total!: number;
-}
-@Schema({ collection: "job_checkpoints" })
-class Checkpoint extends Entity {
-  @Prop(() => String, { required: true, unique: true }) name!: string;
-  @Prop(() => String, { required: true }) token!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.db().model(Order);
-const Checkpoints = client.db().model(Checkpoint);
-const runReceiptWorker = async (signal: AbortSignal): Promise<void> => {};
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-// ---cut---
-const first = new AbortController();
-const running = runReceiptWorker(first.signal);
-await sleep(300);
-await Orders.create({ number: "A-1", total: 10 });
-await sleep(300);
-first.abort();
-await running;
-
-await Orders.create({ number: "A-2", total: 20 }); // written while the worker is stopped
-
-const second = new AbortController();
-const resumed = runReceiptWorker(second.signal);
-await sleep(300);
-second.abort();
-await resumed;
-// receipts sent: A-1, A-2 (each once)
-```
+<Snippet id="recipes/change-stream-jobs/check-restart" title="jobs/receipts.test.ts" twoslash />
 
 Пауза в 300 миллисекунд после запуска даёт обработчику время прочитать маркер и открыть поток. До этого момента запись событием не станет. Второй запуск начал с сохранённого маркера и первым делом получил `A-2`, записанный в простое. А `A-1` повторно не пришёл, потому что маркер уже стоял после него.
 
@@ -221,63 +81,7 @@ await resumed;
 
 ## Полный пример [#full-example]
 
-```ts twoslash title="jobs/receipts.ts"
-import { type ChangeEvent, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-
-// your code: sends the receipt of an order
-declare const __sendReceipt__: (orderNumber: string) => Promise<void>;
-
-// jobs/models.ts
-@Schema({ collection: "orders" })
-export class Order extends Entity {
-  @Prop(() => String, { required: true })
-  number!: string;
-
-  @Prop(() => Number, { required: true, min: 0 })
-  total!: number;
-}
-
-@Schema({ collection: "job_checkpoints" })
-export class Checkpoint extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  name!: string;
-
-  @Prop(() => String, { required: true })
-  token!: string;
-}
-
-export const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.db().model(Order);
-const Checkpoints = client.db().model(Checkpoint);
-
-// jobs/checkpoint.ts: the resume token is kept as a JSON string
-export const loadToken = async (name: string): Promise<unknown> => {
-  const checkpoint = await Checkpoints.findOne({ name }).plain();
-  return checkpoint === null ? undefined : JSON.parse(checkpoint.token);
-};
-
-export const saveToken = async (name: string, token: unknown): Promise<void> => {
-  await Checkpoints.updateOne({ name }, { $set: { token: JSON.stringify(token) } }, { upsert: true });
-};
-
-// jobs/receipts.ts: at-least-once processing with a checkpoint after each event
-export const runReceiptWorker = async (signal: AbortSignal): Promise<void> => {
-  const resumeAfter = await loadToken("receipts");
-  const stream = await Orders.watch(
-    (pipeline) => pipeline.match({ operationType: "insert" }),
-    resumeAfter === undefined ? {} : { resumeAfter },
-  );
-  signal.addEventListener("abort", () => void stream.close());
-
-  const process = async (event: ChangeEvent<Order>): Promise<void> => {
-    if (event.operationType !== "insert") return;
-    await __sendReceipt__(event.fullDocument.number);
-    await saveToken("receipts", stream.resumeToken);
-  };
-
-  for await (const event of stream) await process(event);
-};
-```
+<Snippet id="recipes/change-stream-jobs/full-example" title="jobs/receipts.ts" twoslash />
 
 <Callout type="migration">
 

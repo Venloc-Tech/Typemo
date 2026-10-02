@@ -18,26 +18,7 @@ icon: Workflow
 
 Хук — это метод класса с декоратором [`@Pre`](../reference/hooks/pre-post.mdx#pre) или [`@Post`](../reference/hooks/pre-post.mdx#post). Событие называет операцию (`query.find`), а тип `this` — [`OperationHookContext`](../reference/hooks/operation-context.mdx#operation-hook-context). Чаще всего нужны три хука — добавить условие, дописать обновление и подменить результат.
 
-```ts twoslash title="accounts/account.ts"
-import { type Defaulted, Entity, Pre, Prop, Schema, type OperationHookContext } from "@venloc/typemo";
-
-@Schema({ collection: "accounts" })
-export class Account extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  @Prop(() => String, { required: true })
-  owner!: string;
-
-  @Prop(() => Boolean, { default: false })
-  archived!: Defaulted<boolean>;
-
-  @Pre("query.find")
-  onlyActive(this: OperationHookContext<Account, "query.find">): void {
-    this.modify({ where: { archived: false } });
-  }
-}
-```
+<Snippet id="hooks/operation-hooks/quick-start" title="accounts/account.ts" twoslash />
 
 Теперь любой `find` этой модели пропускает архивные счета, даже если вызывающий код о них не думал. Дальше разберём каждое действие хука на задачах.
 
@@ -47,32 +28,11 @@ export class Account extends Entity {
 
 Метод [`.modify`](../reference/hooks/operation-context.mdx#modify) принимает ключ `where` — условие, которое Typemo соединяет с фильтром вызывающего кода через AND. Значит, хук только сужает выборку и никогда её не расширяет. То, что запросил вызывающий код, остаётся в силе.
 
-```ts twoslash
-import { type Defaulted, Entity, Schema, Prop, TypemoClient } from "@venloc/typemo";
-import { Pre, type OperationHookContext } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-  @Prop(() => Boolean, { default: false }) archived!: Defaulted<boolean>;
-  @Pre("query.find")
-  onlyActive(this: OperationHookContext<Account, "query.find">): void {
-    this.modify({ where: { archived: false } });
-  }
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Accounts = client.db().model(Account);
-// ---cut---
-const mine = await Accounts.find({ owner: "alice" }).sort({ title: 1 }).plain();
-console.log(mine.map((account) => account.title));
-// → ["a", "b"]
-```
+<Snippet id="hooks/operation-hooks/filter-all-reads" twoslash />
 
 В базу ушёл фильтр `{ owner: "alice", archived: false }`. Если бы у `b` было `archived: true`, в ответе остался бы только `a`. Условие хука проходит те же проверки, что и условие в запросе. Поле должно существовать в модели, а значение проходит приведение типа. Поэтому опечатку в хуке видно сразу, и текст у ошибки понятный.
 
-```text
-StrictModeError: filter: "nope" is not a field of Account [unknown-path]
-```
+<Snippet id="hooks/operation-hooks/filter-all-reads-2" />
 
 Компилятор тоже подскажет, ведь `where` типизирован моделью так же, как фильтр `find`.
 
@@ -82,35 +42,13 @@ StrictModeError: filter: "nope" is not a field of Account [unknown-path]
 
 При любом обновлении счёта нужно увеличивать счётчик ревизий. Хук `modify` с ключом `update` добавляет операторы к обновлению вызывающего кода.
 
-```ts twoslash
-import { type Defaulted, Entity, Pre, Prop, Schema, TypemoClient, type OperationHookContext } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-  @Prop(() => Boolean, { default: false }) archived!: Defaulted<boolean>;
-  @Prop(() => Number, { default: 0 }) revision!: Defaulted<number>; // [!code ++]
-
-  @Pre("query.updateMany") // [!code ++]
-  bumpRevision(this: OperationHookContext<Account, "query.updateMany">): void { // [!code ++]
-    this.modify({ update: { $inc: { revision: 1 } } }); // [!code ++]
-  } // [!code ++]
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Accounts = client.db().model(Account);
-// ---cut---
-const result = await Accounts.updateMany({ owner: "alice" }, { $set: { archived: true } });
-console.log(result.modifiedCount);
-// → 2
-```
+<Snippet id="hooks/operation-hooks/extend-update" twoslash />
 
 Вызывающий код писал только `$set`, а в базу ушли оба оператора — `$set` от него и `$inc` от хука. Поэтому `revision` у обоих счетов стал равен 1. Операторы объединяются по имени. Если `$inc` в обновлении уже был, пути хука допишутся в него.
 
 Перезаписать значение, которое обновление уже пишет, хук не может. Один путь под одним оператором дважды — ошибка, иначе хук молча подменил бы значение вызывающего кода.
 
-```text
-QueryError: Account.updateOne: modify(): "$set.title" is already written by the update
-```
+<Snippet id="hooks/operation-hooks/extend-update-2" />
 
 Обновление конвейером (массив стадий) хуки тоже видят, но дописать в него `update` нельзя. Операторы в конвейер не вставить, и вы получите `QueryError`.
 
@@ -118,25 +56,7 @@ QueryError: Account.updateOne: modify(): "$set.title" is already written by the 
 
 Пусть в списке счетов нужен всегда один и тот же порядок. Ключи `select` и `sort` **заменяют** выбор полей и сортировку целиком, а не дополняют их.
 
-```ts twoslash
-import { Entity, Pre, Prop, Schema, TypemoClient, type OperationHookContext } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-
-  @Pre("query.find")
-  newestFirst(this: OperationHookContext<Account, "query.find">): void {
-    this.modify({ select: { title: 1 }, sort: { title: -1 } });
-  }
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Accounts = client.db().model(Account);
-// ---cut---
-const rows = await Accounts.find().plain();
-console.log(rows.map((row) => row.title));
-// → ["c", "b", "a"]
-```
+<Snippet id="hooks/operation-hooks/change-select-and-sort" twoslash />
 
 Записи пришли в обратном порядке и только с полями `_id` и `title` — сортировку и проекцию вызывающего кода хук заменил. Поэтому `sort` и `select` в хуках используйте только там, где правило действительно общее.
 
@@ -144,81 +64,19 @@ console.log(rows.map((row) => row.title));
 
 Скрипт очистки должен уметь работать вхолостую — показать, что собирался сделать, и ничего не удалить. Метод [`.skip`](../reference/hooks/operation-context.mdx#skip) отменяет операцию. Запрос в базу не уходит, а вызывающий код получает переданный вами результат так, будто его вернул сервер.
 
-```ts twoslash
-import { Entity, Pre, Prop, Schema, TypemoClient, type OperationHookContext } from "@venloc/typemo";
-export const settings = { dryRun: false };
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-
-  @Pre("query.deleteMany")
-  dryRun(this: OperationHookContext<Account, "query.deleteMany">): void {
-    if (settings.dryRun) this.skip({ acknowledged: true, deletedCount: 0 });
-  }
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Accounts = client.db().model(Account);
-// ---cut---
-settings.dryRun = true;
-const result = await Accounts.deleteMany({ owner: "bob" });
-console.log(result, await Accounts.countDocuments());
-// → { acknowledged: true, deletedCount: 0 } 3
-```
+<Snippet id="hooks/operation-hooks/skip-operation" twoslash />
 
 Хук передал результат удаления в той форме, в какой его вернул бы сервер, и `deleteMany` завершился без обращения к базе. Все три счёта на месте. После `skip` остальные хуки `@Pre` этой операции не запускаются, а хуки `@Post` запускаются и получают тот же результат.
 
 Подложенный результат проходит остаток конвейера как настоящий. Если вы подставили документы для `find`, вызывающий код получит документы вашей модели. А если документ не подходит под схему, будет та же ошибка приведения, что и при чтении из базы. Хук не может вернуть данные, которых не вернул бы сервер.
 
-```ts twoslash
-import { Entity, Pre, Prop, Schema, TypemoClient, type OperationHookContext } from "@venloc/typemo";
-import { ObjectId } from "mongodb";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-
-  @Pre("query.find")
-  fromCache(this: OperationHookContext<Account, "query.find">): void {
-    this.skip([{ _id: new ObjectId(), title: "cached", owner: "nobody" }]);
-  }
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Accounts = client.db().model(Account);
-// ---cut---
-const rows = await Accounts.find().plain();
-console.log(rows.map((row) => row.title));
-// → ["cached"]
-```
+<Snippet id="hooks/operation-hooks/skip-operation-2" twoslash />
 
 ## Измерить операцию [#measure-operation]
 
 Нужно записать, сколько документов вернуло чтение и сколько времени оно заняло. Данные нужны и до операции, и после. Хуки `@Pre` и `@Post` обмениваются ими через `this.locals` — это `Map`, который создаётся заново для каждой операции.
 
-```ts twoslash
-import { Entity, Post, Pre, Prop, Schema, TypemoClient, type OperationHookContext } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-
-  @Pre("query.find")
-  start(this: OperationHookContext<Account, "query.find">): void {
-    this.locals.set("startedAt", performance.now());
-  }
-
-  @Post("query.find")
-  finish(this: OperationHookContext<Account, "query.find">, result: readonly unknown[]): void {
-    const startedAt = this.locals.get("startedAt") as number;
-    console.log(`${this.model}.${this.operation}: ${result.length} документов за ${Math.round(performance.now() - startedAt)} мс`);
-  }
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Accounts = client.db().model(Account);
-// ---cut---
-await Accounts.find({ owner: "alice" });
-// → Account.find: 2 документов за … мс
-```
+<Snippet id="hooks/operation-hooks/measure-operation" twoslash />
 
 `@Post` получил результат операции аргументом, а время взял из `locals`. У следующего запроса `Map` пустой, и значения разных операций не смешиваются. Если чтение идёт курсором, `@Post` вызывается на каждую порцию, которую база отдала целиком, а `locals` остаётся один на весь курсор.
 
@@ -228,25 +86,7 @@ await Accounts.find({ owner: "alice" });
 
 Пусть любая агрегация по счетам возвращает не больше десяти строк. Ключ `stages` дописывает стадии в конец конвейера, и они проходят те же шаги, что и стадии построителя.
 
-```ts twoslash
-import { Entity, Pre, Prop, Schema, TypemoClient, type OperationHookContext } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-
-  @Pre("aggregate")
-  capRows(this: OperationHookContext<Account, "aggregate">): void {
-    this.modify({ stages: [{ $limit: 1 }] });
-  }
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Accounts = client.db().model(Account);
-// ---cut---
-const rows = await Accounts.aggregate((pipeline) => pipeline.match({ owner: "alice" }));
-console.log(rows.length);
-// → 1
-```
+<Snippet id="hooks/operation-hooks/add-stages" twoslash />
 
 В примере предел снижен до единицы, чтобы результат был виден на трёх счетах. Стадии хука идут после стадий построителя, поэтому предел хука срабатывает последним.
 
@@ -286,9 +126,7 @@ console.log(rows.length);
 
 **`modify` или `skip` не работают в post-хуке.** Хук `@Post` вызывает `this.modify(...)`, и операция падает.
 
-```text
-QueryError: Account.find: modify() is only for pre hooks (the operation already ran)
-```
+<Snippet id="hooks/operation-hooks/troubleshooting" />
 
 К этому моменту операция уже выполнена, менять её поздно. Перенесите вызов в `@Pre`. С `skip` то же самое — `QueryError: Account.find: skip() is only for pre hooks (the operation already ran)`.
 
@@ -302,24 +140,7 @@ QueryError: Account.find: modify() is only for pre hooks (the operation already 
 
 Вы объявили `@Pre("query.find")` в классе строки заказа `Line`, который используется только как поддокумент в `Order`, и ждёте, что хук сработает при `Orders.find()`.
 
-```ts twoslash title="orders/order.ts"
-import { Entity, Pre, Prop, Schema, type OperationHookContext } from "@venloc/typemo";
-
-@Schema()
-class Line extends Entity {
-  @Prop(() => String, { required: true }) sku!: string;
-
-  @Pre("query.find") // [!code warning]
-  withSku(this: OperationHookContext<Line, "query.find">): void {
-    this.modify({ where: { sku: { $ne: "" } } });
-  }
-}
-
-@Schema({ collection: "orders" })
-export class Order extends Entity {
-  @Prop(() => [Line]) lines!: Line[];
-}
-```
+<Snippet id="hooks/operation-hooks/subdocument-hook-skipped" title="orders/order.ts" twoslash />
 
 Хук не вызовется никогда, и ни компилятор, ни `connection.model(Order)` об этом не скажут. После `Orders.find()` на заказе со строкой счётчик вызовов хука остался на нуле.
 
@@ -331,58 +152,7 @@ export class Order extends Entity {
 
 Все хуки с этой страницы в одном файле — условие ко всем чтениям, ревизия при обновлении, прогон удаления вхолостую и подсчёт результатов чтения.
 
-```ts twoslash title="accounts/account.ts"
-import {
-  type Defaulted,
-  Entity,
-  Post,
-  Pre,
-  Prop,
-  Schema,
-  type OperationHookContext,
-} from "@venloc/typemo";
-
-export const settings = { dryRun: false };
-
-@Schema({ collection: "accounts" })
-export class Account extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  @Prop(() => String, { required: true })
-  owner!: string;
-
-  @Prop(() => Boolean, { default: false })
-  archived!: Defaulted<boolean>;
-
-  @Prop(() => Number, { default: 0 })
-  revision!: Defaulted<number>;
-
-  // Все чтения пропускают архивные счета.
-  @Pre("query.find")
-  onlyActive(this: OperationHookContext<Account, "query.find">): void {
-    this.modify({ where: { archived: false } });
-  }
-
-  // Каждое массовое обновление увеличивает ревизию.
-  @Pre("query.updateMany")
-  bumpRevision(this: OperationHookContext<Account, "query.updateMany">): void {
-    this.modify({ update: { $inc: { revision: 1 } } });
-  }
-
-  // Сухой прогон: удаление не уходит в базу.
-  @Pre("query.deleteMany")
-  dryRun(this: OperationHookContext<Account, "query.deleteMany">): void {
-    if (settings.dryRun) this.skip({ acknowledged: true, deletedCount: 0 });
-  }
-
-  // Итог удаления в журнал.
-  @Post("query.deleteMany")
-  logDeleted(this: OperationHookContext<Account, "query.deleteMany">, result: { readonly deletedCount: number | null }): void {
-    console.log(`удалено счетов: ${result.deletedCount}`);
-  }
-}
-```
+<Snippet id="hooks/operation-hooks/full-example" title="accounts/account.ts" twoslash />
 
 <Callout type="migration">
 

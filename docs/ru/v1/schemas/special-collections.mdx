@@ -20,22 +20,7 @@ Typemo описывает всё это прямо в [`@Schema`](../reference/s
 
 Ограниченная коллекция журнала на пять записей.
 
-```ts twoslash title="logs/log.ts"
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-// ---cut---
-@Schema({ collection: "recent_logs", capped: { size: 4096, max: 5 } }) // [!code highlight]
-class Log extends Entity {
-  @Prop(() => Number, { required: true }) n!: number;
-}
-
-const Logs = client.db().model(Log);
-await client.db().init();
-for (let n = 1; n <= 7; n++) await Logs.create({ n });
-const rows = await Logs.find().sort({ n: 1 }).plain();
-console.log(rows.map((row) => row.n));
-// → [3, 4, 5, 6, 7]
-```
+<Snippet id="schemas/special-collections/quick-start" title="logs/log.ts" twoslash />
 
 Ниже разберём остальные виды.
 
@@ -47,27 +32,7 @@ console.log(rows.map((row) => row.n));
 
 Коллекция временных рядов хранит измерения датчиков, курсы, метрики. Сервер раскладывает их по корзинам по времени и метаданным, так что места нужно меньше, а выборки по времени идут быстрее. [`timeseries`](../reference/schemas/schema.mdx#timeseries) требует `timeField` — обязательное поле типа `Date`. Ещё он принимает `metaField` (что измеряется), `granularity` (`seconds`, `minutes`, `hours`) и `expireAfterSeconds` (автоудаление).
 
-```ts twoslash title="sensors/reading.ts"
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-// ---cut---
-@Schema({
-  collection: "readings",
-  timeseries: { timeField: "at", metaField: "sensor", granularity: "minutes" }, // [!code highlight]
-})
-class Reading extends Entity {
-  @Prop(() => Date, { required: true }) at!: Date;
-  @Prop(() => String) sensor?: string;
-  @Prop(() => Number) value?: number;
-}
-
-const Readings = client.db().model(Reading);
-await client.db().init();
-await Readings.create({ at: new Date("2026-01-01T00:00:00Z"), sensor: "s1", value: 1 });
-const rows = await Readings.find({ sensor: "s1" }).plain();
-console.log(rows.map((row) => row.value));
-// → [1]
-```
+<Snippet id="schemas/special-collections/time-series" title="sensors/reading.ts" twoslash />
 
 Ограничения проверяются при описании модели. `timeField` должен быть обязательным (`timeseries: timeField "at" must be required (every measurement has it)`). Коллекция временных рядов не сочетается с `capped` и `clustered` и не допускает уникальных индексов.
 
@@ -79,22 +44,7 @@ console.log(rows.map((row) => row.value));
 
 [`collation`](../reference/schemas/schema.mdx#collation) задаёт правила сравнения строк для всей коллекции — язык, чувствительность к регистру и к акцентам. С `strength: 2` поиск не различает регистр.
 
-```ts twoslash title="accounts/named.ts"
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-// ---cut---
-@Schema({ collection: "names", collation: { locale: "en", strength: 2 } }) // [!code highlight]
-class Named extends Entity {
-  @Prop(() => String) name?: string;
-}
-
-const Names = client.db().model(Named);
-await client.db().init();
-await Names.create({ name: "Anna" });
-const found = await Names.find({ name: "anna" }).plain();
-console.log(found.length);
-// → 1
-```
+<Snippet id="schemas/special-collections/default-collation" title="accounts/named.ts" twoslash />
 
 Текстовый индекс и индекс `2d` сортировку не поддерживают. На такой коллекции их объявляют с `collation: { locale: "simple" }`, иначе будет `ConfigurationError`.
 
@@ -102,26 +52,7 @@ console.log(found.length);
 
 Typemo проверяет данные до записи, но в базу могут писать и другие программы. [`validator`](../reference/schemas/schema.mdx#validator) строит из схемы правила `$jsonSchema` и заводит их на сервере. Коллекция будет отвергать документы с неверными типами, без обязательных полей, вне `enum` и границ. Значение `true` даёт уровень `strict` и действие `error`, а объект уточняет [`validationLevel`](../reference/schemas/schema.mdx#validation-level) и [`validationAction`](../reference/schemas/schema.mdx#validation-action).
 
-```ts twoslash title="accounts/checked.ts"
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-// ---cut---
-@Schema({ collection: "checked", validator: true }) // [!code highlight]
-class Checked extends Entity {
-  @Prop(() => String, { required: true }) name!: string;
-  @Prop(() => Number, { min: 0 }) age?: number;
-}
-
-const Items = client.db().model(Checked);
-await client.db().init();
-const driver = client.unsafeDriver().db("app").collection("checked");
-try {
-  await driver.insertOne({ name: 5 });
-} catch (error) {
-  console.log((error as Error).message);
-}
-// → Document failed validation
-```
+<Snippet id="schemas/special-collections/server-validator" title="accounts/checked.ts" twoslash />
 
 Здесь документ с числом в строковом поле записан в обход Typemo, через драйвер, и сервер его отклонил. Ваши функции `validate` и правила ключей Map на сервере не выразить, их проверяет только Typemo. Правила строит генератор [`JsonSchemaGenerator`](./json-and-standard-schema.mdx).
 
@@ -160,37 +91,7 @@ try {
 
 ## Полный пример [#full-example]
 
-```ts twoslash title="sensors/sensors.service.ts"
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-
-@Schema({
-  collection: "readings",
-  timeseries: { timeField: "at", metaField: "sensor", granularity: "minutes", expireAfterSeconds: 3600 },
-})
-class Reading extends Entity {
-  @Prop(() => Date, { required: true }) at!: Date;
-  @Prop(() => String) sensor?: string;
-  @Prop(() => Number) value?: number;
-}
-
-@Schema({ collection: "recent_alerts", capped: { size: 8192, max: 100 } })
-class Alert extends Entity {
-  @Prop(() => String, { required: true }) text!: string;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Readings = client.db().model(Reading);
-const Alerts = client.db().model(Alert);
-
-// старт: коллекции создаются с нужными параметрами
-await client.db().init();
-
-// запись измерения и тревоги
-export const record = async (sensor: string, value: number) => {
-  await Readings.create({ at: new Date(), sensor, value });
-  if (value > 100) await Alerts.create({ text: `${sensor} is too high` });
-};
-```
+<Snippet id="schemas/special-collections/full-example" title="sensors/sensors.service.ts" twoslash />
 
 ## Что дальше [#next-steps]
 

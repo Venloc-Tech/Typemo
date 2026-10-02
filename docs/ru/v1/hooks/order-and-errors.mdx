@@ -12,66 +12,13 @@ icon: ListOrdered
 
 Модель счёта с тремя хуками `@Pre("document.save")`, одним `@Post` и одним `@PostError`. Каждый хук записывает своё имя в общий журнал `log`. `Accounts` — модель счёта, полученная у клиента.
 
-```ts twoslash title="accounts/account.ts"
-import { Entity, Post, PostError, Pre, Prop, Schema } from "@venloc/typemo";
-
-export const log: string[] = [];
-
-@Schema({ collection: "accounts" })
-export class Account extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  @Pre("document.save")
-  async first(this: Account): Promise<void> {
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    log.push("pre 1 (async)");
-  }
-
-  @Pre("document.save")
-  second(this: Account): void {
-    log.push("pre 2");
-  }
-
-  @Pre("document.save")
-  third(this: Account): void {
-    log.push("pre 3");
-  }
-
-  @Post("document.save")
-  after(this: Account): void {
-    log.push("post");
-  }
-
-  @PostError("document.save")
-  failed(this: Account, error: unknown): void {
-    log.push(`postError ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-```
+<Snippet id="hooks/order-and-errors/prerequisites" title="accounts/account.ts" twoslash />
 
 ## Быстрый путь [#quick-start]
 
 Хуки одной операции идут так — все `@Pre` по очереди, затем сама операция, затем все `@Post`. Если где-то по дороге случилась ошибка, вместо `@Post` выполняются `@PostError`.
 
-```ts twoslash
-import { Entity, Post, Pre, Prop, Schema, TypemoClient } from "@venloc/typemo";
-const log: string[] = [];
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Pre("document.save") async first(this: Account): Promise<void> { await new Promise((resolve) => setTimeout(resolve, 30)); log.push("pre 1 (async)"); }
-  @Pre("document.save") second(this: Account): void { log.push("pre 2"); }
-  @Pre("document.save") third(this: Account): void { log.push("pre 3"); }
-  @Post("document.save") after(this: Account): void { log.push("post"); }
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Accounts = client.db().model(Account);
-// ---cut---
-await Accounts.create({ title: "Main" });
-console.log(log);
-// → ["pre 1 (async)", "pre 2", "pre 3", "post"]
-```
+<Snippet id="hooks/order-and-errors/quick-start" twoslash />
 
 Ниже разберём порядок, каждую ошибку и транзакции.
 
@@ -97,30 +44,7 @@ console.log(log);
 
 Хук проверяет условие и бросает ошибку, если оно нарушено. Тогда операция не выполняется, до базы дело не доходит.
 
-```ts twoslash
-import { Entity, Post, PostError, Pre, Prop, Schema, TypemoClient } from "@venloc/typemo";
-const log: string[] = [];
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Pre("document.save") second(this: Account): void {
-    log.push("pre 2");
-    if (this.title === "forbidden") throw new Error("pre 2 failed");
-  }
-  @Pre("document.save") third(this: Account): void { log.push("pre 3"); }
-  @Post("document.save") after(this: Account): void { log.push("post"); }
-  @PostError("document.save") failed(this: Account, error: unknown): void {
-    log.push(`postError ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Accounts = client.db().model(Account);
-// ---cut---
-await Accounts.create({ title: "forbidden" }).catch((error: Error) => console.log(error.message));
-// → pre 2 failed
-console.log(log);
-// → ["pre 2", "postError pre 2 failed"]
-```
+<Snippet id="hooks/order-and-errors/pre-hook-error" twoslash />
 
 Вызывающий код получил ровно ту ошибку, которую бросил хук, Typemo её не оборачивает. Оставшиеся `@Pre` (`pre 3`) не выполнились, `@Post` тоже. Зато выполнился `@PostError` и получил ошибку. Документ в базу не попал, число документов после ошибки не изменилось.
 
@@ -130,32 +54,7 @@ console.log(log);
 
 Хук после операции бросает ошибку, например когда не ушло сообщение. `@PostError` тогда не выполнится, ведь операция к этому моменту уже успешно завершилась. А что получит вызывающий код, зависит от операции.
 
-```ts twoslash
-import { Entity, Post, PostError, PostHookError, Prop, Schema, TypemoClient } from "@venloc/typemo";
-const log: string[] = [];
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Post("document.save") after(this: Account): void {
-    log.push("post");
-    throw new Error("post failed");
-  }
-  @PostError("document.save") failed(this: Account): void { log.push("postError"); }
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Accounts = client.db().model(Account);
-// ---cut---
-try {
-  await Accounts.create({ title: "Main" });
-} catch (error) {
-  if (error instanceof PostHookError) {
-    console.log(error.applied, error.operation, (error.cause as Error).message);
-    // → true create post failed
-  }
-}
-console.log(log, await Accounts.countDocuments());
-// → ["post"] 1
-```
+<Snippet id="hooks/order-and-errors/post-hook-error" twoslash />
 
 Документ **сохранён**, запись выполнилась до хука. Это самая коварная ошибка хуков. Приложение, которое повторит `create` после ошибки, создаст дубликат. Поэтому у записей вне транзакции Typemo не отдаёт ошибку хука как есть, а оборачивает её в [`PostHookError`](../reference/errors/hierarchy.mdx#post-hook-error).
 
@@ -202,38 +101,7 @@ console.log(log, await Accounts.countDocuments());
 
 Модель и транзакция, которая откатывается из-за ошибки хука.
 
-```ts twoslash title="accounts/accounts.service.ts"
-import { Entity, Pre, Prop, Schema, TypemoClient } from "@venloc/typemo";
-
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  // Запрещённое название отменяет сохранение.
-  @Pre("document.save")
-  rejectForbidden(this: Account): void {
-    if (this.title === "forbidden") throw new Error("title is forbidden");
-  }
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Accounts = client.db().model(Account);
-
-export const openBoth = async (): Promise<void> => {
-  await client.transaction(async () => {
-    await Accounts.create({ title: "in-tx" });
-    await Accounts.create({ title: "forbidden" }); // ошибка откатывает и первый счёт
-  });
-};
-
-try {
-  await openBoth();
-} catch (error) {
-  console.log((error as Error).message, await Accounts.countDocuments({ title: "in-tx" }));
-}
-// → title is forbidden 0
-```
+<Snippet id="hooks/order-and-errors/full-example" title="accounts/accounts.service.ts" twoslash />
 
 <Callout type="migration">
 

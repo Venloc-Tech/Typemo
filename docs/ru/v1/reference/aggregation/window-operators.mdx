@@ -10,104 +10,21 @@ icon: PanelTop
 
 Все примеры используют одну модель заказа магазина — число, необязательное число, массив чисел и дата.
 
-```ts twoslash title="shop/order.ts"
-import { Entity, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-export class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-```
+<Snippet id="reference/aggregation/accumulators/intro" title="shop/order.ts" twoslash />
 
 В коллекции шесть заказов. Alice сделала два (120 и 80), Bob два (45 и 200), Carol два (60 и 95), в этом порядке по дате. Если не сказано иное, окно разбито по клиенту (`partitionBy`) и упорядочено по дате (`sortBy`). Стадии `sort` и `project` после `setWindowFields` нужны только для читаемости. Строки отдаёт [`.plain()`](./pipeline.mdx#plain).
 
 Операторы различаются по требованиям, и компилятор их проверяет. Функциям `fn.rank`, `fn.denseRank`, `fn.documentNumber`, `fn.shift`, `fn.expMovingAvg` и `fn.linearFill` нужен `sortBy`, ведь без порядка «предыдущий» и «место в списке» ничего не значат. `fn.derivative` и `fn.integral` требуют ещё и явное окно. Без `sortBy` компилятор откажет.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-// @errors: 2769
-Orders.aggregate((p) => p.setWindowFields({ output: (f) => ({ r: fn.rank() }) }));
-```
+<Snippet id="reference/aggregation/window-operators/intro" twoslash />
 
 Есть и правило сервера, которое компилятор тоже знает. `fn.rank`, `fn.denseRank`, `fn.documentNumber` и `fn.linearFill` принимают `sortBy` ровно из одного поля, потому что место в рейтинге по двум ключам сервер не считает. С двумя полями вызов не скомпилируется.
 
-```ts twoslash
-// @errors: 2769
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-Orders.aggregate((p) =>
-  p.setWindowFields({ sortBy: { customer: 1, total: 1 }, output: () => ({ place: fn.rank() }) }),
-);
-```
+<Snippet id="reference/aggregation/window-operators/intro-2" twoslash />
 
 Текст ошибки называет поле результата и правило — `$setWindowFields output "place" needs a sortBy with exactly one field (rank, denseRank, documentNumber and linearFill: a server rule)`. Если типы обойти приведением, ту же причину бросит построитель стадии.
 
-```text
-ConfigurationError: $setWindowFields: $rank needs a sortBy with exactly one field (server rule)
-```
+<Snippet id="reference/aggregation/window-operators/intro-3" />
 
 ## Нумерация и сдвиг [#numbering-and-shift]
 
@@ -115,51 +32,7 @@ ConfigurationError: $setWindowFields: $rank needs a sortBy with exactly one fiel
 
 `fn.rank` возвращает место документа в порядке `sortBy`. У равных значений место одно, а следующее пропускается (1, 1, 3). Аргументов он не принимает, возвращает `number`.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      sortBy: { customer: 1 },
-      output: (f) => ({ place: fn.rank() }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, customer: 1, total: 1, place: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { customer: "Alice", total: 120, place: 1 },
-//   { customer: "Alice", total: 80, place: 1 },
-//   { customer: "Bob", total: 45, place: 3 },
-//   { customer: "Bob", total: 200, place: 3 },
-//   { customer: "Carol", total: 60, place: 5 },
-//   { customer: "Carol", total: 95, place: 5 },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/fn-rank" twoslash />
 
 Окно здесь охватывает всю коллекцию (без `partitionBy`) и упорядочено по имени клиента. У двух заказов Alice значение `sortBy` одинаковое, и оба получили место 1. Bob получил место 3, а место 2 пропущено. Так же расставлены места 3 и 5.
 
@@ -167,51 +40,7 @@ console.log(rows);
 
 `fn.denseRank` работает как `fn.rank`, но после равных значений места не пропускает (1, 1, 2).
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      sortBy: { customer: 1 },
-      output: (f) => ({ place: fn.denseRank() }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, customer: 1, total: 1, place: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { customer: "Alice", total: 120, place: 1 },
-//   { customer: "Alice", total: 80, place: 1 },
-//   { customer: "Bob", total: 45, place: 2 },
-//   { customer: "Bob", total: 200, place: 2 },
-//   { customer: "Carol", total: 60, place: 3 },
-//   { customer: "Carol", total: 95, place: 3 },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/fn-dense-rank" twoslash />
 
 На тех же данных места идут подряд — 1, 1, 2, 2, 3, 3.
 
@@ -219,202 +48,21 @@ console.log(rows);
 
 `fn.documentNumber` возвращает порядковый номер документа в окне, начиная с 1. Равные значения получают разные номера. На данных выше это числа от 1 до 6, хотя значений `sortBy` всего три.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      sortBy: { customer: 1 },
-      output: (f) => ({ place: fn.documentNumber() }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, customer: 1, total: 1, place: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { customer: "Alice", total: 120, place: 1 },
-//   { customer: "Alice", total: 80, place: 2 },
-//   { customer: "Bob", total: 45, place: 3 },
-//   { customer: "Bob", total: 200, place: 4 },
-//   { customer: "Carol", total: 60, place: 5 },
-//   { customer: "Carol", total: 95, place: 6 },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/fn-document-number" twoslash />
 
 ### fn.shift [#fn.shift]
 
 `fn.shift` возвращает значение `output` у документа, смещённого на `by` позиций. Минус сдвигает назад, плюс вперёд. Если такого документа нет, результат `null` или `default`, если он задан. `default` — константа, а не выражение.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      partitionBy: (f) => f.customer,
-      sortBy: { placedAt: 1 },
-      output: (f) => ({ previous: fn.shift({ output: f.total, by: -1 }) }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, customer: 1, total: 1, previous: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { customer: "Alice", total: 120, previous: null },
-//   { customer: "Alice", total: 80, previous: 120 },
-//   { customer: "Bob", total: 45, previous: null },
-//   { customer: "Bob", total: 200, previous: 45 },
-//   { customer: "Carol", total: 60, previous: null },
-//   { customer: "Carol", total: 95, previous: 60 },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/fn-shift" twoslash />
 
 У первого заказа клиента нет предыдущего, поэтому `previous` равен `null`. Вместо `null` можно подставить значение.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      partitionBy: (f) => f.customer,
-      sortBy: { placedAt: 1 },
-      output: (f) => ({
-        previous: fn.shift({ output: f.total, by: -1, default: 0 }),
-      }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, customer: 1, total: 1, previous: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { customer: "Alice", total: 120, previous: 0 },
-//   { customer: "Alice", total: 80, previous: 120 },
-//   { customer: "Bob", total: 45, previous: 0 },
-//   { customer: "Bob", total: 200, previous: 45 },
-//   { customer: "Carol", total: 60, previous: 0 },
-//   { customer: "Carol", total: 95, previous: 60 },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/fn-shift-2" twoslash />
 
 Сдвиг вперёд смотрит на следующий заказ.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      partitionBy: (f) => f.customer,
-      sortBy: { placedAt: 1 },
-      output: (f) => ({ next: fn.shift({ output: f.total, by: 1 }) }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, customer: 1, total: 1, next: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { customer: "Alice", total: 120, next: 80 },
-//   { customer: "Alice", total: 80, next: null },
-//   { customer: "Bob", total: 45, next: 200 },
-//   { customer: "Bob", total: 200, next: null },
-//   { customer: "Carol", total: 60, next: 95 },
-//   { customer: "Carol", total: 95, next: null },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/fn-shift-3" twoslash />
 
 ## Скорость и площадь [#rate-and-area]
 
@@ -424,90 +72,11 @@ console.log(rows);
 
 Оператору нужен явный размер окна. Голый `fn.derivative` выводом стадии не считается, и компилятор потребует `withWindow`.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-// @errors: 2769
-Orders.aggregate((p) =>
-  p.setWindowFields({ sortBy: { placedAt: 1 }, output: (f) => ({ d: fn.derivative({ input: f.total }) }) }),
-);
-```
+<Snippet id="reference/aggregation/window-operators/fn-derivative" twoslash />
 
 С окном из двух соседних документов оператор считает изменение суммы за день между заказами.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      partitionBy: (f) => f.customer,
-      sortBy: { placedAt: 1 },
-      output: (f) => ({
-        slope: withWindow(fn.derivative({ input: f.total, unit: "day" }), {
-          documents: [-1, 0],
-        }),
-      }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, customer: 1, total: 1, slope: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { customer: "Alice", total: 120, slope: null },
-//   { customer: "Alice", total: 80, slope: -5.714285714285714 },
-//   { customer: "Bob", total: 45, slope: null },
-//   { customer: "Bob", total: 200, slope: 11.071428571428573 },
-//   { customer: "Carol", total: 60, slope: null },
-//   { customer: "Carol", total: 95, slope: 5 },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/fn-derivative-2" twoslash />
 
 У Alice вышло `(80 - 120) / 7 = -5,71` за день, потому что заказы разделяет неделя. У первого заказа нет левого соседа, и результат `null`.
 
@@ -515,56 +84,7 @@ console.log(rows);
 
 `fn.integral` возвращает площадь под кривой `input` по `sortBy`. Как и `fn.derivative`, он требует `withWindow` и принимает `{ input, unit }`. Результат — `number | null`.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      partitionBy: (f) => f.customer,
-      sortBy: { placedAt: 1 },
-      output: (f) => ({
-        area: withWindow(fn.integral({ input: f.total, unit: "day" }), {
-          documents: ["unbounded", "current"],
-        }),
-      }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, customer: 1, total: 1, area: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { customer: "Alice", total: 120, area: 0 },
-//   { customer: "Alice", total: 80, area: 700 },
-//   { customer: "Bob", total: 45, area: 0 },
-//   { customer: "Bob", total: 200, area: 1715 },
-//   { customer: "Carol", total: 60, area: 0 },
-//   { customer: "Carol", total: 95, area: 542.5 },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/fn-integral" twoslash />
 
 У второго заказа Alice площадь 700. Между заказами семь дней, а среднее из 120 и 80 равно 100.
 
@@ -574,52 +94,7 @@ console.log(rows);
 
 `fn.expMovingAvg` считает экспоненциальное скользящее среднее. Он принимает `input` и либо `N` (число периодов), либо `alpha` (вес свежего значения), но не оба сразу. Результат — `number | null`.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      partitionBy: (f) => f.customer,
-      sortBy: { placedAt: 1 },
-      output: (f) => ({ ema: fn.expMovingAvg({ input: f.total, N: 2 }) }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, customer: 1, total: 1, ema: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { customer: "Alice", total: 120, ema: 120 },
-//   { customer: "Alice", total: 80, ema: 93.33333333333333 },
-//   { customer: "Bob", total: 45, ema: 45 },
-//   { customer: "Bob", total: 200, ema: 148.33333333333334 },
-//   { customer: "Carol", total: 60, ema: 60 },
-//   { customer: "Carol", total: 95, ema: 83.33333333333333 },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/fn-exp-moving-avg" twoslash />
 
 При `N: 2` вес свежего значения равен 2/3. Второе значение Alice — `120 · 1/3 + 80 · 2/3`, то есть `93,33`.
 
@@ -627,51 +102,7 @@ console.log(rows);
 
 `fn.linearFill` заполняет пропуски линейной интерполяцией между известными значениями. Он принимает число или дату и возвращает то же значение с закрытыми пропусками. Нужен `sortBy` из одного поля. Окно здесь охватывает всю коллекцию, потому что скидка есть не у каждого заказа.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      sortBy: { placedAt: 1 },
-      output: (f) => ({ filled: fn.linearFill(f.discount) }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, discount: 1, filled: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { discount: 10, filled: 10 },
-//   { filled: 7.5 },
-//   { discount: 5, filled: 5 },
-//   { filled: 10 },
-//   { filled: 12.5 },
-//   { discount: 15, filled: 15 },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/fn-linear-fill" twoslash />
 
 Пропуск между скидками 10 и 5 стал `7,5`.
 
@@ -679,51 +110,7 @@ console.log(rows);
 
 `fn.locf` (last observation carried forward) переносит последнее известное значение вперёд. Он принимает любое значение. Серверу `sortBy` не обязателен, но без него «последнее» не определено.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      sortBy: { placedAt: 1 },
-      output: (f) => ({ filled: fn.locf(f.discount) }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, discount: 1, filled: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { discount: 10, filled: 10 },
-//   { filled: 10 },
-//   { discount: 5, filled: 5 },
-//   { filled: 5 },
-//   { filled: 5 },
-//   { discount: 15, filled: 15 },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/fn-locf" twoslash />
 
 Пропуски получили последнюю известную скидку. После 10 пошли десятки, а после 5 — снова пятёрки.
 
@@ -733,47 +120,7 @@ console.log(rows);
 
 `fn.covariancePop` считает ковариацию двух величин по совокупности. Он принимает два числа и работает с окном. Результат — `number | null`.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      output: (f) => ({
-        cov: withWindow(fn.covariancePop(f.total, fn.ifNull(f.discount, 0)), {
-          documents: ["unbounded", "unbounded"],
-        }),
-      }),
-    })
-    .limit(1)
-    .project((f) => ({ _id: 0, cov: 1 })),
-).plain();
-console.log(rows);
-// → [{ cov: -25 }]
-```
+<Snippet id="reference/aggregation/window-operators/fn-covariance-pop" twoslash />
 
 Ковариация суммы заказа и скидки по всей коллекции равна −25. Там, где скидки нет, берётся 0.
 
@@ -781,47 +128,7 @@ console.log(rows);
 
 `fn.covarianceSamp` считает ковариацию выборки. Делитель у неё на единицу меньше.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      output: (f) => ({
-        cov: withWindow(fn.covarianceSamp(f.total, fn.ifNull(f.discount, 0)), {
-          documents: ["unbounded", "unbounded"],
-        }),
-      }),
-    })
-    .limit(1)
-    .project((f) => ({ _id: 0, cov: 1 })),
-).plain();
-console.log(rows);
-// → [{ cov: -30 }]
-```
+<Snippet id="reference/aggregation/window-operators/fn-covariance-samp" twoslash />
 
 По тем же данным ковариация выборки равна −30.
 
@@ -829,182 +136,26 @@ console.log(rows);
 
 `fn.minMaxScaler` приводит значение к отрезку `[min, max]` (по умолчанию `[0, 1]`) по минимуму и максимуму окна. Он принимает `{ input, min, max }` и возвращает `number`. Нужен MongoDB 8.2 и новее. Наименьший заказ (45) стал 0, наибольший (200) — 1.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      output: (f) => ({
-        scaled: withWindow(fn.minMaxScaler({ input: f.total }), {
-          documents: ["unbounded", "unbounded"],
-        }),
-      }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, total: 1, scaled: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { total: 120, scaled: 0.4838709677419355 },
-//   { total: 80, scaled: 0.22580645161290322 },
-//   { total: 45, scaled: 0 },
-//   { total: 200, scaled: 1 },
-//   { total: 60, scaled: 0.0967741935483871 },
-//   { total: 95, scaled: 0.3225806451612903 },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/fn-min-max-scaler" twoslash />
 
 ## withWindow [#with-window]
 
 `withWindow` добавляет окно к аккумулятору, который умеет работать в окне — `fn.sum`, `fn.avg`, `fn.min`, `fn.max`, `fn.push`, `fn.count`, `fn.first`, `fn.top` и другим. Так обычный аккумулятор становится оконной функцией. Сумма «от начала до текущего документа», например, даёт нарастающий итог.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      partitionBy: (f) => f.customer,
-      sortBy: { placedAt: 1 },
-      output: (f) => ({
-        running: withWindow(fn.sum(f.total), {
-          documents: ["unbounded", "current"],
-        }),
-      }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, customer: 1, total: 1, running: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { customer: "Alice", total: 120, running: 120 },
-//   { customer: "Alice", total: 80, running: 200 },
-//   { customer: "Bob", total: 45, running: 45 },
-//   { customer: "Bob", total: 200, running: 245 },
-//   { customer: "Carol", total: 60, running: 60 },
-//   { customer: "Carol", total: 95, running: 155 },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/with-window" twoslash />
 
 Второй заказ Alice получил `running: 200` — сумму 120 и 80. `withWindow` — не метод, а самостоятельная функция, её импортируют из `@venloc/typemo`.
 
 Результат — оконная функция, а не аккумулятор. Порядок нужен, когда граница окна не `"unbounded"`, поэтому `setWindowFields` без `sortBy` такую функцию не примет.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-// @errors: 2769
-Orders.aggregate((p) =>
-  p.setWindowFields({
-    output: (f) => ({ running: withWindow(fn.sum(f.total), { documents: ["unbounded", "current"] }) }),
-  }),
-);
-```
+<Snippet id="reference/aggregation/window-operators/with-window-2" twoslash />
 
 <Params>
 <Param name="expr" type="ExprNode" required>
 
 Аккумулятор, к которому добавляется окно. Принимаются только аккумуляторы, которые допускают окно. Для `fn.rank`, `fn.shift` и похожих операторов окно задаёт сервер, и компилятор откажет.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-// @errors: 2379
-withWindow(fn.rank(), { documents: [-1, 0] });
-```
+<Snippet id="reference/aggregation/window-operators/with-window-3" twoslash />
 
 </Param>
 <Param name="window" type="WindowSpec" required>
@@ -1018,116 +169,17 @@ withWindow(fn.rank(), { documents: [-1, 0] });
 
 Окно можно задать и по диапазону значения. Тогда границы — это расстояние по полю `sortBy`, а для дат к ним добавляется единица `unit`. Вот сумма заказов клиента за последние 10 дней.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      partitionBy: (f) => f.customer,
-      sortBy: { placedAt: 1 },
-      output: (f) => ({
-        last10: withWindow(fn.sum(f.total), { range: [-10, 0], unit: "day" }),
-      }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, customer: 1, total: 1, last10: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { customer: "Alice", total: 120, last10: 120 },
-//   { customer: "Alice", total: 80, last10: 200 },
-//   { customer: "Bob", total: 45, last10: 45 },
-//   { customer: "Bob", total: 200, last10: 200 },
-//   { customer: "Carol", total: 60, last10: 60 },
-//   { customer: "Carol", total: 95, last10: 155 },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/with-window-4" twoslash />
 
 Второй заказ Bob сделан через 14 дней после первого. В его окно первый заказ не попал, и `last10` равно 200. Заказы Alice и Carol идут с интервалом 7 дней, и их суммы включают предыдущий заказ.
 
 Вместо суммы подойдёт любой аккумулятор с окном, например скользящее среднее двух соседних заказов.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Vars, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true, enum: ["new", "paid", "cancelled"] })
-  status!: "new" | "paid" | "cancelled";
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Number)
-  discount?: number;
-
-  @Prop(() => [Number])
-  prices!: number[];
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p
-    .setWindowFields({
-      partitionBy: (f) => f.customer,
-      sortBy: { placedAt: 1 },
-      output: (f) => ({
-        avg3: withWindow(fn.avg(f.total), { documents: [-1, 0] }),
-      }),
-    })
-    .sort({ placedAt: 1 })
-    .project((f) => ({ _id: 0, customer: 1, total: 1, avg3: 1 })),
-).plain();
-console.log(rows);
-// → [
-//   { customer: "Alice", total: 120, avg3: 120 },
-//   { customer: "Alice", total: 80, avg3: 100 },
-//   { customer: "Bob", total: 45, avg3: 45 },
-//   { customer: "Bob", total: 200, avg3: 122.5 },
-//   { customer: "Carol", total: 60, avg3: 60 },
-//   { customer: "Carol", total: 95, avg3: 77.5 },
-// ]
-```
+<Snippet id="reference/aggregation/window-operators/with-window-5" twoslash />
 
 <FullType>
 
-```ts
-export const withWindow: <V, K extends ExprKind, const W extends WindowSpec>(
-  expr: ExprNode<V, K> & ("bounded" extends K ? unknown : { readonly error: "…" }),
-  window: W,
-) => ExprNode<V, WindowedKind<K, W>>;
-```
+<Snippet id="reference/aggregation/window-operators/with-window-6" />
 
 </FullType>
 
@@ -1141,12 +193,7 @@ export const withWindow: <V, K extends ExprKind, const W extends WindowSpec>(
 
 Граница — тип `WindowBound`, то есть число, `"current"` или `"unbounded"`.
 
-```ts twoslash
-import { type WindowSpec } from "@venloc/typemo";
-
-const running: WindowSpec = { documents: ["unbounded", "current"] };
-const lastWeek: WindowSpec = { range: [-7, "current"], unit: "day" };
-```
+<Snippet id="reference/aggregation/window-operators/window-spec" twoslash />
 
 Окно `documents: ["unbounded", "unbounded"]` охватывает весь раздел, и `sortBy` ему не нужен. Любому другому окну и любому окну `range` `sortBy` нужен, и компилятор это проверяет.
 

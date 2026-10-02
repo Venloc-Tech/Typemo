@@ -12,41 +12,13 @@ icon: FlaskConical
 
 Модель счёта ниже и тест-раннер `bun:test`. С другим раннером код будет тем же. Тестовая база — отдельная, не рабочая, и приложение берёт её адрес из настройки. Если тестам нужны транзакции или подписка на изменения, база должна быть реплика-сетом (несколько серверов MongoDB с копией одних данных, для транзакций хватит и одного).
 
-```ts twoslash title="accounts/account.ts"
-import { Entity, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "accounts" })
-export class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  title!: string;
-
-  @Prop(() => Number, { required: true })
-  balance!: number;
-}
-```
+<Snippet id="reference/observability/sentry/intro" title="accounts/account.ts" twoslash />
 
 ## Быстрый путь [#quick-start]
 
 Опишите фабрику один раз, и в тесте данные создаются одной строкой.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-import { defineFactory } from "@venloc/typemo/testing";
-
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true }) balance!: number;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank-test" });
-const Accounts = client.db().model(Account);
-// ---cut---
-const accountFactory = defineFactory(Accounts, (n) => ({ title: `Account ${n}`, balance: 100 }));
-
-const rich = await accountFactory.create({ balance: 1_000_000 });
-// → документ со title "Account 1" и balance 1000000
-```
+<Snippet id="testing/testing-apps/quick-start" twoslash />
 
 Ниже разберём подготовку базы, фабрики и проверку индексов.
 
@@ -56,26 +28,7 @@ const rich = await accountFactory.create({ balance: 1_000_000 });
 
 Пустой фильтр в [`deleteMany`](../reference/writes/writes.mdx#delete-many) запрещён — в рабочем коде одна опечатка удалила бы всю коллекцию. А в тесте «удалить всё» как раз и нужно, поэтому пишите это явно через [`Filters.all()`](../reference/policies/violations.mdx#filters.all). Пересоздать базу целиком можно и через драйвер, об этом в разделе [доступ к драйверу](../connection/driver-access.mdx).
 
-```ts title="accounts/accounts.test.ts"
-import { afterAll, beforeAll, beforeEach, expect, test } from "bun:test";
-import { Filters, TypemoClient } from "@venloc/typemo";
-import { Account } from "./account.ts";
-
-let client: TypemoClient;
-
-beforeAll(async () => {
-  client = await TypemoClient.connect(process.env.TEST_MONGO_URI ?? "mongodb://localhost:27017", { dbName: "bank-test" });
-  await client.db().model(Account).syncIndexes();
-});
-
-beforeEach(async () => {
-  await client.db().model(Account).deleteMany(Filters.all());
-});
-
-afterAll(async () => {
-  await client.close();
-});
-```
+<Snippet id="testing/testing-apps/clean-test-database" title="accounts/accounts.test.ts" />
 
 Не пропускайте `syncIndexes`. Он создаёт индексы из схемы, и без них тесты уникальности и плана ничего не докажут. Клиент закрывайте в `afterAll`, иначе раннер не завершится.
 
@@ -83,26 +36,7 @@ afterAll(async () => {
 
 Скажем, тесту нужны три счёта, а важно в них только одно поле. Фабрика берёт значения по умолчанию из функции от номера (1, 2, …), так что уникальный `title` не конфликтует. В тесте вы переопределяете только то, что нужно.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-import { defineFactory } from "@venloc/typemo/testing";
-
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true }) balance!: number;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank-test" });
-const Accounts = client.db().model(Account);
-const accountFactory = defineFactory(Accounts, (n) => ({ title: `Account ${n}`, balance: 100 }));
-// ---cut---
-const draft = accountFactory.build({ balance: 5 });
-// → { title: "Account 1", balance: 5 }   (данные, без сохранения)
-
-const three = await accountFactory.createMany(3, (n) => ({ balance: n * 10 }));
-// → три сохранённых счёта: Account 2, 3, 4 с balance 20, 30, 40
-```
+<Snippet id="testing/testing-apps/factories" twoslash />
 
 `build` только собирает данные, `create` ещё и сохраняет. Счётчик у фабрики общий, поэтому второй вызов получает номер 2. Если номера не должны зависеть от порядка запуска, вызывайте `accountFactory.reset()` между тестами.
 
@@ -112,14 +46,7 @@ const three = await accountFactory.createMany(3, (n) => ({ balance: n * 10 }));
 
 Бывает, что поле переименовали или поменяли фильтр, и запрос молча начал читать всю коллекцию. [`expectIndexScan`](../reference/testing/testing.mdx#expect-index-scan) выполняет `explain` и бросает [`IndexUsageError`](../reference/testing/testing.mdx#index-usage-error), если индекс не используется.
 
-```ts title="accounts/accounts.test.ts"
-import { expectIndexScan } from "@venloc/typemo/testing";
-
-test("поиск счёта по названию идёт по индексу", async () => {
-  const Accounts = client.db().model(Account);
-  await expectIndexScan(Accounts.find({ title: "Account 1" }), { index: "title_1", maxDocsExamined: 1 });
-});
-```
+<Snippet id="testing/testing-apps/check-index-used" title="accounts/accounts.test.ts" />
 
 Для поля без индекса тот же тест падает с `the query is not served by an index: it scans the whole collection (COLLSCAN). plan: COLLSCAN; examined 3 documents, returned 3`.
 

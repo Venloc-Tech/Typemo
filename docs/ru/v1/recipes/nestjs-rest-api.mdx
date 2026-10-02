@@ -24,14 +24,7 @@ icon: Server
 
 Пять маршрутов и перевод.
 
-```text
-GET    /accounts?status=open&limit=20   список
-GET    /accounts/:id                    один счёт
-POST   /accounts                        открыть
-PATCH  /accounts/:id                    переименовать
-DELETE /accounts/:id                    закрыть
-POST   /accounts/transfer               перевести деньги
-```
+<Snippet id="recipes/nestjs-rest-api/quick-start" />
 
 Дальше по очереди пройдём каждый файл приложения, потом запросы с ответами и тест.
 
@@ -39,78 +32,13 @@ POST   /accounts/transfer               перевести деньги
 
 Счёт принадлежит организации. Поле `tenantId` помечено как тенант, и политика сама фильтрует и заполняет его по контексту запроса. Статус по умолчанию — `open`. Закрытый счёт не удаляется, чтобы у истории переводов не терялись концы.
 
-```ts twoslash title="accounts/account.ts"
-import { type Defaulted, Entity, Prop, Schema, Tenant, type TenantField } from "@venloc/typemo";
-
-@Schema({ collection: "accounts", tenant: true })
-export class Account extends Entity {
-  @Prop(() => String)
-  @Tenant()
-  tenantId!: TenantField<string>;
-
-  @Prop(() => String, { required: true, minLength: 1 })
-  title!: string;
-
-  @Prop(() => Number, { required: true, min: 0 })
-  balance!: number;
-
-  @Prop(() => String, { enum: ["open", "closed"] as const, default: "open" })
-  status!: Defaulted<"open" | "closed">;
-}
-```
+<Snippet id="recipes/nestjs-rest-api/define-account" title="accounts/account.ts" twoslash />
 
 ## Написать сервис [#write-service]
 
 Сервис работает с моделью и ничего не знает об HTTP. Перевод помечен [`@Transactional()`](../reference/integrations/nestjs.mdx#transactional), так что списание и зачисление случаются вместе или никак. Обе операции — атомарные `$inc` с условием «счёт открыт», а `.orFail()` превращает закрытый или чужой счёт в ошибку, которая откатывает транзакцию.
 
-```ts twoslash title="accounts/accounts.service.ts"
-import { Injectable } from "@nestjs/common";
-import { type CreateInput, type Defaulted, Entity, type IdOf, type Model, Prop, Schema, Tenant, type TenantField, type UpdateInput } from "@venloc/typemo";
-import { InjectModel, Transactional } from "@venloc/typemo-nestjs";
-@Schema({ collection: "accounts", tenant: true })
-class Account extends Entity {
-  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
-  @Prop(() => String, { required: true, minLength: 1 }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-  @Prop(() => String, { enum: ["open", "closed"] as const, default: "open" }) status!: Defaulted<"open" | "closed">;
-}
-// ---cut---
-@Injectable()
-export class AccountsService {
-  constructor(@InjectModel(Account) private readonly accounts: Model<Account>) {}
-
-  list(status: "open" | "closed" | undefined, limit: number) {
-    return this.accounts
-      .find(status === undefined ? {} : { status })
-      .sort({ title: 1 })
-      .limit(limit)
-      .select({ title: 1, balance: 1, status: 1 })
-      .plain();
-  }
-
-  get(id: IdOf<Account>) {
-    return this.accounts.findById(id).orFail().plain();
-  }
-
-  async open(body: CreateInput<Account>) {
-    return (await this.accounts.create(body)).$toPlain();
-  }
-
-  update(id: IdOf<Account>, body: UpdateInput<Account>) {
-    return this.accounts.findByIdAndUpdate(id, { $set: body }).orFail().plain();
-  }
-
-  async close(id: IdOf<Account>): Promise<void> {
-    await this.accounts.updateOne({ _id: id }, { $set: { status: "closed" } });
-  }
-
-  @Transactional()
-  async transfer(from: IdOf<Account>, to: IdOf<Account>, amount: number): Promise<void> {
-    await this.accounts.findOneAndUpdate({ _id: from, status: "open" }, { $inc: { balance: -amount } }).orFail();
-    await this.accounts.findOneAndUpdate({ _id: to, status: "open" }, { $inc: { balance: amount } }).orFail();
-  }
-}
-```
+<Snippet id="recipes/nestjs-rest-api/write-service" title="accounts/accounts.service.ts" twoslash />
 
 Фильтра по организации в сервисе нет. Его добавляет политика тенанта к каждой операции, построенной внутри запроса.
 
@@ -122,79 +50,7 @@ export class AccountsService {
 - [`ParseIdPipe`](../reference/integrations/nestjs.mdx#parse-id-pipe) разбирает id из адреса.
 - Строку запроса проверяем руками. Статус — одно из двух значений, `limit` — от 1 до 100.
 
-```ts twoslash title="accounts/accounts.controller.ts"
-import { BadRequestException, Body, Controller, Delete, Get, HttpCode, Injectable, Param, Patch, Post, Query } from "@nestjs/common";
-import { type CreateInput, type Defaulted, Entity, type IdOf, type Model, Prop, Schema, Tenant, type TenantField, type UpdateInput } from "@venloc/typemo";
-import { InjectModel, ParseIdPipe, ValidateBodyPipe } from "@venloc/typemo-nestjs";
-@Schema({ collection: "accounts", tenant: true })
-class Account extends Entity {
-  @Prop(() => String) @Tenant() tenantId!: TenantField<string>;
-  @Prop(() => String, { required: true, minLength: 1 }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-  @Prop(() => String, { enum: ["open", "closed"] as const, default: "open" }) status!: Defaulted<"open" | "closed">;
-}
-@Injectable()
-class AccountsService {
-  list(_status: "open" | "closed" | undefined, _limit: number) { return []; }
-  get(_id: IdOf<Account>) { return {}; }
-  open(_body: CreateInput<Account>) { return {}; }
-  update(_id: IdOf<Account>, _body: UpdateInput<Account>) { return {}; }
-  async close(_id: IdOf<Account>) {}
-  async transfer(_from: IdOf<Account>, _to: IdOf<Account>, _amount: number) {}
-}
-// ---cut---
-const STATUSES = ["open", "closed"] as const;
-
-@Controller("accounts")
-export class AccountsController {
-  constructor(
-    private readonly service: AccountsService,
-    @InjectModel(Account) private readonly accounts: Model<Account>,
-  ) {}
-
-  @Get()
-  list(@Query("status") status?: string, @Query("limit") limit = "20") {
-    if (status !== undefined && !(STATUSES as readonly string[]).includes(status)) {
-      throw new BadRequestException(`status is one of ${STATUSES.join(", ")}`);
-    }
-    const count = Number(limit);
-    if (!Number.isInteger(count) || count < 1 || count > 100) throw new BadRequestException("limit is 1 to 100");
-    return this.service.list(status as "open" | "closed" | undefined, count);
-  }
-
-  @Get(":id")
-  get(@Param("id", ParseIdPipe.for(Account)) id: IdOf<Account>) {
-    return this.service.get(id);
-  }
-
-  @Post()
-  open(@Body(ValidateBodyPipe.for(Account, { pick: ["title", "balance"] })) body: CreateInput<Account>) {
-    return this.service.open(body);
-  }
-
-  @Patch(":id")
-  update(
-    @Param("id", ParseIdPipe.for(Account)) id: IdOf<Account>,
-    @Body(ValidateBodyPipe.for(Account, { pick: ["title"], partial: true })) body: UpdateInput<Account>,
-  ) {
-    return this.service.update(id, body);
-  }
-
-  @Delete(":id")
-  @HttpCode(204)
-  close(@Param("id", ParseIdPipe.for(Account)) id: IdOf<Account>) {
-    return this.service.close(id);
-  }
-
-  @Post("transfer")
-  @HttpCode(204)
-  transfer(@Body() body: { readonly from: string; readonly to: string; readonly amount: number }) {
-    if (typeof body.amount !== "number" || !(body.amount > 0)) throw new BadRequestException("amount is positive");
-    const ids = new ParseIdPipe(this.accounts);
-    return this.service.transfer(ids.transform(body.from), ids.transform(body.to), body.amount);
-  }
-}
-```
+<Snippet id="recipes/nestjs-rest-api/write-controller" title="accounts/accounts.controller.ts" twoslash />
 
 У перевода тело — это команда, а не документ, поэтому `ValidateBodyPipe` тут не подходит. Id разбирает `ParseIdPipe`, созданный прямо на модели, а сумму проверяем сами.
 
@@ -202,30 +58,7 @@ export class AccountsController {
 
 Модуль счетов регистрирует модель. Корневой модуль подключает клиента и создаёт коллекцию при старте. В `main.ts` подключены фильтр ошибок и перехватчик тенанта.
 
-```ts twoslash title="main.ts"
-import { Module } from "@nestjs/common";
-import { NestFactory } from "@nestjs/core";
-import { Entity, Prop, Schema } from "@venloc/typemo";
-import { PolicyInterceptor, TypemoExceptionFilter, TypemoModule } from "@venloc/typemo-nestjs";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-}
-class AccountsController {}
-class AccountsService {}
-// ---cut---
-@Module({ imports: [TypemoModule.forFeature([Account])], controllers: [AccountsController], providers: [AccountsService] })
-export class AccountsModule {}
-
-@Module({ imports: [TypemoModule.forRoot("mongodb://localhost:27017", { dbName: "bank", sync: "init" }), AccountsModule] })
-export class AppModule {}
-
-const app = await NestFactory.create(AppModule);
-app.useGlobalFilters(new TypemoExceptionFilter());
-app.useGlobalInterceptors(new PolicyInterceptor({ tenant: (request) => request.headers["x-org"] }));
-app.enableShutdownHooks();
-await app.listen(3000);
-```
+<Snippet id="recipes/nestjs-rest-api/assemble-app" title="main.ts" twoslash />
 
 ## Запросы и ответы [#requests-and-responses]
 
@@ -233,99 +66,37 @@ await app.listen(3000);
 
 Откроем счёт. В ответ придёт созданный документ — организацию поставила политика, статус взят по умолчанию.
 
-```text
-POST /accounts { "title": "Main", "balance": 100 }
-→ 201 { "_id": "…", "tenantId": "acme", "title": "Main", "balance": 100, "status": "open" }
-```
+<Snippet id="recipes/nestjs-rest-api/requests-and-responses" />
 
 Задать организацию самому не выйдет, `tenantId` нет в `pick`.
 
-```text
-POST /accounts { "title": "Hack", "balance": 1, "tenantId": "globex" }
-→ 422 { "message": "Validation failed", "errors": { "tenantId": "not allowed here" } }
-```
+<Snippet id="recipes/nestjs-rest-api/requests-and-responses-2" />
 
 Переведём 30 с `Main` на `Savings`, открытый с нулевым балансом, и посмотрим список.
 
-```text
-POST /accounts/transfer { "from": "<Main>", "to": "<Savings>", "amount": 30 }
-→ 204
-GET /accounts
-→ 200 [{ "_id": "…", "title": "Main", "balance": 70, "status": "open" },
-       { "_id": "…", "title": "Savings", "balance": 30, "status": "open" }]
-```
+<Snippet id="recipes/nestjs-rest-api/requests-and-responses-3" />
 
 Перевод 500 с `Savings` нарушает `min: 0`. Ядро отвергает обновление, транзакция откатывается, и баланс `Savings` остаётся 30.
 
-```text
-POST /accounts/transfer { "from": "<Savings>", "to": "<Main>", "amount": 500 }
-→ 422 { "message": "Validation failed", "errors": { "balance": "$inc -500 on 30 gives -470, below the minimum 0; nothing was written" } }
-```
+<Snippet id="recipes/nestjs-rest-api/requests-and-responses-4" />
 
 Переименовать счёт можно, а поменять баланс через `PATCH` нельзя.
 
-```text
-PATCH /accounts/<Main> { "title": "Everyday" }        → 200 { …, "title": "Everyday" }
-PATCH /accounts/<Main> { "balance": 1000000 }          → 422 { "errors": { "balance": "not allowed here" } }
-```
+<Snippet id="recipes/nestjs-rest-api/requests-and-responses-5" />
 
 Закроем `Savings` и переведём на него. `.orFail()` не нашёл открытый счёт, и списание с `Main` откатилось.
 
-```text
-DELETE /accounts/<Savings>                                        → 204
-GET /accounts?status=closed                                        → 200 [{ …, "title": "Savings", "status": "closed" }]
-POST /accounts/transfer { "from": "<Main>", "to": "<Savings>", "amount": 1 } → 404 { "message": "Not found" }
-GET /accounts/<Main>                                               → 200 { …, "balance": 70 }
-```
+<Snippet id="recipes/nestjs-rest-api/requests-and-responses-6" />
 
 Другая организация чужих счетов не видит, а неверный id и неверный статус дают 400.
 
-```text
-GET /accounts            (x-org: globex)   → 200 []
-GET /accounts/<Main>     (x-org: globex)   → 404 { "message": "Not found" }
-GET /accounts/12                           → 400 { "message": "Invalid id: expected ObjectId (not a 24-character hex string)" }
-GET /accounts?status=frozen                → 400 { "message": "status is one of open, closed" }
-```
+<Snippet id="recipes/nestjs-rest-api/requests-and-responses-7" />
 
 ## Проверить тестом [#verify-with-test]
 
 e2e-тест поднимает приложение на тестовой базе ([`TypemoTestingModule`](../reference/integrations/nestjs.mdx#typemo-testing-module.for-root)) и повторяет запросы выше.
 
-```ts twoslash title="test/accounts.e2e-spec.ts"
-import { afterAll, beforeAll, expect, test } from "bun:test";
-import { type INestApplication, Module } from "@nestjs/common";
-import { Test } from "@nestjs/testing";
-import { PolicyInterceptor, TypemoExceptionFilter } from "@venloc/typemo-nestjs";
-import { TypemoTestingModule } from "@venloc/typemo-nestjs/testing";
-@Module({})
-class AccountsModule {}
-// ---cut---
-let app: INestApplication;
-let url = "";
-const call = (method: string, path: string, body?: unknown, org = "acme") =>
-  fetch(`${url}${path}`, {
-    method,
-    headers: { "content-type": "application/json", "x-org": org },
-    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-  });
-
-beforeAll(async () => {
-  const moduleRef = await Test.createTestingModule({
-    imports: [TypemoTestingModule.forRoot(process.env.MONGO_URI ?? ""), AccountsModule],
-  }).compile();
-  app = moduleRef.createNestApplication();
-  app.useGlobalFilters(new TypemoExceptionFilter());
-  app.useGlobalInterceptors(new PolicyInterceptor({ tenant: (request) => request.headers["x-org"] }));
-  await app.listen(0, "127.0.0.1");
-  url = `http://127.0.0.1:${(app.getHttpServer().address() as { port: number }).port}`;
-});
-afterAll(() => app.close());
-
-test("an organization sees only its accounts", async () => {
-  await call("POST", "/accounts", { title: "Main", balance: 100 });
-  expect(await (await call("GET", "/accounts", undefined, "globex")).json()).toEqual([]);
-});
-```
+<Snippet id="recipes/nestjs-rest-api/verify-with-test" title="test/accounts.e2e-spec.ts" twoslash />
 
 ## Как выбрать [#how-to-choose]
 

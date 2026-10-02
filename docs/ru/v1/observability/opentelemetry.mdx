@@ -18,13 +18,7 @@ icon: Radar
 @venloc/typemo-opentelemetry @opentelemetry/api
 ```
 
-```ts title="telemetry.ts"
-import { TypemoClient } from "@venloc/typemo";
-import { TypemoOpenTelemetry } from "@venloc/typemo-opentelemetry";
-
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank" });
-const subscription = TypemoOpenTelemetry.instrument(client);
-```
+<Snippet id="observability/opentelemetry/quick-start" title="telemetry.ts" />
 
 Теперь каждая операция даёт спан — `Typemo.find (Account)`, `Typemo.insertOne (Account)` и так далее. Ниже разберём задачи по порядку.
 
@@ -32,14 +26,7 @@ const subscription = TypemoOpenTelemetry.instrument(client);
 
 Спаны есть, но ни у одного нет родителя. Так бывает, когда в процессе нет **менеджера контекста** — объекта, который переносит «текущий спан» через `await`. Адаптер делает спан операции активным на время операции. Спаны ваших хуков и подзапросов подгрузки связей вкладываются в него, но только если менеджер зарегистрирован.
 
-```ts title="telemetry.ts"
-import { context, trace } from "@opentelemetry/api";
-import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
-import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
-
-context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
-trace.setGlobalTracerProvider(new BasicTracerProvider({ spanProcessors: [new BatchSpanProcessor(exporter)] }));
-```
+<Snippet id="observability/opentelemetry/nested-spans" title="telemetry.ts" />
 
 Здесь `exporter` — ваш экспортёр. Этот менеджер на Bun сохранил контекст через `await`, внутри транзакции и при её повторе.
 
@@ -49,18 +36,7 @@ trace.setGlobalTracerProvider(new BasicTracerProvider({ spanProcessors: [new Bat
 
 Вот какие спаны дали `create`, `find`, повторная вставка и транзакция с `stepSpans: true` и `commandSpans: true`.
 
-```ts
-// Typemo.transaction                      (INTERNAL, typemo.transaction.attempts: 1)
-//   └─ Typemo.updateOne (Account)         (CLIENT, typemo.transaction: true)
-//        ├─ Typemo.step cast              (INTERNAL)
-//        ├─ Typemo.step validate          (INTERNAL)
-//        ├─ update                        (CLIENT, команда драйвера)
-//        └─ Typemo.step populate          (INTERNAL)
-// Typemo.find (Account)                   (CLIENT, db.query.summary: "find accounts")
-// Typemo.find.cursor (Account)            (курсор; событие cursor.batch)
-// Typemo.insertOne (Account)              (CLIENT, статус ERROR, error.type: "DuplicateKeyError")
-// Typemo.aggregate (database bank)        (CLIENT, connection.aggregate: без модели и коллекции)
-```
+<Snippet id="observability/opentelemetry/trace-view" />
 
 Конвенция OpenTelemetry советует называть спан вроде `find accounts`, но здесь имя другое — `Typemo.find (Account)`. Так сразу видно, что спан от ODM и какой модели он касается. Коллекция лежит в `db.collection.name`. Полные таблицы атрибутов и метрик — в [справочнике](../reference/observability/opentelemetry.mdx#attributes).
 
@@ -68,9 +44,7 @@ trace.setGlobalTracerProvider(new BasicTracerProvider({ spanProcessors: [new Bat
 
 Спаны шагов по умолчанию выключены, потому что для них ядру приходится строить дополнительные события. Включите `stepSpans`, когда нужно понять, что заняло время внутри операции — приведение типов, проверка, ваши хуки или подгрузка связей.
 
-```ts
-TypemoOpenTelemetry.instrument(client, { stepSpans: true });
-```
+<Snippet id="observability/opentelemetry/slow-step" />
 
 Появятся дочерние спаны `Typemo.step cast`, `Typemo.step validate`, `Typemo.step populate`. Спан шага создаётся, когда шаг уже закончился, а начало ему сдвигают назад на длительность шага.
 
@@ -78,10 +52,7 @@ TypemoOpenTelemetry.instrument(client, { stepSpans: true });
 
 Иногда нужно знать, какой сервер выполнил команду и сколько она заняла. Для этого клиент должен быть создан с `monitorCommands: true`, иначе регистрация бросит `ConfigurationError: TypemoClient "default": driver command events need the client option monitorCommands: true`.
 
-```ts
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank", monitorCommands: true });
-TypemoOpenTelemetry.instrument(client, { commandSpans: true });
-```
+<Snippet id="observability/opentelemetry/command-spans" />
 
 Спан команды называется по команде (`find`, `insert`) и вложен в спан операции. Его `server.address` и `server.port` указывают на сервер, который на самом деле выполнил команду, а не просто на первый хост строки подключения. Есть у него и `db.collection.name`.
 
@@ -99,9 +70,7 @@ TypemoOpenTelemetry.instrument(client, { commandSpans: true });
 
 Трассы обычно уходят во внешний сервис. Атрибут `db.query.text` содержит форму запроса, и по умолчанию все значения в нём заменены на `"?"` — `{"filter":{"balance":{"$gt":"?"},"iban":"?"}}`. Опция `sensitive` работает так же, как у [подписчика ядра](../reference/observability/events.mdx#subscriber-sensitive), и действует в том числе на исключение, записанное в спан. Поля, помеченные `sensitive` в схеме, остаются замаскированными даже при `"show"`. Тенант попадает в `typemo.tenant` спана операции только с `includeTenant: true`.
 
-```ts
-TypemoOpenTelemetry.instrument(client, { sensitive: "mask", includeTenant: false });
-```
+<Snippet id="observability/opentelemetry/hide-user-data" />
 
 ## Как выбрать [#how-to-choose]
 

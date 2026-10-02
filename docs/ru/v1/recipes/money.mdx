@@ -21,43 +21,7 @@ icon: Coins
 
 Сумма — это целое число копеек в поле `BigInt`, и прибавляется она оператором `$inc`. Переводить рубли в копейки и обратно приложение должно само. Вот как сумма выглядит на разных этапах.
 
-```ts twoslash
-import { type Decimal128 } from "mongodb";
-import { Entity, Prop, Schema, Types, TypemoClient, type Defaulted } from "@venloc/typemo";
-class __BadRequest__ extends Error {}
-class Money {
-  static parse(text: string): bigint {
-    const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text);
-    if (!match) throw new __BadRequest__(`"${text}" is not an amount like 12.34`);
-    return BigInt(match[1] ?? "0") * 100n + BigInt((match[2] ?? "").padEnd(2, "0"));
-  }
-  static format(minor: bigint): string {
-    const negative = minor < 0n;
-    const abs = negative ? -minor : minor;
-    return `${negative ? "-" : ""}${abs / 100n}.${String(abs % 100n).padStart(2, "0")}`;
-  }
-}
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => BigInt, { min: 0n, default: 0n }) balance!: Defaulted<bigint>;
-}
-@Schema({ collection: "rates" })
-class Rate extends Entity {
-  @Prop(() => String, { required: true, unique: true }) pair!: string;
-  @Prop(() => Types.Decimal128, { required: true }) value!: Decimal128;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
-const Accounts = client.db().model(Account);
-const Rates = client.db().model(Rate);
-// ---cut---
-await Accounts.create({ title: "Main", balance: Money.parse("100.00") });
-await Accounts.updateOne({ title: "Main" }, { $inc: { balance: Money.parse("12.34") } });
-
-const account = await Accounts.findOne({ title: "Main" }).plain().orFail();
-console.log(account.balance, Money.format(BigInt(account.balance)));
-// → "11234" "112.34"
-```
+<Snippet id="recipes/money/quick-start" twoslash />
 
 Ниже разберём каждый шаг — как разобрать сумму из строки, как не уйти в минус, как сделать перевод и когда вместо `int64` нужен `Decimal128`.
 
@@ -65,18 +29,7 @@ console.log(account.balance, Money.format(BigInt(account.balance)));
 
 Поле `balance` имеет тип `BigInt`. В MongoDB это `int64`, целое до 9 223 372 036 854 775 807. Обычное число JavaScript хранит целые точно только до 2⁵³, это около девяти квадриллионов. Для копеек хватило бы и этого, но `int64` даёт запас и не позволяет записать дробь. `1.5` вместо копейки станет ошибкой, а не тихим округлением. Опция `min: 0n` запрещает отрицательный баланс.
 
-```ts twoslash title="accounts/account.ts"
-import { type Defaulted, Entity, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "accounts" })
-export class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  title!: string;
-
-  @Prop(() => BigInt, { min: 0n, default: 0n })
-  balance!: Defaulted<bigint>;
-}
-```
+<Snippet id="recipes/money/amount-in-cents" title="accounts/account.ts" twoslash />
 
 Число копеек не должно быть `number`. Поле принимает `bigint` или десятичную строку, и дробь отсекается ещё на уровне типов. Если `number` всё же дошёл до записи, скажем из `any` или чужого JSON, дальше всё зависит от значения. Безопасное целое приводится к `int64`, а дробь и целое больше `Number.MAX_SAFE_INTEGER` дают [`CastError`](../reference/errors/data-errors.mdx#cast-error) с подсказкой, как записать число правильно. Тексты ошибок — в разделе «Если что-то пошло не так».
 
@@ -86,23 +39,7 @@ export class Account extends Entity {
 
 Клиент присылает сумму строкой `"12.34"`, и отдаёте вы её тоже строкой. Перевод между строкой и копейками — код вашего приложения, в Typemo его нет. Соберите его в один класс и разбирайте строго. Три знака после запятой — это ошибка клиента, а не повод округлить.
 
-```ts twoslash title="money/money.ts"
-class __BadRequest__ extends Error {}
-// ---cut---
-export class Money {
-  static parse(text: string): bigint {
-    const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text);
-    if (!match) throw new __BadRequest__(`"${text}" is not an amount like 12.34`);
-    return BigInt(match[1] ?? "0") * 100n + BigInt((match[2] ?? "").padEnd(2, "0"));
-  }
-
-  static format(minor: bigint): string {
-    const negative = minor < 0n;
-    const abs = negative ? -minor : minor;
-    return `${negative ? "-" : ""}${abs / 100n}.${String(abs % 100n).padStart(2, "0")}`;
-  }
-}
-```
+<Snippet id="recipes/money/parse-and-show-amount" title="money/money.ts" twoslash />
 
 `Money.parse("12.3")` даёт `1230n`, `Money.parse("7")` — `700n`, а `Money.format(5n)` — `"0.05"`. Строки `"12.345"`, `"-1"`, `"abc"` и `"1e3"` бросают `__BadRequest__` с текстом `"12.345" is not an amount like 12.34`. Отрицательных сумм клиент не присылает, знак задаёт сама операция — пополнение или списание.
 
@@ -110,42 +47,7 @@ export class Money {
 
 Прибавляйте и вычитайте оператором [`$inc`](../reference/writes/update-operators.mdx#inc). Не читайте баланс, чтобы посчитать в коде и записать обратно. Два одновременных запроса прочитали бы одно и то же число, и одно изменение потерялось бы. `$inc` выполняется в базе целиком, и гонки нет. Значение он принимает как `bigint` или его десятичную строку.
 
-```ts twoslash title="accounts/accounts.service.ts"
-import { type Decimal128 } from "mongodb";
-import { Entity, Prop, Schema, Types, TypemoClient, type Defaulted } from "@venloc/typemo";
-class __BadRequest__ extends Error {}
-class Money {
-  static parse(text: string): bigint {
-    const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text);
-    if (!match) throw new __BadRequest__(`"${text}" is not an amount like 12.34`);
-    return BigInt(match[1] ?? "0") * 100n + BigInt((match[2] ?? "").padEnd(2, "0"));
-  }
-  static format(minor: bigint): string {
-    const negative = minor < 0n;
-    const abs = negative ? -minor : minor;
-    return `${negative ? "-" : ""}${abs / 100n}.${String(abs % 100n).padStart(2, "0")}`;
-  }
-}
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => BigInt, { min: 0n, default: 0n }) balance!: Defaulted<bigint>;
-}
-@Schema({ collection: "rates" })
-class Rate extends Entity {
-  @Prop(() => String, { required: true, unique: true }) pair!: string;
-  @Prop(() => Types.Decimal128, { required: true }) value!: Decimal128;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
-const Accounts = client.db().model(Account);
-const Rates = client.db().model(Rate);
-// ---cut---
-export const deposit = (title: string, amount: string) =>
-  Accounts.updateOne({ title }, { $inc: { balance: Money.parse(amount) } }).orFail();
-
-export const withdraw = (title: string, amount: string) =>
-  Accounts.updateOne({ title }, { $inc: { balance: -Money.parse(amount) } }).orFail();
-```
+<Snippet id="recipes/money/deposit-and-withdraw" title="accounts/accounts.service.ts" twoslash />
 
 Граница `min: 0n` защищает от овердрафта прямо в записи. Если списание больше баланса, [`updateOne`](../reference/writes/writes.mdx#update-one) его отклонит, а документ не изменится. Для счёта со 112.34 на балансе списание 1000.00 даст [`ValidationError`](../reference/errors/data-errors.mdx#validation-error) с текстом `Validation failed: "balance": $inc -100000 on 11234 gives -88766, below the minimum 0; nothing was written [min]`.
 
@@ -155,84 +57,11 @@ export const withdraw = (title: string, amount: string) =>
 
 Перевод — это две записи, и пройти или не пройти они должны вместе. Для этого нужна транзакция. [`client.transaction`](../reference/transactions/transactions.mdx#transaction) выполняет функцию в общей сессии, и любая ошибка откатывает обе записи. Передавать сессию в каждый вызов не нужно, операции моделей находят её сами. Подробнее — в руководстве [Транзакции](../transactions/transactions.mdx).
 
-```ts twoslash title="accounts/accounts.service.ts"
-import { type Decimal128 } from "mongodb";
-import { Entity, Prop, Schema, Types, TypemoClient, type Defaulted } from "@venloc/typemo";
-class __BadRequest__ extends Error {}
-class Money {
-  static parse(text: string): bigint {
-    const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text);
-    if (!match) throw new __BadRequest__(`"${text}" is not an amount like 12.34`);
-    return BigInt(match[1] ?? "0") * 100n + BigInt((match[2] ?? "").padEnd(2, "0"));
-  }
-  static format(minor: bigint): string {
-    const negative = minor < 0n;
-    const abs = negative ? -minor : minor;
-    return `${negative ? "-" : ""}${abs / 100n}.${String(abs % 100n).padStart(2, "0")}`;
-  }
-}
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => BigInt, { min: 0n, default: 0n }) balance!: Defaulted<bigint>;
-}
-@Schema({ collection: "rates" })
-class Rate extends Entity {
-  @Prop(() => String, { required: true, unique: true }) pair!: string;
-  @Prop(() => Types.Decimal128, { required: true }) value!: Decimal128;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
-const Accounts = client.db().model(Account);
-const Rates = client.db().model(Rate);
-// ---cut---
-export const transfer = (from: string, to: string, amount: string) => {
-  const minor = Money.parse(amount);
-  return client.transaction(async () => {
-    await Accounts.updateOne({ title: from }, { $inc: { balance: -minor } }).orFail();
-    await Accounts.updateOne({ title: to }, { $inc: { balance: minor } }).orFail();
-  });
-};
-```
+<Snippet id="recipes/money/transfer-money" title="accounts/accounts.service.ts" twoslash />
 
 На счёте `Main` лежит 100.00, на `Savings` пусто. После `transfer("Main", "Savings", "30.50")` балансы стали `"6950"` и `"3050"` копеек. Две неудачные попытки ничего не меняют.
 
-```ts twoslash
-import { type Decimal128 } from "mongodb";
-import { Entity, Prop, Schema, Types, TypemoClient, type Defaulted } from "@venloc/typemo";
-class __BadRequest__ extends Error {}
-class Money {
-  static parse(text: string): bigint {
-    const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text);
-    if (!match) throw new __BadRequest__(`"${text}" is not an amount like 12.34`);
-    return BigInt(match[1] ?? "0") * 100n + BigInt((match[2] ?? "").padEnd(2, "0"));
-  }
-  static format(minor: bigint): string {
-    const negative = minor < 0n;
-    const abs = negative ? -minor : minor;
-    return `${negative ? "-" : ""}${abs / 100n}.${String(abs % 100n).padStart(2, "0")}`;
-  }
-}
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => BigInt, { min: 0n, default: 0n }) balance!: Defaulted<bigint>;
-}
-@Schema({ collection: "rates" })
-class Rate extends Entity {
-  @Prop(() => String, { required: true, unique: true }) pair!: string;
-  @Prop(() => Types.Decimal128, { required: true }) value!: Decimal128;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
-const Accounts = client.db().model(Account);
-const Rates = client.db().model(Rate);
-const transfer = async (from: string, to: string, amount: string) => { await Accounts.countDocuments(); };
-// ---cut---
-await transfer("Main", "Savings", "1000.00").catch((error) => console.log(error.name, error.message));
-// → ValidationError Validation failed: "balance": $inc -100000 on 6950 gives -93050, below the minimum 0; nothing was written [min]
-
-await transfer("Main", "Nope", "1.00").catch((error) => console.log(error.name, error.message));
-// → DocumentNotFoundError Account.updateOne: no document matched the filter (orFail)
-```
+<Snippet id="recipes/money/transfer-money-2" twoslash />
 
 Во второй попытке списание с `Main` внутри транзакции уже прошло, но зачисление на несуществующий счёт бросило ошибку, и списание откатилось. После обеих попыток на `Main` по-прежнему `"6950"`.
 
@@ -242,42 +71,7 @@ await transfer("Main", "Nope", "1.00").catch((error) => console.log(error.name, 
 
 Клиенту нужна строка `"69.50"`, а не `"6950"`. Читайте через [`.plain()`](../reference/query/reading.mdx#plain). `balance` в нём — десятичная строка копеек, которую `Money.format` превратит в читаемую сумму, а `JSON.stringify` пропустит без ошибок.
 
-```ts twoslash title="accounts/accounts.service.ts"
-import { type Decimal128 } from "mongodb";
-import { Entity, Prop, Schema, Types, TypemoClient, type Defaulted } from "@venloc/typemo";
-class __BadRequest__ extends Error {}
-class Money {
-  static parse(text: string): bigint {
-    const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text);
-    if (!match) throw new __BadRequest__(`"${text}" is not an amount like 12.34`);
-    return BigInt(match[1] ?? "0") * 100n + BigInt((match[2] ?? "").padEnd(2, "0"));
-  }
-  static format(minor: bigint): string {
-    const negative = minor < 0n;
-    const abs = negative ? -minor : minor;
-    return `${negative ? "-" : ""}${abs / 100n}.${String(abs % 100n).padStart(2, "0")}`;
-  }
-}
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => BigInt, { min: 0n, default: 0n }) balance!: Defaulted<bigint>;
-}
-@Schema({ collection: "rates" })
-class Rate extends Entity {
-  @Prop(() => String, { required: true, unique: true }) pair!: string;
-  @Prop(() => Types.Decimal128, { required: true }) value!: Decimal128;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
-const Accounts = client.db().model(Account);
-const Rates = client.db().model(Rate);
-// ---cut---
-export const getBalance = async (title: string) => {
-  const account = await Accounts.findOne({ title }).plain().orFail();
-  return { title: account.title, balance: Money.format(BigInt(account.balance)) };
-};
-// getBalance("Main") → { title: "Main", balance: "69.50" }
-```
+<Snippet id="recipes/money/send-amount" title="accounts/accounts.service.ts" twoslash />
 
 Тип `account.balance` здесь не `string`, а `` `${bigint}` ``. Компилятор знает, что это строка с целым числом, и `BigInt(account.balance)` безопасен. Значение выше 2⁵³ проходит без потерь — счёт с `9007199254740993n` копеек вернётся как `"9007199254740993"`.
 
@@ -285,34 +79,13 @@ export const getBalance = async (title: string) => {
 
 Курс валюты — величина с дробной частью, и округлить её до копейки нельзя. Например, `92.5031` рубля за доллар. Для таких значений подходит `Decimal128`. Это десятичное число до 34 значащих цифр без двоичных погрешностей.
 
-```ts twoslash title="rates/rate.ts"
-import { type Decimal128 } from "mongodb";
-import { Entity, Prop, Schema, Types } from "@venloc/typemo";
-
-@Schema({ collection: "rates" })
-export class Rate extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  pair!: string;
-
-  @Prop(() => Types.Decimal128, { required: true })
-  value!: Decimal128;
-}
-```
+<Snippet id="recipes/money/rate-in-decimal128" title="rates/rate.ts" twoslash />
 
 В [`create`](../reference/writes/writes.mdx#create) значение можно передать строкой — `Rates.create({ pair: "USD/RUB", value: "92.5031" })`. В прочитанном документе лежит настоящий `Decimal128`, и `rateDoc.value.toString()` даёт `"92.5031"`, а `.plain()` отдаёт строку `"92.5031"`. Строку с посторонними символами Typemo не примет и ответит `Cast to Decimal128 failed at path "value" for "abc" (string): not a decimal number string [format]`.
 
 Арифметики у `Decimal128` в JavaScript нет, поэтому пересчитывайте в целых числах. Разберите строку курса на целое и число знаков и умножайте `bigint`.
 
-```ts twoslash title="money/convert.ts"
-// ---cut---
-export const convert = (minor: bigint, rate: string): bigint => {
-  const [whole = "0", fraction = ""] = rate.split(".");
-  const scale = 10n ** BigInt(fraction.length);
-  const numerator = BigInt(whole + fraction);
-  return (minor * numerator * 2n + scale) / (scale * 2n);
-};
-// convert(10000n, "92.5031") → 925031n (копейки: 100.00 × 92.5031 = 9250.31)
-```
+<Snippet id="recipes/money/rate-in-decimal128-2" title="money/convert.ts" twoslash />
 
 Формула делит с округлением до ближайшего целого. Каждый пересчёт даёт целое число копеек, а не дробь, которую пришлось бы куда-то девать.
 
@@ -333,9 +106,7 @@ export const convert = (minor: bigint, rate: string): bigint => {
 
 **Сумма записана дробным числом.** Вы храните `balance: number` и пишете `12.34`. Через пару операций `0.1 + 0.2` разойдётся с ожидаемым. Замените поле на `BigInt` в копейках. Если же в поле `BigInt` попытаться записать дробь, Typemo остановит запись.
 
-```text
-CastError: Cast to Long failed at path "balance" for 1.5 (number): a fractional number is not an int64; pass a bigint (5n) or a decimal integer string ("5") [integer]
-```
+<Snippet id="recipes/money/troubleshooting" />
 
 В `$inc` текст тот же, только путь называется `$inc.balance`. Целое больше `Number.MAX_SAFE_INTEGER` приходит уже неточным, и Typemo не гадает, какое число вы имели в виду. Ошибка будет такой — `Cast to Long failed at path "balance" for 9007199254740992 (number): beyond Number.MAX_SAFE_INTEGER the number is already imprecise; pass a bigint (5n) or a decimal integer string ("5") [precision]`. Пишите `9007199254740993n` или `"9007199254740993"`.
 
@@ -347,83 +118,7 @@ CastError: Cast to Long failed at path "balance" for 1.5 (number): a fractional 
 
 ## Полный пример [#full-example]
 
-```ts twoslash title="bank/money.ts"
-import { type Decimal128 } from "mongodb";
-import { type Defaulted, Entity, Prop, Schema, Types, TypemoClient } from "@venloc/typemo";
-
-export class __BadRequest__ extends Error {}
-
-// money/money.ts: strings ⇄ kopecks (your code, not part of Typemo)
-export class Money {
-  static parse(text: string): bigint {
-    const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text);
-    if (!match) throw new __BadRequest__(`"${text}" is not an amount like 12.34`);
-    return BigInt(match[1] ?? "0") * 100n + BigInt((match[2] ?? "").padEnd(2, "0"));
-  }
-
-  static format(minor: bigint): string {
-    const negative = minor < 0n;
-    const abs = negative ? -minor : minor;
-    return `${negative ? "-" : ""}${abs / 100n}.${String(abs % 100n).padStart(2, "0")}`;
-  }
-
-  // rounds to the nearest kopeck; the rate is a Decimal128 string such as "92.5031"
-  static convert(minor: bigint, rate: string): bigint {
-    const [whole = "0", fraction = ""] = rate.split(".");
-    const scale = 10n ** BigInt(fraction.length);
-    return (minor * BigInt(whole + fraction) * 2n + scale) / (scale * 2n);
-  }
-}
-
-// models
-@Schema({ collection: "accounts" })
-export class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  title!: string;
-
-  @Prop(() => BigInt, { min: 0n, default: 0n })
-  balance!: Defaulted<bigint>;
-}
-
-@Schema({ collection: "rates" })
-export class Rate extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  pair!: string;
-
-  @Prop(() => Types.Decimal128, { required: true })
-  value!: Decimal128;
-}
-
-export const client = await TypemoClient.connect("mongodb://localhost:27017/bank");
-const Accounts = client.db().model(Account);
-const Rates = client.db().model(Rate);
-
-// operations
-export const deposit = (title: string, amount: string) =>
-  Accounts.updateOne({ title }, { $inc: { balance: Money.parse(amount) } }).orFail();
-
-export const withdraw = (title: string, amount: string) =>
-  Accounts.updateOne({ title }, { $inc: { balance: -Money.parse(amount) } }).orFail();
-
-export const transfer = (from: string, to: string, amount: string) => {
-  const minor = Money.parse(amount);
-  return client.transaction(async () => {
-    await Accounts.updateOne({ title: from }, { $inc: { balance: -minor } }).orFail();
-    await Accounts.updateOne({ title: to }, { $inc: { balance: minor } }).orFail();
-  });
-};
-
-export const getBalance = async (title: string) => {
-  const account = await Accounts.findOne({ title }).plain().orFail();
-  return { title: account.title, balance: Money.format(BigInt(account.balance)) };
-};
-
-export const convertBalance = async (title: string, pair: string) => {
-  const account = await Accounts.findOne({ title }).plain().orFail();
-  const rate = await Rates.findOne({ pair }).plain().orFail();
-  return Money.format(Money.convert(BigInt(account.balance), rate.value));
-};
-```
+<Snippet id="recipes/money/full-example" title="bank/money.ts" twoslash />
 
 <Callout type="migration">
 

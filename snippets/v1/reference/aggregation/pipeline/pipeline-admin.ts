@@ -1,0 +1,19 @@
+import { Entity, type Hidden, fn, Index, Pipeline, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "orders" })
+@Index({ status: 1 })
+class Order extends Entity {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => String, { required: true }) status!: string;
+  @Prop(() => Number, { required: true }) total!: number;
+  @Prop(() => BigInt) points?: bigint;
+  @Prop(() => String, { hidden: true }) internalNote?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+// ---cut---
+const plan = Pipeline.admin().currentOp({ idleConnections: false }).limit(1).plan();
+console.log(plan.target, plan.pipeline);
+// → { kind: "database", admin: true } [{ $currentOp: { idleConnections: false } }, { $limit: 1 }]
+const operations = await client.aggregate(plan);
+console.log(operations.length);
+// → 1

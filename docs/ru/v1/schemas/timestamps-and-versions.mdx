@@ -16,24 +16,7 @@ icon: Clock
 
 Оберните базовый класс — `Timestamped(Entity)`. Даты появятся при создании, а `updatedAt` сдвинется при первом же изменении.
 
-```ts twoslash title="posts/post.ts"
-import { Entity, Prop, Schema, Timestamped, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "posts" })
-class Post extends Timestamped(Entity) {
-  @Prop(() => String, { required: true }) title!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Posts = client.db().model(Post);
-// ---cut---
-const post = await Posts.create({ title: "Hello" });
-console.log(post.createdAt.getTime() === post.updatedAt.getTime());
-// → true
-
-post.title = "Hello, world";
-await post.$save();
-console.log(post.updatedAt.getTime() > post.createdAt.getTime());
-// → true
-```
+<Snippet id="schemas/timestamps-and-versions/quick-start" title="posts/post.ts" twoslash />
 
 Ниже разберём, когда именно меняются метки, и добавим версию.
 
@@ -43,21 +26,7 @@ console.log(post.updatedAt.getTime() > post.createdAt.getTime());
 
 `updatedAt` обновляет каждая запись, которая дошла до документа. Это [`$save`](../reference/documents/document-api.mdx#save) с изменениями, [`updateOne`](../reference/writes/writes.mdx#update-one), `updateMany`, `findOneAndUpdate`, замена и upsert. Ставить его самому не нужно. `updatedAt` сдвигается даже от записи, которая по значению ничего не меняет. Например, от `$set` того же заголовка или `$addToSet` значения, которое уже есть в массиве (сервер при этом сообщает `modifiedCount: 1`). Ядро до записи не знает, изменит ли сервер что-нибудь.
 
-```ts twoslash title="posts/posts.service.ts"
-import { Entity, Prop, Schema, Timestamped, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "posts" })
-class Post extends Timestamped(Entity) {
-  @Prop(() => String, { required: true }) title!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Posts = client.db().model(Post);
-// ---cut---
-const post = await Posts.create({ title: "a" });
-await Posts.updateOne({ _id: post._id }, { $set: { title: "b" } });
-const reread = await Posts.findById(post._id).orFail();
-console.log(reread.createdAt.getTime() === post.createdAt.getTime(), reread.updatedAt.getTime() >= post.updatedAt.getTime());
-// → true true
-```
+<Snippet id="schemas/timestamps-and-versions/how-timestamps-change" title="posts/posts.service.ts" twoslash />
 
 Попытку изменить `createdAt` обновлением остановит [`StrictModeError`](../reference/errors/data-errors.mdx#strict-mode-error) с причиной `immutable` — `$set.createdAt: "createdAt" is immutable; it is written only when the document is created ($setOnInsert on upsert) [immutable]`. В типах такое обновление не скомпилируется. При upsert, когда документ создаёт обновление, обе метки получают одно значение.
 
@@ -67,26 +36,7 @@ console.log(reread.createdAt.getTime() === post.createdAt.getTime(), reread.upda
 
 `Versioned(Entity)` добавляет `__v`. Это счётчик, который ядро увеличивает, когда изменение зависит от позиции элементов массива. Иначе два процесса, меняющие один массив по индексу, затёрли бы друг друга. Миксины сочетаются в любом порядке — `Timestamped(Versioned(Entity))`.
 
-```ts twoslash title="posts/post.ts"
-import { Entity, Prop, Schema, Timestamped, TypemoClient, Versioned } from "@venloc/typemo";
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-// ---cut---
-@Schema({ collection: "posts" })
-class Post extends Timestamped(Versioned(Entity)) { // [!code highlight]
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => [String]) tags!: string[];
-}
-
-const Posts = client.db().model(Post);
-const post = await Posts.create({ title: "a", tags: [] });
-console.log(post.__v);
-// → 0
-
-post.tags.push("news");
-await post.$save();
-console.log(post.__v);
-// → 1
-```
+<Snippet id="schemas/timestamps-and-versions/add-version" title="posts/post.ts" twoslash />
 
 Изменение обычного поля версию не увеличивает. А замена документа целиком через `replaceOne` сохраняет `createdAt` и текущее значение `__v`.
 
@@ -116,9 +66,7 @@ console.log(post.__v);
 
 **`optimisticConcurrency` в модели без `Versioned`.** Модель не соберётся.
 
-```text
-ConfigurationError: optimisticConcurrency needs the version field — extend Versioned(...)
-```
+<Snippet id="schemas/timestamps-and-versions/troubleshooting" />
 
 Добавьте `Versioned` в цепочку наследования — `class Account extends Versioned(Entity)`.
 
@@ -126,29 +74,7 @@ ConfigurationError: optimisticConcurrency needs the version field — extend Ver
 
 ## Полный пример [#full-example]
 
-```ts twoslash title="posts/posts.service.ts"
-import { Entity, Prop, Schema, Timestamped, TypemoClient, Versioned } from "@venloc/typemo";
-
-@Schema({ collection: "posts", optimisticConcurrency: true })
-class Post extends Timestamped(Versioned(Entity)) {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => [String]) tags!: string[];
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Posts = client.db().model(Post);
-
-// создание: метки и версия проставляются сами
-export const publish = async (title: string) => Posts.create({ title, tags: [] });
-
-// изменение: updatedAt растёт, а при чужой правке $save бросит VersionError
-export const rename = async (id: Post["_id"], title: string) => {
-  const post = await Posts.findById(id).orFail();
-  post.title = title;
-  await post.$save();
-  return post.updatedAt;
-};
-```
+<Snippet id="schemas/timestamps-and-versions/full-example" title="posts/posts.service.ts" twoslash />
 
 <Callout type="migration">
 

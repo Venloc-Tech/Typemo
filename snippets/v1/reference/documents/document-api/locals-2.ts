@@ -1,0 +1,1 @@
+$locals(): Record<string, unknown>;

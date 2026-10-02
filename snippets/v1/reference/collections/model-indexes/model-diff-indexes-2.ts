@@ -1,0 +1,1 @@
+diffIndexes(): Promise<IndexDiff>

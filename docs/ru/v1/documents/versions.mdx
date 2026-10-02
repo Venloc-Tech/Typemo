@@ -12,44 +12,11 @@ icon: GitMerge
 
 Главный пример заказа — он наследует `Versioned`, так что массивы защищены, — и счёт `Ledger` с включённой `optimisticConcurrency`. Основы изменения документа — в руководстве [Изменить и сохранить документ](./change-and-save.mdx).
 
-```ts twoslash title="models/ledger.ts"
-import { Entity, Prop, Schema, Versioned } from "@venloc/typemo";
-
-@Schema({ collection: "ledgers", optimisticConcurrency: true })
-export class Ledger extends Versioned(Entity) {
-  @Prop(() => String, { required: true })
-  owner!: string;
-
-  @Prop(() => Number, { required: true })
-  balance!: number;
-}
-```
+<Snippet id="documents/versions/prerequisites" title="models/ledger.ts" twoslash />
 
 ## Быстрый путь [#quick-start]
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, VersionError, Versioned } from "@venloc/typemo";
-@Schema({ collection: "ledgers", optimisticConcurrency: true })
-class Ledger extends Versioned(Entity) {
-  @Prop(() => String, { required: true }) owner!: string;
-  @Prop(() => Number, { required: true }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Ledgers = client.db().model(Ledger);
-// ---cut---
-const created = await Ledgers.create({ owner: "ann", balance: 10 });
-const first = await Ledgers.findById(created._id).orFail();
-const second = await Ledgers.findById(created._id).orFail();
-
-first.balance = 20;
-await first.$save();
-console.log(first.__v);
-// → 1
-
-second.balance = 30;
-await second.$save().catch((error) => console.log(error instanceof VersionError));
-// → true
-```
+<Snippet id="documents/versions/quick-start" twoslash />
 
 Второй клиент не перезаписал баланс молча, а получил ошибку. Ниже разберём, что в ней лежит, как повторить операцию и когда версия работает без `optimisticConcurrency`.
 
@@ -57,70 +24,19 @@ await second.$save().catch((error) => console.log(error instanceof VersionError)
 
 Ошибка называет модель, версию, которую вы прочитали, и изменённые пути. В базе остаётся то, что записал первый клиент.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, VersionError, Versioned } from "@venloc/typemo";
-@Schema({ collection: "ledgers", optimisticConcurrency: true })
-class Ledger extends Versioned(Entity) {
-  @Prop(() => String, { required: true }) owner!: string;
-  @Prop(() => Number, { required: true }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Ledgers = client.db().model(Ledger);
-const created = await Ledgers.create({ owner: "ann", balance: 10 });
-const first = await Ledgers.findById(created._id).orFail();
-const second = await Ledgers.findById(created._id).orFail();
-first.balance = 20;
-await first.$save();
-second.balance = 30;
-// ---cut---
-try {
-  await second.$save();
-} catch (error) {
-  if (error instanceof VersionError) {
-    console.log(error.version, error.modifiedPaths);
-    // → 0 ["balance"]
-  }
-}
-```
+<Snippet id="documents/versions/catch-conflict" twoslash />
 
-```text
-VersionError: Ledger: no document at version 0 (it was changed or deleted since it was read); modified: balance
-```
+<Snippet id="documents/versions/catch-conflict-2" />
 
 В сообщении сказано «изменён или удалён», потому что по версии одно от другого не отличить. Если документ действительно удалили, Typemo выяснит это одним дополнительным чтением и вместо `VersionError` бросит [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#document-not-found-error).
 
-```text
-DocumentNotFoundError: Ledger.save: the document is no longer in the collection (deleted since it was read, or out of the scope of the operation's policies); nothing was written
-```
+<Snippet id="documents/versions/catch-conflict-3" />
 
 ## Повторить операцию [#retry-operation]
 
 На `VersionError` правильно реагировать так — прочитать документ заново, применить изменение к свежему состоянию и сохранить снова. Слепо повторять сохранение старого документа нельзя, в нём по-прежнему устаревшая версия.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, VersionError, Versioned } from "@venloc/typemo";
-@Schema({ collection: "ledgers", optimisticConcurrency: true })
-class Ledger extends Versioned(Entity) {
-  @Prop(() => String, { required: true }) owner!: string;
-  @Prop(() => Number, { required: true }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Ledgers = client.db().model(Ledger);
-// ---cut---
-export const deposit = async (ledgerId: Ledger["_id"], amount: number) => {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const ledger = await Ledgers.findById(ledgerId).orFail();
-    ledger.balance += amount;
-    try {
-      await ledger.$save();
-      return ledger.balance;
-    } catch (error) {
-      if (!(error instanceof VersionError)) throw error;
-    }
-  }
-  throw new Error("the ledger is busy, try again later");
-};
-```
+<Snippet id="documents/versions/retry-operation" twoslash />
 
 Число попыток ограничено. Если конфликты повторяются, лучше сообщить об этом, чем крутиться бесконечно. А счётчики, которые меняют многие клиенты, надёжнее менять атомарным `$inc` через [`updateOne`](../reference/writes/writes.mdx#update-one). Он не конфликтует вовсе.
 
@@ -128,46 +44,7 @@ export const deposit = async (ledgerId: Ledger["_id"], amount: number) => {
 
 У документа с `Versioned`, но без `optimisticConcurrency` защищены только изменения массивов **по позиции**. Операция вроде `tags.1 = "B"` ссылается на индекс. Если другой клиент успел убрать первый элемент, индекс `1` теперь указывает на другой элемент, и правка легла бы не туда. Поэтому Typemo делает такое обновление условным по версии.
 
-```ts twoslash
-import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
-@Schema({ nested: true })
-class Address {
-  @Prop(() => String, { required: true }) city!: string;
-  @Prop(() => String) street?: string;
-}
-@Schema()
-class Line extends Entity {
-  @Prop(() => String, { required: true }) sku!: string;
-  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
-}
-@Schema({ collection: "orders" })
-class Order extends Versioned(Entity) {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => [String]) tags!: string[];
-  @Prop(() => [Line]) lines!: Line[];
-  @Prop(() => Address) address?: Address;
-  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
-  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Orders = client.db().model(Order);
-import { VersionError } from "@venloc/typemo";
-// ---cut---
-const created = await Orders.create({ customer: "alice", tags: ["a", "b", "c"], lines: [] });
-const mine = await Orders.findById(created._id).orFail();
-const theirs = await Orders.findById(created._id).orFail();
-
-theirs.tags.pull("a");
-await theirs.$save(); // версия 0 → 1
-
-mine.tags.set(1, "B"); // я хотел заменить "b", но после чужого удаления это "c"
-try {
-  await mine.$save();
-} catch (error) {
-  console.log(error instanceof VersionError && error.modifiedPaths);
-  // → ["tags.1"]
-}
-```
+<Snippet id="documents/versions/protect-arrays" twoslash />
 
 Изменениям, которые от позиций не зависят, версия не нужна. Скалярное поле, `push`, `pull` и `addToSet` дают обновления, которые применяются независимо друг от друга. Так что если один клиент поменял `customer`, а другой добавил тег, конфликта не будет.
 
@@ -192,17 +69,13 @@ try {
 
 **Документ прочитан без версии.** Вы прочитали документ с проекцией без `__v`, а сохранению нужна версия. Тогда [`$save`](../reference/documents/document-api.mdx#save) откажется работать, ведь молча пропустить проверку значило бы выключить защиту.
 
-```text
-QueryError: Order: this save needs the version "__v", but the document was read without it (a projection left it out); select it, or read the document again — the check is never skipped silently
-```
+<Snippet id="documents/versions/troubleshooting" />
 
 Добавьте `__v` в проекцию или прочитайте документ целиком.
 
 **Версию поменяли вручную.** Поле `__v` ведёт ядро. Присвоить ему значение можно только в обход типов, и тогда сохранение откажется работать, а [`$getChanges`](../reference/documents/document-api.mdx#get-changes) покажет причину в `$problems`.
 
-```text
-QueryError: Ledger.__v is the version key: the core maintains it; it cannot be changed by hand
-```
+<Snippet id="documents/versions/troubleshooting-2" />
 
 Не трогайте `__v`. Если нужна защита от конфликтов, включите `optimisticConcurrency`.
 
@@ -210,31 +83,7 @@ QueryError: Ledger.__v is the version key: the core maintains it; it cannot be c
 
 ## Полный пример [#full-example]
 
-```ts twoslash title="ledgers/ledgers.service.ts"
-import { Entity, Prop, Schema, TypemoClient, VersionError, Versioned } from "@venloc/typemo";
-@Schema({ collection: "ledgers", optimisticConcurrency: true })
-class Ledger extends Versioned(Entity) {
-  @Prop(() => String, { required: true }) owner!: string;
-  @Prop(() => Number, { required: true }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
-const Ledgers = client.db().model(Ledger);
-// ---cut---
-export const withdraw = async (ledgerId: Ledger["_id"], amount: number) => {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const ledger = await Ledgers.findById(ledgerId).orFail();
-    if (ledger.balance < amount) throw new Error("not enough money");
-    ledger.balance -= amount;
-    try {
-      await ledger.$save();
-      return ledger.balance;
-    } catch (error) {
-      if (!(error instanceof VersionError)) throw error;
-    }
-  }
-  throw new Error("the ledger is busy, try again later");
-};
-```
+<Snippet id="documents/versions/full-example" title="ledgers/ledgers.service.ts" twoslash />
 
 ## Если вы пришли из Mongoose [#from-mongoose]
 

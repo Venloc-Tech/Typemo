@@ -1,0 +1,1 @@
+plain(): AggregateQuery<PlainValue<Row>>

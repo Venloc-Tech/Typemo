@@ -17,55 +17,13 @@ icon: LayoutGrid
 - Отменённый заказ `bob` на 200.
 - Новый заказ `carol` на 30.
 
-```ts twoslash title="orders/order.ts"
-import { Entity, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-export class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => String, { required: true })
-  status!: string;
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-```
+<Snippet id="aggregation/facets/prerequisites" title="orders/order.ts" twoslash />
 
 ## Быстрый путь [#quick-start]
 
 Каждое поле объекта — имя ветки. Значение — функция, которая получает пустой строитель ветки и добавляет стадии.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-const query = Orders.aggregate((p) =>
-  p.facet({
-    total: (b) => b.count("n"),
-    page: (b) => b.sort({ placedAt: "descending" }).limit(2).project({ customer: 1, total: 1, _id: 0 }),
-    byStatus: (b) => b.sortByCount((f) => f.status),
-  }),
-);
-const [report] = await query.plain();
-//     ^?
-// → { total: [{ n: 5 }], page: [{ customer: "carol", total: 30 }, { customer: "bob", total: 200 }],
-//     byStatus: [{ _id: "paid", count: 3 }, …] }
-```
+<Snippet id="aggregation/facets/quick-start" twoslash />
 
 Ниже разберём, как устроен результат, что делать с пустым набором и что в ветке запрещено.
 
@@ -75,31 +33,7 @@ const [report] = await query.plain();
 
 Обычно сначала идёт общий отбор [`match`](../reference/aggregation/stages.mdx#match), а потом `facet`. Тогда `total` и `page` считаются по одному набору, и число из `total` сходится со строками из `page`.
 
-```ts twoslash title="orders/orders.service.ts"
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-export const orderPage = async (status: string) => {
-  const query = Orders.aggregate((p) =>
-    p.match({ status }).facet({
-      count: (b) => b.count("n"),
-      rows: (b) => b.sort({ placedAt: "descending" }).skip(0).limit(20),
-    }),
-  );
-  const [report] = await query.plain();
-  return { total: report?.count[0]?.n ?? 0, rows: report?.rows ?? [] };
-};
-```
+<Snippet id="aggregation/facets/summary-with-page" title="orders/orders.service.ts" twoslash />
 
 Обратите внимание на `report?.count[0]?.n ?? 0`. Если под фильтр ничего не подошло, ветка `count` пуста, ведь стадия `count` строку с нулём не создаёт. Ветка `rows` тогда тоже пуста. Сама строка `facet` при этом есть, так что `report` определён, а вот `[0]` может оказаться пустым. Тип вам об этом напомнит.
 
@@ -107,30 +41,7 @@ export const orderPage = async (status: string) => {
 
 В ветку можно поставить любые стадии, кроме запрещённых внутри `facet`. Группировку, корзины, повторный подсчёт. Так строится левая панель фильтров с числом товаров по каждому значению.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-const query = Orders.aggregate((p) =>
-  p.facet({
-    byStatus: (b) => b.sortByCount((f) => f.status),
-    bySize: (b) =>
-      b.bucket({ groupBy: (f) => f.total, boundaries: [0, 100, 500], output: () => ({ orders: fn.count() }) }),
-  }),
-);
-const [report] = await query;
-//     ^?
-```
+<Snippet id="aggregation/facets/group-by" twoslash />
 
 Ветка `bySize` использует [`bucket`](../reference/aggregation/stages.mdx#bucket), ветка `byStatus` — [`sortByCount`](../reference/aggregation/stages.mdx#sort-by-count). Подробнее о них — в руководстве [Группировка и отчёты](grouping.mdx).
 
@@ -138,23 +49,7 @@ const [report] = await query;
 
 Внутри ветки не работают стадии, которые должны стоять первыми или пишут в базу. Это вложенный `facet`, [`out`](../reference/aggregation/stages.mdx#out), [`merge`](../reference/aggregation/stages.mdx#merge) и стадии, допустимые только в начале конвейера. Вызвать `out` у строителя ветки не получится — его тип разрешает вызов только на верхнем уровне конвейера, и ошибку видно при компиляции (`The 'this' context … is not assignable to method's 'this'`).
 
-```ts twoslash
-// @errors: 2739 2769
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-await Orders.aggregate((p) => p.facet({ nested: (b) => b.out("archive") }));
-```
+<Snippet id="aggregation/facets/branch-limits" twoslash />
 
 Ветка без стадий бросает `ConfigurationError` при сборке, потому что пустой конвейер бессмыслен. Если веток нет совсем, тоже будет `ConfigurationError`.
 
@@ -178,42 +73,7 @@ await Orders.aggregate((p) => p.facet({ nested: (b) => b.out("archive") }));
 
 ## Полный пример [#full-example]
 
-```ts twoslash title="orders/orders.service.ts"
-import { Entity, Prop, Schema, TypemoClient, fn, Pipeline, type RowOf } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => String, { required: true }) status!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-export const ordersOverview = async (status: string, page: number) => {
-  const query = Orders.aggregate((p) =>
-    p.match({ status }).facet({
-      count: (b) => b.count("n"),
-      rows: (b) =>
-        b
-          .sort({ placedAt: "descending" })
-          .skip((page - 1) * 20)
-          .limit(20)
-          .project({ customer: 1, total: 1, _id: 0 }),
-      bySize: (b) =>
-        b.bucket({ groupBy: (f) => f.total, boundaries: [0, 100, 500], default: "other" }),
-    }),
-  );
-  const [report] = await query.plain();
-  return {
-    total: report?.count[0]?.n ?? 0,
-    rows: report?.rows ?? [],
-    bySize: report?.bySize ?? [],
-  };
-};
-```
+<Snippet id="aggregation/facets/full-example" title="orders/orders.service.ts" twoslash />
 
 ## Что дальше [#next-steps]
 

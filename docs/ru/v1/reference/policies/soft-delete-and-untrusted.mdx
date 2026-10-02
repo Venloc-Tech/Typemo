@@ -8,18 +8,7 @@ icon: ShieldAlert
 
 Примеры первой половины — блог. У поста есть заголовок и метка удаления.
 
-```ts twoslash title="posts/post.ts"
-import { Entity, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "posts", softDelete: true })
-export class Post extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  @Prop(() => Date, { nullable: true })
-  deletedAt?: Date | null;
-}
-```
+<Snippet id="policies/soft-delete/quick-start" title="posts/post.ts" twoslash />
 
 ## SoftDelete.restore [#soft-delete.restore]
 
@@ -27,26 +16,7 @@ export class Post extends Entity {
 
 Это обычная запись модели. Она ленивая, ничего не отправляется до `await`. У неё работают [`.session()`](../query/options.mdx#session) и [`.policy()`](../query/options.mdx#policy), хуки, аудит и политика тенанта. Внутри вызывается `updateMany` с `onlyDeleted`, так что живые документы `restore` не затронет.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, SoftDelete } from "@venloc/typemo";
-@Schema({ collection: "posts", softDelete: true })
-class Post extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => Date, { nullable: true }) deletedAt?: Date | null;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Posts = client.connection.model(Post);
-// ---cut---
-await Posts.deleteOne({ title: "Two" });
-console.log(await Posts.countDocuments());
-// → 2
-
-const result = await SoftDelete.restore(Posts, { title: "Two" });
-console.log(result.matchedCount, result.modifiedCount);
-// → 1 1
-console.log(await Posts.countDocuments());
-// → 3
-```
+<Snippet id="reference/policies/soft-delete-and-untrusted/soft-delete-restore" twoslash />
 
 <Returns type="WriteBuilder<UpdateResult>">
 
@@ -69,9 +39,7 @@ console.log(await Posts.countDocuments());
 
 <FullType>
 
-```ts
-static restore<T extends object>(model: Model<T>, filter: Filter<T, true>): WriteBuilder<UpdateResult<IdOf<T>>>
-```
+<Snippet id="reference/policies/soft-delete-and-untrusted/soft-delete-restore-2" />
 
 </FullType>
 
@@ -81,25 +49,7 @@ static restore<T extends object>(model: Model<T>, filter: Filter<T, true>): Writ
 
 Живых документов `purge` не трогает никогда, он работает в режиме «только удалённые». Перепутав фильтр, живую запись случайно не стереть. Сначала документ нужно удалить обычным образом.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, SoftDelete } from "@venloc/typemo";
-@Schema({ collection: "posts", softDelete: true })
-class Post extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => Date, { nullable: true }) deletedAt?: Date | null;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Posts = client.connection.model(Post);
-// ---cut---
-await Posts.deleteOne({ title: "Three" });
-const purged = await SoftDelete.purge(Posts, { title: "Three" });
-console.log(purged.deletedCount);
-// → 1
-
-const live = await SoftDelete.purge(Posts, { title: "One" });
-console.log(live.deletedCount);
-// → 0
-```
+<Snippet id="policies/soft-delete/restore-and-purge" twoslash />
 
 <Returns type="WriteBuilder<DeleteResult>">
 
@@ -122,9 +72,7 @@ console.log(live.deletedCount);
 
 <FullType>
 
-```ts
-static purge<T extends object>(model: Model<T>, filter: Filter<T, true>): WriteBuilder<DeleteResult>
-```
+<Snippet id="reference/policies/soft-delete-and-untrusted/soft-delete-purge" />
 
 </FullType>
 
@@ -136,55 +84,23 @@ static purge<T extends object>(model: Model<T>, filter: Filter<T, true>): WriteB
 
 Внутри помеченного значения на любой глубине запрещён ключ, который начинается с `$`. Иначе клиент подменил бы значение оператором. Скажем, приложение ищет `find({ name: req.body.name })`, а клиент присылает `{"name": {"$ne": "zzz"}}`. Условие «имя равно» превращается в «имя не равно zzz», и находятся все документы. Ключ с `+` тоже запрещён. В проекции `+путь` добавляет [скрытое поле](../schemas/field-markers.mdx#hidden), и клиент мог бы получить хеш пароля.
 
-```ts twoslash title="users/users.service.ts"
-import { Entity, Prop, Schema, TypemoClient, untrusted } from "@venloc/typemo";
-@Schema({ collection: "users" })
-class User extends Entity {
-  @Prop(() => String, { required: true }) name!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Users = client.connection.model(User);
-// ---cut---
-export const findByName = async (body: unknown) => {
-  return Users.find(untrusted({ name: (body as { name: unknown }).name }) as { name: string }).plain();
-};
-```
+<Snippet id="reference/policies/soft-delete-and-untrusted/untrusted" title="users/users.service.ts" twoslash />
 
 Функция возвращает то же значение, что получила, без изменений. Проверяет она только форму, то есть ключи. Типы, диапазоны и допустимые поля она не смотрит, поэтому `untrusted` — **дополнительная** защита, а не замена проверки ввода. Проверьте данные схемой валидации и постройте фильтр сами из проверенных значений. `untrusted` поймает то, что проверка пропустила.
 
 Запрет срабатывает на любой глубине, включая массивы и `Map`. Ниже ошибка на глубине массива. Текст взят из реального запуска.
 
-```ts twoslash
-import { untrusted, StrictModeError } from "@venloc/typemo";
-// ---cut---
-try {
-  untrusted({ a: [{ b: { $gt: 1 } }] });
-} catch (error) {
-  if (error instanceof StrictModeError) {
-    console.log(error.message);
-    // → untrusted value: "$gt" at "a.0.b.$gt" — an operator inside data from outside (query selector injection); validate the input and build the filter yourself [sanitize]
-    console.log(error.reason, error.path);
-    // → "sanitize" "a.0.b.$gt"
-  }
-}
-```
+<Snippet id="reference/policies/soft-delete-and-untrusted/untrusted-2" twoslash />
 
 ### UntrustedPlace [#untrusted-place]
 
 Тип `UntrustedPlace` — это `"filter" | "update" | "projection"`, то есть место, куда попадут данные. Проверка для всех трёх одна, меняются только слова ошибки. Они объясняют, чем оператор грозит именно в этом месте. Без аргумента подразумевается фильтр. Тексты взяты из реального запуска.
 
-```text
-"filter": untrusted value: "$ne" at "title.$ne" — an operator inside data from outside (query selector injection); validate the input and build the filter yourself [sanitize]
-"update": untrusted value: "$set" at "$set" — an operator inside data from outside would change what the update does (update operator injection); validate the input and build the update yourself [sanitize]
-"projection": untrusted value: "$slice" at "a.$slice" — an operator inside data from outside would turn the projection into a computed expression; validate the input and build the projection yourself [sanitize]
-```
+<Snippet id="reference/policies/soft-delete-and-untrusted/untrusted-place" />
 
 Ключ с `+` тоже называется по месту. В проекции он добавил бы скрытое поле, а в фильтре и обновлении это вообще не имя поля.
 
-```text
-"projection": untrusted value: "+passwordHash" at "+passwordHash" — a "+path" key inside data from outside would select a Hidden field; validate the input and build the projection yourself [sanitize]
-"filter":     untrusted value: "+passwordHash" at "+passwordHash" — a "+path" key inside data from outside is not a field name (in a projection it selects a Hidden field); validate the input and build the filter yourself [sanitize]
-```
+<Snippet id="reference/policies/soft-delete-and-untrusted/untrusted-place-2" />
 
 Если передать место не из этих трёх, Typemo бросает `QueryError`. Такое возможно только без типов — `untrusted(value, place): place must be "filter", "update" or "projection", got string "nope"`.
 
@@ -211,11 +127,7 @@ try {
 
 <FullType>
 
-```ts
-type UntrustedPlace = "filter" | "update" | "projection";
-
-const untrusted: <const V>(value: V, place?: UntrustedPlace) => V
-```
+<Snippet id="reference/policies/soft-delete-and-untrusted/untrusted-place-3" />
 
 </FullType>
 
@@ -229,19 +141,7 @@ const untrusted: <const V>(value: V, place?: UntrustedPlace) => V
 
 `Untrusted.check` делает ту же проверку, что и [`untrusted`](#untrusted), но как явный вызов и без возврата значения. Берите его, когда значение надо проверить, а не пропускать через функцию. Например, чтобы проверить целый объект настроек перед сохранением.
 
-```ts twoslash
-import { Untrusted } from "@venloc/typemo";
-// ---cut---
-Untrusted.check({ d: new Date() });
-// → нормально: дата — данные, внутрь не смотрим
-
-try {
-  Untrusted.check(new Map([["$x", 1]]));
-} catch (error) {
-  console.log((error as Error).message);
-  // → untrusted value: "$x" at "$x" — an operator inside data from outside (query selector injection); validate the input and build the filter yourself [sanitize]
-}
-```
+<Snippet id="reference/policies/soft-delete-and-untrusted/untrusted-check" twoslash />
 
 <Returns type="void">
 
@@ -264,9 +164,7 @@ try {
 
 <FullType>
 
-```ts
-static check(value: unknown, place?: UntrustedPlace): void
-```
+<Snippet id="reference/policies/soft-delete-and-untrusted/untrusted-check-2" />
 
 </FullType>
 

@@ -17,69 +17,13 @@ icon: Rows3
 - В `orders` пять заказов. У `alice` — 120 (5 января), 80 (10 февраля) и 30 (1 марта), у `bob` — 50 (11 февраля) и 200 (2 марта).
 - В `daily_sales` продажи по дням. День 1 — 10, день 2 без значения, день 4 — 40, день 5 без значения, а дня 3 нет вовсе.
 
-```ts twoslash title="shop/models.ts"
-import { Entity, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-export class Order extends Entity {
-  @Prop(() => String, { required: true })
-  customer!: string;
-
-  @Prop(() => Number, { required: true })
-  total!: number;
-
-  @Prop(() => Date, { required: true })
-  placedAt!: Date;
-}
-
-@Schema({ collection: "daily_sales" })
-export class DailySales extends Entity {
-  @Prop(() => Number, { required: true })
-  day!: number;
-
-  @Prop(() => Number)
-  amount?: number;
-}
-```
+<Snippet id="aggregation/windows/prerequisites" title="shop/models.ts" twoslash />
 
 ## Быстрый путь [#quick-start]
 
 Разделите строки на группы (`partitionBy`), упорядочьте их внутри группы (`sortBy`) и опишите, что посчитать для каждой строки. Нарастающий итог — это сумма, обёрнутая в [`withWindow`](../reference/aggregation/window-operators.mdx#with-window), а место в списке даёт [`fn.rank`](../reference/aggregation/window-operators.mdx#fn.rank).
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-@Schema({ collection: "daily_sales" })
-class DailySales extends Entity {
-  @Prop(() => Number, { required: true }) day!: number;
-  @Prop(() => Number) amount?: number;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-const Sales = client.connection.model(DailySales);
-// ---cut---
-const query = Orders.aggregate((p) =>
-  p.setWindowFields({
-    partitionBy: (f) => f.customer,
-    sortBy: { placedAt: 1 },
-    output: (f) => ({
-      running: withWindow(fn.sum(f.total), { documents: ["unbounded", "current"] }),
-      rank: fn.rank(),
-    }),
-  }),
-);
-const rows = await query;
-//    ^?
-// → alice: (120, running 120, rank 1), (80, 200, 2), (30, 230, 3); bob: (50, 50, 1), (200, 250, 2)
-```
+<Snippet id="aggregation/windows/quick-start" twoslash />
 
 Ниже разберём окна, соседние значения и починку рядов.
 
@@ -93,34 +37,7 @@ const rows = await query;
 
 Если окно не задано, оно охватывает всю группу. Тогда каждая строка получает общий итог своей группы. С `group` так не выйдет, не потеряв строки.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-@Schema({ collection: "daily_sales" })
-class DailySales extends Entity {
-  @Prop(() => Number, { required: true }) day!: number;
-  @Prop(() => Number) amount?: number;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-const Sales = client.connection.model(DailySales);
-// ---cut---
-const rows = await Orders.aggregate((p) =>
-  p.setWindowFields({
-    partitionBy: (f) => f.customer,
-    output: (f) => ({ customerTotal: fn.sum(f.total) }),
-  }),
-);
-// → alice: 120, 80, 30 → customerTotal 230 у каждой; bob: 50, 200 → 250
-```
+<Snippet id="aggregation/windows/group-total-per-row" twoslash />
 
 `sortBy` тут не нужен — на сумму по всей группе порядок не влияет.
 
@@ -128,35 +45,7 @@ const rows = await Orders.aggregate((p) =>
 
 [`fn.shift`](../reference/aggregation/window-operators.mdx#fn.shift) берёт значение со сдвигом по порядку, и `by: -1` — это предыдущая строка. У первой строки предыдущей нет, поэтому там `null`.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-@Schema({ collection: "daily_sales" })
-class DailySales extends Entity {
-  @Prop(() => Number, { required: true }) day!: number;
-  @Prop(() => Number) amount?: number;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-const Sales = client.connection.model(DailySales);
-// ---cut---
-const query = Orders.aggregate((p) =>
-  p
-    .setWindowFields({ sortBy: { placedAt: 1 }, output: (f) => ({ prev: fn.shift({ output: f.total, by: -1 }) }) })
-    .project({ total: 1, prev: 1, _id: 0 }),
-);
-const rows = await query;
-//    ^?
-// → [{ total: 120, prev: null }, { total: 80, prev: 120 }, { total: 50, prev: 80 }, { total: 30, prev: 50 }, { total: 200, prev: 30 }]
-```
+<Snippet id="aggregation/windows/previous-value" twoslash />
 
 Разницу с предыдущим посчитает `fn.subtract(f.total, f.prev)` в следующей стадии. Все оконные операторы — `rank`, `denseRank`, `documentNumber`, `derivative`, `integral`, `expMovingAvg` и другие — перечислены в справочнике [Оконные операторы](../reference/aggregation/window-operators.mdx).
 
@@ -164,31 +53,7 @@ const rows = await query;
 
 В `daily_sales` нет дня 3, и график продаж покажет провал. [`densify`](../reference/aggregation/stages.mdx#densify) создаёт недостающие строки с заданным шагом. В новых строках есть только поле ряда и поля группировки, поэтому остальные поля в типе становятся необязательными.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-@Schema({ collection: "daily_sales" })
-class DailySales extends Entity {
-  @Prop(() => Number, { required: true }) day!: number;
-  @Prop(() => Number) amount?: number;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-const Sales = client.connection.model(DailySales);
-// ---cut---
-const query = Sales.aggregate((p) => p.densify({ field: "day", range: { step: 1, bounds: "full" } }));
-const rows = await query;
-//    ^?
-// → [{ day: 1, amount: 10 }, { day: 2 }, { day: 3 }, { day: 4, amount: 40 }, { day: 5 }]
-```
+<Snippet id="aggregation/windows/fill-gaps" twoslash />
 
 Для дат добавьте `unit`, например `"day"` или `"month"`. `bounds` бывает `"full"` — от минимума до максимума, `"partition"` — в пределах группы, или явной парой значений.
 
@@ -196,36 +61,7 @@ const rows = await query;
 
 У дня 2 и дня 5 суммы нет. [`fill`](../reference/aggregation/stages.mdx#fill) заполняет их способом `method` или значением из выражения. Способ `"locf"` берёт последнее известное значение, `"linear"` — линейную интерполяцию, и обоим нужен порядок `sortBy`.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-@Schema({ collection: "daily_sales" })
-class DailySales extends Entity {
-  @Prop(() => Number, { required: true }) day!: number;
-  @Prop(() => Number) amount?: number;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-const Sales = client.connection.model(DailySales);
-// ---cut---
-const filled = await Sales.aggregate((p) =>
-  p.fill({ sortBy: { day: 1 }, output: { amount: { method: "locf" } } }).project({ day: 1, amount: 1, _id: 0 }),
-);
-// → [{ day: 1, amount: 10 }, { day: 2, amount: 10 }, { day: 4, amount: 40 }, { day: 5, amount: 40 }]
-
-const zeros = await Sales.aggregate((p) =>
-  p.fill({ output: { amount: { value: () => 0 } } }).project({ day: 1, amount: 1, _id: 0 }),
-);
-// → [{ day: 1, amount: 10 }, { day: 2, amount: 0 }, { day: 4, amount: 40 }, { day: 5, amount: 0 }]
-```
+<Snippet id="aggregation/windows/fill-empty" twoslash />
 
 Чтобы получить непрерывный ряд без пустот, сначала поставьте `densify`, а потом `fill`.
 
@@ -245,52 +81,13 @@ const zeros = await Sales.aggregate((p) =>
 
 **Функции порядка без `sortBy`.** Ранг считается по порядку, и `fn.rank()` без `sortBy` смысла не имеет. Компилятор такое отвергает.
 
-```ts twoslash
-// @errors: 2769
-import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-@Schema({ collection: "daily_sales" })
-class DailySales extends Entity {
-  @Prop(() => Number, { required: true }) day!: number;
-  @Prop(() => Number) amount?: number;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-const Sales = client.connection.model(DailySales);
-// ---cut---
-await Orders.aggregate((p) => p.setWindowFields({ output: () => ({ rank: fn.rank() }) }));
-```
+<Snippet id="aggregation/windows/troubleshooting" twoslash />
 
 Добавьте `sortBy: { placedAt: 1 }`.
 
 **Ранг по нескольким полям.** `rank`, `denseRank`, `documentNumber` и `linearFill` сервер считает только по порядку из одного поля. «Место по клиенту и сумме вместе» ему не объяснить, и Typemo останавливает такой вызов при компиляции.
 
-```ts twoslash
-// @errors: 2769
-import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-// ---cut---
-await Orders.aggregate((p) =>
-  p.setWindowFields({ sortBy: { customer: 1, total: 1 }, output: () => ({ place: fn.rank() }) }),
-);
-```
+<Snippet id="aggregation/windows/troubleshooting-2" twoslash />
 
 Ошибка называет поле результата и правило — `$setWindowFields output "place" needs a sortBy with exactly one field (rank, denseRank, documentNumber and linearFill: a server rule)`. Оставьте один ключ порядка, например `sortBy: { total: -1 }`. Если типы обойдены приведением, ту же причину назовёт построитель стадии — `ConfigurationError: $setWindowFields: $rank needs a sortBy with exactly one field (server rule)`.
 
@@ -298,49 +95,7 @@ await Orders.aggregate((p) =>
 
 ## Полный пример [#full-example]
 
-```ts twoslash title="reports/customers.ts"
-import { Entity, Prop, Schema, TypemoClient, fn, withWindow } from "@venloc/typemo";
-
-@Schema({ collection: "orders" })
-class Order extends Entity {
-  @Prop(() => String, { required: true }) customer!: string;
-  @Prop(() => Number, { required: true }) total!: number;
-  @Prop(() => Date, { required: true }) placedAt!: Date;
-}
-
-@Schema({ collection: "daily_sales" })
-class DailySales extends Entity {
-  @Prop(() => Number, { required: true }) day!: number;
-  @Prop(() => Number) amount?: number;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Orders = client.connection.model(Order);
-const Sales = client.connection.model(DailySales);
-// ---cut---
-export const orderTimeline = () =>
-  Orders.aggregate((p) =>
-    p
-      .setWindowFields({
-        partitionBy: (f) => f.customer,
-        sortBy: { placedAt: 1 },
-        output: (f) => ({
-          running: withWindow(fn.sum(f.total), { documents: ["unbounded", "current"] }),
-          rank: fn.rank(),
-          previous: fn.shift({ output: f.total, by: -1 }),
-        }),
-      })
-      .project({ customer: 1, total: 1, running: 1, rank: 1, previous: 1, _id: 0 }),
-  ).plain();
-
-export const continuousSales = () =>
-  Sales.aggregate((p) =>
-    p
-      .densify({ field: "day", range: { step: 1, bounds: "full" } })
-      .fill({ sortBy: { day: 1 }, output: { amount: { method: "locf" } } })
-      .project({ day: 1, amount: 1, _id: 0 }),
-  );
-```
+<Snippet id="aggregation/windows/full-example" title="reports/customers.ts" twoslash />
 
 ## Что дальше [#next-steps]
 

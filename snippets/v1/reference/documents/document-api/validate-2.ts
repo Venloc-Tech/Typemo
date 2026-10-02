@@ -1,0 +1,1 @@
+$validate(): Promise<void>;

@@ -20,28 +20,7 @@ icon: Upload
 
 Одна порция — это один вызов `bulkWrite` со списком операций «обнови по `sku`, а если такого нет, создай» (`upsert`). Режим `ordered: false` велит выполнить все операции, даже если какая-то упала.
 
-```ts twoslash
-import { BulkWriteError, Entity, Prop, Schema, TypemoClient, type BulkWriteOperation } from "@venloc/typemo";
-@Schema({ collection: "products" })
-class Product extends Entity {
-  @Prop(() => String, { required: true, unique: true }) sku!: string;
-  @Prop(() => String, { required: true, unique: true }) name!: string;
-  @Prop(() => Number, { required: true, min: 0 }) price!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Products = client.db().model(Product);
-type Row = { sku: string; name: string; price: number };
-// ---cut---
-const result = await Products.bulkWrite(
-  [
-    { updateOne: { filter: { sku: "S1" }, update: { $set: { name: "One", price: 10 } }, upsert: true } },
-    { updateOne: { filter: { sku: "S3" }, update: { $set: { name: "Three", price: 30 } }, upsert: true } },
-  ],
-  { ordered: false },
-);
-console.log(result.upsertedCount, result.matchedCount);
-// → 2 0
-```
+<Snippet id="recipes/bulk-import/quick-start" twoslash />
 
 Ниже добавим то, без чего настоящий импорт не обходится, — порции, сбор ошибок и отчёт.
 
@@ -49,33 +28,13 @@ console.log(result.upsertedCount, result.matchedCount);
 
 У товара три поля. Артикул `sku` и название уникальны. По `sku` мы находим товар при обновлении, а уникальное название понадобится, чтобы получить в примере настоящую ошибку сервера.
 
-```ts twoslash title="products/product.ts"
-import { Entity, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "products" })
-export class Product extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  sku!: string;
-
-  @Prop(() => String, { required: true, unique: true })
-  name!: string;
-
-  @Prop(() => Number, { required: true, min: 0 })
-  price!: number;
-}
-```
+<Snippet id="recipes/bulk-import/define-model" title="products/product.ts" twoslash />
 
 ## Нарезать строки на порции [#batch-rows]
 
 Порция — это кусок списка фиксированного размера. Размер подбирают так, чтобы запрос не был огромным, а обменов было немного. Для небольших документов подходят сотни и тысячи строк. Делайте размер параметром, а не константой в коде, и подбирайте его под свои документы.
 
-```ts twoslash title="import/portions.ts"
-export const portions = function* <T>(rows: readonly T[], size: number): Generator<{ start: number; rows: readonly T[] }> {
-  for (let start = 0; start < rows.length; start += size) {
-    yield { start, rows: rows.slice(start, start + size) };
-  }
-};
-```
+<Snippet id="recipes/bulk-import/batch-rows" title="import/portions.ts" twoslash />
 
 Вместе с порцией отдаётся её `start` — номер первой строки во всём файле. С ним ошибка внутри порции назовёт номер строки в файле, а не номер внутри порции.
 
@@ -87,10 +46,7 @@ export const portions = function* <T>(rows: readonly T[], size: number): Generat
 
 Скажем, в пакете четыре операции с ценами `1`, `-1`, `"abc"` и `4`. Запишутся первая и последняя, а две другие `writeErrors` опишет так.
 
-```text
-[1] ValidationError: Validation failed: "price": must be at least 0 [min]
-[2] CastError: Cast to number failed at path "$set.price" for "abc" (string): expected a number [type]
-```
+<Snippet id="recipes/bulk-import/schema-checks-every-operation" />
 
 Сам `BulkWriteError` называет число неудач и первую из них — `Product.bulkWrite: 2 write(s) failed (first at index 1: Validation failed: "price": must be at least 0 [min])`. Для вставки без обязательной цены текст такой — `Validation failed: "price": upsert would create a document without the required field "price"; give it in the filter (an equality), in $set or in $setOnInsert [required]`.
 
@@ -100,35 +56,7 @@ export const portions = function* <T>(rows: readonly T[], size: number): Generat
 
 Порция превращается в список операций. Все отказы приходят одной ошибкой [`BulkWriteError`](../reference/errors/server-errors.mdx#bulk-write-error). В её `writeErrors` у каждой неудачи есть индекс операции, а в `result` — то, что успело записаться. Отказы проверки схемы и отказы сервера лежат в одном списке, ведь для импорта это одно и то же — строка не записана. В неупорядоченном режиме успешные операции остаются записанными, поэтому счётчики берутся и из ошибки.
 
-```ts twoslash title="import/write-portion.ts"
-import { BulkWriteError, Entity, Prop, Schema, TypemoClient, type BulkWriteOperation } from "@venloc/typemo";
-@Schema({ collection: "products" })
-class Product extends Entity {
-  @Prop(() => String, { required: true, unique: true }) sku!: string;
-  @Prop(() => String, { required: true, unique: true }) name!: string;
-  @Prop(() => Number, { required: true, min: 0 }) price!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Products = client.db().model(Product);
-type Row = { sku: string; name: string; price: number };
-// ---cut---
-export const writePortion = async (rows: readonly Row[]) => {
-  const operations: BulkWriteOperation<Product>[] = rows.map((row) => ({
-    updateOne: { filter: { sku: row.sku }, update: { $set: { name: row.name, price: row.price } }, upsert: true },
-  }));
-  try {
-    const result = await Products.bulkWrite(operations, { ordered: false });
-    return { created: result.upsertedCount, updated: result.modifiedCount, failures: [] as { index: number; reason: string }[] };
-  } catch (error) {
-    if (!(error instanceof BulkWriteError)) throw error;
-    return {
-      created: error.result.upsertedCount,
-      updated: error.result.modifiedCount,
-      failures: error.writeErrors.map((failure) => ({ index: failure.index, reason: failure.error.name })),
-    };
-  }
-};
-```
+<Snippet id="recipes/bulk-import/write-batch-collect-failures" title="import/write-portion.ts" twoslash />
 
 Ошибки других классов, например сетевые или серверные, пробрасываются дальше. Такой импорт надо остановить, а не записать в отчёт.
 
@@ -138,33 +66,7 @@ export const writePortion = async (rows: readonly Row[]) => {
 
 `importProducts` идёт по порциям, записывает каждую и складывает счётчики. Номер строки в отчёте — это номер в файле, считая с нуля, то есть начало порции плюс индекс операции в ней.
 
-```ts twoslash title="import/import-products.ts"
-import { BulkWriteError, Entity, Prop, Schema, TypemoClient, type BulkWriteOperation } from "@venloc/typemo";
-@Schema({ collection: "products" })
-class Product extends Entity {
-  @Prop(() => String, { required: true, unique: true }) sku!: string;
-  @Prop(() => String, { required: true, unique: true }) name!: string;
-  @Prop(() => Number, { required: true, min: 0 }) price!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Products = client.db().model(Product);
-type Row = { sku: string; name: string; price: number };
-type Failure = { row: number; reason: string };
-const writePortion = async (rows: readonly Row[]) => ({ created: rows.length, updated: 0, failures: [] as { index: number; reason: string }[] });
-// ---cut---
-export const importProducts = async (rows: readonly Row[], portionSize = 500) => {
-  const report = { created: 0, updated: 0, rejected: [] as Failure[] };
-  for (let start = 0; start < rows.length; start += portionSize) {
-    const written = await writePortion(rows.slice(start, start + portionSize));
-    report.created += written.created;
-    report.updated += written.updated;
-    for (const failure of written.failures) {
-      report.rejected.push({ row: start + failure.index, reason: failure.reason });
-    }
-  }
-  return report;
-};
-```
+<Snippet id="recipes/bulk-import/single-import" title="import/import-products.ts" twoslash />
 
 Вызов на шести строках с порцией в две строки показывает всё сразу.
 
@@ -172,36 +74,7 @@ export const importProducts = async (rows: readonly Row[], portionSize = 500) =>
 - Строку 3 с отрицательной ценой отвергает схема.
 - Повторный `S1` в строке 4 обновляет товар, созданный строкой 0, поэтому `updated` равен 1.
 
-```ts twoslash
-import { BulkWriteError, Entity, Prop, Schema, TypemoClient, type BulkWriteOperation } from "@venloc/typemo";
-@Schema({ collection: "products" })
-class Product extends Entity {
-  @Prop(() => String, { required: true, unique: true }) sku!: string;
-  @Prop(() => String, { required: true, unique: true }) name!: string;
-  @Prop(() => Number, { required: true, min: 0 }) price!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Products = client.db().model(Product);
-type Row = { sku: string; name: string; price: number };
-const importProducts = async (rows: readonly Row[], portionSize = 500) => ({ created: 0, updated: 0, rejected: [] as { row: number; reason: string }[] });
-// ---cut---
-const report = await importProducts(
-  [
-    { sku: "S1", name: "One", price: 10 },
-    { sku: "S2", name: "Existing", price: 20 },
-    { sku: "S3", name: "Three", price: 30 },
-    { sku: "S4", name: "Four", price: -5 },
-    { sku: "S1", name: "One!", price: 11 },
-    { sku: "S5", name: "Five", price: 50 },
-  ],
-  2,
-);
-console.log(report);
-// → { created: 3, updated: 1, rejected: [
-//     { row: 1, reason: "DuplicateKeyError" },
-//     { row: 3, reason: "ValidationError" },
-//   ] }
-```
+<Snippet id="recipes/bulk-import/single-import-2" twoslash />
 
 ## Хуки модели работают и в пакете [#model-hooks-in-bulk]
 
@@ -209,39 +82,15 @@ console.log(report);
 
 Для импорта важно, что будет, если `@Pre` хук одной операции бросит исключение. Всё решает режим пакета, как и с ошибкой проверки схемы. В неупорядоченном пакете эта операция не отправится и попадёт в `writeErrors` под своим индексом, а остальные запишутся. Упорядоченный пакет остановится до отправки, ничего не запишет, и придёт исключение самого хука. Пусть хук отказывает артикулам на `X-`.
 
-```ts twoslash title="products/product.ts"
-import { Entity, Prop, Pre, Schema, type OperationHookContext } from "@venloc/typemo";
-
-@Schema({ collection: "products" })
-export class Product extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  sku!: string;
-
-  @Prop(() => String, { required: true, unique: true })
-  name!: string;
-
-  @Prop(() => Number, { required: true, min: 0 })
-  price!: number;
-
-  @Pre("query.updateOne")
-  rejectReserved(this: OperationHookContext<Product, "query.updateOne">): void {
-    const sku = (this.filter as { sku?: string }).sku;
-    if (this.bulkIndex !== undefined && sku?.startsWith("X-")) throw new Error(`sku ${sku} is reserved`);
-  }
-}
-```
+<Snippet id="recipes/bulk-import/model-hooks-in-bulk" title="products/product.ts" twoslash />
 
 Пакет из трёх операций (`A-1`, `X-1`, `D-1`) в неупорядоченном режиме записал `A-1` и `D-1` и бросил `BulkWriteError`. В `writeErrors` один элемент с индексом `1` и без кода сервера, а исключение хука лежит в `cause` его `error`.
 
-```text
-BulkWriteError: Product.bulkWrite: 1 write(s) failed (first at index 1: Product.updateOne (bulkWrite[1]): a pre hook threw: sku X-1 is reserved)
-```
+<Snippet id="recipes/bulk-import/model-hooks-in-bulk-2" />
 
 В упорядоченном режиме тот же пакет ничего не записал и бросил исключение хука как есть, без `BulkWriteError`.
 
-```text
-Error: sku X-1 is reserved
-```
+<Snippet id="recipes/bulk-import/model-hooks-in-bulk-3" />
 
 Если строку нужно отвергнуть ещё до обращения к базе и записать в отчёт под её настоящим номером в файле, проверяйте её до построения операций. Просто отфильтруйте такие строки в `importProducts`. А хук подходит для того, что должно одинаково срабатывать на каждой записи, — для журнала или дополнения обновления через [`modify`](../reference/hooks/operation-context.mdx#modify).
 
@@ -267,59 +116,7 @@ Error: sku X-1 is reserved
 
 ## Полный пример [#full-example]
 
-```ts twoslash title="import/import-products.ts"
-import { BulkWriteError, type BulkWriteOperation, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-
-@Schema({ collection: "products" })
-export class Product extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  sku!: string;
-
-  @Prop(() => String, { required: true, unique: true })
-  name!: string;
-
-  @Prop(() => Number, { required: true, min: 0 })
-  price!: number;
-}
-
-export const client = await TypemoClient.connect("mongodb://localhost:27017/shop");
-const Products = client.db().model(Product);
-
-export type Row = { sku: string; name: string; price: number };
-export type Failure = { row: number; reason: string };
-
-// write one portion; the schema checks every operation, refusals come back as indexes into this portion
-const writePortion = async (rows: readonly Row[]) => {
-  const operations: BulkWriteOperation<Product>[] = rows.map((row) => ({
-    updateOne: { filter: { sku: row.sku }, update: { $set: { name: row.name, price: row.price } }, upsert: true },
-  }));
-  try {
-    const result = await Products.bulkWrite(operations, { ordered: false });
-    return { created: result.upsertedCount, updated: result.modifiedCount, failures: [] as { index: number; reason: string }[] };
-  } catch (error) {
-    if (!(error instanceof BulkWriteError)) throw error;
-    return {
-      created: error.result.upsertedCount,
-      updated: error.result.modifiedCount,
-      failures: error.writeErrors.map((failure) => ({ index: failure.index, reason: failure.error.name })),
-    };
-  }
-};
-
-// the whole import: portions, row numbers of the file, one report
-export const importProducts = async (rows: readonly Row[], portionSize = 500) => {
-  const report = { created: 0, updated: 0, rejected: [] as Failure[] };
-  for (let start = 0; start < rows.length; start += portionSize) {
-    const written = await writePortion(rows.slice(start, start + portionSize));
-    report.created += written.created;
-    report.updated += written.updated;
-    for (const failure of written.failures) {
-      report.rejected.push({ row: start + failure.index, reason: failure.reason });
-    }
-  }
-  return report;
-};
-```
+<Snippet id="recipes/bulk-import/full-example" title="import/import-products.ts" twoslash />
 
 <Callout type="migration">
 

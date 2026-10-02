@@ -14,37 +14,13 @@ icon: Plug
 
 Модель счёта из файла `accounts/account.ts` и строка подключения к локальному серверу. Пакеты `@venloc/typemo` и `mongodb` должны быть установлены, а `tsconfig` настроен по руководству [Установка и настройка](../getting-started/installation.mdx).
 
-```ts twoslash title="accounts/account.ts"
-import { Entity, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "accounts" })
-export class Account extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  @Prop(() => String, { required: true })
-  owner!: string;
-}
-```
+<Snippet id="connection/clients-and-extensions/prerequisites" title="accounts/account.ts" twoslash />
 
 ## Быстрый путь [#quick-start]
 
 Чаще всего нужен один клиент и одна база, а при остановке приложения клиент закрывается. [`TypemoClient.connect`](../reference/connection/typemo-client.mdx#typemo-client.connect) создаёт клиент и сразу подключает его. [`client.connection`](../reference/connection/typemo-client.mdx#client.connection) даёт подключение к базе по умолчанию, а [`connection.model`](../reference/connection/connection.mdx#connection.model) — модель.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-}
-// ---cut---
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-console.log(await Accounts.countDocuments());
-// → 0
-await client.close();
-```
+<Snippet id="connection/connect/quick-start" twoslash />
 
 Ниже разберём каждый шаг на настоящих задачах — выбор базы, ожидание готовности, несколько баз, состояние и закрытие.
 
@@ -52,11 +28,7 @@ await client.close();
 
 Создайте клиент один раз и держите его всё время, пока работает процесс. Клиент ведёт пул соединений, и каждый новый клиент — это новый пул. Поэтому клиент обычно создают в отдельном файле и экспортируют.
 
-```ts twoslash title="db/client.ts"
-import { TypemoClient } from "@venloc/typemo";
-
-export const client = await TypemoClient.connect("mongodb://localhost:27017/app", { name: "main" });
-```
+<Snippet id="connection/connect/create-client-on-start" title="db/client.ts" twoslash />
 
 Строка подключения — обычный адрес MongoDB, `mongodb://` или `mongodb+srv://`. Всё остальное, например `localhost:27017` без схемы, [`TypemoClient`](../reference/connection/typemo-client.mdx#new-typemo-client) отвергает сразу, ещё до обращения к сети, с ошибкой `ConfigurationError: TypemoClient: the first argument is a connection string (mongodb:// or mongodb+srv://)`.
 
@@ -64,9 +36,7 @@ export const client = await TypemoClient.connect("mongodb://localhost:27017/app"
 
 Если сервер недоступен, `connect` падает с [`ConnectionError`](../reference/errors/configuration-errors.mdx#connection-error), и клиента вы не получаете. Ошибка объясняет причину. Здесь адрес указывает на порт, где ничего не слушает.
 
-```text
-ConnectionError: no server available: connect ECONNREFUSED 127.0.0.1:1
-```
+<Snippet id="connection/connect/create-client-on-start-2" />
 
 Перед этим драйвер ждёт подходящий сервер до `serverSelectionTimeoutMS`, по умолчанию 30 секунд. Так что при ошибке в адресе приложение остановится не сразу.
 
@@ -76,27 +46,11 @@ ConnectionError: no server available: connect ECONNREFUSED 127.0.0.1:1
 
 Опцию и строку можно сочетать, но они должны совпадать. Если `dbName` называет одну базу, а строка подключения другую, [`new TypemoClient`](../reference/connection/typemo-client.mdx#new-typemo-client) бросит `ConfigurationError`. Иначе часть кода работала бы не с той базой, и вы узнали бы об этом по пропавшим данным.
 
-```ts twoslash
-import { TypemoClient } from "@venloc/typemo";
-// ---cut---
-const fromUri = new TypemoClient("mongodb://localhost:27017/reports");
-console.log(fromUri.options.dbName);
-// → "reports"
-
-const fromOption = new TypemoClient("mongodb://localhost:27017", { dbName: "app" });
-console.log(fromOption.options.dbName);
-// → "app"
-
-const fallback = new TypemoClient("mongodb://localhost:27017");
-console.log(fallback.options.dbName);
-// → "test"
-```
+<Snippet id="connection/connect/default-database" twoslash />
 
 При расхождении ошибка выглядит так.
 
-```text
-ConfigurationError: TypemoClient: dbName "other" conflicts with the database "app" of the connection string
-```
+<Snippet id="connection/connect/default-database-2" />
 
 `test` придумал не Typemo, это база по умолчанию самого драйвера. Забудете указать базу, и приложение молча начнёт писать в `test`. Поэтому в настоящих проектах базу называйте явно.
 
@@ -104,25 +58,7 @@ ConfigurationError: TypemoClient: dbName "other" conflicts with the database "ap
 
 Модель возвращает [`connection.model`](../reference/connection/connection.mdx#connection.model), передайте ему класс с `@Schema`. Для одного класса на одном подключении вы всегда получаете один и тот же объект. Так что вызывайте `model` там, где удобно, и не держите результат в глобальной переменной.
 
-```ts twoslash title="accounts/accounts.service.ts"
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-// ---cut---
-export const openAccount = async (owner: string, title: string) => {
-  const Accounts = client.connection.model(Account);
-  return Accounts.create({ owner, title });
-};
-
-export const listAccounts = async (owner: string) => {
-  const Accounts = client.db().model(Account);
-  return Accounts.find({ owner }).plain();
-};
-```
+<Snippet id="connection/connect/get-model-and-work" title="accounts/accounts.service.ts" twoslash />
 
 [`client.db()`](../reference/connection/typemo-client.mdx#client.db) без аргумента возвращает то же, что `client.connection`. Первый вызов `model` для класса проверяет схему, поэтому ошибка в описании полей всплывёт здесь, а не при первой записи. Что делать с моделью дальше, рассказано в руководстве [Чтение данных](../queries/reading-data.mdx).
 
@@ -130,61 +66,19 @@ export const listAccounts = async (owner: string) => {
 
 Бывает, что данные разложены по разным базам — архив отдельно, отчёты отдельно, у каждого тенанта своя база. Новые клиенты для этого не нужны. [`client.db(name)`](../reference/connection/typemo-client.mdx#client.db) и [`connection.useDb(name)`](../reference/connection/connection.mdx#connection.use-db) возвращают подключение к другой базе **того же клиента**. Пул соединений общий, а модели и данные у каждой базы свои.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-// ---cut---
-const archive = client.connection.useDb("app_archive");
-await archive.model(Account).create({ owner: "alice", title: "Old" });
-
-const live = await client.connection.model(Account).countDocuments({ title: "Old" });
-const old = await archive.model(Account).countDocuments({ title: "Old" });
-// → live: 0, old: 1
-```
+<Snippet id="connection/connect/multiple-databases" twoslash />
 
 Запись `Account` лежит в базе `app_archive`, а в `app` её нет. Модели одного класса на разных подключениях — это разные модели с разными базами. Закрывать `archive` отдельно нельзя, да и не нужно, закрывается весь клиент.
 
 Транзакция при этом может охватить несколько баз одного клиента. Обе записи ниже фиксируются вместе.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const archive = client.connection.useDb("app_archive");
-// ---cut---
-await client.transaction(async () => {
-  await client.connection.model(Account).create({ owner: "zed", title: "Live" });
-  await archive.model(Account).create({ owner: "zed", title: "Copy" });
-});
-```
+<Snippet id="connection/connect/multiple-databases-2" twoslash />
 
 ## Создать коллекции и индексы [#create-collections-and-indexes]
 
 Typemo сам ничего в базе не создаёт — ни коллекций, ни индексов. Коллекция появится при первой записи, но индексов из схемы (`unique`, `index`) до этого нет, а значит, нет и гарантии уникальности. Поэтому при старте вызывайте [`connection.init`](../reference/connection/connection.mdx#connection.init). Он создаст то, чего в базе ещё нет, и ничего не удалит и не поменяет.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-client.connection.model(Account);
-// ---cut---
-const report = await client.connection.init();
-console.log(report.inSync, report.created);
-// → true ["collection accounts", "index accounts.title_1"]
-```
+<Snippet id="connection/connect/create-collections-and-indexes" twoslash />
 
 По отчёту видно, что база теперь соответствует моделям (`inSync: true`), а в `created` перечислено то, что создал именно этот вызов. При повторном запуске `created` будет пустым, создавать уже нечего.
 
@@ -196,32 +90,17 @@ console.log(report.inSync, report.created);
 
 Обычно `await TypemoClient.connect(...)` — это всё, что нужно. Но иногда клиент создают раньше, чем подключают. Модуль экспортирует клиент, а `connect` вызывает код запуска. Для этого есть [`new TypemoClient`](../reference/connection/typemo-client.mdx#new-typemo-client) и отдельный [`client.connect`](../reference/connection/typemo-client.mdx#client.connect).
 
-```ts twoslash title="db/client.ts"
-import { TypemoClient } from "@venloc/typemo";
-
-export const client = new TypemoClient("mongodb://localhost:27017/app", { readyTimeoutMS: 5_000 });
-
-export const start = async () => {
-  await client.connect();
-};
-```
+<Snippet id="connection/connect/wait-ready" title="db/client.ts" twoslash />
 
 Пока `start` не вызван, операции моделей не падают и не теряются. Каждая ждёт подключения сама и продолжается, как только клиент готов. Очереди с повтором нет, продолжается тот же самый вызов.
 
 Вечно операция ждать не будет. Лимит — её собственный `timeoutMS`, а если его нет, то [`readyTimeoutMS`](../reference/connection/typemo-client.mdx#client-options) клиента, по умолчанию 10 секунд. Когда лимит выйдет, придёт [`TimeoutError`](../reference/errors/server-errors.mdx#timeout-error), и по тексту видно, что забыли вызвать `connect`.
 
-```text
-TimeoutError: TypemoClient "default" is not connected after 100 ms: call connect() (operations issued before connect() wait for it)
-```
+<Snippet id="connection/connect/wait-ready-2" />
 
 Если дождаться подключения нужно явно, например перед запуском HTTP-сервера, вызовите [`client.ready`](../reference/connection/typemo-client.mdx#client.ready) с нужным сроком. Ноль значит «ждать без ограничения».
 
-```ts twoslash
-import { TypemoClient } from "@venloc/typemo";
-const client = new TypemoClient("mongodb://localhost:27017/app");
-// ---cut---
-await client.ready(0);
-```
+<Snippet id="connection/connect/wait-ready-3" twoslash />
 
 Если `connect` упадёт, ту же ошибку получат все, кто ждёт. Клиент вернётся в состояние `idle`, и `connect` можно вызвать ещё раз. На недоступном адресе это даёт две одинаковые ошибки подряд.
 
@@ -229,47 +108,19 @@ await client.ready(0);
 
 [`client.close`](../reference/connection/typemo-client.mdx#client.close) закрывает пул соединений и завершает сессии. Вызывайте его при остановке приложения и в конце скриптов, иначе открытый клиент не даст процессу завершиться. Закрытый клиент снова не откроешь. Операции на нём сразу падают с `ConnectionError`, а повторный `close` ничего не делает.
 
-```text
-ConnectionError: TypemoClient "main" is closed; create a new client
-```
+<Snippet id="connection/connect/close-client" />
 
 Операции, которые в момент закрытия ещё ждали подключения, тоже получают `ConnectionError` с `failure: "closed"`, только текст у них `TypemoClient "main" was closed`.
 
 Чтобы в скрипте не забыть про закрытие, объявите клиент через `await using`. Тогда [`client[Symbol.asyncDispose]`](../reference/connection/typemo-client.mdx#client.async-dispose) закроет его сам в конце блока, даже если внутри вылетела ошибка.
 
-```ts twoslash title="scripts/count-accounts.ts"
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) owner!: string;
-}
-// ---cut---
-{
-  await using client = await TypemoClient.connect("mongodb://localhost:27017/app");
-  const total = await client.connection.model(Account).countDocuments();
-  console.log(total);
-  // → 0
-}
-// здесь клиент уже закрыт
-```
+<Snippet id="connection/connect/close-client-2" title="scripts/count-accounts.ts" twoslash />
 
 ## Следить за состоянием подключения [#connection-state]
 
 У клиента есть состояние — `idle`, `connecting`, `connected`, `unavailable` или `closed`. Оно пригодится для проверок готовности («сервер доступен?») и для журнала. [`client.onStateChange`](../reference/connection/typemo-client.mdx#client.on-state-change) вызывает вашу функцию при каждой смене, а текущее значение всегда лежит в [`client.state`](../reference/connection/typemo-client.mdx#client.state).
 
-```ts twoslash title="db/monitor.ts"
-import { TypemoClient } from "@venloc/typemo";
-const client = new TypemoClient("mongodb://localhost:27017/app");
-// ---cut---
-const stop = client.onStateChange((state) => console.log("db:", state));
-await client.connect();
-// → "db: connecting"
-// → "db: connected"
-await client.close();
-// → "db: closed"
-stop();
-```
+<Snippet id="connection/connect/connection-state" title="db/monitor.ts" twoslash />
 
 Функция получает только смены. Начальное `idle` ей не приходит, его читайте из `client.state`.
 
@@ -281,14 +132,7 @@ stop();
 
 Проверить это можно сразу после подключения через [`client.supportsTransactions`](../reference/connection/typemo-client.mdx#client.supports-transactions). Он равен `true` для реплика-сета, `false` для одиночного сервера и `undefined`, пока клиент не подключался.
 
-```ts twoslash title="db/health.ts"
-import { TypemoClient } from "@venloc/typemo";
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-// ---cut---
-if (client.supportsTransactions === false) {
-  throw new Error("MongoDB должен работать как реплика-сет: транзакции не поддерживаются");
-}
-```
+<Snippet id="connection/connect/replica-set" title="db/health.ts" twoslash />
 
 Как пользоваться транзакциями, рассказано в руководстве [Транзакции](../transactions/transactions.mdx).
 
@@ -308,17 +152,7 @@ if (client.supportsTransactions === false) {
 
 **Приложение не завершается после последней операции.** Скрипт всё выполнил, а процесс висит, пока его не прервут. Тот же скрипт с `close` выходит с кодом 0. Процесс держит открытый пул соединений. Закройте клиент в конце скрипта или объявите его через `await using`.
 
-```ts twoslash
-import { TypemoClient } from "@venloc/typemo";
-// ---cut---
-// неправильно: клиент остаётся открытым
-const leaky = await TypemoClient.connect("mongodb://localhost:27017/app");
-
-// правильно: закрывается в конце блока
-{
-  await using client = await TypemoClient.connect("mongodb://localhost:27017/app");
-}
-```
+<Snippet id="connection/connect/troubleshooting" twoslash />
 
 **Ошибка `is not connected after … ms`.** Операция ждала подключения и не дождалась. Клиент создан через `new TypemoClient`, а `connect` так и не вызвали или вызвали позже лимита. Текст ошибки сам подсказывает выход — вызовите [`client.connect`](../reference/connection/typemo-client.mdx#client.connect) при запуске или создайте клиент через `TypemoClient.connect`.
 
@@ -330,46 +164,7 @@ const leaky = await TypemoClient.connect("mongodb://localhost:27017/app");
 
 Здесь всё вместе — клиент, подготовка базы, работа с моделью и закрытие. Код, которого нет в Typemo и который пишете вы, помечен `__…__`.
 
-```ts twoslash title="main.ts"
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  title!: string;
-
-  @Prop(() => String, { required: true })
-  owner!: string;
-}
-
-// код читателя: ошибка на границе приложения
-class __NotFound__ extends Error {}
-
-const main = async () => {
-  // клиент: одна строка подключения, база указана явно
-  const client = await TypemoClient.connect("mongodb://localhost:27017/app", { name: "main" });
-
-  // состояние: пишем в журнал каждую смену
-  client.onStateChange((state) => console.log("db:", state));
-
-  // проверка окружения: транзакциям нужен реплика-сет
-  if (client.supportsTransactions === false) throw new Error("replica set required");
-
-  // подготовка базы: создаём индексы, которых нет
-  const Accounts = client.connection.model(Account);
-  await client.connection.init();
-
-  // работа с моделью
-  await Accounts.create({ owner: "alice", title: "Main" });
-  const found = await Accounts.findOne({ owner: "alice" }).orFail();
-  if (found.title !== "Main") throw new __NotFound__("account is missing");
-
-  // закрытие при остановке
-  await client.close();
-};
-
-await main();
-```
+<Snippet id="connection/connect/full-example" title="main.ts" twoslash />
 
 <Callout type="migration">
 

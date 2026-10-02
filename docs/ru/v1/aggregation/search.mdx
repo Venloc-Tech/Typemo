@@ -18,45 +18,13 @@ icon: Search
 
 Клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель статьи блога. У неё есть поисковый индекс `articles_text` для `$search` и векторный индекс `vec` для поля `embedding`, оба объявлены по руководству о поисковых индексах.
 
-```ts twoslash title="blog/article.ts"
-import { Entity, Prop, Schema, Spec, type Vector } from "@venloc/typemo";
-
-@Schema({ collection: "articles" })
-export class Article extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  @Prop(() => String, { required: true })
-  body!: string;
-
-  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 }))
-  embedding?: Vector;
-}
-```
+<Snippet id="aggregation/search/prerequisites" title="blog/article.ts" twoslash />
 
 ## Быстрый путь [#quick-start]
 
 `search` принимает имя индекса и оператор поиска, например `text`. Оценку релевантности даёт [`fn.meta`](../reference/aggregation/expr-misc.mdx#fn.meta).
 
-```ts twoslash
-import { Entity, Prop, Schema, Spec, TypemoClient, fn, Pipeline, type Vector } from "@venloc/typemo";
-
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) embedding?: Vector;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
-const Articles = client.connection.model(Article);
-// ---cut---
-const pipeline = Pipeline.from(Article)
-  .search({ index: "articles_text", text: { path: "title", query: "mongo" } })
-  .project(() => ({ title: 1, score: fn.meta("searchScore") }));
-console.log(JSON.stringify(pipeline.plan().pipeline));
-// → [{"$search":{"index":"articles_text","text":{"path":"title","query":"mongo"}}},{"$project":{"title":1,"score":{"$meta":"searchScore"}}}]
-```
+<Snippet id="aggregation/search/quick-start" twoslash />
 
 Ниже разберём операторы, векторный поиск и объединение результатов.
 
@@ -71,79 +39,19 @@ console.log(JSON.stringify(pipeline.plan().pipeline));
 
 Поле `path` проверяется по модели, так что опечатка не скомпилируется.
 
-```ts twoslash
-import { Entity, Prop, Schema, Spec, TypemoClient, fn, Pipeline, type Vector } from "@venloc/typemo";
-
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) embedding?: Vector;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
-const Articles = client.connection.model(Article);
-// ---cut---
-const pipeline = Pipeline.from(Article).search({
-  index: "articles_text",
-  compound: {
-    must: [{ text: { path: "title", query: "mongo" } }],
-    should: [{ phrase: { path: "body", query: "full text" } }],
-  },
-});
-```
+<Snippet id="aggregation/search/text-search-with-filter" twoslash />
 
 Конвейер собирается в `{"$search":{"index":"articles_text","compound":{"must":[{"text":…}],"should":[{"phrase":…}]}}}`. В `search` есть и другие операторы — `phrase`, `autocomplete`, `equals`, `range`, `regex`, `wildcard`, `near`, `queryString`, `moreLikeThis`, а ещё `highlight`, `count` и `sort`. Полный перечень — в справочнике [Стадии](../reference/aggregation/stages.mdx#search).
 
 Через [`Model.aggregate`](../reference/aggregation/pipeline.mdx#model.aggregate) `search` тоже вызывается первой стадией. Если у модели есть [скрытые поля](../schemas/hidden-and-sensitive.mdx#hidden-in-aggregation), Typemo убирает их стадией `$unset` и ставит её сразу после поиска, а не перед ним. Сервер принимает `$search`, `$searchMeta` и `$vectorSearch` только первыми. Отправленный конвейер начинается так — `[{ $search: … }, { $unset: ["…"] }, …]`.
 
-```ts twoslash title="blog/articles.service.ts"
-import { Entity, Prop, Schema, Spec, TypemoClient, fn, Pipeline, type Vector } from "@venloc/typemo";
-
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) embedding?: Vector;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
-const Articles = client.connection.model(Article);
-// ---cut---
-export const searchTitles = (query: string) =>
-  Articles.aggregate((p) =>
-    p
-      .search({ index: "articles_text", text: { path: "title", query } })
-      .project(() => ({ title: 1, score: fn.meta("searchScore"), _id: 0 }))
-      .limit(10),
-  ).plain();
-```
+<Snippet id="aggregation/search/text-search-with-filter-2" title="blog/articles.service.ts" twoslash />
 
 ## Получить метаданные поиска [#search-meta]
 
 [`searchMeta`](../reference/aggregation/stages.mdx#search-meta) возвращает не документы, а сведения о поиске. Сколько всего совпадений и как они распределены по фасетам. С ним можно показать «найдено 128 статей», не выгружая сами статьи.
 
-```ts twoslash
-import { Entity, Prop, Schema, Spec, TypemoClient, fn, Pipeline, type Vector } from "@venloc/typemo";
-
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) embedding?: Vector;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
-const Articles = client.connection.model(Article);
-// ---cut---
-const pipeline = Pipeline.from(Article).searchMeta({
-  index: "articles_text",
-  text: { path: "title", query: "mongo" },
-  count: { type: "total" },
-});
-console.log(JSON.stringify(pipeline.plan().pipeline));
-// → [{"$searchMeta":{"index":"articles_text","text":{"path":"title","query":"mongo"},"count":{"type":"total"}}}]
-```
+<Snippet id="aggregation/search/search-meta" twoslash />
 
 ## Искать по смыслу [#semantic-search]
 
@@ -154,57 +62,13 @@ console.log(JSON.stringify(pipeline.plan().pipeline));
 - `exact: true` включает точный поиск вместо приближённого.
 - `filter` отбирает документы по индексируемым полям ещё до сравнения.
 
-```ts twoslash title="blog/similar.service.ts"
-import { Entity, Prop, Schema, Spec, TypemoClient, fn, Pipeline, type Vector } from "@venloc/typemo";
-
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) embedding?: Vector;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
-const Articles = client.connection.model(Article);
-// ---cut---
-export const similar = (queryVector: number[]) =>
-  Articles.aggregate((p) =>
-    p
-      .vectorSearch({ index: "vec", path: "embedding", queryVector, limit: 5, numCandidates: 50 })
-      .project(() => ({ title: 1, score: fn.meta("vectorSearchScore"), _id: 0 })),
-  ).plain();
-```
+<Snippet id="aggregation/search/semantic-search" title="blog/similar.service.ts" twoslash />
 
 ## Объединить текстовый и векторный поиск [#hybrid-search]
 
 Текстовый поиск находит точные слова, векторный — похожий смысл, а вместе они дают список лучше. [`rankFusion`](../reference/aggregation/stages.mdx#rank-fusion) принимает именованные подконвейеры и объединяет их результаты по месту в каждом списке. `weights` задают вес каждого подконвейера. Это тоже первая стадия, и ей нужен MongoDB 8.1 или новее.
 
-```ts twoslash
-import { Entity, Prop, Schema, Spec, TypemoClient, fn, Pipeline, type Vector } from "@venloc/typemo";
-
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) embedding?: Vector;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
-const Articles = client.connection.model(Article);
-// ---cut---
-const pipeline = Pipeline.from(Article)
-  .rankFusion({
-    input: {
-      pipelines: {
-        text: (p) => p.search({ text: { path: "body", query: "mongo" } }).limit(10),
-        vector: (p) =>
-          p.vectorSearch({ index: "vec", path: "embedding", queryVector: [0.1, 0.2, 0.3], limit: 10 }),
-      },
-    },
-    combination: { weights: { text: 2, vector: 1 } },
-  })
-  .limit(5);
-```
+<Snippet id="aggregation/search/hybrid-search" twoslash />
 
 Имена в `weights` сверяются с именами подконвейеров, и вес несуществующего подконвейера не скомпилируется. [`scoreFusion`](../reference/aggregation/stages.mdx#score-fusion) (MongoDB 8.2+) объединяет по **оценкам**, а не по местам. Ему нужна `normalization` — `"none"`, `"sigmoid"` или `"minMaxScaler"`, — чтобы привести оценки разных поисков к одной шкале. [`score`](../reference/aggregation/stages.mdx#score) (MongoDB 8.2+) задаёт оценку документа выражением.
 
@@ -226,22 +90,7 @@ const pipeline = Pipeline.from(Article)
 
 **Поиск не первой стадией.** `search`, `searchMeta`, `vectorSearch`, `rankFusion` и `scoreFusion` вызываются только на пустом конвейере. После другой стадии они не скомпилируются.
 
-```ts twoslash
-// @errors: 2684
-import { Entity, Prop, Schema, Spec, TypemoClient, fn, Pipeline, type Vector } from "@venloc/typemo";
-
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) embedding?: Vector;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
-const Articles = client.connection.model(Article);
-// ---cut---
-Pipeline.from(Article).limit(10).search({ text: { path: "title", query: "mongo" } });
-```
+<Snippet id="aggregation/search/troubleshooting" twoslash />
 
 Поставьте поиск первым, а `limit` после него.
 
@@ -249,36 +98,7 @@ Pipeline.from(Article).limit(10).search({ text: { path: "title", query: "mongo" 
 
 ## Полный пример [#full-example]
 
-```ts twoslash title="blog/search.service.ts"
-import { Entity, Prop, Schema, Spec, TypemoClient, fn, Pipeline, type Vector } from "@venloc/typemo";
-
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Spec.vector({ dtype: "float32", dimensions: 3 })) embedding?: Vector;
-}
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/blog");
-const Articles = client.connection.model(Article);
-// ---cut---
-// 1. Поиск по словам с оценкой.
-export const searchArticles = (query: string) =>
-  Articles.aggregate((p) =>
-    p
-      .search({ index: "articles_text", text: { path: "title", query } })
-      .project(() => ({ title: 1, score: fn.meta("searchScore"), _id: 0 }))
-      .limit(10),
-  ).plain();
-
-// 2. Поиск по смыслу.
-export const similarArticles = (queryVector: number[]) =>
-  Articles.aggregate((p) =>
-    p
-      .vectorSearch({ index: "vec", path: "embedding", queryVector, limit: 5 })
-      .project(() => ({ title: 1, _id: 0 })),
-  ).plain();
-```
+<Snippet id="aggregation/search/full-example" title="blog/search.service.ts" twoslash />
 
 ## Что дальше [#next-steps]
 

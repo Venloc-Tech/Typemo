@@ -12,24 +12,7 @@ icon: RefreshCw
 
 Примеры используют две модели — счёт с уникальным названием и журнал проводок ограниченного размера.
 
-```ts twoslash title="accounts/models.ts"
-import { Entity, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "accounts" })
-export class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  title!: string;
-
-  @Prop(() => String, { required: true, index: true })
-  owner!: string;
-}
-
-@Schema({ collection: "ledger", capped: { size: 65_536, max: 100 } })
-export class LedgerEntry extends Entity {
-  @Prop(() => String, { required: true })
-  note!: string;
-}
-```
+<Snippet id="reference/collections/sync-all/intro" title="accounts/models.ts" twoslash />
 
 Результаты в комментариях получены на пустой базе, если рядом не сказано иное.
 
@@ -41,30 +24,7 @@ export class LedgerEntry extends Entity {
 
 Для каждой коллекции метод делает три шага по очереди. Он приводит параметры коллекции ([`ensureCollection`](./collection-manager.mdx#model.ensure-collection)), обычные индексы ([`syncIndexes`](./model-indexes.mdx#model.sync-indexes)) и, если схема объявляет поисковые индексы, их тоже ([`syncSearchIndexes`](./model-indexes.mdx#model.sync-search-indexes)). Потом для каждого представления вызывается [`TypedView.ensure`](./typed-view.mdx#typed-view.ensure). Сбой любого шага запоминается, остальные шаги идут дальше.
 
-```ts twoslash
-import { Entity, Prop, Schema, SyncAll, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => String, { required: true, index: true }) owner!: string;
-}
-@Schema({ collection: "ledger", capped: { size: 65_536, max: 100 } })
-class LedgerEntry extends Entity {
-  @Prop(() => String, { required: true }) note!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const connection = client.connection;
-connection.model(Account);
-connection.model(LedgerEntry);
-// ---cut---
-const report = await SyncAll.run(connection);
-console.log(report.inSync, report.failed);
-// → false false
-console.log(report.collections.map((c) => [c.collection, c.options?.result, c.indexes?.toCreate]));
-// → [["accounts", "created", ["title_1", "owner_1"]], ["ledger", "created", []]]
-console.log(report.created);
-// → ["collection accounts", "index accounts.title_1", "index accounts.owner_1", "collection ledger"]
-```
+<Snippet id="reference/collections/sync-all/sync-all-run" twoslash />
 
 `inSync` здесь `false`, хотя ничего не сломалось. В базе было что создавать, и список `created` говорит, что именно создано. Когда всё создано, повторный вызов вернёт `inSync: true` и пустой `created`.
 
@@ -89,9 +49,7 @@ console.log(report.created);
 
 <FullType>
 
-```ts
-static run(connection: Connection, options?: SyncAllOptions): Promise<SyncReport>
-```
+<Snippet id="reference/collections/sync-all/sync-all-run-2" />
 
 </FullType>
 
@@ -101,23 +59,7 @@ static run(connection: Connection, options?: SyncAllOptions): Promise<SyncReport
 
 С `dryRun: true` метод сообщает, что изменилось бы, и ничего не записывает — ни коллекций, ни индексов, ни представлений. Так удобно проверять базу перед деплоем, например в CI. После такого вызова на пустой базе в ней по-прежнему нет ни одной коллекции.
 
-```ts twoslash
-import { Entity, Prop, Schema, SyncAll, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => String, { required: true, index: true }) owner!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const connection = client.connection;
-connection.model(Account);
-// ---cut---
-const plan = await SyncAll.run(connection, { dryRun: true });
-console.log(plan.inSync, plan.collections[0]?.indexes?.dryRun);
-// → false true
-console.log(plan.created);
-// → ["collection accounts", "index accounts.title_1", "index accounts.owner_1"]
-```
+<Snippet id="reference/collections/sync-all/validate-without-saving" twoslash />
 
 При `dryRun` список `created` показывает то, что было бы создано. Если проверка находит сбой, например коллекцию, устроенную иначе, чем в схеме, метод и с `dryRun` бросает `SyncError`. Деплой с таким расхождением всё равно не прошёл бы.
 
@@ -125,44 +67,11 @@ console.log(plan.created);
 
 Скажем, в `accounts` два счёта с одним названием, а `ledger` уже есть как обычная коллекция без ограничения размера. Оба сбоя попадут в одну ошибку.
 
-```ts twoslash
-import { Entity, Prop, Schema, SyncAll, SyncError, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => String, { required: true, index: true }) owner!: string;
-}
-@Schema({ collection: "ledger", capped: { size: 65_536, max: 100 } })
-class LedgerEntry extends Entity {
-  @Prop(() => String, { required: true }) note!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const connection = client.connection;
-connection.model(Account);
-connection.model(LedgerEntry);
-const db = client.unsafeDriver().db("app");
-await db.createCollection("ledger");
-await db.collection("accounts").insertMany([
-  { title: "Main", owner: "alice" },
-  { title: "Main", owner: "bob" },
-]);
-// ---cut---
-try {
-  await SyncAll.run(connection);
-} catch (error) {
-  if (error instanceof SyncError) {
-    console.log(error.failures.map((f) => [f.kind, f.name, f.model, f.errors.map((e) => e.name)]));
-    // → [["collection", "accounts", "Account", ["IndexSyncError"]],
-    //    ["collection", "ledger", "LedgerEntry", ["CollectionOptionsError"]]]
-  }
-}
-```
+<Snippet id="reference/collections/sync-all/one-model-failed" twoslash />
 
 Сбой индекса `accounts` не помешал остальным шагам. Параметры коллекции `accounts` сверены (`error.report.collections[0].options.result` равен `"unchanged"`), индекс `owner_1` построен, и не создался только `title_1`. У записи `ledger`, где не сошлись параметры коллекции, поле `options` пустое. Сообщение подсказывает, что делать.
 
-```text
-collection "ledger": exists with options MongoDB cannot change (capped): drop the collection and create it again
-```
+<Snippet id="reference/collections/sync-all/one-model-failed-2" />
 
 ### Какие модели пропускаются [#skipped-models]
 
@@ -178,28 +87,7 @@ collection "ledger": exists with options MongoDB cannot change (capped): drop th
 
 `SyncAll.collections` возвращает схемы корневых моделей подключения, по одной на коллекцию. По этому списку `run` проходит шаги коллекций. Представлений в нём нет, а наследники с общей коллекцией не перечисляются повторно. Метод пригодится для проверок вроде «какие коллекции затронет деплой».
 
-```ts twoslash
-import { Entity, Prop, Schema, SyncAll, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => String, { required: true, index: true }) owner!: string;
-}
-@Schema({ collection: "ledger", capped: { size: 65_536, max: 100 } })
-class LedgerEntry extends Entity {
-  @Prop(() => String, { required: true }) note!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const connection = client.connection;
-// ---cut---
-console.log(SyncAll.collections(connection).map((schema) => schema.collection));
-// → []
-
-connection.model(Account);
-connection.model(LedgerEntry);
-console.log(SyncAll.collections(connection).map((schema) => schema.collection));
-// → ["accounts", "ledger"]
-```
+<Snippet id="reference/collections/sync-all/sync-all-collections" twoslash />
 
 <Returns type="readonly SchemaInfo[]">
 
@@ -217,9 +105,7 @@ console.log(SyncAll.collections(connection).map((schema) => schema.collection));
 
 <FullType>
 
-```ts
-static collections(connection: Connection): readonly SchemaInfo[]
-```
+<Snippet id="reference/collections/sync-all/sync-all-collections-2" />
 
 </FullType>
 
@@ -287,26 +173,7 @@ static collections(connection: Connection): readonly SchemaInfo[]
 
 Перехватите `SyncError` — тогда вы выведете все сбои одним списком и остановите деплой. Исходные ошибки лежат в его `errors`, полный отчёт в `report`.
 
-```ts twoslash
-import { Entity, Prop, Schema, SyncError, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const connection = client.connection;
-connection.model(Account);
-// ---cut---
-try {
-  await connection.syncAll();
-} catch (error) {
-  if (error instanceof SyncError) {
-    for (const failure of error.failures) console.error(failure.name, failure.errors.map((e) => e.message));
-    throw new Error(`database sync failed: ${error.errors.length} problem(s)`, { cause: error });
-  }
-  throw error;
-}
-```
+<Snippet id="reference/collections/sync-all/read-failure" twoslash />
 
 ---
 

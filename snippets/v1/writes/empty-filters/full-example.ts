@@ -1,0 +1,27 @@
+import { BulkWriteError, CastError, type CreateInput, type Defaulted, DocumentNotFoundError, DuplicateKeyError, Entity, Filters, fn, type Immutable, Prop, QueryError, type Replacement, Schema, Spec, StrictModeError, Timestamped, TypemoClient, type Update, type UpdateInput, type UpdatePipelineFor, UpdatePipelines, ValidationError, type WriteValue } from "@venloc/typemo";
+@Schema({ collection: "accounts" })
+class Account extends Entity {
+  @Prop(() => String, { required: true, unique: true }) title!: string;
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { min: 0, default: 0 }) balance!: Defaulted<number>;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => String) note?: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+// Clear notes by search conditions; no conditions means a refusal
+export const clearNotes = async (owner?: string, title?: string) => {
+  const filter: { owner?: string; title?: string } = {};
+  if (owner !== undefined) filter.owner = owner;
+  if (title !== undefined) filter.title = title;
+  if (Object.keys(filter).length === 0) {
+    throw new Error("укажите, чьи заметки очистить");
+  }
+  return Accounts.updateMany(filter, { $unset: { note: "" } });
+};
+
+// Clear the notes of every account on purpose
+export const clearAllNotes = async () => {
+  return Accounts.updateMany(Filters.all(), { $unset: { note: "" } });
+};

@@ -1,0 +1,33 @@
+import { Entity, type Hidden, Prop, Schema, Spec, TypemoClient, Versioned } from "@venloc/typemo";
+@Schema({ nested: true })
+class Address {
+  @Prop(() => String, { required: true }) city!: string;
+  @Prop(() => String) street?: string;
+}
+@Schema()
+class Line extends Entity {
+  @Prop(() => String, { required: true }) sku!: string;
+  @Prop(() => Number, { required: true, min: 0 }) qty!: number;
+}
+@Schema({ collection: "orders" })
+class Order extends Versioned(Entity) {
+  @Prop(() => String, { required: true }) customer!: string;
+  @Prop(() => [String]) tags!: string[];
+  @Prop(() => [Line]) lines!: Line[];
+  @Prop(() => Address) address?: Address;
+  @Prop(() => Spec.map(Number)) fees?: Map<string, number>;
+  @Prop(() => String, { hidden: true }) note?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "shop" });
+const Orders = client.db().model(Order);
+import { ValidationError } from "@venloc/typemo";
+// ---cut---
+const order = Orders.new({ customer: "alice", tags: [], lines: [{ sku: "A1", qty: 2 }] });
+order.lines.push({ sku: "B2", qty: -1 });
+
+try {
+  await order.$validate();
+} catch (error) {
+  if (error instanceof ValidationError) console.log(error.issues.map((issue) => issue.path.join(".")));
+  // → ["lines.1.qty"]
+}

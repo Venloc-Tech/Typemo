@@ -1,0 +1,1 @@
+next(): Promise<T | null>

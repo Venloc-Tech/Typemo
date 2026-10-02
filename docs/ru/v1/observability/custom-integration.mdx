@@ -14,78 +14,11 @@ icon: Plug
 
 Минимальный адаптер принимает цель, клиент или `Typemo`, и возвращает подписку. Снять её можно вызовом `unsubscribe()` или выходом из области `using`. Адаптер ниже считает операции и ошибки по модели и операции, а среднее время получается из суммы.
 
-```ts twoslash title="monitoring/operation-stats.ts"
-import type { InstrumentationSubscriber, Subscription } from "@venloc/typemo";
-
-interface InstrumentTarget {
-  readonly instrument: (subscriber: InstrumentationSubscriber) => Subscription;
-}
-
-interface Stat {
-  count: number;
-  errors: number;
-  totalMS: number;
-}
-
-export class OperationStats {
-  readonly #stats = new Map<string, Stat>();
-
-  static instrument(target: InstrumentTarget): { stats: OperationStats; subscription: Subscription } {
-    const stats = new OperationStats();
-    const subscription = target.instrument({
-      steps: false, // шаги не нужны: ядро их не строит
-      handle: (event) => {
-        if (event.type !== "operation.end" && event.type !== "operation.error") return;
-        const key = `${event.model ?? `database ${event.database}`}.${event.operation}`;
-        const stat = stats.#stats.get(key) ?? { count: 0, errors: 0, totalMS: 0 };
-        stat.count += 1;
-        stat.totalMS += event.durationMS;
-        if (event.type === "operation.error") stat.errors += 1;
-        stats.#stats.set(key, stat);
-      },
-    });
-    return { stats, subscription };
-  }
-
-  snapshot(): Record<string, Stat> {
-    return Object.fromEntries(this.#stats);
-  }
-}
-```
+<Snippet id="observability/custom-integration/quick-start" title="monitoring/operation-stats.ts" twoslash />
 
 Ключ собирается из модели и операции. У операции уровня базы (`connection.aggregate`) модели нет, `event.model` равно `null`, поэтому в ключе вместо неё стоит база. Вот как адаптер подключается и что он насчитал на настоящей базе после одной вставки и трёх `find`, один из которых с `.orFail()` на пустом результате.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-import type { InstrumentationSubscriber, Subscription } from "@venloc/typemo";
-
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => Number, { required: true }) balance!: number;
-}
-declare const OperationStats: {
-  instrument(target: { instrument: (s: InstrumentationSubscriber) => Subscription }): {
-    stats: { snapshot(): Record<string, { count: number; errors: number; totalMS: number }> };
-    subscription: Subscription;
-  };
-};
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank" });
-const Accounts = client.db().model(Account);
-// ---cut---
-const { stats, subscription } = OperationStats.instrument(client);
-
-await Accounts.create({ title: "Main", balance: 100 });
-await Accounts.find({}).plain();
-await Accounts.find({}).plain();
-await Accounts.find({ title: "none" }).orFail().catch(() => undefined);
-
-const snapshot = stats.snapshot();
-// snapshot["Account.insertOne"].count → 1
-// snapshot["Account.find"].count → 3, snapshot["Account.find"].errors → 1
-
-subscription.unsubscribe();
-```
+<Snippet id="observability/custom-integration/quick-start-2" twoslash />
 
 Ниже разберём, что учесть, когда адаптер перерастает счётчик.
 
@@ -93,19 +26,7 @@ subscription.unsubscribe();
 
 Адаптеру редко нужны все события. Чем меньше он просит, тем меньше работы у ядра. Шаги строятся, только если их хочет хоть один подписчик, а команды драйвера и события пула включаются флагами `driverCommands` и `poolEvents`. Скажите ядру, что вам нужно, и обрабатывайте только это.
 
-```ts twoslash
-import { TypemoClient } from "@venloc/typemo";
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank", monitorCommands: true });
-// ---cut---
-client.instrument({
-  steps: false,
-  poolEvents: true,
-  driverCommands: false,
-  handle: (event) => {
-    if (event.type === "driver.pool") console.log(event.name, event.address);
-  },
-});
-```
+<Snippet id="observability/custom-integration/choose-events" twoslash />
 
 `steps: false` значит, что этот подписчик шагов не получает. Если их попросил кто-то другой, ядро шаги построит, но этому подписчику не доставит. С `steps: false` пришли только `operation.start` и `operation.end`.
 
@@ -113,21 +34,7 @@ client.instrument({
 
 Спан или замер открывается на `operation.start`, а закрывается на `operation.end` или `operation.error`. Ключом служит `operationId`. Он уникален в процессе, а у вложенных запросов подгрузки связей в `parentId` лежит номер внешней операции.
 
-```ts twoslash title="monitoring/open-operations.ts"
-import type { InstrumentationSubscriber } from "@venloc/typemo";
-
-const open = new Map<number, { startedAt: number; parentId: number | undefined }>();
-
-export const timer: InstrumentationSubscriber = {
-  handle: (event) => {
-    if (event.type === "operation.start") {
-      open.set(event.operationId, { startedAt: event.timestamp, parentId: event.parentId });
-    } else if (event.type === "operation.end" || event.type === "operation.error") {
-      open.delete(event.operationId); // не забудьте: иначе карта растёт
-    }
-  },
-};
-```
+<Snippet id="observability/custom-integration/operation-state" title="monitoring/open-operations.ts" twoslash />
 
 `operation.start` приходит самым первым, ещё до приведения типов, проверки и `pre`-хуков. Поэтому событие ошибки бывает и у операции, которая не дошла до драйвера, например упала на приведении типов. Закрывайте состояние в обеих ветках. При отписке закройте и то, что осталось открытым, — адаптер OpenTelemetry, например, на `unsubscribe()` заканчивает все незавершённые спаны.
 
@@ -135,18 +42,7 @@ export const timer: InstrumentationSubscriber = {
 
 Системе трассировки нужно знать, что хук, вложенный запрос или команда драйвера относятся к этой операции. Для этого подписчик задаёт `wrap`. Ядро выполняет операцию внутри неё, а вы на это время ставите свой контекст.
 
-```ts twoslash
-import { TypemoClient } from "@venloc/typemo";
-import { AsyncLocalStorage } from "node:async_hooks";
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "bank" });
-// ---cut---
-const current = new AsyncLocalStorage<number>();
-
-client.instrument({
-  handle: () => {},
-  wrap: (operation, run) => current.run(operation.operationId, run),
-});
-```
+<Snippet id="observability/custom-integration/wrap" twoslash />
 
 Договор такой. Вызовите `run` ровно один раз и верните то, что она вернёт, или дождитесь этого. Результат операции определяет `run`, что бы ни вернула `wrap`. Если `wrap` бросила исключение до `run` или вовсе её не вызвала, это попадёт в `console.error` как ошибка подписчика, а операция всё равно выполнится. Несколько `wrap` вкладываются друг в друга в порядке регистрации. У курсора `wrap` охватывает только открытие. Подробнее — в справочнике [`InstrumentationSubscriber`](../reference/observability/events.mdx#instrumentation-subscriber).
 

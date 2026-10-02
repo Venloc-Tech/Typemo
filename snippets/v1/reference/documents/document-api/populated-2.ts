@@ -1,0 +1,1 @@
+$populated(path: string): unknown;

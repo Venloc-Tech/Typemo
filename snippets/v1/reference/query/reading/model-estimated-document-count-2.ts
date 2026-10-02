@@ -1,0 +1,1 @@
+estimatedDocumentCount(): OptionQuery<number>

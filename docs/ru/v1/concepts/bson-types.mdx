@@ -18,18 +18,7 @@ MongoDB хранит документы не в JSON, а в **BSON**. Это д�
 
 JSON знает только строку, число, логическое значение, `null`, массив и объект. Число в нём — это число JavaScript, то есть double. Посмотрим, что станет с остальными типами, если отдать их в `JSON.stringify` напрямую. Так сделал бы обработчик запроса, который отправляет прочитанную строку клиенту.
 
-```ts twoslash
-import { Binary, Decimal128, Long, ObjectId } from "mongodb";
-// ---cut---
-console.log(JSON.stringify({ id: new ObjectId("6abcb88b25109dc2cd5d67c3") }));
-// → {"id":"6abcb88b25109dc2cd5d67c3"}
-console.log(JSON.stringify({ price: Decimal128.fromString("19.99") }));
-// → {"price":{"$numberDecimal":"19.99"}}
-console.log(JSON.stringify({ bytes: new Binary(new Uint8Array([1, 2, 3])) }));
-// → {"bytes":"AQID"}
-console.log(JSON.stringify({ total: Long.fromString("9007199254740993") }));
-// → {"total":{"high":2097152,"low":1,"unsigned":false}}
-```
+<Snippet id="concepts/bson-types/not-json-safe" twoslash />
 
 У каждого значения своя беда, и ни одно не годится клиенту без переделки. `ObjectId` стал строкой, и клиент пришлёт обратно строку, а не идентификатор. `Decimal128` превратился в объект со служебным ключом, двоичные данные — в строку base64, а `Long` — в две половинки числа.
 
@@ -88,80 +77,15 @@ console.log(JSON.stringify({ total: Long.fromString("9007199254740993") }));
 
 Поле объявляется классом, который соответствует типу в базе. Это `BigInt` для int64, `Types.Decimal128` для точного числа, `Types.UUID`, `Date`. Допустим, датчик пишет показания с точным весом, большим счётчиком и идентификатором устройства.
 
-```ts twoslash title="sensors/reading.ts"
-import { Decimal128, UUID } from "mongodb";
-import { Entity, Prop, Schema, Types } from "@venloc/typemo";
-
-@Schema({ collection: "readings" })
-export class Reading extends Entity {
-  @Prop(() => String, { required: true })
-  label!: string;
-
-  @Prop(() => BigInt)
-  total?: bigint;
-
-  @Prop(() => Types.Decimal128)
-  weight?: Decimal128;
-
-  @Prop(() => Types.UUID)
-  device?: UUID;
-
-  @Prop(() => Date)
-  at?: Date;
-}
-```
+<Snippet id="concepts/bson-types/in-typemo-code" title="sensors/reading.ts" twoslash />
 
 Форму задаёт то, как вы читаете, а не схема. `.lean()` отдаёт значения драйвера, а `.plain()` — данные, которые можно сразу отправить клиенту. Разницу видно в подсказках редактора, запускать ничего не нужно.
 
-```ts twoslash
-import { Decimal128, UUID } from "mongodb";
-import { Entity, Prop, Schema, TypemoClient, Types } from "@venloc/typemo";
-@Schema({ collection: "readings" })
-class Reading extends Entity {
-  @Prop(() => String, { required: true }) label!: string;
-  @Prop(() => BigInt) total?: bigint;
-  @Prop(() => Types.Decimal128) weight?: Decimal128;
-  @Prop(() => Types.UUID) device?: UUID;
-  @Prop(() => Date) at?: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/sensors");
-const Readings = client.connection.model(Reading);
-// ---cut---
-const doc = await Readings.findOne({ label: "r1" }).orFail();
-const inDocument = doc.total;
-//    ^?
-const forClient = doc.$toPlain().total;
-//    ^?
-const device = doc.$toPlain().device;
-//    ^?
-```
+<Snippet id="concepts/bson-types/in-typemo-code-2" twoslash />
 
 `doc.total` осталось `bigint | undefined`. Поле необязательное, а документ хранит значение как есть. В результате `.plain()` то же поле уже `` `${bigint}` `` (тип [`Int64String`](../reference/values/form-types.mdx#int64-string)) — строка из десятичных цифр, которую методы записи примут обратно без приведения. Идентификатор устройства там — `string`. Вот как это выглядит для одного документа.
 
-```ts twoslash
-import { Decimal128, UUID } from "mongodb";
-import { Entity, Prop, Schema, TypemoClient, Types } from "@venloc/typemo";
-@Schema({ collection: "readings" })
-class Reading extends Entity {
-  @Prop(() => String, { required: true }) label!: string;
-  @Prop(() => BigInt) total?: bigint;
-  @Prop(() => Types.Decimal128) weight?: Decimal128;
-  @Prop(() => Types.UUID) device?: UUID;
-  @Prop(() => Date) at?: Date;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/sensors");
-const Readings = client.connection.model(Reading);
-// ---cut---
-const reading = await Readings.create({
-  label: "r1",
-  total: 9007199254740993n,
-  weight: Types.Decimal128.fromString("19.99"),
-  device: "0f8fad5b-d9cb-469f-a165-70867728950e", // a string is accepted for UUID
-  at: new Date("2026-01-02T03:04:05Z"),
-});
-console.log(JSON.stringify(reading.$toPlain()));
-// → {"_id":"…","label":"r1","total":"9007199254740993","weight":"19.99","device":"0f8fad5b-d9cb-469f-a165-70867728950e","at":"2026-01-02T03:04:05.000Z"}
-```
+<Snippet id="concepts/bson-types/in-typemo-code-3" twoslash />
 
 Посмотрите на `total` в ответе. Это строка, и последняя цифра в ней `3`, то есть `bigint` дошёл до клиента без потерь. Обычное число эту цифру потеряло бы.
 

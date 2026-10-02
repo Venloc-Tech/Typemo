@@ -1,0 +1,1 @@
+currentTransaction(): TransactionScope | undefined

@@ -1,0 +1,1 @@
+listIndexes(): Promise<IndexDescriptionInfo[]>

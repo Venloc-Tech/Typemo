@@ -22,48 +22,15 @@ icon: KeyRound
 
 Подключённый клиент из `db/client.ts` и модель счёта из `accounts/account.ts`. В базе два счёта — `Main` с балансом 100 и `Savings` с балансом 50.
 
-```ts twoslash title="db/client.ts"
-import { TypemoClient } from "@venloc/typemo";
+<Snippet id="connection/driver-access/prerequisites" title="db/client.ts" twoslash />
 
-export const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-```
-
-```ts twoslash title="accounts/account.ts"
-import { Entity, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "accounts" })
-export class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  title!: string;
-
-  @Prop(() => Number, { required: true, min: 0 })
-  balance!: number;
-}
-```
+<Snippet id="reference/transactions/transactions/intro" title="accounts/account.ts" twoslash />
 
 ## Быстрый путь [#quick-start]
 
 Откройте сессию, запустите в ней транзакцию средствами драйвера, передавайте сессию операциям и закройте её в `finally`. Метод драйвера `withTransaction` сам фиксирует транзакцию и повторяет её при временных сбоях.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-// ---cut---
-const session = await client.startSession();
-try {
-  await session.withTransaction(async () => {
-    await Accounts.create({ title: "Manual", balance: 1 }, { session });
-  });
-} finally {
-  await session.endSession();
-}
-```
+<Snippet id="reference/transactions/transactions/start-session" twoslash />
 
 После фиксации запись `Manual` появилась в коллекции. Ниже разберём, как передавать сессию, как фиксировать вручную и какие тут действуют правила.
 
@@ -71,27 +38,7 @@ try {
 
 Запросам сессию передают через [`.session()`](../reference/query/options.mdx#session), записям — опцией `session`. Сама явная сессия ни к чему не присоединяется. Операция без неё выполнится вне транзакции, даже если вы открыли транзакцию строкой выше.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-// ---cut---
-const session = await client.startSession();
-try {
-  session.startTransaction();
-  const account = await Accounts.findOne({ title: "Main" }).session(session).orFail();
-  await Accounts.updateOne({ title: "Savings" }, { $inc: { balance: 10 } }).session(session);
-  await Accounts.create({ title: "Extra", balance: 5 }, { session });
-  await session.commitTransaction();
-} finally {
-  await session.endSession();
-}
-```
+<Snippet id="transactions/sessions/pass-session" twoslash />
 
 Здесь транзакция фиксируется вручную — `startTransaction`, затем операции, затем `commitTransaction`. Если что-то сломалось, вызовите `abortTransaction` в блоке `catch`. Иначе транзакция провисит открытой, пока её не закроет сам сервер.
 
@@ -101,34 +48,7 @@ try {
 
 Документ, загруженный с сессией, запоминает её. [`$save`](../reference/documents/document-api.mdx#save) сам возьмёт ту же сессию, второй раз её передавать не нужно. Узнать сессию документа можно через [`$session`](../reference/documents/document-api.mdx#session). Тот же метод с аргументом её ставит или сбрасывает.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-// ---cut---
-const session = await client.startSession();
-try {
-  session.startTransaction();
-  const main = await Accounts.findOne({ title: "Main" }).session(session).orFail();
-  console.log(main.$session() === session);
-  // → true
-
-  main.balance = 60;
-  await main.$save();
-  await session.commitTransaction();
-
-  main.$session(null);
-  console.log(main.$session());
-  // → undefined
-} finally {
-  await session.endSession();
-}
-```
+<Snippet id="transactions/sessions/document-in-session" twoslash />
 
 Сессия закончилась, а документ ещё нужен — сбросьте её через `$session(null)`. Иначе сохранение в закрытой сессии упадёт с [`DriverError`](../reference/errors/configuration-errors.mdx#driver-error) и текстом `Use of expired sessions is not permitted`.
 
@@ -136,23 +56,7 @@ try {
 
 Иногда внутри [`client.transaction`](../reference/transactions/transactions.mdx#transaction) операция должна пройти мимо транзакции. Например, запись в журнал, которая обязана остаться, даже если транзакция откатится. Передайте `session(null)`, а записям — `{ session: null }`.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-// ---cut---
-await client
-  .transaction(async () => {
-    await Accounts.updateOne({ title: "Savings" }, { $inc: { balance: 100 } }).session(null);
-    throw new Error("abort");
-  })
-  .catch(() => undefined);
-```
+<Snippet id="transactions/sessions/leave-transaction" twoslash />
 
 Транзакция откатилась, а запись с `session(null)` осталась, и баланс `Savings` вырос на 100, до 150. Это осознанное исключение. Пользуйтесь им, только когда запись действительно должна пережить откат.
 
@@ -167,9 +71,7 @@ await client
 
 Два чтения в одной сессии, `countDocuments` и `find`, прошли. Две одновременные записи и запись рядом с чтением получили отказ.
 
-```text
-StrictModeError: Account.updateOne: the session is in use by Account.updateOne, which has not finished; operations on one session must run one after another — await each one; only reads may overlap, and only outside a transaction (MongoDB does not support concurrent operations on a session) [concurrent-session]
-```
+<Snippet id="transactions/sessions/concurrency-rules" />
 
 Отвергнутая операция до сервера не доходит, так что сессия после такой ошибки остаётся рабочей. Ставьте `await` перед каждой операцией, и правило вас не коснётся.
 
@@ -177,9 +79,7 @@ StrictModeError: Account.updateOne: the session is in use by Account.updateOne, 
 
 Уровни чтения и подтверждения записи задают при запуске транзакции, а не у операций. Например, `session.startTransaction({ readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } })`. Операция внутри транзакции со своим `readConcern`, `writeConcern`, `readPreference` (кроме `primary`) или `timeoutMS` получит `StrictModeError` с причиной `transaction-option`. Транзакции, открытой вручную, это тоже касается. Вот что вернул `find().session(session).readConcern("majority")` внутри неё.
 
-```text
-StrictModeError: Account.find: readConcern "majority" inside a transaction — the transaction's own settings apply (set them on transaction()) [transaction-option]
-```
+<Snippet id="reference/policies/violations/transaction-option" />
 
 Сервер не даёт отдельной операции переопределить настройки транзакции, а драйвер молча выбросил бы их. Typemo говорит об этом сразу. В сессии без транзакции эти опции у операций разрешены.
 
@@ -198,24 +98,7 @@ StrictModeError: Account.find: readConcern "majority" inside a transaction — t
 
 **Запись осталась после отката.** Вы открыли транзакцию, но в одну операцию забыли передать сессию. Она прошла мимо транзакции и пережила откат. Так запись `Forgot` без сессии осталась после `abortTransaction`, и в коллекции нашёлся 1 документ.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-const session = await client.startSession();
-session.startTransaction();
-// ---cut---
-// неправильно: сессия не передана, запись вне транзакции
-await Accounts.create({ title: "Forgot", balance: 1 });
-
-// правильно: запись в той же сессии
-await Accounts.create({ title: "Kept", balance: 1 }, { session });
-```
+<Snippet id="transactions/sessions/troubleshooting" twoslash />
 
 Явная сессия сама к операциям не присоединяется, это умеет только `client.transaction`. Не хотите следить за каждым вызовом — пользуйтесь ей.
 
@@ -227,50 +110,7 @@ await Accounts.create({ title: "Kept", balance: 1 }, { session });
 
 Всё вместе в одном файле — ручная сессия с фиксацией и откатом, документ, загруженный в сессии, и закрытие сессии. Код, которого нет в Typemo, помечен `__…__`.
 
-```ts twoslash title="accounts/manual-transfer.ts"
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  title!: string;
-
-  @Prop(() => Number, { required: true, min: 0 })
-  balance!: number;
-}
-
-declare const __askBank__: () => Promise<boolean>;
-
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-
-// перевод, фиксацию которого решает внешняя система
-export const transferWithApproval = async (from: string, to: string, amount: number): Promise<boolean> => {
-  const session = await client.startSession();
-  try {
-    session.startTransaction();
-
-    // документ запоминает сессию: $save пишет в ту же транзакцию
-    const source = await Accounts.findOne({ title: from }).session(session).orFail();
-    source.balance = source.balance - amount;
-    await source.$save();
-    await Accounts.updateOne({ title: to }, { $inc: { balance: amount } }).session(session);
-
-    // фиксацию решает ответ банка
-    if (await __askBank__()) {
-      await session.commitTransaction();
-      return true;
-    }
-    await session.abortTransaction();
-    return false;
-  } catch (error) {
-    if (session.inTransaction()) await session.abortTransaction();
-    throw error;
-  } finally {
-    await session.endSession();
-  }
-};
-```
+<Snippet id="transactions/sessions/full-example" title="accounts/manual-transfer.ts" twoslash />
 
 ## Что дальше [#next-steps]
 

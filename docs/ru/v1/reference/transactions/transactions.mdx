@@ -12,18 +12,7 @@ icon: ArrowLeftRight
 
 Во всех примерах одна модель счёта.
 
-```ts twoslash title="accounts/account.ts"
-import { Entity, Prop, Schema } from "@venloc/typemo";
-
-@Schema({ collection: "accounts" })
-export class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true })
-  title!: string;
-
-  @Prop(() => Number, { required: true, min: 0 })
-  balance!: number;
-}
-```
+<Snippet id="reference/transactions/transactions/intro" title="accounts/account.ts" twoslash />
 
 ---
 
@@ -33,25 +22,7 @@ export class Account extends Entity {
 
 Внутри функции ничего передавать не нужно. Каждая операция моделей (чтение, запись, курсор, агрегация, `populate`, пакетная запись) находит транзакцию сама и работает в её сессии. Забыть сессию в одном из вызовов нельзя, а в Mongoose такая операция молча выполнялась вне транзакции.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-// ---cut---
-const left = await client.transaction(async () => {
-  const source = await Accounts.findOne({ title: "Main" }).orFail();
-  await Accounts.updateOne({ title: "Main" }, { $inc: { balance: -30 } });
-  await Accounts.updateOne({ title: "Savings" }, { $inc: { balance: 30 } });
-  return source.balance - 30;
-});
-console.log(left);
-// → 70  (на счёте Main было 100)
-```
+<Snippet id="reference/transactions/transactions/transaction" twoslash />
 
 Если функция бросила ошибку, транзакция откатывается, а до вас ошибка доходит **той же самой**, без обёртки. В примере `caught === thrown` равно `true`. Ошибки самой библиотеки, например нарушение уникальности или ошибка проверки, тоже откатывают транзакцию и приходят как есть.
 
@@ -76,9 +47,7 @@ console.log(left);
 
 <FullType>
 
-```ts
-transaction<R>(fn: TransactionCallback<R>, options?: TransactionOptions): Promise<R>
-```
+<Snippet id="reference/connection/connection/connection-transaction-2" />
 
 </FullType>
 
@@ -88,29 +57,7 @@ transaction<R>(fn: TransactionCallback<R>, options?: TransactionOptions): Promis
 
 Ниже две транзакции одновременно увеличивают баланс одного счёта. Обе стартуют с первой попытки, одна проигрывает конфликт и запускается заново.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-// ---cut---
-const runs: string[] = [];
-const bump = (name: string) =>
-  client.transaction(async (scope) => {
-    runs.push(`${name}${scope.attempt}`);
-    await Accounts.updateOne({ title: "Main" }, { $inc: { balance: 1 } });
-    await sleep(150);
-  });
-
-await Promise.all([bump("A"), bump("B")]);
-console.log(runs.slice(0, 2), runs.length > 2);
-// → ["A1", "B1"] true
-```
+<Snippet id="reference/transactions/transactions/retries" twoslash />
 
 Проигравшая транзакция повторяется, пока победитель не зафиксируется. Функции выполнились в сумме 9 раз, баланс вырос ровно на 2. Число попыток зависит от времени и нагрузки, так что полагаться на него нельзя. Важно другое — при правильно написанной функции результат от числа повторов не зависит.
 
@@ -122,64 +69,23 @@ console.log(runs.slice(0, 2), runs.length > 2);
 
 Поэтому изменение документа, загруженного **снаружи** транзакции, при повторе применится дважды. В примере первая попытка терпит временный сбой при фиксации. При остатке 100 функция вычитает 10, сбой, повтор видит 90, вычитает ещё 10 и сохраняет 80, а не 90.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-// ---cut---
-const account = await Accounts.findOne({ title: "Main" }).orFail();
-
-await client.transaction(async () => {
-  account.balance = account.balance - 10;
-  await account.$save();
-});
-// при одном временном сбое: в базе 80, а не 90
-```
+<Snippet id="reference/transactions/transactions/state-on-retry" twoslash />
 
 Читайте документ внутри функции или меняйте его атомарной записью. `updateOne` с `$inc` не зависит от того, что лежало в памяти.
 
 ### При ошибках [#on-errors]
 
-```ts twoslash
-import { ConfigurationError, Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-// ---cut---
-try {
-  await client.transaction(async () => {
-    await client.transaction(async () => {});
-  });
-} catch (error) {
-  if (error instanceof ConfigurationError) console.log(error.message);
-  // → transaction(): transactions do not nest (already inside a transaction of this client)
-}
-```
+<Snippet id="reference/transactions/transactions/on-errors" twoslash />
 
 Транзакции не вкладываются, у MongoDB вложенных транзакций нет. Вызов `transaction` внутри транзакции того же клиента сразу бросает [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error) и не присоединяется молча. Остальные ошибки внутри транзакции показаны ниже.
 
-```text
-StrictModeError: Account.find: the session is in use by Account.countDocuments, which has not finished; operations on one session must run one after another — await each one; only reads may overlap, and only outside a transaction (MongoDB does not support concurrent operations on a session) [concurrent-session]
-StrictModeError: Account.find: readConcern "majority" inside a transaction — the transaction's own settings apply (set them on transaction()) [transaction-option]
-StrictModeError: Account.find: timeoutMS 100 (the transaction has timeoutMS 5000) inside a transaction — the transaction's own settings apply (set them on transaction()) [transaction-option]
-ConfigurationError: Account.countDocuments: called inside a transaction of another client; its model cannot join that transaction — pass session(null) (or { session: null }) to run it outside explicitly
-```
+<Snippet id="reference/transactions/transactions/on-errors-2" />
 
 Первая ошибка — одновременные операции. Внутри транзакции нельзя запускать операции параллельно (`Promise.all`), даже чтения. Сервер отвечает на это ошибкой, а драйвер называет такое поведение неопределённым, поэтому библиотека отказывает заранее. Вторая и третья — собственные настройки операции. `readConcern`, `writeConcern`, `readPreference` (кроме `primary`) и `timeoutMS` у отдельной операции внутри транзакции запрещены, их задают на самой транзакции. Четвёртая — модель другого клиента, она к транзакции присоединиться не может. Везде это [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error) с причинами `concurrent-session` и `transaction-option`.
 
 Отдельный случай — сервер без транзакций. На одиночном `mongod` `transaction` сразу бросает `ConfigurationError`, функцию он не вызывает.
 
-```text
-ConfigurationError: TypemoClient "default": transaction(): transactions need a replica set or a sharded cluster; this server is a standalone mongod. Run MongoDB as a replica set (a single-member one is enough).
-```
+<Snippet id="reference/connection/typemo-client/client-transaction-2" />
 
 `session(null)` (или `{ session: null }`) намеренно запускает операцию вне текущей транзакции. Запись останется, даже если транзакция откатится.
 
@@ -193,24 +99,7 @@ ConfigurationError: TypemoClient "default": transaction(): transactions need a r
 
 `TransactionOptions` — необязательный объект настроек, второй аргумент [`transaction`](#transaction). Вы задаёте настройки в простой форме, а в объекты драйвера библиотека превращает их сама. Отдельная операция внутри транзакции переопределить их не может и получит [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error) с причиной `transaction-option`.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-// ---cut---
-const total = await client.transaction(async () => Accounts.countDocuments(), {
-  readConcern: "snapshot",
-  writeConcern: { w: "majority" },
-  timeoutMS: 5_000,
-});
-console.log(total);
-// → 2
-```
+<Snippet id="reference/transactions/transactions/transaction-options" twoslash />
 
 <Params title="Поля объекта">
 <Param name="readConcern" type={'"local" | "majority" | "snapshot"'}>
@@ -237,14 +126,7 @@ console.log(total);
 
 <FullType>
 
-```ts
-interface TransactionOptions {
-  readonly readConcern?: "local" | "majority" | "snapshot";
-  readonly writeConcern?: { readonly w?: number | "majority"; readonly journal?: boolean };
-  readonly timeoutMS?: number;
-  readonly maxCommitTimeMS?: number;
-}
-```
+<Snippet id="reference/transactions/transactions/transaction-options-2" />
 
 </FullType>
 
@@ -254,33 +136,13 @@ interface TransactionOptions {
 
 `TransactionCallback<R>` — тип функции, которую принимает [`transaction`](#transaction). Это асинхронная функция, она получает [`TransactionScope`](#transaction-scope) и возвращает значение типа `R`. Тип пригодится, когда вы выносите тело транзакции в отдельную функцию или передаёте его параметром.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient, type TransactionCallback } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-// ---cut---
-const countAccounts: TransactionCallback<number> = async (scope) => {
-  console.log(scope.attempt);
-  // → 1
-  return Accounts.countDocuments();
-};
-
-const count = await client.transaction(countAccounts);
-//    ^?
-```
+<Snippet id="reference/transactions/transactions/transaction-callback" twoslash />
 
 Если `scope` не нужен, аргумент можно не принимать. Операции внутри и так находят транзакцию сами.
 
 <FullType>
 
-```ts
-type TransactionCallback<R> = (scope: TransactionScope) => Promise<R>
-```
+<Snippet id="reference/transactions/transactions/transaction-callback-2" />
 
 </FullType>
 
@@ -292,25 +154,7 @@ type TransactionCallback<R> = (scope: TransactionScope) => Promise<R>
 
 Сессию закрываете вы, вызовом `endSession()`. Библиотека этого не делает, а незакрытая сессия держит ресурсы на сервере, пока не истечёт её срок.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const Accounts = client.connection.model(Account);
-// ---cut---
-const session = await client.startSession();
-try {
-  await session.withTransaction(async () => {
-    await Accounts.create({ title: "Manual", balance: 1 }, { session });
-  });
-} finally {
-  await session.endSession();
-}
-```
+<Snippet id="reference/transactions/transactions/start-session" twoslash />
 
 <Params>
 <Param name="options" type="ClientSessionOptions">
@@ -338,23 +182,7 @@ try {
 
 `client.currentTransaction()` отвечает, идёт ли текущий асинхронный вызов внутри транзакции **этого** клиента, и возвращает её [`TransactionScope`](#transaction-scope). Метод нужен обёрткам, которым надо решить, открывать транзакцию или работать в уже открытой. Вкладывать транзакции нельзя, и второй [`transaction`](#transaction) внутри первого — ошибка. По этому принципу работает, например, `@Transactional({ join: true })` из пакета для NestJS ([`Transactional`](../integrations/nestjs.mdx#transactional)).
 
-```ts twoslash
-import { TypemoClient } from "@venloc/typemo";
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-// ---cut---
-const run = async (work: () => Promise<void>): Promise<void> => {
-  if (client.currentTransaction() !== undefined) return work();
-  return client.transaction(work);
-};
-
-console.log(client.currentTransaction());
-// → undefined
-await client.transaction(async (scope) => {
-  console.log(client.currentTransaction() === scope);
-  // → true
-  await run(async () => {});
-});
-```
+<Snippet id="reference/transactions/transactions/client-current-transaction" twoslash />
 
 Вопрос ничего не начинает. Метод не открывает сессию и не отправляет команд. Транзакцию он видит там же, где её видят операции моделей, то есть после `await`, в вызванных функциях и в колбэках внутри функции транзакции.
 
@@ -368,9 +196,7 @@ await client.transaction(async (scope) => {
 
 <FullType>
 
-```ts
-currentTransaction(): TransactionScope | undefined
-```
+<Snippet id="reference/transactions/transactions/client-current-transaction-2" />
 
 </FullType>
 
@@ -384,28 +210,7 @@ currentTransaction(): TransactionScope | undefined
 
 `TransactionScope` — объект, который получает функция транзакции. Он описывает текущую транзакцию и её текущую попытку. Обычно он нужен ради двух вещей. Первая — узнать номер попытки (`attempt`). Вторая — передать сессию (`scope.session`) вызову драйвера, который о транзакции Typemo ничего не знает.
 
-```ts twoslash
-import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Schema({ collection: "accounts" })
-class Account extends Entity {
-  @Prop(() => String, { required: true, unique: true }) title!: string;
-  @Prop(() => Number, { required: true, min: 0 }) balance!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017/app");
-const raw = client.unsafeDriver().db("app").collection("accounts");
-// ---cut---
-await client
-  .transaction(async (scope) => {
-    console.log(scope.attempt, scope.timeoutMS, scope.session.inTransaction());
-    // → 1 undefined true
-    await raw.insertOne({ title: "Raw", balance: 1 }, { session: scope.session });
-    throw new Error("abort");
-  })
-  .catch(() => undefined);
-
-console.log(await raw.countDocuments({ title: "Raw" }));
-// → 0
-```
+<Snippet id="reference/transactions/transactions/transaction-scope" twoslash />
 
 Запись драйвера с `session: scope.session` откатилась вместе с транзакцией. Без этого аргумента она осталась бы в базе, потому что вызовы драйвера сами в транзакцию не присоединяются.
 
@@ -459,25 +264,7 @@ console.log(await raw.countDocuments({ title: "Raw" }));
 
 <FullType>
 
-```ts
-class TransactionScope {
-  static current(): TransactionScope | undefined;
-  readonly id: number;
-  readonly session: ClientSession;
-  readonly owner: object;
-  readonly timeoutMS: number | undefined;
-  readonly startedAt: number;
-  get attempt(): number;
-  get participants(): readonly TransactionParticipant[];
-  enlist(participant: TransactionParticipant): void;
-}
-
-interface TransactionParticipant {
-  readonly onRetry?: () => void | Promise<void>;
-  readonly onAbort?: () => void | Promise<void>;
-  readonly onCommit?: () => void | Promise<void>;
-}
-```
+<Snippet id="reference/transactions/transactions/enlist" />
 
 </FullType>
 

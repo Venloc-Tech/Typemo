@@ -1,0 +1,1 @@
+diffSearchIndexes(): Promise<SearchIndexDiff>

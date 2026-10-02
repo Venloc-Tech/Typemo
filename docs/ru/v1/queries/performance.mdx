@@ -22,45 +22,13 @@ icon: Gauge
 - «Mongo tips» — 50.
 - «Cooking» — 500, текст «pasta».
 
-```ts twoslash title="articles/article.ts"
-import { Entity, Index, Prop, Schema } from "@venloc/typemo";
-
-@Index({ views: 1 })
-@Schema({ collection: "articles" })
-export class Article extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  @Prop(() => String, { required: true })
-  body!: string;
-
-  @Prop(() => Number, { required: true })
-  views!: number;
-}
-```
+<Snippet id="queries/performance/prerequisites" title="articles/article.ts" twoslash />
 
 ## Быстрый путь [#quick-start]
 
 Попросите план запроса и посмотрите на стадии. `IXSCAN` значит «по индексу», `COLLSCAN` — «вся коллекция». Функция [`explainIndexUsage`](../reference/testing/testing.mdx#explain-index-usage) из пакета `@venloc/typemo/testing` сводит ответ базы в короткий отчёт.
 
-```ts twoslash
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-import { explainIndexUsage } from "@venloc/typemo/testing";
-@Index({ views: 1 })
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Number, { required: true }) views!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Articles = client.db().model(Article);
-// ---cut---
-const byViews = await explainIndexUsage(Articles.find({ views: { $gt: 10 } }));
-const byBody = await explainIndexUsage(Articles.find({ body: "pasta" }));
-console.log(byViews.stages, byBody.stages);
-// → ["FETCH", "IXSCAN"] ["COLLSCAN"]
-```
+<Snippet id="queries/performance/quick-start" twoslash />
 
 Запрос по `views` идёт по индексу, а запрос по `body` читает все три статьи ради одной. Ниже разберём каждый шаг подробнее.
 
@@ -68,22 +36,7 @@ console.log(byViews.stages, byBody.stages);
 
 Допустим, список популярных статей открывается медленно. Вызовите [`.explain`](../reference/query/search-and-explain.mdx#explain) у того же запроса. Документов он не вернёт, зато покажет, как база собирается его выполнять. Ответ — это документ сервера, и его форма зависит от версии. Поэтому Typemo его не разбирает, и поля читаются без подсказок типов.
 
-```ts twoslash
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Index({ views: 1 })
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Number, { required: true }) views!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Articles = client.db().model(Article);
-// ---cut---
-const plan = await Articles.find({ views: { $gt: 10 } }).explain();
-console.log(plan.queryPlanner);
-// → { …, winningPlan: { stage: "FETCH", inputStage: { stage: "IXSCAN", indexName: "views_1", … } } }
-```
+<Snippet id="queries/performance/explain" twoslash />
 
 План читается изнутри наружу. Внутренняя стадия `IXSCAN` находит по индексу `views_1` подходящие ключи, а внешняя `FETCH` читает по этим ключам сами документы. `winningPlan` — это победивший план, база выбрала его из нескольких вариантов.
 
@@ -91,26 +44,7 @@ console.log(plan.queryPlanner);
 
 Без выполнения запроса план говорит только о намерениях. Чтобы увидеть, сколько работы база сделала на самом деле, передайте `"executionStats"`. Запрос выполнится, и вы получите счётчики. Главное — сравнить `nReturned`, сколько документов вернулось, и `totalDocsExamined`, сколько база прочитала. У хорошего запроса они близки.
 
-```ts twoslash
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Index({ views: 1 })
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Number, { required: true }) views!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Articles = client.db().model(Article);
-// ---cut---
-const good = await Articles.find({ views: 500 }).explain("executionStats");
-console.log(good.executionStats);
-// → { nReturned: 1, totalKeysExamined: 1, totalDocsExamined: 1, … }
-
-const bad = await Articles.find({ body: "pasta" }).explain("executionStats");
-console.log(bad.executionStats);
-// → { nReturned: 1, totalKeysExamined: 0, totalDocsExamined: 3, … }
-```
+<Snippet id="queries/performance/work-done" twoslash />
 
 Во втором запросе база просмотрела все три статьи и вернула одну. На трёх документах этого не заметить, а на миллионе то же условие прочитает миллион документов ради одного. Признак беды — `totalDocsExamined` намного больше `nReturned`, а в плане стоит `COLLSCAN`. Лечится это индексом на поле фильтра, через [`@Index`](../reference/schemas/index-decorators.mdx) или опцию `index` у поля, и потом синхронизацией.
 
@@ -120,49 +54,13 @@ console.log(bad.executionStats);
 
 [`explainIndexUsage`](../reference/testing/testing.mdx#explain-index-usage) запускает `explain("executionStats")` и возвращает разобранный отчёт. В нём стадии плана, использованные индексы, признак просмотра всей коллекции и счётчики. Функция живёт в отдельном входе пакета `@venloc/typemo/testing` и рассчитана на тесты, но в консоли или отладочном скрипте она так же удобна.
 
-```ts twoslash
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-import { explainIndexUsage } from "@venloc/typemo/testing";
-@Index({ views: 1 })
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Number, { required: true }) views!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Articles = client.db().model(Article);
-// ---cut---
-const usage = await explainIndexUsage(Articles.find({ body: "pasta" }));
-console.log(usage.collectionScan, usage.docsExamined, usage.docsReturned);
-// → true 3 1
-```
+<Snippet id="queries/performance/short-report" twoslash />
 
 ### Запрос, который читает только индекс [#covered-query]
 
 Самый дешёвый запрос вообще не читает документы, ведь всё нужное уже лежит в индексе. Так бывает, когда в ответе только индексированные поля. Выберите именно их и исключите `_id`, которого в индексе `views_1` нет.
 
-```ts twoslash
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-import { explainIndexUsage } from "@venloc/typemo/testing";
-@Index({ views: 1 })
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Number, { required: true }) views!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Articles = client.db().model(Article);
-// ---cut---
-const covered = await explainIndexUsage(Articles.find({ views: { $gt: 10 } }).select({ views: 1, _id: 0 }));
-console.log(covered.stages, covered.docsExamined, covered.covered);
-// → ["PROJECTION_COVERED", "IXSCAN"] 0 true
-
-const fetched = await explainIndexUsage(Articles.find({ views: { $gt: 10 } }));
-console.log(fetched.stages, fetched.docsExamined, fetched.covered);
-// → ["FETCH", "IXSCAN"] 2 false
-```
+<Snippet id="queries/performance/covered-query" twoslash />
 
 `covered` равен `true`, только когда в плане нет `FETCH` и база не прочитала ни одного документа, то есть `docsExamined` равен нулю. Одного отсутствия `FETCH` мало. Запрос по `_id` идёт через `EXPRESS_IXSCAN` без стадии `FETCH`, но документ всё равно читает, поэтому `covered` у него `false`.
 
@@ -170,24 +68,7 @@ console.log(fetched.stages, fetched.docsExamined, fetched.covered);
 
 Индекс по `views` помогает и сортировке по `views`, ключи в нём уже лежат по порядку. А если сортировать по другому полю, базе придётся собрать подходящие документы в памяти и отсортировать их самой. В плане это видно как стадия `SORT` поверх остальных.
 
-```ts twoslash
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-import { explainIndexUsage } from "@venloc/typemo/testing";
-@Index({ views: 1 })
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Number, { required: true }) views!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Articles = client.db().model(Article);
-// ---cut---
-const sameIndex = await explainIndexUsage(Articles.find({ views: { $gt: 10 } }).sort({ views: 1 }));
-const otherField = await explainIndexUsage(Articles.find({ views: { $gt: 10 } }).sort({ title: 1 }));
-console.log(sameIndex.stages, otherField.stages);
-// → ["FETCH", "IXSCAN"] ["SORT", "FETCH", "IXSCAN"]
-```
+<Snippet id="queries/performance/in-memory-sort" twoslash />
 
 На больших выборках сортировка в памяти упирается в лимит памяти базы. Поэтому индекс лучше строить сразу под пару «фильтр и сортировка». Как задавать сортировку, рассказано в руководстве [Сортировка и страницы](./sorting-and-pages.mdx).
 
@@ -195,23 +76,7 @@ console.log(sameIndex.stages, otherField.stages);
 
 Обычно база выбирает индекс сама и делает это хорошо. Но бывает, что план показывает неудачный выбор, а перестроить индексы нельзя. Тогда назовите индекс явно через [`.hint`](../reference/query/options.mdx#hint) — по имени (`"views_1"`) или по ключам (`{ views: 1 }`).
 
-```ts twoslash
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Index({ views: 1 })
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Number, { required: true }) views!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Articles = client.db().model(Article);
-// ---cut---
-const byName = await Articles.find({ views: { $gt: 10 } }).hint("views_1").sort({ views: 1 }).plain();
-const byKeys = await Articles.find({ views: { $gt: 10 } }).hint({ views: 1 }).sort({ views: 1 }).plain();
-console.log(byName.length, byKeys.length);
-// → 2 2
-```
+<Snippet id="queries/performance/force-index" twoslash />
 
 Подсказка останется в коде, даже когда данные изменятся и другой индекс станет лучше. Так что держите её на крайний случай. Если индекса с таким именем нет, база откажется выполнять запрос, и вы получите [`ServerError`](../reference/errors/server-errors.mdx#server-error) с текстом `hint provided does not correspond to an existing index (code 2 BadValue)`.
 
@@ -219,48 +84,13 @@ console.log(byName.length, byKeys.length);
 
 Медленный запрос виден в журнале базы или в профилировщике, но непонятно, какой код его породил. [`.comment`](../reference/query/options.mdx#comment) прикрепляет к запросу текстовую метку. Результат не меняется, а метка видна в журнале и в `system.profile`. Пишите в ней место в коде, а не данные, ведь метка попадает в логи сервера.
 
-```ts twoslash title="articles/articles.service.ts"
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Index({ views: 1 })
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Number, { required: true }) views!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Articles = client.db().model(Article);
-// ---cut---
-export const listPopular = () =>
-  Articles.find({ views: { $gt: 10 } }).comment("articles: popular list").sort({ views: -1 }).plain();
-
-console.log((await listPopular()).length);
-// → 2
-```
+<Snippet id="queries/performance/find-in-server-log" title="articles/articles.service.ts" twoslash />
 
 ## Ограничить время запроса [#query-timeout]
 
 Один тяжёлый запрос не должен держать всё приложение. [`.timeoutMS`](../reference/query/options.mdx#timeout-ms) ограничивает время всей операции на стороне клиента. Не уложились — драйвер прервёт запрос и бросит [`TimeoutError`](../reference/errors/server-errors.mdx#timeout-error). `0` значит «без ограничения», а отрицательное число даёт `QueryError`.
 
-```ts twoslash
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-@Index({ views: 1 })
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Number, { required: true }) views!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Articles = client.db().model(Article);
-// ---cut---
-try {
-  await Articles.find().timeoutMS(1).plain();
-} catch (error) {
-  console.log(String(error));
-  // → "TimeoutError: operation timed out (timeoutMS): Server reported a timeout error"
-}
-```
+<Snippet id="queries/performance/query-timeout" twoslash />
 
 Одна миллисекунда взята нарочно, чтобы запрос не успел. Текст после двоеточия зависит от того, где истёк срок. Если при выборе сервера, там будет `Timed out during server selection`, а класс ошибки и начало текста те же. В приложении ставьте срок, за который нормальный запрос успевает с запасом.
 
@@ -270,30 +100,7 @@ try {
 
 Можно задать имя индекса, предел числа просмотренных документов и `covered: true`, если запрос обязан читаться из индекса целиком. Обратная проверка, [`expectCollScan`](../reference/testing/testing.mdx#expect-coll-scan), нужна, когда индекса нет намеренно.
 
-```ts twoslash title="articles/articles.index.test.ts"
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-import { expectIndexScan } from "@venloc/typemo/testing";
-@Index({ views: 1 })
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true }) title!: string;
-  @Prop(() => String, { required: true }) body!: string;
-  @Prop(() => Number, { required: true }) views!: number;
-}
-const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
-const Articles = client.db().model(Article);
-// ---cut---
-const usage = await expectIndexScan(Articles.find({ views: 500 }), { index: "views_1", maxDocsExamined: 1 });
-console.log(usage.stages);
-// → ["FETCH", "IXSCAN"]
-
-try {
-  await expectIndexScan(Articles.find({ body: "pasta" }));
-} catch (error) {
-  console.log(String(error));
-  // → "IndexUsageError: the query is not served by an index: it scans the whole collection (COLLSCAN). plan: COLLSCAN; examined 3 documents, returned 1"
-}
-```
+<Snippet id="queries/performance/test-index" title="articles/articles.index.test.ts" twoslash />
 
 О тестировании приложения подробнее в руководстве [Тестировать приложение](../testing/testing-apps.mdx).
 
@@ -328,49 +135,7 @@ try {
 
 Здесь всё вместе — запрос с меткой и сроком, разбор плана и проверка индекса. Код, которого нет в Typemo и который пишете вы, помечен `__…__`.
 
-```ts twoslash title="articles/articles.service.ts"
-import { Entity, Index, Prop, Schema, TypemoClient } from "@venloc/typemo";
-import { expectIndexScan, explainIndexUsage } from "@venloc/typemo/testing";
-
-@Index({ views: 1 })
-@Schema({ collection: "articles" })
-class Article extends Entity {
-  @Prop(() => String, { required: true })
-  title!: string;
-
-  @Prop(() => String, { required: true })
-  body!: string;
-
-  @Prop(() => Number, { required: true })
-  views!: number;
-}
-
-// код читателя: журнал приложения
-declare const __log__: (message: string) => void;
-
-export const createArticles = (client: TypemoClient) => {
-  const Articles = client.db().model(Article);
-
-  // рабочий запрос: метка для журнала сервера и предел времени
-  const popular = () =>
-    Articles.find({ views: { $gt: 10 } })
-      .comment("articles: popular list")
-      .timeoutMS(2_000)
-      .sort({ views: -1 })
-      .plain();
-
-  // диагностика: читает ли запрос всю коллекцию
-  const diagnose = async () => {
-    const usage = await explainIndexUsage(Articles.find({ views: { $gt: 10 } }));
-    __log__(`stages: ${usage.stages.join(" > ")}; examined ${usage.docsExamined}, returned ${usage.docsReturned}`);
-  };
-
-  // проверка для теста: запрос обязан идти по индексу
-  const assertIndexed = () => expectIndexScan(Articles.find({ views: { $gt: 10 } }), { index: "views_1" });
-
-  return { popular, diagnose, assertIndexed };
-};
-```
+<Snippet id="queries/performance/full-example" title="articles/articles.service.ts" twoslash />
 
 <Callout type="migration">
 

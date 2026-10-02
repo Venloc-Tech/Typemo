@@ -1,0 +1,21 @@
+import { Entity, type Hidden, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "accounts", changeStreamPreAndPostImages: true })
+class Account extends Entity {
+  @Prop(() => String, { required: true }) owner!: string;
+  @Prop(() => Number, { required: true }) balance!: number;
+  @Prop(() => String, { hidden: true }) pin?: Hidden<string>;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Accounts = client.db().model(Account);
+// ---cut---
+const stream = await Accounts.watch({ fullDocumentBeforeChange: "whenAvailable" });
+const account = await Accounts.create({ owner: "kim", balance: 5 });
+await Accounts.deleteOne({ _id: account._id });
+await stream.next();
+
+const event = await stream.next();
+if (event.operationType === "delete") {
+  console.log(event.fullDocumentBeforeChange?.owner);
+  // → "kim"
+}
+await stream.close();

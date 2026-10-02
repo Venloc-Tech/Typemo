@@ -1,0 +1,25 @@
+import { Entity, Prop, Schema, TypemoClient } from "@venloc/typemo";
+@Schema({ collection: "members" })
+class Member extends Entity {
+  @Prop(() => String, { required: true }) name!: string;
+  @Prop(() => String, { enum: ["user", "editor", "admin"], required: true }) role!: "user" | "editor" | "admin";
+  @Prop(() => String) nickname?: string;
+  @Prop(() => Number) age?: number;
+  @Prop(() => [String]) tags!: string[];
+}
+@Schema({ collection: "posts" })
+class Post extends Entity {
+  @Prop(() => String, { required: true }) title!: string;
+}
+const client = await TypemoClient.connect("mongodb://localhost:27017", { dbName: "app" });
+const Members = client.db().model(Member);
+const Posts = client.db().model(Post);
+// ---cut---
+const withNick = await Members.find().where("nickname").exists().sort({ name: 1 }).plain();
+//    ^?
+console.log(withNick.map((member) => member.name));
+// → ["Alice", "Carol"]
+
+const withoutNick = await Members.find().where("nickname").exists(false).plain();
+console.log(withoutNick.map((member) => member.name));
+// → ["Bob"]
