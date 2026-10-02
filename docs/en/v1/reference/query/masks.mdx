@@ -1,0 +1,166 @@
+---
+title: Masks
+description: ".mask, MaskedQuery, the Mask.* presets, and the SENSITIVE_MASK and SENSITIVE_HIDDEN constants: show the client only part of a value"
+icon: EyeOff
+---
+
+A **mask** replaces a field's value with a safe form. The address `alice@gmail.com` becomes `a***@gmail.com`, and a card number becomes `************4242`. You need a mask when a field must be shown, but not in full. A support agent needs to tell which card it is, and has no use for the full number. If you don't need the field at all, don't read it. For that there are [`.select`](./reading.mdx#select) and [`hidden`](../schemas/prop.mdx#hidden). This page describes the [`.mask`](#mask) method of a query and all the ready-made `Mask.*` masks.
+
+If you're new to this, read the guide [Response masks](../../queries/response-masks.mdx) first. This page is the reference.
+
+All the examples use one customer model. It has a required name and email, a phone that can be `null`, an optional age, an array of cards, and a dictionary of notes.
+
+<Snippet id="queries/response-masks/prerequisites" title="models/customer.ts" twoslash />
+
+The collection holds two customers. Alice has the email `alice@gmail.com`, the phone `+79161234567`, is 30 years old, has two cards (`4242 4242 4242 4242` with the holder `Alice A` and `5555 5555 5555 4444` without a holder), and a note `vip` with the value `yes`. Bob has the email `bob@example.org`, the phone `null`, is 17, and has no cards. The results in the `// →` comments are cut down to the fields that matter for the example.
+
+---
+
+## .mask [#mask]
+
+`.mask` applies masks to the query result. You pass a "path → mask" object. The path names a field, nested ones go through a dot, array elements are walked automatically, and dictionary values go through `$*`. A mask is the string `"mask"` (the value becomes `"?"`), a function, or a ready-made `Mask.*` mask.
+
+<Snippet id="reference/query/masks/mask" twoslash />
+
+The mask is applied as the **last step**, after the read, the filling in of related documents, and the conversion to a `.lean()` or `.plain()` result. Hooks, events, and audit see the real data, and the mask touches only what the calling code receives. It doesn't change the source data, and the result is a copy.
+
+<Returns type="MaskedQuery">
+
+A terminal query that gives the result with masks after `await`. For `find` it's an array, for `findOne` a row or `null`. The result type takes the masks into account. A field with `"mask"` gets the type `"?"`, a field with a function gets the type of its result, and if the field can be `null`, `"?"` is added to the type. `MaskedQuery` has `exec`, `cursor` (for lists), and `expect`. There are no other builder methods, because the query is fixed before masking.
+
+</Returns>
+
+<Params>
+<Param name="spec" type="object of path to mask" required>
+
+The keys are paths of the result row. The compiler suggests them and checks that the path exists and that the function accepts the type of the value at that path. The values are `"mask"`, a function `(value) => …`, or an object with a `mask` method, like any `Mask.*` returns. If a value isn't a mask, you get a `QueryError` with the text `mask: "email" takes "mask" or a mask function`. An empty path gives a `QueryError` with the text `mask: an empty path`, and a path that isn't in the result row gives a `StrictModeError` (see the section [A path that isn't in the result](#path-not-in-result)).
+
+The values `null` and `undefined` at a masked path always become `"?"`, and the function isn't called. So functions receive the value type without `null`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/masks/mask-2" />
+
+</FullType>
+
+### Nested values [#nested-values]
+
+A path through an array walks every element, so `cards.number` masks the number of each card. Dictionary values are masked through `$*`. The dictionary key stays, and only the value is masked.
+
+<Snippet id="reference/query/masks/nested-values" twoslash />
+
+The second card has no holder, so the result has no `holder` field either. A missing field stays missing.
+
+### A custom function [#custom-function]
+
+Any function works instead of a ready-made mask. It receives the real value and returns what the calling code will see.
+
+<Snippet id="reference/query/masks/custom-function" twoslash />
+
+If the function throws, the query ends with a `QueryError` with the text `mask: the mask of "email" (model Customer) threw`. Quietly returning the real value instead of the mask would be a leak.
+
+### Only for lean and plain [#lean-and-plain-only]
+
+A document with a masked value could be saved by accident, and the database would end up with the mask instead of the data. So `.mask` works only on [`.lean()`](./reading.mdx#lean) and [`.plain()`](./reading.mdx#plain), and doesn't compile on a document. If the call comes from code without types, Typemo throws a `QueryError`.
+
+<Snippet id="reference/query/masks/lean-and-plain-only" />
+
+### A path that isn't in the result [#path-not-in-result]
+
+A mask on a nonexistent path would mask nothing. A typo in `emial` would leave the real email in the response, and nobody would notice the leak. So the compiler rejects such a path, and if the mask object is built from data it can't see, Typemo checks the paths itself. A [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error) is thrown right at the `.mask` call, before any query to the database.
+
+<Snippet id="reference/query/masks/path-not-in-result" twoslash />
+
+<Snippet id="queries/response-masks/troubleshooting-3" />
+
+Nested paths (`cards.nope`) and `findOne` queries are checked the same way. But a mask protects only the result of one query, and it doesn't replace care. To hide a field entirely, use [`.select`](./reading.mdx#select).
+
+### Cursor [#cursor]
+
+`MaskedQuery` has `.cursor()` for lists. The mask is applied to each row as it's read. `findOne` has no cursor.
+
+<FullType label="MaskedQuery">
+
+<Snippet id="reference/query/masks/cursor" />
+
+</FullType>
+
+### When not to use it [#when-not-to-use]
+
+If the client doesn't need the field at all, don't read it. [`.select`](./reading.mdx#select) with an exclusion, or [`hidden`](../schemas/prop.mdx#hidden) in the model, is more reliable than a mask, because the value never leaves the database. If a field must be masked **everywhere**, including logs and errors, set the `sensitive` option in the model with the same `Mask.*`. It also applies to events and error texts, while `.mask` applies only to the result of one query.
+
+---
+
+## The Mask presets [#mask-presets]
+
+`Mask` is a set of ready-made masks. Each call, for example `Mask.email()`, returns a `{ mask }` object. It fits both `.mask` and the `sensitive` option. All masks share the same rules.
+
+- A mask is typed by the value it accepts. `Mask.email()` won't compile on a numeric field.
+- A mask never throws an error because of data. `null`, a value of the wrong type, or an unusable value gives `"?"`, because losing a detail is better than revealing the value.
+- Only invalid factory arguments cause an error. It throws a `ConfigurationError` right when the factory is called, not on the first row of data.
+- Strings are counted by code points, so emoji and surrogate pairs aren't cut in half.
+
+There is no separate "hide" mask. The string `"mask"` in `.mask({ field: "mask" })` gives `"?"`.
+
+### Strings [#strings]
+
+<TypeTable
+  type={{
+    "Mask.keep(options?)": { description: "Keeps the first `start` and last `end` characters (2 each by default) and replaces the middle with the `char` character (`*` by default). A string that's too short gives `\"?\"`. `Mask.keep().mask(\"abcdefgh\")` → `\"ab****gh\"`. `Mask.keep({ start: 1, end: 0, char: \"#\" }).mask(\"secret\")` → `\"s#####\"`. `Mask.keep().mask(\"abcd\")` → `\"?\"`.", type: "MaskOf<string>" },
+    "Mask.email(options?)": { description: "The first letter of the local part and the domain. With `{ domain: false }` the domain is hidden too, and only the last suffix stays. Text without `@` gives `\"?\"`. `\"alice@gmail.com\"` → `\"a***@gmail.com\"`, and with `{ domain: false }` → `\"a***@***.com\"`.", type: "MaskOf<string>" },
+    "Mask.phone()": { description: "The leading `+`, the first digit, and the last two. Only digits count. Fewer than five digits gives `\"?\"`. `\"+79161234567\"` → `\"+7********67\"`.", type: "MaskOf<string>" },
+    "Mask.card()": { description: "Only the last four digits of the card number, with separators removed. Fewer than eight digits gives `\"?\"`. `\"4242 4242 4242 4242\"` → `\"************4242\"`.", type: "MaskOf<string>" },
+    "Mask.iban()": { description: "The country code with the check digits (the first four characters) and the last four characters, with spaces removed. Eight characters or fewer give `\"?\"`. `\"DE89370400440532013000\"` → `\"DE89**************3000\"`.", type: "MaskOf<string>" },
+    "Mask.initials()": { description: "The first letter of each word, with a period. Text without words gives `\"?\"`. `\"Ivan Petrov\"` → `\"I. P.\"`.", type: "MaskOf<string>" },
+    "Mask.truncate(length)": { description: "The first `length` characters and the full length of the string. `Mask.truncate(3).mask(\"abcdefgh\")` → `\"abc…(8)\"`.", type: "MaskOf<string>" },
+    "Mask.token(options?)": { description: "The prefix (up to the last `_`) and the last `tail` characters of the secret part, three by default. If the tail would take more than a third of the secret, only the prefix is shown. `\"sk_live_51HxAbCdEfGhIj9fQ\"` → `\"sk_live_…9fQ\"`, `\"sk_live_abc\"` → `\"sk_live_…\"`.", type: "MaskOf<string>" },
+    "Mask.jwt(options?)": { description: "The decoded header and chosen payload fields (`claims`, `sub` and `exp` by default), but never the signature. Only primitive values are shown. A corrupted token gives `\"?\"`. The result is an object `{ header: { alg: \"HS256\", typ: \"JWT\" }, claims: { sub: \"42\", exp: 1900000000 } }`.", type: "MaskOf<string>" },
+    "Mask.url()": { description: "Removes the login and password, replaces every parameter value with `?`, and the fragment with `#?`. Text that isn't an absolute URL gives `\"?\"`. `\"https://bob:pw@example.com/a?token=abc#top\"` → `\"https://example.com/a?token=?#?\"`.", type: "MaskOf<string>" },
+    "Mask.ip()": { description: "For IPv4 the last octet becomes 0. For IPv6 only the /48 prefix stays. A non-address gives `\"?\"`. `\"10.1.2.3\"` → `\"10.1.2.0\"`, `\"2001:db8:1:2::9\"` → `\"2001:db8:1::\"`.", type: "MaskOf<string>" },
+    "Mask.hmac(options)": { description: "A keyed HMAC-SHA256 as `h:` and a hexadecimal prefix (`length` characters, from 1 to 64, 16 by default). Equal values give an equal label, so you can match values without showing them. The `key` (a string or bytes) is required and belongs to the mask, and there is no shared key. `\"alice\"` → `\"h:d549a403b8af6fa2\"` for the key `\"pepper-pepper-pepper\"`.", type: "MaskOf<string>" },
+  }}
+/>
+
+### Numbers, dates, sizes [#numbers-dates-sizes]
+
+<TypeTable
+  type={{
+    "Mask.round(step)": { description: "Rounds to the step. A number stays a number, a `bigint` becomes a decimal string (JSON has no `bigint`), and a `Decimal128` becomes an exact decimal string with no loss of precision. Halves round away from zero. `step` is a positive finite number. `Mask.round(100).mask(1234)` → `1200`, `Mask.round(0.05).mask(1.26)` → `1.25`, `Mask.round(10).mask(15n)` → `\"20\"`.", type: "MaskOf<number | bigint | Decimal128>" },
+    "Mask.bucket(bounds)": { description: "A number becomes the label of the range it fell into. The lower bound belongs to the range that starts with it. `bounds` are finite numbers in strictly ascending order, at least one. For `[18, 35, 60]`, the value `10` gives `\"<18\"`, `18` gives `\"18–35\"`, `40` gives `\"35–60\"`, and `70` gives `\"60+\"`.", type: "MaskOf<number>" },
+    "Mask.date(unit)": { description: "A date becomes a year or a month in UTC. An invalid date gives `\"?\"`. `Mask.date(\"year\")` → `\"1990\"`, `Mask.date(\"month\")` → `\"1990-05\"`.", type: "MaskOf<Date>" },
+    "Mask.size()": { description: "Keeps only the size: code points for strings, elements for arrays, dictionaries, and sets. It's called `size`, not `length`, because a static `length` on a class conflicts with `Function.length`. `\"secret\"` → `\"<6 chars>\"`, `[1, 2, 3]` → `\"<3 items>\"`.", type: "MaskOf<string | readonly unknown[] | ReadonlyMap | ReadonlySet>" },
+  }}
+/>
+
+### Any values [#any-values]
+
+<TypeTable
+  type={{
+    "Mask.presence()": { description: "Keeps only whether a value is present. For `null`, `undefined`, an empty string, and an empty array, dictionary, or set it gives `\"<empty>\"`, otherwise `\"<set>\"`.", type: "MaskOf<unknown>" },
+    "Mask.type()": { description: "Keeps only the run-time type of the value. `\"x\"` → `\"<string>\"`, a date → `\"<Date>\"`, an array → `\"<array>\"`.", type: "MaskOf<unknown>" },
+    "Mask.keys()": { description: "An object, `Mixed`, or a dictionary keeps its keys, and every value becomes `\"?\"`. `{ a: 1, b: \"x\" }` → `{ a: \"?\", b: \"?\" }`. Arrays, dates, and BSON values give `\"?\"`.", type: "MaskOf<object>" },
+    "Mask.fixed(text)": { description: "Always the same text, whatever the value is. `Mask.fixed(\"[redacted]\")` → `\"[redacted]\"`.", type: "MaskOf<unknown>" },
+    "Mask.when(predicate, then, otherwise)": { description: "Picks a mask by the value. Each branch is `\"show\"` (the real value), `\"mask\"` (`\"?\"`), or another mask. `null` and `undefined` always give `\"?\"`, and the predicate isn't called. With `Mask.when((name: string) => name.length < 4, \"show\", Mask.keep({ start: 1, end: 0 }))` the value `\"bob\"` stays, and `\"alexander\"` → `\"a********\"`.", type: "MaskOf<T>" },
+  }}
+/>
+
+### Invalid factory arguments [#invalid-factory-arguments]
+
+The factory checks its arguments at once and throws a `ConfigurationError`, instead of an error on the first row of data.
+
+<Snippet id="reference/query/masks/invalid-factory-arguments" />
+
+### Mask types [#mask-types]
+
+`MaskOf<T>` is the type of a ready-made mask for values `T`, an object with a `mask` method. `MaskChoice<T>` is a `Mask.when` branch, that is, `"show"`, `"mask"`, or `MaskOf<T>`. `MaskFunction<V>` and `MaskValue<V>` are the mask function and the value of a `.mask` entry. `MaskPaths`, `MaskSpecCheck`, `ApplyMask`, and `MaskResult` are the types the compiler uses to check paths and compute the result type. You usually don't write them by hand.
+
+---
+
+## SENSITIVE_MASK and SENSITIVE_HIDDEN [#sensitive-mask]
+
+Two constants with the texts that stand in for values. `SENSITIVE_MASK` equals `"?"` and stands in for a masked value. `SENSITIVE_HIDDEN` equals `"[hidden]"` and stands in for a fully hidden value, together with the whole condition of the field. Code that reads masked data needs them to tell a mask from a real value, for example when parsing errors and events.
+
+<Snippet id="reference/query/masks/sensitive-mask" twoslash />

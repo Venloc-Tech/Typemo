@@ -1,0 +1,130 @@
+---
+title: Models in modules
+description: "forFeature in NestJS: models by class, another database, discriminators, plugin statics, views, and creating collections on startup"
+icon: Layers
+---
+
+A NestJS module gets its models through `TypemoModule.forFeature`. You list entity classes, and the module turns each one into a provider you inject with `@InjectModel`. Below we'll go through everything you can list there: ordinary entities, entities in another database, discriminator children, entities with plugin statics, views, and materialized results. At the end, how to create their collections and indexes on startup.
+
+## What you need [#prerequisites]
+
+The app from the [Connect Typemo to NestJS](./setup.mdx) guide with the account entity.
+
+<Snippet id="integrations/nestjs/models/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+List the module's entities and turn on creating missing collections on startup.
+
+<Snippet id="integrations/nestjs/models/quick-start" title="app.module.ts" twoslash />
+
+Below we'll cover each kind of entry and how to choose `sync`.
+
+## One entity in several modules [#shared-entity]
+
+Both the accounts module and the reports module need accounts. List `Account` in the [`forFeature`](../../reference/integrations/nestjs.mdx#typemo-module.for-feature) of each. The model provider calls `connection.model(Account)` from the core, and the core returns one object per entity and database. So both modules get **the same** object. Comparing the injected models with `toBe` confirmed it.
+
+Registering by class closes a hole that registering by string left open. Two different `Account` classes in two modules are two models with two tokens, and neither silently takes the other's place.
+
+## An entity in another database [#entity-in-other-database]
+
+Archived accounts live in the `archive` database of the same cluster. The second argument of `forFeature` sets the entry's target: `{ db }` for a database, `{ client }` for another client.
+
+<Snippet id="integrations/nestjs/models/entity-in-other-database" title="archive/archive.service.ts" twoslash />
+
+The target is part of the token. `@InjectModel(Account)` and `@InjectModel(Account, { db: "archive" })` are two different models, and they write to different databases. There's no collection name in `forFeature`. It's set on the entity (`@Schema({ collection })`), and two registrations of one entity with different collections would contradict each other.
+
+## Discriminator children [#discriminator-children]
+
+An event has kinds, for example a link click and a sign-up, and all of them live in one collection. Children are defined with [`@Discriminator`](../../reference/schemas/discriminator.mdx) as usual, and you can list them in `forFeature` in any order.
+
+<Snippet id="integrations/nestjs/models/discriminator-children" title="events/events.module.ts" twoslash />
+
+The core knows on its own that `ClickEvent` is a child of `Event` and creates its model in the base's collection. With three different orders in the list, the result was one `events` collection, and the created click had `__t` equal to `"click"`. If the list has only the child, the base is compiled for it in the same collection, but the base gets no provider. To inject the base model, list it too.
+
+## A model with plugin statics [#model-with-plugin-statics]
+
+A plugin adds a static method to models, and the service wants to call it on the injected model with types. The `{ entity, statics }` entry injects a model with [`Model.statics(plugin)`](../../reference/hooks/plugins.mdx#model.statics) applied.
+
+<Snippet id="integrations/nestjs/models/model-with-plugin-statics" title="notes/notes.module.ts" twoslash />
+
+You write the parameter type yourself: `Model<Note> & PluginStatics<typeof countPlugin>`. On startup the module checks that the plugin really is applied to the schema, otherwise the type would promise a method that doesn't exist. Without `@Plugin(countPlugin)` on the entity, startup fails with `ConfigurationError: Note: plugin "count" is not applied to this model's schema`.
+
+## A view [#view]
+
+The service needs only accounts with money in them, and that condition should live in one place. You describe a view with [`TypemoModule.view`](../../reference/integrations/nestjs.mdx#typemo-module.view) and list it in the same `forFeature`.
+
+<Snippet id="integrations/nestjs/models/view" title="accounts/accounts.module.ts" twoslash />
+
+What gets injected is a [`TypedView`](../../reference/collections/typed-view.mdx), and it can only read. The pipeline is checked against the class at compile time. If `project` doesn't produce `balance`, the definition won't compile. Of two accounts, `Main` with a balance of 5 and `Empty` with 0, the view returned only `Main`.
+
+The `sync` option creates the view in the database on startup (more on it below). Until the view exists, reading throws a [`ConfigurationError`](../../reference/errors/configuration-errors.mdx#configuration-error) rather than returning an empty list.
+
+Within a database, a class is one thing, either a model or a view. If you register `FundedAccount` as a model in one module and as a view in another, startup fails with `ConfigurationError`. Otherwise the app would end up with two different objects for one collection.
+
+## A materialized result [#materialized-result]
+
+An account summary is expensive to compute, and recomputing it on a schedule is enough. [`TypemoModule.materialized`](../../reference/integrations/nestjs.mdx#typemo-module.materialized) describes an ordinary collection that a pipeline fills.
+
+<Snippet id="integrations/nestjs/models/materialized-result" title="reports/reports.module.ts" twoslash />
+
+On the same two accounts, `rebuild()` returned `[{ _id: "Main", total: 5 }]`. The result doesn't recompute itself. Your code calls `refresh()`, for example a scheduled job or a handler.
+
+## Create collections on startup [#create-collections-on-start]
+
+The environment is new, there's no database yet, and the unique index has to exist before the first write. The [`sync`](../../reference/integrations/nestjs.mdx#sync) option in the root `forRoot` decides what the module does to the database on startup.
+
+- `false` (the default): nothing. Starting the app doesn't change the database.
+- `"init"`: [`connection.init()`](../../reference/connection/connection.mdx#connection.init). Creates missing collections, indexes, and views, without changing or deleting anything.
+- `"sync"`: [`connection.syncAll()`](../../reference/connection/connection.mdx#connection.sync-all). Brings everything in line with the schemas and, for example, replaces an index declared differently.
+
+Syncing runs after all modules have registered their models, for every database that has models from `forFeature`. With `sync: "init"` and an entity with a unique field, the collection and the `_id_` and `code_1` indexes appeared, and with `sync: false` the database stayed empty. If an index in the database is declared differently, `"init"` fails startup with a [`SyncError`](../../reference/errors/configuration-errors.mdx#sync-error), and `"sync"` replaces the index.
+
+## How to choose `sync` [#how-to-choose]
+
+Ask yourself who owns the database schema in your environment.
+
+- **There's a deployment or migration step**: keep `false` and call `connection.init()` or `syncAll()` there. Ten running copies of the app shouldn't rebuild indexes ten times.
+- **There's no separate step**: in development, tests, or a small app. Then `"init"` is safe, since it only adds what's missing.
+- **The app is the only owner of the schema**, and replacing an index on deploy is expected. Then use `"sync"`, but remember that rebuilding a large index puts load on the server.
+
+## When not to use it [#when-not-to-use]
+
+A module that needs only another module's service doesn't have to import `forFeature`. The model is the owning module's internal business. A one-off summary you don't need to store is better computed with an aggregation in the service ([`Model.aggregate`](../../reference/aggregation/pipeline.mdx#model.aggregate)) than as a materialized result.
+
+## Troubleshooting [#troubleshooting]
+
+**An entity is listed twice.** `forFeature([Account, Account])` or `[Account, { entity: Account, statics }]` fails right at the call: `ConfigurationError: TypemoModule.forFeature: Account is listed twice`. Keep one entry and give it the statics.
+
+**`collection` in a forFeature entry.** `forFeature([{ entity: Account, collection: "x" }])` doesn't compile, and if you bypass the types it fails with `unknown key "collection" in { entity: Account } (known: entity, statics)`. The collection is set on the entity.
+
+**A class without `@Schema`.** Startup fails with `ConfigurationError: NotASchema: not a schema; decorate the class with @Schema()`. A discriminator child, though, doesn't need `@Schema`, because it takes the base's options.
+
+## Full example [#full-example]
+
+The accounts module: an entity with a child, a view, a summary, and creating collections on startup.
+
+<Snippet id="integrations/nestjs/models/full-example" title="accounts/accounts.module.ts" twoslash />
+
+<Callout type="migration" title="Coming from @nestjs/mongoose">
+
+`forFeature([{ name, schema, discriminators }])` → `forFeature([Entity, Child])`, where children are ordinary entries. There's no `forFeatureAsync` with a schema from a factory and injection. Plugins are attached with the `@Plugin` decorator or in `onClientCreate`. Views are registered in the same `forFeature`, not in a separate list.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Transactions and policies per request" href="./transactions-and-policies.mdx">
+  How to change several models in one transaction and take the tenant from the request.
+</Card>
+<Card title="Read a predefined selection through a view" href="../../collections/views.mdx">
+  How views work without Nest: defining, creating, and updating them.
+</Card>
+<Card title="Sync indexes" href="../../collections/index-sync.mdx">
+  What `init` and `syncAll` do and how to read their report.
+</Card>
+<Card title="forFeature in the reference" href="../../reference/integrations/nestjs.mdx#typemo-module.for-feature">
+  Every kind of entry, the entry's target, and the errors.
+</Card>
+</Cards>

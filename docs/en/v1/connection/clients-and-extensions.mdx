@@ -1,0 +1,141 @@
+---
+title: Multiple clients and extensions
+description: "Run several clients in one app and decide where to register extensions, plugins, and subscribers: for all clients or for one"
+icon: Layers
+---
+
+One process can hold several clients. For example, the app's main database, a separate server for reports, and a client that a library created. Everything that extends Typemo (schema extensions, plugins, event subscribers) can be registered **globally**, and then every client sees it. Or it can be registered **on one client**.
+
+Below we cover how to choose the level, what clients share and what they keep to themselves, and why the order of registration matters so much. If you haven't connected to a database through Typemo before, start with [Connect to the database](./connect.mdx).
+
+## What you need [#prerequisites]
+
+- The account model below.
+- Two clients: `main` for production data and `reports` for reports.
+- A `label` extension that stores a UI caption in the field description. To Typemo it's only metadata. The extension never steps into operations and never bypasses policies.
+
+<Snippet id="connection/clients-and-extensions/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+There are two levels of registration, a wide one and a narrow one. [`Typemo.use`](../reference/connection/typemo.mdx#typemo.use) registers a schema extension for all clients, and [`client.use`](../reference/connection/typemo-client.mdx#client.use) for one. [`Typemo.instrument`](../reference/connection/typemo.mdx#typemo.instrument) registers a subscriber to the events of all clients, and [`client.instrument`](../reference/connection/typemo-client.mdx#client.instrument) to the events of one.
+
+<Snippet id="connection/clients-and-extensions/quick-start" twoslash />
+
+We'll go through both levels on real tasks below.
+
+## Keep two clients [#two-clients]
+
+You need a second client when the data lives on another server or needs other settings, such as an operation timeout or a pool size. For a second database on **the same** server you don't need a client. [`client.db`](../reference/connection/typemo-client.mdx#client.db) is enough.
+
+Give the clients names with the `name` option. The name goes into events and error texts, so the log shows right away which client was involved.
+
+<Snippet id="connection/clients-and-extensions/two-clients" title="db/clients.ts" twoslash />
+
+The clients are completely independent. Each has its own pool, its own state, and its own shutdown, so `main` survives `reports` being closed.
+
+## Register an extension for all clients [#register-global]
+
+An **extension** adds a new key inside the `ext` of `@Prop` or `@Schema` to the model description and checks its values. That's how integrations keep their settings right on the field. An extension has two parts: a type declaration for the compiler (`declare module`) and a registration with a value check.
+
+Register globally whatever should work in every model of the app and in libraries that create their own clients.
+
+<Snippet id="connection/clients-and-extensions/register-global" title="extensions/label.ts" twoslash />
+
+Now any model on any client can write `ext: { label: { text: "…" } }`. The check runs when the schema compiles, that is on the first [`connection.model`](../reference/connection/connection.mdx#connection.model). A wrong value fails there, not on the first write. The check's error becomes the `cause` of a `ConfigurationError`.
+
+You can't register the same name twice. If a name is taken globally, a client can't take it, and the other way around.
+
+<Snippet id="connection/clients-and-extensions/register-global-2" />
+
+## Register an extension for one client [#register-per-client]
+
+If only the models of one client need an extension, register it on that client. The other clients don't know about it, and a model with that key on another client won't compile. Here's the error for a model that has `ext: { label: … }` on its `owner` field.
+
+<Snippet id="connection/clients-and-extensions/register-per-client" />
+
+The error names the field and suggests what to do. This separation helps when a library creates its own client and its own models. Its extensions don't get into your app, and yours don't get in its way.
+
+<Snippet id="connection/clients-and-extensions/register-per-client-2" title="db/reports-client.ts" twoslash />
+
+## Register before the first model [#register-before-first-model]
+
+Order matters. Once a client has compiled its first model, it's too late to register an extension. If one showed up later, it couldn't check the schemas that are already built. The error names the model that closed the registry.
+
+<Snippet id="connection/clients-and-extensions/register-before-first-model" />
+
+Extensions and plugins close by the same rule, on the first **successful** schema compilation.
+
+- The client registry (`client.use`) and the connection registry ([`connection.plugins`](../reference/connection/connection.mdx#connection.plugins)) close on the first model of that client or connection.
+- The global registries [`Typemo.use`](../reference/connection/typemo.mdx#typemo.use) and [`Typemo.plugin`](../reference/connection/typemo.mdx#typemo.plugin) close on the first model on **any** client.
+
+The reason is the same everywhere. A late plugin or extension wouldn't affect the schemas already compiled, so it would work for some models and not for others.
+
+A failed compilation closes nothing. If a model didn't compile because of an unregistered `ext` key, register the key and call `connection.model` again. After such an error, `Typemo.use`, `Typemo.plugin`, and `client.use` still accept registrations. Until its first model is compiled, a client sees both its own extensions and the global ones, even those registered after the client was created.
+
+This has a consequence for libraries. If a library creates a client and models on import, your global `Typemo.use` and `Typemo.plugin` are already closed after that import. So do your global registrations before any imports that create models. An extension on a client (`client.use`) isn't at risk here, because your client has no compiled model yet.
+
+<Snippet id="connection/clients-and-extensions/register-before-first-model-2" />
+
+Hence the startup order. First global plugins and extensions, then clients and their extensions, and only then models.
+
+## Subscribe to the events of all clients or one [#subscribe]
+
+Operation events (start, end, and error) go to a subscriber registered globally or on one client. Integrations like metrics and tracing need a global subscriber, since it sees every client. An event carries the client name, the database, and the operation, so one subscriber can tell them apart.
+
+<Snippet id="connection/clients-and-extensions/subscribe" title="observability/log.ts" twoslash />
+
+A client subscriber ([`client.instrument`](../reference/connection/typemo-client.mdx#client.instrument)) sees only the operations of its own client. Both registrations return a subscription with an `unsubscribe()` method. How events work is covered in [Operation events](../observability/events.mdx).
+
+## How to choose the level [#how-to-choose]
+
+Ask yourself **who besides your models should see this setting**.
+
+- **The whole process, including libraries with their own clients**: register globally.
+- **One client**: register on the client. Then other code doesn't get your extension, and yours doesn't get theirs.
+- **The app has one client**: there's hardly any difference, and the global level is enough.
+
+An app usually registers plugins and observability subscribers globally, and extensions on the clients whose models use them.
+
+## When not to use it [#when-not-to-use]
+
+If a field setting only needs to be stored, not checked, you don't need an extension. [`@Prop`](../reference/schemas/prop.mdx) with its own options is enough. And an extension can't change how an operation behaves, such as its filter or update. It doesn't take part in operations and doesn't bypass policies. To step into an operation, use [hooks](../hooks/operation-hooks.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**Registration after the first model.** An extension or plugin is registered in a module that's imported after the models. The `are fixed once a schema is compiled` error names the model that closed the registry. Move the registration up, into a file that runs before the models are set up.
+
+**The extension is declared for the compiler but not registered.** `declare module` tells only the compiler about the key. Without `Typemo.use` or `client.use`, TypeScript accepts the model, but the first [`connection.model`](../reference/connection/connection.mdx#connection.model) fails with `ext "label" is not a registered extension`. You need both parts.
+
+**The extension is registered on one client, but the model comes from another.** It's the same error, only on the model of the second client. Register the extension on the second client too, or globally with [`Typemo.use`](../reference/connection/typemo.mdx#typemo.use).
+
+## Full example [#full-example]
+
+The startup file does everything in the right order: global plugins and extensions, two clients, a subscriber, and models.
+
+<Snippet id="connection/clients-and-extensions/full-example" title="bootstrap.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose you add global plugins with `mongoose.plugin`. In Typemo it's [`Typemo.plugin`](../reference/connection/typemo.mdx#typemo.plugin), and it's stricter. Registering after the first schema has compiled throws a [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configuration-error) instead of silently leaving the plugin off some models.
+
+Mongoose has no separate notion of a schema extension (`Typemo.use`, `client.use`). Typemo tells apart a plugin, which changes the schema, and an extension, which only carries and checks metadata.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Reuse behavior across models" href="../hooks/plugins.mdx">
+  Write a schema plugin and attach it to a model, a connection, or the whole process.
+</Card>
+<Card title="Add your own field and schema options" href="../extensions/custom-options.mdx">
+  Add your own key to `ext` and read it from the schema description.
+</Card>
+<Card title="Operation events" href="../observability/events.mdx">
+  What an event holds and how to write a subscriber for metrics and logs.
+</Card>
+<Card title="Typemo" href="../reference/connection/typemo.mdx">
+  The global `plugin`, `use`, and `instrument` with exact signatures and errors.
+</Card>
+</Cards>

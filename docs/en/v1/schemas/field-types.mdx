@@ -1,0 +1,144 @@
+---
+title: Choose a field type
+description: "Which type to pick for a field: how Number, Int32, BigInt, and Decimal128 differ, and how dates, identifiers, and binary data are stored"
+icon: Braces
+---
+
+You pass the field type to [`@Prop`](../reference/schemas/prop.mdx#prop) as the first argument. It decides three things at once: how the value is stored in the database, which values the library accepts, and what the value looks like in code. Strings and dates are straightforward. But for numbers, money, and identifiers MongoDB has several types, and a poor choice doesn't show right away. A number doesn't fit, money loses cents, an identifier isn't found by a string.
+
+If MongoDB is new to you, remember one thing. It stores documents in the **BSON** format, which has more types than JavaScript, for example `int32`, `int64`, and `decimal128`. Typemo gives you a field type for each of them.
+
+## What you need [#prerequisites]
+
+A model described as in [Define a model](./define-model.mdx). The examples build a bank account model and add fields to it one at a time.
+
+## Quick start [#quick-start]
+
+Most of the time five types are enough: a string, a number, a boolean, a date, and an identifier. Bring in the others when you need them.
+
+<Snippet id="schemas/field-types/quick-start" title="accounts/account.ts" twoslash />
+
+A field type is a JavaScript constructor (`String`, `Number`, `Boolean`, `Date`, `BigInt`, `RegExp`), a class from [`Types`](../reference/schemas/types-and-spec.mdx#types), or the result of the [`Spec`](../reference/schemas/types-and-spec.mdx#spec) builder. Below we'll go through the types by situation.
+
+## Store numbers [#numbers]
+
+`Number` accepts any finite JavaScript number. An integer value goes into the database as an `int32`, a fraction as a `double`. `5` and `1.5` have different types in the database, and that happens on its own.
+
+<Snippet id="schemas/field-types/numbers" twoslash />
+
+If you need one specific type, declare it explicitly. [`Types.Int32`](../reference/schemas/types-and-spec.mdx#types) accepts only integers in the `int32` range, and [`Types.Double`](../reference/schemas/types-and-spec.mdx#types) always stores a `double`. A value that doesn't fit is an error, not a rounding. The library won't quietly turn `1.5` into `1`.
+
+<Snippet id="schemas/field-types/numbers-2" twoslash />
+
+`Number` won't let `NaN` or infinity through either: `Cast to number failed at path "limit" for NaN (number): NaN and Infinity are not allowed [finite]`. A string instead of a number gives a `CastError` with the reason `type`. `"5"` won't become a number, or else a typo in a request body would turn into wrong data.
+
+## Store very large integers [#big-integers]
+
+A regular JavaScript number holds integers exactly only up to 2⁵³. For larger values, like an operation counter or an external numeric identifier, use `BigInt`. In the database it's an `int64` (the `long` type), and in code it's a `bigint`.
+
+<Snippet id="schemas/field-types/big-integers" twoslash />
+
+In [`$toPlain()`](../documents/serialization.mdx) and in JSON an `int64` value becomes a **decimal string**. A client that parses JSON into regular numbers would get a value above 2⁵³ with lost precision, and no error at all.
+
+For writes, the types allow a `bigint` and a decimal string (`"9007199254740993"`). In TypeScript code the [`Int64String`](../reference/schemas/field-markers.mdx#int64-string) type describes such a string. The string is accepted not only in `create` but also in filters and in `$inc`, `$mul`, `$min`, and `$max`. A string with a plus sign, a leading zero, or spaces gives a `CastError` with the reason `format`: `Cast to Long failed at path "operations" for "+5" (string): a string must be a decimal integer (no sign +, leading zeros, -0, spaces, exponent or prefix) [format]`.
+
+At runtime a regular number passes only if it's a safe integer, up to 2⁵³. Otherwise it lost precision before it was ever written, and you get a `CastError` with a hint on what to pass instead: `Cast to Long failed at path "operations" for 1152921504606847000 (number): beyond Number.MAX_SAFE_INTEGER the number is already imprecise; pass a bigint (5n) or a decimal integer string ("5") [precision]`. A fraction gets the same treatment: `a fractional number is not an int64; pass a bigint (5n) or a decimal integer string ("5") [integer]`. The types don't let a number into this field, so this can happen only in untyped code.
+
+## Store money [#money]
+
+A `double` won't do for money, since `0.1 + 0.2` isn't `0.3` in it. `Types.Decimal128` stores a decimal number exactly, with up to 34 significant digits. Pass the value as a string or a `Decimal128` object, not as a number. A JavaScript number already carries the binary representation error, and the imprecision would appear before the write.
+
+<Snippet id="schemas/field-types/money" twoslash />
+
+Like `BigInt`, `Decimal128` becomes a string in `$toPlain()` and in JSON, or a JavaScript number would lose the cents. The input types accept a `Decimal128` and a string, and `Types.Decimal128.fromString("1.10")` remains a second way to create a value. A string with a typo gives a `CastError` with the reason `format`: `Cast to Decimal128 failed at path "amount" for "abc" (string): not a decimal number string [format]`. At runtime a number also goes through, by way of its shortest decimal notation. `19.99` turns into `"19.99"`, and `NaN` and infinity are rejected. But the types don't let a number in here.
+
+## Store dates [#dates]
+
+`Date` stores a point in time in UTC with millisecond precision. Besides a `Date` object, the field accepts an ISO 8601 string: a date (`2024-01-01`) or a date with a time **and a time zone**. A string without a zone, like `2024-01-01T10:00`, is ambiguous. It would mean a different time in different places, so the library won't accept it.
+
+<Snippet id="schemas/field-types/dates" twoslash />
+
+The input type requires a `Date`, hence the `as never` in the example. A string is allowed at runtime so you can take data from JSON, but application code usually passes a `Date`.
+
+## Store identifiers [#ids]
+
+Store a reference to a document or an external identifier as `Types.ObjectId` or `Types.UUID`. Both accept their own value and a string: 24 hex characters for `ObjectId` and the `8-4-4-4-12` format for `UUID`. So you can pass an identifier from a request URL to `create`, to an update, and to a filter without converting anything by hand.
+
+<Snippet id="schemas/field-types/ids" twoslash />
+
+A malformed string gives a `CastError` with the reason `format`: `Cast to ObjectId failed at path "from" for "zz" (string): not a 24-character hex string [format]`. In `$toPlain()` and in JSON both types become strings. If the document's own identifier (`_id`) needs the type, rather than a reference field, extend [`EntityWithId`](../reference/schemas/base-classes.mdx#entity-with-id). That's covered in [Use your own _id type](./custom-ids.mdx).
+
+## Store binary data, timestamps, and vectors [#binary-timestamps-vectors]
+
+The other types come up less often.
+
+- `Types.Binary` stores binary data of subtype 0. For another subtype there's [`Spec.binary`](../reference/schemas/types-and-spec.mdx#spec.binary).
+- `Types.Timestamp` is MongoDB's internal timestamp. Don't confuse it with `Date`. It isn't meant for your own dates.
+- [`Spec.vector`](../reference/schemas/types-and-spec.mdx#spec.vector) describes a vector of numbers for search by meaning. The size and the element type are set in the description itself.
+
+<Snippet id="schemas/field-types/binary-timestamps-vectors" twoslash />
+
+A vector accepts an ordinary array of numbers (`number[]`) and is stored as a binary value of subtype 9. The number of elements is checked against the description, and in `$toPlain()` and in JSON the vector becomes a `number[]` again.
+
+<Snippet id="schemas/field-types/binary-timestamps-vectors-2" twoslash />
+
+[Full-text and vector search](../queries/text-and-vector-search.mdx) shows how to turn a vector into a search.
+
+## Allow several types [#union-types]
+
+Sometimes a field is a string or a number, for example a setting's value or an identifier from an external system. That's what [`Spec.union`](../reference/schemas/types-and-spec.mdx#spec.union) is for. Each value must match **exactly one** member of the union, otherwise it's unclear how to store it.
+
+<Snippet id="schemas/field-types/union-types" twoslash />
+
+The [Value forms](../reference/values/value-forms.mdx) reference shows what each type looks like in a document, in `.lean()` and `.plain()` results, and in JSON.
+
+## How to choose a number type [#how-to-choose]
+
+Ask yourself: **what happens if the number turns out imprecise?**
+
+- **Nothing bad**, as with a rating or a view count: `Number`.
+- **The number must be an integer, and a fraction must be rejected**: `Types.Int32`.
+- **The integer may exceed 2⁵³, or it's an external numeric identifier**: `BigInt`.
+- **It's money or another quantity where every digit after the decimal point matters**: `Types.Decimal128`.
+
+You'll rarely need `Types.Double`. Use it when the database must hold exactly a `double`, for example for compatibility with another application.
+
+## When not to use it [#when-not-to-use]
+
+If the value is a set of fields rather than one quantity, you need a nested object ([Define nested objects and subdocuments](./nested-and-subdocuments.mdx)), not a type from this page. A list of values of one type is written as `[String]` (see [Store lists of values and subdocuments](./arrays.mdx)), and a dictionary with keys you don't know in advance uses `Spec.map` (see [Store a dictionary with arbitrary keys](./maps.mdx)). There are no `Set`, `Map`, `Array`, or `Object` field types. Those approaches take their place.
+
+## Troubleshooting [#troubleshooting]
+
+**A fraction isn't saved.** `Types.Int32` instead of `Number` rejects `1.5`. `int32` is an integer type, and rounding quietly would mean losing data. If you need fractions, change the type to `Number` or `Types.Double`.
+
+**Money "loses" cents.** A `Number` field saved `0.30000000000000004`. Binary arithmetic is to blame, since a `double` can't represent most decimal fractions exactly. Store money as `Types.Decimal128`, and add and compare it on the database side or with a decimal library.
+
+**A large number arrives different in JSON.** The client got `9007199254740992` instead of `9007199254740993`, because the value was sent as a regular number. Use `BigInt` and hand the client [`$toPlain()`](../reference/documents/document-api.mdx#to-plain) or `.plain()`, where an `int64` is already a string.
+
+**A string doesn't find a document by its identifier.** `Types.ObjectId` accepts a string in a filter too, but only one of the right length made of hex characters. A typo gives a `CastError` with the reason `format`, not an empty result. The library tells you outright that the value isn't an identifier instead of returning "nothing found".
+
+## Full example [#full-example]
+
+One file with an account that has fields of different types. It's created and sent to the client through `.plain()`. Code that isn't part of Typemo is marked `__…__`.
+
+<Snippet id="schemas/field-types/full-example" title="accounts/accounts.service.ts" twoslash />
+
+<Callout type="migration">
+
+Typemo separates the number types explicitly: `Types.Int32`, `Types.Double`, `BigInt` (int64), and `Types.Decimal128`. A value of another type is rejected, not quietly cast, so `"5"` won't become a number. You use `Types.ObjectId` instead of `Schema.Types.ObjectId`. There's no "any value" type (`Mixed`), and Typemo doesn't allow a field without a described schema.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Required fields, null, and missing values" href="./required-and-null.mdx">
+  How to declare that a field is required, allows `null`, or may be missing.
+</Card>
+<Card title="Types and Spec" href="../reference/schemas/types-and-spec.mdx">
+  Every `Types` class and `Spec` builder with their exact errors.
+</Card>
+<Card title="Value forms" href="../reference/values/value-forms.mdx">
+  How each type looks in a document, in `.lean()`, `.plain()`, and JSON.
+</Card>
+</Cards>

@@ -1,0 +1,168 @@
+---
+title: Large results
+description: "Process thousands of documents without loading them into memory: a cursor, eachAsync with parallelism and batches, and errors mid-stream"
+icon: Rows3
+---
+
+A plain `await` first collects **all** the documents it found into an array and only then hands it to you. For a list on a page that's fine. For an export to another system, a migration, or a nightly report rebuild it's bad. There are tens of thousands of documents, and memory runs out before you start processing them.
+
+The answer is a **cursor**. It hands out documents one at a time as they're read from the database and keeps only the current batch in memory. [`.cursor()`](../reference/query/reading.mdx#cursor) returns one.
+
+If you're new to MongoDB, remember one thing. The database returns a result in batches, and the cursor is your side of that read. While it's open, resources are held on the server too, so a cursor has to be read to the end or closed.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and an order model. Code that isn't part of Typemo and that you write yourself is marked `__…__`.
+
+<Snippet id="queries/large-results/prerequisites" title="orders/order.ts" twoslash />
+
+The collection has five orders numbered 1 to 5. The odd ones are paid (`paid`), and the even ones are new (`new`). Every example reads the orders by ascending number, so the order of the results is clear. The results in the `// →` comments come from this data.
+
+## Quick start [#quick-start]
+
+Walk the cursor with a `for await` loop. Each row arrives as an ordinary object, as from `.plain()`, and only the current batch lives in memory.
+
+<Snippet id="queries/large-results/quick-start" twoslash />
+
+We'll go through the ways to process documents on real tasks below. The cursor methods are described in the [Cursor](../reference/query/cursor.mdx) reference.
+
+## Export every document [#export-all]
+
+Most often you need to read everything and send it to another system. You build the query as usual, only it ends with [`.cursor()`](../reference/query/reading.mdx#cursor) instead of `await`. The same chain as always picks the form of the rows. Without `.plain()` and `.lean()` they're documents, and with them they're data.
+
+<Snippet id="queries/large-results/export-all" title="export/export-orders.ts" twoslash />
+
+Always set a sort. Without one the order of documents isn't defined, and you can't repeat the export. For large exports `_id` is the most convenient, since it's unique and every document has it.
+
+[`.skip`](../reference/query/reading.mdx#skip), [`.limit`](../reference/query/reading.mdx#limit), and [`.batchSize`](../reference/query/options.mdx#batch-size) work with a cursor too. The last one sets how many documents the database sends per round trip. The batch size must be a positive integer. The database would read `batchSize(0)` as "the default size", so Typemo answers with a `QueryError` (`batchSize must be a positive integer, got 0 (number)`, with a note about zero). You get the default batch by not calling the method at all.
+
+The loop closes the cursor for you, both when it has read everything and when you leave early with `break` or an error. After an early exit that cursor can't be read anymore, or you get a [`QueryError`](../reference/errors/query-errors.mdx#query-error).
+
+<Snippet id="queries/large-results/export-all-2" />
+
+That's by design. Reading a cursor you've already closed would mean your code reads different data from what you think, and a silent empty result would hide the bug. To read the data again, open a new cursor.
+
+And `for await` must iterate the cursor, not the query itself. A loop over a query like `for await (const order of Orders.find())` throws a `QueryError` with a hint on how to do it right.
+
+<Snippet id="queries/large-results/export-all-3" />
+
+## Process documents in parallel [#process-in-parallel]
+
+If each document means waiting on the network, for example to send it to another system, a `for await` loop sits idle. The next document waits for the previous one to finish. [`.eachAsync`](../reference/query/cursor.mdx#each-async) calls your function for each document and can keep several calls running at once.
+
+<Snippet id="queries/large-results/process-in-parallel" twoslash />
+
+With `parallel: 3`, at most three calls run at the same time. Documents are still read one at a time, and only your function runs in parallel. The completion order isn't guaranteed, and order 3 may finish before order 2. If the order matters, leave `parallel` at one, which is the default. At the end `.eachAsync` closes the cursor itself, even if your function threw.
+
+## Process documents in batches [#process-in-batches]
+
+Sometimes the receiver prefers batches, for example when inserting into another database. Then the `batchSize` option collects documents into arrays. Your function receives an array instead of one document, and a batch number instead of a document number.
+
+<Snippet id="queries/large-results/process-in-batches" twoslash />
+
+The last batch is shorter than the others. In the example it has one order.
+
+Don't confuse this option with the query's [`.batchSize`](../reference/query/options.mdx#batch-size). That one controls how many documents the database sends per network round trip. The `batchSize` of `.eachAsync` controls how many documents your function gets per call. Batches and parallelism combine. `{ batchSize: 100, parallel: 4 }` processes 100 documents at a time, four batches at once.
+
+## Transform rows on the fly [#transform-rows]
+
+[`.map`](../reference/query/cursor.mdx#map) returns a new cursor whose rows come from your function. That way you can bring a document into the shape you need before the rest of the code reads it. And if you need to collect everything into an array, [`.toArray`](../reference/query/cursor.mdx#to-array) does that.
+
+<Snippet id="queries/large-results/transform-rows" twoslash />
+
+The original cursor and the result of `.map` read the same stream. A row read through one of them is gone for the other. If you need both forms of a row, transform it inside one loop instead of opening two cursors.
+
+## Change documents during an export [#update-while-exporting]
+
+If the cursor reads documents rather than a `.lean()` result, you can change and save each row. That's how migrations work: walk every order with a given status and change it.
+
+<Snippet id="queries/large-results/update-while-exporting" title="scripts/mark-sent.ts" twoslash />
+
+Each cursor row is a full document, and [`$save()`](../reference/documents/document-api.mdx#save) sends only the changed field to the database. But for large volumes a single [`updateMany`](../reference/writes/writes.mdx#update-many) with the same filter runs orders of magnitude faster than a million saves one by one. Use a cursor only when each document needs its own logic.
+
+## Resume an export after a failure [#resume-export]
+
+An export that runs for hours can fail halfway, because of the network, a process restart, or an error on the receiver's side. To avoid starting over, remember the `_id` of the last document you processed and start the next run from it. This needs a sort by `_id`, since only that makes "after this document" unambiguous.
+
+<Snippet id="queries/large-results/resume-export" title="export/export-orders.ts" twoslash />
+
+The filter accepts a string in place of an `ObjectId`, as everywhere, so you don't need to convert the id by hand. On the next run, pass the saved value, and the export continues from the first unprocessed document.
+
+Sending must be **idempotent**. If a document went out but the position wasn't saved in time, it goes out again after a restart, and the receiver must accept the duplicate calmly.
+
+## Handle errors mid-stream [#stream-errors]
+
+An error inside a `for await` loop breaks the loop and closes the cursor. An error from the function in `.eachAsync` behaves the same way. The first error stops processing, calls already started under `parallel` finish, and the error itself comes out unwrapped.
+
+<Snippet id="queries/large-results/stream-errors" twoslash />
+
+Orders 4 and 5 were never processed. If you need to reach the end despite individual failures, turn on `continueOnError: true`. Then each document gets its own function call, and the errors are collected and arrive together at the end as an [`EachAsyncError`](../reference/query/cursor.mdx#each-async-error).
+
+<Snippet id="queries/large-results/stream-errors-2" twoslash />
+
+All the function's errors are in the `errors` field in document order, and the first one is also available as `cause`. Choose the mode by the cost of a failure. If a skipped document makes the whole export meaningless, keep the default mode. If the documents are independent, turn on `continueOnError` and go through the list of errors at the end.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **what you need to do with each document**.
+
+- **Read them one by one and do something**: use `for await`. It's the shortest and clearest option, and you can leave it with `break`.
+- **The function waits on the network, and the processing order doesn't matter**: [`.eachAsync`](../reference/query/cursor.mdx#each-async) with `parallel`.
+- **The receiver prefers batches**: add `batchSize`.
+- **You need to transform rows or collect the rest into an array**: [`.map`](../reference/query/cursor.mdx#map) and [`.toArray`](../reference/query/cursor.mdx#to-array).
+- **You need manual control**, for example to take the first few documents and close the cursor: [`.next`](../reference/query/cursor.mdx#next) and [`.close`](../reference/query/cursor.mdx#close).
+
+## When not to use it [#when-not-to-use]
+
+You don't need a cursor for a list on a page. It shows a limited number of records, and an ordinary `await` with [`.limit`](../reference/query/reading.mdx#limit) is enough. For pages the user scrolls through, there's [keyset pagination](./keyset-pagination.mdx) or [`.skip`](../reference/query/reading.mdx#skip).
+
+You can also change or delete documents by a condition without a cursor. [`updateMany`](../reference/writes/writes.mdx#update-many) and [`deleteMany`](../reference/writes/writes.mdx#delete-many) do it in one query. And if you only need numbers per group, sums, or counts, compute them in the database with [aggregation](../aggregation/first-aggregation.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**The cursor is closed.** You left the loop with `break` and then called `.next()` on the same cursor. By then it's already closed.
+
+<Snippet id="queries/large-results/troubleshooting" twoslash />
+
+Open a new cursor with `Orders.find().sort({ number: 1 }).plain().cursor()`. A closed cursor can't be reopened.
+
+**The export eats all the memory.** You called `await` instead of `.cursor()`, and all the documents ended up in one array. For an export, replace it with `.cursor()` and process the rows one at a time.
+
+<Snippet id="queries/large-results/troubleshooting-2" twoslash />
+
+**The processing order got mixed up.** With `parallel` above one, calls finish in any order. If the receiver expects orders by ascending number, keep `parallel` at one, or send batches with `batchSize`, since the order within a batch is preserved.
+
+**`.orFail()` on a cursor does nothing.** [`.orFail()`](../reference/query/reading.mdx#or-fail) on a cursor doesn't throw on an empty result. A cursor hands out documents in batches and can't know in advance that there will be none. An empty result ends the loop without a single iteration, so if that's a failure for you, check a counter after the loop.
+
+## Full example [#full-example]
+
+An order export script. It can continue from where it failed, sends in parallel and in batches, and collects errors.
+
+<Snippet id="queries/large-results/full-example" title="export/export-orders.ts" twoslash />
+
+<Callout type="migration">
+
+`.cursor()`, `for await`, and `eachAsync` with `parallel`, `batchSize`, and `continueOnError` are familiar from Mongoose. Typemo has three differences.
+
+- `for await` must iterate the result of [`.cursor()`](../reference/query/reading.mdx#cursor), not the query itself.
+- After you leave the loop the cursor is closed, and reading it throws a `QueryError`.
+- `eachAsync` errors with `continueOnError` arrive as one [`EachAsyncError`](../reference/query/cursor.mdx#each-async-error) holding all the function's errors.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Cursor" href="../reference/query/cursor.mdx">
+  Every cursor method and `EachAsyncError`, with exact types and error texts.
+</Card>
+<Card title="Keyset pagination" href="./keyset-pagination.mdx">
+  Show the user a long list page by page instead of exporting it whole.
+</Card>
+<Card title="Query options" href="../reference/query/options.mdx">
+  `.batchSize`, `.timeoutMS`, and other options that affect reading with a cursor.
+</Card>
+<Card title="Bulk writes" href="../writes/bulk.mdx">
+  Write batches of documents that a cursor has read.
+</Card>
+</Cards>

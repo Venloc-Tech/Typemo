@@ -1,0 +1,159 @@
+---
+title: Inheritance and discriminators
+description: "Store documents with different sets of fields in one collection, and read them all together or by kind"
+icon: GitBranch
+---
+
+Sometimes entities of the same sort differ in their fields. A payment can be a card or a bank transfer, each with its own data, and the report has to cover all of them. For this Typemo has **inheritance with discriminators**. Subclasses of a base class live in **one collection** with the base and differ by the value of a special field, the **discriminator key**. Read through the base model, and you get every document, each as an instance of its own class. Read through a subclass's model, and you get only its documents.
+
+If MongoDB is new to you, one fact is enough. A collection doesn't require all documents to have the same fields, which is what makes this scheme possible at all. Typemo adds strictness on top, since it knows which class each document belongs to.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the payment models from `payments/payment.ts`. How to set up `tsconfig` for decorators is described in [Installation and setup](../getting-started/installation.mdx).
+
+## Quick start [#quick-start]
+
+The base gets a regular [`@Schema`](../reference/schemas/schema.mdx#schema). A subclass gets [`@Discriminator("value")`](../reference/schemas/discriminator.mdx#discriminator) and a key declaration with the same literal. A subclass doesn't need its own `@Schema`, since it takes the base's options.
+
+<Snippet id="schemas/discriminators/quick-start" title="payments/payment.ts" twoslash />
+
+By default the key is called `__t`. Typemo writes it when the document is created, so you don't pass it. Below we'll work with such a hierarchy on real tasks.
+
+## Store different kinds in one collection [#kinds-in-one-collection]
+
+The `payments` collection already holds the card from the quick start. Let's add a second kind, an IBAN transfer, and one more document without a kind, created through the base model. Here's how they look in the database.
+
+<Snippet id="schemas/discriminators/kinds-in-one-collection" title="payments/payment.ts" twoslash />
+
+A subclass has the base's fields plus its own, and required fields and checks work as usual. `CardPayments.create({ amount: 1 })` without `last4` throws a [`ValidationError`](../reference/errors/data-errors.mdx#validation-error) with the text `Validation failed: "last4": the field is required [required]`.
+
+The compiler won't let through a field of another subclass. And if you get around the types, casting rejects it. `CardPayments.create({ amount: 1, last4: "1", iban: "…" })` throws a [`CastError`](../reference/errors/data-errors.mdx#cast-error), `Cast to CardPayment failed at path "iban" for "…" (string): not a field of CardPayment [unknown-key]`. A document with fields of two kinds never gets into the database.
+
+## Read all documents or one kind [#read-all-and-kind]
+
+The base model returns every document in the collection, and each one is an instance of its own class. A subclass's model adds a condition on the key to the query and sees only its own documents. You can see this both in the counts and in the query condition itself.
+
+<Snippet id="schemas/discriminators/read-all-and-kind" title="payments/payments.service.ts" twoslash />
+
+A subclass model's condition is an ordinary filter on the key. `CardPayments.find()` goes to the database as `{ __t: "card" }`. So add any conditions of your own to the query, and they combine with the condition on the kind.
+
+You can filter the base model by the key too, if the base lists its subclasses (see [The base model knows its subclasses](#base-model-knows-children)). Then the key is visible to the filter type. Without the list, the compiler rejects `__t` as an unknown field. A document without a key stays a base `Payment`. It belongs to no subclass, and a subclass's model won't see it.
+
+## Narrow the type to a specific kind [#narrow-to-kind]
+
+Without extra information, the base model knows only the base's fields. A row read through it is `amount` and `_id`, without `last4` or `iban`. For model documents, `instanceof` works. Each document is an instance of its kind's class, and the check narrows the type.
+
+<Snippet id="schemas/discriminators/narrow-to-kind" title="payments/payments.service.ts" twoslash />
+
+`.lean()` and `.plain()` results and JSON have no classes. They're plain objects. The key tells them apart, and for that the base has to know about its subclasses. That's the next section.
+
+## The base model knows its subclasses [#base-model-knows-children]
+
+List the subclasses in the base's [`discriminators`](../reference/schemas/schema.mdx#discriminators) option and declare the key with the [`Discriminators<…>`](../reference/schemas/discriminator.mdx#discriminators) type. Then every read through the base model returns a union of "a base document without a key, or any subclass". A check on the key narrows it to the right kind, with no type casts and no hand-written union. This works for model documents, `.lean()` and `.plain()` results, JSON, and the cursor.
+
+<Snippet id="schemas/discriminators/base-model-knows-children" title="payments/payment.ts" twoslash />
+
+The arrow in the list is needed because the subclasses are declared below the base. The key in the base is optional. A document created through the base model has no kind, and in the last branch `row.__t` is `undefined`. Model documents narrow the same way: `doc.__t === "card"` gives you the card's fields, and `instanceof` still works.
+
+If the key has a custom name, both parts change: `discriminatorKey: "kind"` in the options and `declare readonly kind?: Discriminators<…>` in the class. Don't declare this field in the base with `@Prop`. The schema adds the key, the same way it adds `__t`.
+
+The list is checked against the hierarchy when the model is built. A subclass missing from the list, an extra class, or a duplicate gives a `ConfigurationError`, and the compiler notices if the list and the key type disagree. The error texts are in the [`@Schema`](../reference/schemas/schema.mdx#discriminators) reference.
+
+## Create a document of a kind through the base model [#create-kind-via-base]
+
+The base model accepts the key in the data if you're creating a document of a known kind. Typemo picks the class by the value and returns an instance of the subclass. An unregistered value is an error, not a quietly created base document.
+
+<Snippet id="schemas/discriminators/create-kind-via-base" title="payments/payments.service.ts" twoslash />
+
+The `as never` is here because the base model's input type doesn't know the subclasses' fields. It's safer to create a document through the model of the kind you need, where the types check the fields.
+
+## Update and delete documents of a kind [#update-and-delete-kind]
+
+Subclass models act only on their own documents. The condition on the key is added to updates and deletes as well. If an update's condition matches a document of another kind, it finds nothing and changes nothing.
+
+<Snippet id="schemas/discriminators/update-and-delete-kind" title="payments/payments.service.ts" twoslash />
+
+A subclass's model won't accept a field of another kind at all. The compiler rejects the filter `{ last4: "0000" }` on `TransferPayments`, and if you get around the types, at runtime you get a [`StrictModeError`](../reference/errors/data-errors.mdx#strict-mode-error), `filter: "last4" is not a field of TransferPayment [unknown-path]`. That's why bulk operations through a subclass's model are safer than through the base one. `TransferPayments.deleteMany({ … })` won't touch card payments even if the condition turns out too broad.
+
+## Store different variants inside an array [#variants-in-array]
+
+Discriminators aren't only for collections. An array field can hold nested objects of different kinds, for example page blocks: text and an image. The block's base class is a nested object without an `_id` collection, and the key gets its own name through `discriminatorKey`.
+
+<Snippet id="schemas/discriminators/variants-in-array" title="pages/page.ts" twoslash />
+
+Each element is checked against the schema of its kind.
+
+- A field of another kind is rejected. `blocks: [{ kind: "text", url: "u" }]` gives a `CastError`, `Cast to document failed at path "blocks.0.url" for "u" (string): not a field of TextBlock [unknown-key]`.
+- An unknown key value gives `Cast to document failed at path "blocks.0.kind" for "video" (string): "video" is not a discriminator value of Block (known: text, image) [discriminator]`.
+- A required field of the element's own kind is checked as usual. A `{ kind: "text" }` block without text gives `Validation failed: "blocks.0.text": the field is required [required]`.
+
+## How to choose [#how-to-choose]
+
+Ask yourself: **do you need to read these entities together?**
+
+- **A report, a list, or a search covers all kinds at once, and the kinds' fields differ**: you need a discriminator. One query, one index, one collection.
+- **The kinds barely overlap, are read and written separately, and repeating the shared fields does no harm**: two models in two collections are simpler. Each has its own indexes, and no key is needed.
+- **The kinds differ only by the value of one field, and the set of fields is the same**: an ordinary [`enum`](../reference/schemas/prop.mdx#enum) on the field is enough, with no class hierarchy.
+
+## When not to use it [#when-not-to-use]
+
+Reusing model code isn't a reason for a discriminator. You can move shared fields into a base class without `@Discriminator`, but then the subclasses become separate models with separate collections. And for a field that's sometimes a string and sometimes a number, there's [`Spec.union`](../reference/schemas/types-and-spec.mdx#spec.union), not a discriminator.
+
+## Troubleshooting [#troubleshooting]
+
+**The decorator is there, but the key isn't declared.** Without the line `declare readonly __t: DiscriminatorValue<"card">` the class won't compile, because the compiler has nothing to tell subclasses apart by. The error tells you what to add.
+
+<Snippet id="schemas/discriminators/troubleshooting" twoslash />
+
+Add `declare readonly __t: DiscriminatorValue<"card">` to the class (or your `discriminatorKey` instead of `__t`), and the error goes away.
+
+**A subclass with its own `@Schema`.** Collection options belong to the base. Put `@Schema` on a subclass, and Typemo refuses when it builds the model instead of quietly starting to write to another collection.
+
+<Snippet id="schemas/discriminators/troubleshooting-2" />
+
+Remove `@Schema` from the subclass. If the kinds must live in different collections, they aren't subclasses but separate models.
+
+**Two subclasses with the same value.** Values must be unique across the whole hierarchy. A duplicate is found when any model of the hierarchy is built, not only the one where it's declared.
+
+<Snippet id="schemas/discriminators/troubleshooting-3" />
+
+Give the subclasses different values.
+
+**A subclass is missing from the base's list.** If the base lists its subclasses and a new class didn't make it into the list, the build fails and names the class.
+
+<Snippet id="schemas/discriminators/troubleshooting-4" />
+
+Add the class to the base's `discriminators: () => [...]`. A duplicated or extra class is caught the same way. The texts are in the [`@Schema`](../reference/schemas/schema.mdx#discriminators) reference.
+
+**The key can't be rewritten.** The compiler won't let you assign the key on a loaded document, and an update with the key is rejected. The kind is chosen on create and doesn't change after that.
+
+<Snippet id="schemas/discriminators/troubleshooting-5" />
+
+To change the kind, create a document of the kind you need and delete the old one.
+
+## Full example [#full-example]
+
+Here's everything together in one file: three kinds of payments, a report over all of them, and work with one kind. Code that isn't part of Typemo is marked `__…__`.
+
+<Snippet id="schemas/discriminators/full-example" title="payments/payments.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose you create a discriminator by calling `Base.discriminator("name", schema)`, and the key is stored in `__t`. In Typemo a subclass is an ordinary class with `@Discriminator`. The type of its fields is inferred from the class, and the `declare readonly __t` declaration makes the key part of the type. An unregistered key value is a cast error, not a quietly created base document. The key can't change after creation, and a duplicate value in the hierarchy is found at build time. As in Mongoose, the `discriminatorKey` option sets the key's name. The `discriminators` option gives you a union of the subclasses, which Mongoose doesn't have.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="@Discriminator" href="../reference/schemas/discriminator.mdx">
+  The decorator's arguments, every check, and the exact error texts.
+</Card>
+<Card title="Indexes" href="./indexes.mdx">
+  How the base's indexes work on a shared collection and how to limit an index to one kind.
+</Card>
+<Card title="Store lists of values and subdocuments" href="./arrays.mdx">
+  Arrays of values and nested objects, including elements of different variants.
+</Card>
+</Cards>

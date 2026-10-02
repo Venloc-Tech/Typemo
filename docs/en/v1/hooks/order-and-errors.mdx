@@ -1,0 +1,124 @@
+---
+title: Hook order and errors
+description: "The order hooks run in, what happens on an error in pre, post, and postError, and how hooks behave in a transaction"
+icon: ListOrdered
+---
+
+Hooks from different classes, plugins, and phases run in a strict order, and the result depends on it. Each hook sees what the previous one changed, and an error in any of them decides whether the operation reaches the database. This page covers two things: what runs first, and what happens to the operation and the data when a hook throws.
+
+If you haven't written hooks yet, start with [Hook into an operation](./operation-hooks.mdx) and [Run code when a document is saved](./document-hooks.mdx). Order and errors work the same way for both kinds of hooks.
+
+## What you need [#prerequisites]
+
+An account model with three `@Pre("document.save")` hooks, one `@Post`, and one `@PostError`. Each hook writes its name into a shared `log`. `Accounts` is the account model you get from the client.
+
+<Snippet id="hooks/order-and-errors/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+The hooks of one operation go like this: every `@Pre` in turn, then the operation itself, then every `@Post`. If an error happens somewhere along the way, the `@PostError` hooks run instead of `@Post`.
+
+<Snippet id="hooks/order-and-errors/quick-start" twoslash />
+
+Below we go through the order, each kind of error, and transactions.
+
+## Hook order [#hook-order]
+
+Hooks of one event and one phase run strictly one after another, and each waits for the previous one. The first hook in the example is async and waits 30 milliseconds, but the second one still starts only after it. Hooks never run in parallel, so a hook can rely on the result of the one before it.
+
+Hooks are ordered like this:
+
+1. Hooks of the base class.
+2. Hooks of the class itself, in the order they're declared in the file.
+3. Plugin hooks ([`@Plugin`](../reference/hooks/plugins.mdx#plugin), `Typemo.plugin`).
+
+Say a base class has a `@Pre("query.find")`, a subclass has two more, and a plugin has a third. They run in the order `base`, `class #1`, `class #2`, `plugin`. `@Post` hooks run in the same order as `@Pre`, not in reverse.
+
+Across phases the order is: every `@Pre`, the operation, every `@Post`. If your `@Pre` changed the operation through [`.modify`](../reference/hooks/operation-context.mdx#modify), the next `@Pre` sees the changed operation, because Typemo rebuilds it after every hook. Documents with subdocuments have a more involved order. First the root's `pre`, then the subdocuments', then the `post` of the subdocuments and of the root. The details are in [Run code when a document is saved](./document-hooks.mdx#subdocuments).
+
+An empty insert calls hooks too. `insertMany([])` and `bulkWrite([])` fire `@Pre` and `@Post`, even though they send nothing to the database.
+
+[`bulkWrite`](../reference/writes/writes.mdx#bulk-write) has its own order. First come the `@Pre` document hooks of the inserts along with validation, then the `@Pre` operation hooks of the batch in list order, then the `@Pre` hooks of `model.bulkWrite` and the request itself. After the request comes the `@Post` of the `model.bulkWrite` hook, followed by the `@Post` operation and document hooks in order. If the batch fails, the operations the server managed to apply finish with `@Post`, and the rest with `@PostError`. Details and examples are in [Bulk writes](../writes/bulk.mdx#bulk-write-hooks).
+
+## An error in a pre hook [#pre-hook-error]
+
+A hook checks a condition and throws if it's broken. Then the operation doesn't run and never reaches the database.
+
+<Snippet id="hooks/order-and-errors/pre-hook-error" twoslash />
+
+The calling code got exactly the error the hook threw. Typemo doesn't wrap it. The remaining `@Pre` (`pre 3`) didn't run, and neither did `@Post`. But `@PostError` did run and got the error. The document never reached the database, and the document count didn't change after the error.
+
+`@PostError` is called on any error of the operation, not only on a hook error. For example, a filter cast error happens before `@Pre`. Then the `@Pre` hooks don't run at all, and `find({ nope: 1 })` calls only `@PostError` with a `StrictModeError`. So in `@PostError`, don't assume the `@Pre` hooks have already run.
+
+## An error in a post hook [#post-hook-error]
+
+A hook after the operation throws, for example when a message failed to send. `@PostError` doesn't run then, because by this point the operation has already succeeded. What the calling code gets depends on the operation.
+
+<Snippet id="hooks/order-and-errors/post-hook-error" twoslash />
+
+The document **is saved**. The write happened before the hook. This is the trickiest hook error. An app that retries `create` after the error creates a duplicate. That's why, for writes outside a transaction, Typemo doesn't pass the hook's error through as is. It wraps it in a [`PostHookError`](../reference/errors/hierarchy.mdx#post-hook-error).
+
+- `applied: true` means "the write was applied, don't retry".
+- `operation`: the name of the method that was called.
+- `result`: the result of the write.
+- `cause`: the hook's error.
+
+On a read, the calling code gets the hook's error as is, because reading again is safe.
+
+Still, don't throw from `@Post` for actions the calling code has no reason to know about, like sending an email or writing a log entry. Catch those errors inside the hook and report them some other way. If the side effect is mandatory, run the whole operation in a [transaction](../transactions/transactions.mdx). Then an error in `@Post` rolls back the write, and the calling code gets the hook's error itself.
+
+## An error inside @PostError [#error-in-post-error]
+
+If `@PostError` itself throws, the calling code gets that error instead of the original one. The original isn't lost. It's in `cause`. Say `@PostError` threw `Error("postError failed")` and replaced the `StrictModeError` of a bad filter. The `StrictModeError` is still in `error.cause`. Even so, `@PostError` should log the error and return, not throw a new one.
+
+## Hooks and transactions [#hooks-and-transactions]
+
+If an operation runs in a transaction, its hooks run inside it. In an operation hook, `this.inTransaction` is `true`, and `this.session` is the transaction's session. `countDocuments` inside `client.transaction(...)` shows `inTransaction=true session=true`, and outside a transaction `inTransaction=false session=false`.
+
+A hook error that escapes the transaction callback rolls back the whole transaction. For example, the transaction creates an account `in-tx`, and then a `@Pre` hook of the next `create` throws. After the rollback, there's no `in-tx` account in the database.
+
+The same goes for an error in `@Post`. The write happened inside the transaction and is rolled back with it. The calling code gets the hook's error itself, not a `PostHookError`, since there's nothing to retry: the write wasn't applied. Outside a transaction, as you saw above, the write stays.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **what happens if the hook's action doesn't run**.
+
+- **The operation mustn't run without it**, as with a check or a condition: do it in `@Pre` and throw. The operation won't run, and the data stays as it was.
+- **The operation must stand, and the action is secondary**, like a log or a notification: do it in `@Post` and catch errors inside the hook.
+- **The hook and the write must succeed or fail together**: wrap the operation in a [transaction](../transactions/transactions.mdx).
+
+## When not to use it [#when-not-to-use]
+
+If you need to handle an operation's error where you call it, `try`/`catch` is enough. See [Error handling](../errors/handling.mdx). `@PostError` is for when the reaction to an error is the same on every path to the operation, like writing to a failure log.
+
+## Troubleshooting [#troubleshooting]
+
+**The document is saved even after an error in `post`.** The calling code got a `PostHookError` (or the hook's own error on a read), but the record is in the database. The operation ran before `@Post`. Don't retry the call. Check `error.applied`, and catch errors inside `@Post` or use a transaction.
+
+**`postError` wasn't called.** If `@Post` threw, `@PostError` isn't called, because the operation succeeded. It fires only on an error of the operation itself or of `@Pre`.
+
+## Full example [#full-example]
+
+A model and a transaction that rolls back because of a hook error.
+
+<Snippet id="hooks/order-and-errors/full-example" title="accounts/accounts.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, the `post` hook wasn't called for an empty `insertMany`, and the `pre` hooks of `bulkSave` ran in parallel, in an unpredictable order. In Typemo, hooks always run one after another, and `insertMany([])` and `bulkWrite([])` call hooks too. Every path of an operation ends with exactly one of two: `@Post` or `@PostError`.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Hook into an operation" href="./operation-hooks.mdx">
+  How to change and skip queries from hooks.
+</Card>
+<Card title="Transactions" href="../transactions/transactions.mdx">
+  How to run several operations as one and what happens on a rollback.
+</Card>
+<Card title="@Pre, @Post, and @PostError" href="../reference/hooks/pre-post.mdx">
+  Every hook event and its result.
+</Card>
+</Cards>

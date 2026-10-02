@@ -1,0 +1,110 @@
+---
+title: Reference other models
+description: "Store a reference to a document in another collection with Ref, ref, refPath, and refModel, and see what such a field accepts and what's checked on write"
+icon: Link
+---
+
+You link documents of different collections with a **reference**. A post doesn't store a copy of its author, only the author's `_id`. The author's name then lives in one place and changes with one write. In Typemo a reference is an ordinary field with an identifier type, plus the [`ref`](../reference/schemas/prop.mdx#ref) option and the [`Ref<M>`](../reference/schemas/field-markers.mdx#ref) marker type. They tell the library and the compiler which model the field points to. They also let you load the author's document with a [`populate`](../reference/populate/populate.mdx#populate) query.
+
+A reference is always stored **the same way**, as an identifier. The author's document itself never sits inside the post. After `populate` it appears only in the read result, and the database still holds the identifier. Even if you pass the author's document instead of an identifier on write, its `_id` is what goes to the database.
+
+## What you need [#prerequisites]
+
+A model described as in [Define a model](./define-model.mdx). The examples build a blog with an author and their posts. [Show related data](../populate/basics.mdx) covers populating references in detail.
+
+## Quick start [#quick-start]
+
+Declare a reference field as an identifier with `ref` and the type `Ref<Author>`.
+
+<Snippet id="schemas/references/quick-start" title="blog/post.ts" twoslash />
+
+`ref` is a **function** that returns the class. That way a model declared further down the file or in another module exists by the time the schema is built. Below we'll cover what you can write into the field and how to get the related document.
+
+## Write a reference [#write-ref]
+
+A reference field accepts an identifier in three forms.
+
+- An `ObjectId` value.
+- Its string of 24 hex characters. Handy when the identifier came from a request URL.
+- The model's document itself: a document, a `.lean()` result, or a class instance. Handy when you already have the document and see no point in pulling out its `_id`.
+
+In all three cases the identifier is what goes to the database.
+
+<Snippet id="schemas/references/write-ref" twoslash />
+
+The same goes for updates (`$set: { author: ann }`), filters (`find({ author: ann })`), arrays of references, and `Map` values that are references. Everywhere, a document turns into its `_id`.
+
+Notice that Typemo doesn't check that a document with that identifier **exists**. A reference to a nonexistent author gets written, since MongoDB has no foreign keys. If that matters, check for existence yourself before the write or inside a transaction.
+
+## Get the related document [#get-related]
+
+[`populate`](../reference/populate/populate.mdx#populate) puts the document into the result in place of the identifier. The value in the database doesn't change. If there's no document with that identifier, the reference becomes `null`.
+
+<Snippet id="schemas/references/get-related" twoslash />
+
+After `populate` the field's type changes too. The compiler knows it now holds the author's document, not an identifier. [Show related data](../populate/basics.mdx) describes how to populate several levels and how that affects speed.
+
+## Reference different models [#dynamic-ref]
+
+Sometimes one field points to documents of different models. Say a comment belongs either to a post or to an author. There are two ways to handle that.
+
+- [`refPath`](../reference/schemas/prop.mdx#ref-path): the path to a field of **the same document** that holds the name of the target model's class.
+- [`refModel`](../reference/schemas/prop.mdx#ref-model): a function that picks the class itself.
+
+Declare the field as `Ref<A | B>`, and both models must be obtained on the connection.
+
+<Snippet id="schemas/references/dynamic-ref" twoslash />
+
+`ref`, `refPath`, and `refModel` are mutually exclusive. Two options at once give a `ConfigurationError`: `"ref", "refPath" and "refModel" are exclusive (one form of reference)`.
+
+## A reference in an array [#ref-array]
+
+A list of references is an array of identifiers, `@Prop(() => [Types.ObjectId], { ref: () => Author })` with the type `Ref<Author>[]`. The `ref` option applies to each element, and `populate` replaces all of them. The rules and checks for arrays are described in [Store lists of values and subdocuments](./arrays.mdx).
+
+## Reference a model with its own `_id` [#ref-custom-id]
+
+If the target model's `_id` isn't an `ObjectId`, name its type as the second parameter of `Ref`, and pass the same type as the first argument of `@Prop`. For example, `@Prop(() => String, { ref: () => Country }) country?: Ref<Country, string>` for a country with a string code, or `Ref<Session, UUID>[]` for an array of `UUID` values. Everything else, including `populate`, works the same way. Such models are described in [Use your own _id type](./custom-ids.mdx).
+
+## How to choose [#how-to-choose]
+
+Ask yourself: **is the related data always read together or separately?**
+
+- **The author is needed in almost every response, has little data, and hardly ever changes**: consider a [nested object](./nested-and-subdocuments.mdx). A copy saves you a second query.
+- **The data is shared, grows, or changes**: store a reference. The author's record is then updated in one place.
+- **You need the reverse direction, "all of an author's posts"**: don't store a list on the author. Describe a [virtual relation](./virtuals.mdx) instead.
+
+## When not to use it [#when-not-to-use]
+
+A reference doesn't guarantee integrity. MongoDB won't delete the posts when the author is deleted. Cascading deletes and existence checks are up to your application code or a transaction ([Transactions](../transactions/transactions.mdx)). And an identifier from an external system that you never plan to populate doesn't need `ref`. A field of type `Types.ObjectId` or `String` is enough.
+
+## Troubleshooting [#troubleshooting]
+
+**A malformed identifier.** `create({ author: "zz" })` gives a `CastError` with the reason `format`: `Cast to ObjectId failed at path "author" for "zz" (string): not a 24-character hex string [format]`. The library doesn't guess identifiers and doesn't send the database something that can't be one. Pass an `ObjectId`, its hex string, or the author's document.
+
+**`ref` and `Ref<M>` don't agree.** The compiler watches the pair and reports one of these messages: `@Prop "author": "ref" is set, but the field type is not Ref<Model>`, `the field is Ref<Model>, add ref: () => Model`, or `"ref" points to another model than the field's Ref<Model>`. The result type after `populate` is inferred from `Ref<M>`, and a mismatch would produce wrong types.
+
+## Full example [#full-example]
+
+One file with an author, a post with a reference, and a read with `populate`. Code that isn't part of Typemo is marked `__…__`.
+
+<Snippet id="schemas/references/full-example" title="blog/posts.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose you set `ref` as a string with the model's name. In Typemo `ref` is a function that returns the class. As in Mongoose, a document in a reference field turns into its `_id`, but a reference is always stored the same way, as an identifier. The compiler checks the `ref` and `Ref<M>` pair, so the field type after `populate` is inferred precisely.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Add computed fields and reverse references" href="./virtuals.mdx">
+  The reverse relation "all of an author's posts" and computed values that aren't stored.
+</Card>
+<Card title="Show related data" href="../populate/basics.mdx">
+  How to populate references several levels deep and what happens to the result type.
+</Card>
+<Card title="@Prop" href="../reference/schemas/prop.mdx#ref">
+  The `ref`, `refPath`, and `refModel` options and their errors.
+</Card>
+</Cards>

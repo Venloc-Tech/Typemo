@@ -1,0 +1,646 @@
+---
+title: Events
+description: "The InstrumentationSubscriber, every event type for operations, transactions, the driver, and the pool, and the sensitive modes"
+icon: Activity
+---
+
+While an operation runs, the Typemo core reports on it with **events**. An operation started, finished, or failed, a step completed, the driver sent a command. An event is a plain object with a `type` field. The receiver is a **subscriber**, an object with a `handle` function that you register through [`client.instrument`](../connection/typemo-client.mdx#client.instrument) or [`Typemo.instrument`](../connection/typemo.mdx#typemo.instrument). The [`@venloc/typemo-opentelemetry`](./opentelemetry.mdx) and [`@venloc/typemo-sentry`](./sentry.mdx) packages run on this, and you write your own log or metrics the same way.
+
+If you're setting up observability for the first time, start with the guide [Operation events](../../observability/events.mdx). This page is a reference. It covers the subscriber, every event type, and the rules by which filter values end up in events.
+
+The examples use a bank account model.
+
+<Snippet id="reference/observability/events/intro" title="accounts/account.ts" twoslash />
+
+We got the values below on a real database. The collection holds one account `{ title: "Main", balance: 100, iban: "DE00" }`.
+
+---
+
+## InstrumentationSubscriber [#instrumentation-subscriber]
+
+`InstrumentationSubscriber` is what you pass to `instrument`. It's an object with the required `handle` function and settings that tell the core which events you need and in what form. The core builds an event only when someone is there to receive it. Without subscribers observability costs nothing, and an event no subscriber asked for (for example, steps when every subscriber has `steps: false`) isn't created at all.
+
+<Snippet id="reference/observability/events/instrumentation-subscriber" twoslash />
+
+`handle` receives an event from the [`InstrumentationEvent`](#instrumentation-event) union. TypeScript narrows it to the right type by the `type` field, so inside the `if`, `documentCount` and `durationMS` are available.
+
+<Returns type="void">
+
+`handle` returns nothing. An exception from `handle` doesn't break the operation. The core catches it and writes a line like `[typemo] an instrumentation subscriber threw on "operation.start":` and the error itself to `console.error`. An observer must not take down what it observes, but it also mustn't stay silent about its own failure.
+
+</Returns>
+
+<Params title="Subscriber fields">
+<Param name="handle" type="(event: InstrumentationEvent) => void" required>
+
+Receives every event the subscriber asked for. It must not throw exceptions or wait for anything. It runs on the path of the operation, and a slow `handle` slows the operation down.
+
+</Param>
+<Param name="sensitive" type="SubscriberSensitive" default={'"mask"'}>
+
+How the values of filters, updates, and errors look in this subscriber's events. For details, see the section [`SubscriberSensitive`](#subscriber-sensitive).
+
+</Param>
+<Param name="driverCommands" type="boolean" default="false">
+
+Turns on the `driver.command.*` driver command events, tied to the operation that sent them. The client must be created with the option `monitorCommands: true`, otherwise `client.instrument` throws `ConfigurationError: TypemoClient "default": driver command events need the client option monitorCommands: true`. The client option is described in the [client options](../connection/typemo-client.mdx#client-options).
+
+</Param>
+<Param name="poolEvents" type="boolean" default="false">
+
+Turns on the `driver.pool` events of the driver's connection pool.
+
+</Param>
+<Param name="steps" type="boolean" default="true">
+
+Turns on the nested `operation.step` step events. If every subscriber of the client has `steps: false`, step events aren't created at all. With `steps: false` a `find` operation produced only `operation.start` and `operation.end`.
+
+</Param>
+<Param name="includeTenant" type="boolean" default="false">
+
+Puts the operation's tenant into `OperationInfo.tenant`. It's absent by default, because the tenant is user data, and events go to other people's systems.
+
+</Param>
+<Param name="wrap" type="(operation: OperationInfo, run: () => Promise<void>) => Promise<unknown>">
+
+A function inside which the core runs the operation. Integrations need it to make their own context active for everything the operation starts: hooks, nested populate queries, and driver commands. That's how OpenTelemetry makes the operation span the parent of all nested spans. The core calls `wrap` only for subscribers that set it.
+
+The contract is this. Call `run` exactly once and return what it returns. The result of the operation is always decided by `run`, whatever `wrap` returns. If `wrap` threw an exception before calling `run`, or didn't call it at all, that's reported as a `handle` error, and the operation still runs. Several `wrap` functions nest in the order of registration. Client subscribers go before global ones, and the first registered ends up outermost. For a cursor, `wrap` covers only the opening, up to the first batch request.
+
+A `wrap` that writes to a log before and after `run` produced the order `wrap:in find > operation.start > operation.end > wrap:out`.
+
+</Param>
+</Params>
+
+<Callout type="warning">
+
+`handle` must not change events or keep `event.schema`. It's a reference to the model schema, not a copy, and you can't serialize a whole event (`JSON.stringify(event)`).
+
+</Callout>
+
+### Registration errors [#registration-errors]
+
+`instrument` checks the subscriber right away and throws `ConfigurationError`.
+
+| What's wrong | Text |
+|---|---|
+| no `handle` function | `an instrumentation subscriber is an object { handle(event) }` |
+| `sensitive` isn't from the list | `the sensitive option of an instrumentation subscriber is "mask", "show", "hide" or { mask: (value, { path }) => json }` |
+| `wrap` isn't a function | `an instrumentation subscriber's wrap must be a (operation, run) => Promise callback` |
+| `driverCommands: true` without `monitorCommands` | `TypemoClient "default": driver command events need the client option monitorCommands: true` |
+
+The first, second, and third rows are the same for `Typemo.instrument`. The fourth happens only with a client.
+
+### When a subscriber doesn't fit [#when-not-to-use]
+
+A subscriber only observes, and it can't help you change an operation (add a condition, reject a query). For that there are hooks, [`@Pre`](../hooks/pre-post.mdx#pre) and [`.modify`](../hooks/operation-context.mdx#modify). For tracing and Sentry, don't write a subscriber from scratch. Use the ready-made [`@venloc/typemo-opentelemetry`](./opentelemetry.mdx) and [`@venloc/typemo-sentry`](./sentry.mdx).
+
+<FullType>
+
+<Snippet id="reference/observability/events/when-not-to-use" />
+
+</FullType>
+
+---
+
+## SubscriberSensitive [#subscriber-sensitive]
+
+`SubscriberSensitive` is the way values are shown in events. A filter `{ balance: { $gt: 50 }, title: "Main" }` contains user data, and events go to tracing systems, logs, and error trackers. So by default the core leaves only the **shape** of the query in the event. Keys and operators stay, and values are replaced with `"?"`. A subscriber chooses a more open mode explicitly, and that's a decision about data leaks, not a convenience setting.
+
+<Snippet id="reference/observability/events/subscriber-sensitive" twoslash />
+
+The values of the `iban` field stayed `"?"` even though the mode is `"show"`. The field has `sensitive: "mask"` in the schema, and the schema mark is stronger than the subscriber's choice. A field mark applies in all subscribers, including other people's that you didn't write.
+
+<TypeTable
+  type={{
+    '"mask"': { description: "The default. Every unmarked value becomes `\"?\"`, and the shape of the query stays, `{ balance: { $gt: \"?\" }, title: \"?\" }`.", type: "string" },
+    '"show"': { description: "The real values (already cast to the type) of unmarked fields. Only by explicit choice, and then the events contain user data.", type: "string" },
+    '"hide"': { description: "The whole condition of an unmarked field is replaced with `\"[hidden]\"`. The key stays, and the operators aren't visible. For `{ balance: { $gt: 50 } }` you get `{ balance: \"[hidden]\" }`.", type: "string" },
+    "{ mask }": { description: "Every unmarked value goes through your function `(value, { path }) => json`, where `path` is the field path in the database (an empty string outside fields). An exception from `mask` gives `\"?\"` and an `instrumentation.error` event.", type: "{ readonly mask: (value: unknown, context: { readonly path: string }) => SensitiveJson }" },
+  }}
+/>
+
+With the same filter and `sensitive: "hide"` we got `{"balance":"[hidden]","iban":"?","title":"[hidden]"}`, and `iban` has its own mark. With `{ mask: (v, { path }) => path === "title" ? "T" : "?" }` we got `{"balance":{"$gt":"?"},"title":"T"}`.
+
+The mode applies not only to `summary` but also to driver commands in `driver.command.started` events, and to the error in `error` and `failure`. A `CastError` from `updateOne` with `balance: "abc"` reached the calling code with the text `Cast to number failed at path "$set.balance" for "abc" (string): expected a number [type]`, and in the `operation.error` event it came with `for "?"`. Fields marked `sensitive` and hidden (`Hidden`) fields never reach the event in any mode. For these marks, see the guide [Hidden and sensitive fields](../../schemas/hidden-and-sensitive.mdx).
+
+<FullType>
+
+<Snippet id="reference/observability/events/subscriber-sensitive-2" />
+
+</FullType>
+
+---
+
+## Subscription [#subscription]
+
+`Subscription` is what `instrument` returns, the registration of a subscriber. With it you can stop receiving events: in tests, when the application stops, or when the configuration changes.
+
+<Snippet id="reference/observability/events/subscription" twoslash />
+
+<Params title="Fields">
+<Param name="unsubscribe" type="() => void" required>
+
+Removes the registration. After the call `handle` isn't called anymore. Calling it again is safe.
+
+</Param>
+<Param name="[Symbol.dispose]" type="() => void" required>
+
+Does the same when the subscription leaves a `using` scope. Inside the `using` block `handle` received the operation's events, and a `find` after the block didn't.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/observability/events/subscription-2" />
+
+</FullType>
+
+---
+
+## InstrumentationEvent [#instrumentation-event]
+
+`InstrumentationEvent` is the union of all events. They're told apart by the `type` field, so `switch (event.type)` gives the exact type with its fields in each branch. The string values of `type` are collected in the `InstrumentationEventType` type.
+
+<Snippet id="reference/observability/events/instrumentation-event" twoslash />
+
+The order of events is this. An operation first has `operation.start`, then the nested `operation.step`, `driver.command.started`, and `driver.command.succeeded` (if the subscriber asked for them), and finally `operation.end` or `operation.error`. A cursor adds `cursor.batch` between the start and the end. A transaction has `transaction.start`, the events of its operations, then `transaction.commit` or `transaction.abort`, and on a retry `transaction.retry` in between. The `driver.pool` pool events arrive independently of operations.
+
+<TypeTable
+  type={{
+    "operation.start": { description: "The operation started. [`OperationStartEvent`](#operation-start-event).", type: "OperationStartEvent" },
+    "operation.end": { description: "The operation finished, and for a cursor, when it's exhausted or closed. [`OperationEndEvent`](#operation-end-event).", type: "OperationEndEvent" },
+    "operation.error": { description: "The operation failed. [`OperationErrorEvent`](#operation-error-event).", type: "OperationErrorEvent" },
+    "operation.step": { description: "A step of the operation is complete. [`StepEvent`](#step-event).", type: "StepEvent" },
+    "cursor.batch": { description: "A cursor received the next batch. [`CursorBatchEvent`](#cursor-batch-event).", type: "CursorBatchEvent" },
+    "transaction.start | commit | abort | retry": { description: "The life of `client.transaction`. [`TransactionEvent`](#transaction-event).", type: "TransactionEvent" },
+    "driver.command.started | succeeded | failed": { description: "A driver command. [`DriverCommandEvent`](#driver-command-event).", type: "DriverCommandEvent" },
+    "driver.pool": { description: "A connection pool event. [`PoolEvent`](#pool-event).", type: "PoolEvent" },
+    "instrumentation.error": { description: "A failure of observability itself. [`InstrumentationErrorEvent`](#instrumentation-error-event).", type: "InstrumentationErrorEvent" },
+  }}
+/>
+
+<FullType>
+
+<Snippet id="reference/observability/events/instrumentation-event-2" />
+
+</FullType>
+
+---
+
+## InstrumentationEventType [#instrumentation-event-type]
+
+`InstrumentationEventType` is the type of the `type` field of any event, a union of the strings from the table above. It's useful when you keep a set of the types you care about.
+
+<Snippet id="reference/observability/events/instrumentation-event-type" twoslash />
+
+---
+
+## OperationInfo [#operation-info]
+
+`OperationInfo` is the part shared by the three operation events, and their fields inherit it. It holds everything needed to tell which operation it is and where it runs: the name, model, collection, database, client, transaction, and server. The fields `operationId` and `parentId` link the events of one operation and the populate queries nested in it. Integrations build nested spans from them.
+
+A database-level operation ([`connection.aggregate`](../connection/connection.mdx#connection.aggregate), [`client.aggregate`](../connection/typemo-client.mdx#client.aggregate)) has no model, so three fields can be `null`: `model`, `collection`, and `schema`. The collection is `null` for an aggregation of the whole database or of `admin` too. For `Pipeline.sessions()` it's `"system.sessions"`. A subscriber that builds a label from these fields has to check for `null`, and the type forces it to.
+
+The same type is described from the hooks side on the page [`OperationInfo` in the hook context](../hooks/operation-context.mdx#operation-info). The operation name is [`OperationName`](../hooks/operation-context.mdx#operation-name).
+
+<Snippet id="reference/observability/events/operation-info" twoslash />
+
+<TypeTable
+  type={{
+    "operationId": { description: "The process-unique number of the operation. The next operation gets a greater one.", type: "number" },
+    "parentId": { description: "The number of the outer operation if this one is a nested populate query, otherwise `undefined`.", type: "number | undefined" },
+    "operation": { description: "The operation name, for example `find`, `updateOne`, `insertOne`.", type: "OperationName" },
+    "mode": { description: "How the operation runs. `\"run\"` is to the end, `\"cursor\"` is through a cursor, and `\"explain\"` is the query plan.", type: "\"run\" | \"cursor\" | \"explain\"" },
+    "model": { description: "The model class name, for example `\"Account\"`. `null` for a database-level operation.", type: "string | null" },
+    "collection": { description: "The collection name. `null` for an aggregation of the whole database or of `admin`, and `\"system.sessions\"` for `Pipeline.sessions()`.", type: "string | null" },
+    "database": { description: "The database name. `\"admin\"` for `Pipeline.admin()`, and `\"config\"` for `Pipeline.sessions()`.", type: "string" },
+    "connection": { description: "The client name, that is the `name` option, `\"default\"` by default.", type: "string" },
+    "inTransaction": { description: "Whether the operation runs inside `client.transaction`.", type: "boolean" },
+    "transactionId": { description: "The transaction number (`TransactionEvent.transactionId`) if the operation is in one. `undefined` outside a transaction.", type: "number | undefined" },
+    "serverAddress": { description: "The first host of the connection string. The exact server of each command is in `DriverCommandEvent.address`.", type: "string | undefined" },
+    "serverPort": { description: "The port of the first host.", type: "number | undefined" },
+    "populatePath": { description: "The path of the relation being populated for a nested query, otherwise `undefined`.", type: "string | undefined" },
+    "schema": { description: "A read-only description of the model schema ([`SchemaInfo`](../schemas/schema-info.mdx)), a reference, not a copy. An important consequence: don't serialize the whole event. `null` for a database-level operation.", type: "SchemaInfo | null" },
+    "tenant": { description: "The tenant. Present only for subscribers with `includeTenant: true`.", type: "unknown" },
+  }}
+/>
+
+`serverAddress` and `serverPort` are the first host from the connection string, not necessarily the one that answered. In a replica set (several MongoDB servers holding copies of the same data, though one server is enough for transactions) any node can run the command, so turn on `driverCommands` for the exact address.
+
+<FullType>
+
+<Snippet id="reference/hooks/operation-context/operation-info" />
+
+</FullType>
+
+---
+
+## OperationSummary [#operation-summary]
+
+`OperationSummary` is the shape of an operation's input for the `operation.start` event. It holds the filter, the update, the pipeline, the projection, the sort, and the document count. The values in it are replaced by the rules of [`SubscriberSensitive`](#subscriber-sensitive), which is `"?"` in the default mode. The format is borrowed from `db.query.summary` of OpenTelemetry. Keys and operators stay, and the data doesn't. A trace shows which query it was, but not whose.
+
+<Snippet id="reference/observability/events/operation-summary" twoslash />
+
+For `Accounts.find({ balance: { $gt: 50 }, iban: "DE00" })` the summary was `{"filter":{"balance":{"$gt":"?"},"iban":"?"}}`, and for `Accounts.create(...)` it was `{"count":1}`.
+
+<TypeTable
+  type={{
+    "filter": { description: "The filter with masked values.", type: "unknown" },
+    "update": { description: "The update with masked values.", type: "unknown" },
+    "pipeline": { description: "The aggregation pipeline with masked values.", type: "unknown" },
+    "projection": { description: "The projection.", type: "unknown" },
+    "sort": { description: "The sort.", type: "unknown" },
+    "count": { description: "The number of inserted documents (`insertOne`, `insertMany`) or operations (`bulkWrite`).", type: "number" },
+  }}
+/>
+
+---
+
+## OperationStartEvent [#operation-start-event]
+
+`OperationStartEvent` is the first event of an operation, before casting, validation, and the `pre` hooks. Use it to open a span or remember the start time. The events of the preparation steps (`cast`, `validate`, the `@Pre` hooks) are delivered after it. `create` produced the order `operation.start`, `operation.step` (`cast`), `operation.step` (`validate`), `driver.command.started`. That's why `operation.start` exists even for an operation that failed on casting or validation and never reached the driver.
+
+<Snippet id="reference/observability/events/operation-start-event" twoslash />
+
+Besides the fields of [`OperationInfo`](#operation-info) it has three fields.
+
+<Params title="Fields">
+<Param name="type" type={'"operation.start"'} required>
+
+The event marker.
+
+</Param>
+<Param name="timestamp" type="number" required>
+
+When the event happened, in milliseconds since the epoch, like `Date.now()`.
+
+</Param>
+<Param name="summary" type="OperationSummary" required>
+
+The shape of the operation's input. It's computed on the first read and remembered, so a subscriber that doesn't read `summary` doesn't pay for it. If the subscriber's `mask` function fails during that read, an [`instrumentation.error`](#instrumentation-error-event) event arrives.
+
+</Param>
+</Params>
+
+`operation.start` arrives for an operation that's about to fail on type casting too. An `updateOne` with `$set.balance: "abc"` produced `operation.start` and right after it `operation.error` with `failedStep: "cast"`, without a single driver command.
+
+---
+
+## OperationEndEvent [#operation-end-event]
+
+`OperationEndEvent` arrives when the operation finished successfully. For a cursor, that's the moment it's exhausted or closed, not opened. Use it to count the duration and the number of documents.
+
+<Snippet id="reference/observability/events/operation-end-event" twoslash />
+
+<Params title="Fields">
+<Param name="type" type={'"operation.end"'} required>
+
+The event marker.
+
+</Param>
+<Param name="timestamp" type="number" required>
+
+When the event happened, in epoch milliseconds.
+
+</Param>
+<Param name="durationMS" type="number" required>
+
+How long the operation lasted, in milliseconds, a fractional number.
+
+</Param>
+<Param name="documentCount" type="number | undefined" required>
+
+How many documents were returned, written, or affected, if that's known, otherwise `undefined`. For a `create` of one document it's `1`.
+
+</Param>
+</Params>
+
+---
+
+## OperationErrorEvent [#operation-error-event]
+
+`OperationErrorEvent` arrives instead of `operation.end` when the operation failed at some step. The step name in `failedStep` shows where exactly. `cast` is type casting, `validate` is validation, `execute` is the driver call, and `postProcess` is a step after it, for example `.orFail()` on an empty result.
+
+<Snippet id="reference/observability/events/operation-error-event" twoslash />
+
+<Params title="Fields">
+<Param name="type" type={'"operation.error"'} required>
+
+The event marker.
+
+</Param>
+<Param name="timestamp" type="number" required>
+
+When the event happened, in epoch milliseconds.
+
+</Param>
+<Param name="durationMS" type="number" required>
+
+How long the operation ran before the error.
+
+</Param>
+<Param name="failedStep" type="StepName | undefined" required>
+
+The step the operation failed at, if it's known. These are the step names of the operation pipeline: `resolveContext`, `validateOptions`, `normalize`, `resolvePaths`, `cast`, `policies`, `defaults`, `validate`, `hooksPre`, `instrumentStart`, `execute`, `postProcess`, `populate`, `audit`, `hooksPost`, `instrumentEnd`.
+
+</Param>
+<Param name="error" type="unknown" required>
+
+The error in the form the calling code received it. It's a Typemo error or your own error from a hook. It went through masking by the subscriber's `sensitive`. With `"mask"` the values of unmarked fields in `CastError`, `ValidationError`, `DuplicateKeyError`, and `ServerValidationError` are replaced with `"?"`, and the values of marked and hidden fields never get into it. The calling code receives the original error with the real values.
+
+</Param>
+<Param name="classification" type="ErrorClassification" required>
+
+The kind of failure. `kind` holds `validation`, `cast`, `not-found`, `duplicate-key`, `timeout`, `connection`, `server`, or another kind. `name` is the error class name, `code` is the server error code, `errorLabels` are the labels, `retryable` says whether a retry makes sense, and `transient` says whether the whole transaction can be retried. For `.orFail()` on an empty result it came as `{ kind: "not-found", name: "DocumentNotFoundError", errorLabels: [], retryable: false, transient: false }`, and for the string `"abc"` in a numeric field as `{ kind: "cast", name: "CastError", … }`.
+
+</Param>
+</Params>
+
+---
+
+## StepEvent [#step-event]
+
+`StepEvent` is the completion of a nested step of an operation. It helps you see where the time went: type casting, validation, hooks, or populate. Step events come one per step, after it ends, and carry the duration.
+
+<Snippet id="reference/observability/events/step-event" twoslash />
+
+For a `find` on a model with `@Pre` and `@Post` hooks the steps arrived in the order `cast`, `validate`, `hooksPre`, `populate`, `hooksPost`. A model without hooks has no `hooksPre` and `hooksPost`, leaving `cast`, `validate`, `populate`.
+
+<Params title="Fields">
+<Param name="type" type={'"operation.step"'} required>
+
+The event marker.
+
+</Param>
+<Param name="operationId" type="number" required>
+
+The operation the step belongs to. The step has none of the other [`OperationInfo`](#operation-info) fields, so take them from the `operation.start` event by this number.
+
+</Param>
+<Param name="step" type="StepName" required>
+
+The step name: `cast`, `validate`, `hooksPre`, `hooksPost`, `populate`.
+
+</Param>
+<Param name="timestamp" type="number" required>
+
+When the step ended, in epoch milliseconds.
+
+</Param>
+<Param name="durationMS" type="number" required>
+
+How long the step lasted.
+
+</Param>
+</Params>
+
+---
+
+## CursorBatchEvent [#cursor-batch-event]
+
+`CursorBatchEvent` is the next batch of documents a cursor received. With it you see how long a large export takes to read and in what batch sizes.
+
+<Snippet id="reference/observability/events/cursor-batch-event" twoslash />
+
+<Params title="Fields">
+<Param name="type" type={'"cursor.batch"'} required>
+
+The event marker.
+
+</Param>
+<Param name="operationId" type="number" required>
+
+The operation the cursor belongs to.
+
+</Param>
+<Param name="timestamp" type="number" required>
+
+When the batch was received, in epoch milliseconds.
+
+</Param>
+<Param name="batch" type="number" required>
+
+The batch number, and the first one is `0`.
+
+</Param>
+<Param name="size" type="number" required>
+
+How many documents are in the batch. With two documents in the collection one batch arrived, `{ batch: 0, size: 2 }`.
+
+</Param>
+</Params>
+
+For cursors, read the guide [Large results](../../queries/large-results.mdx).
+
+---
+
+## TransactionEvent [#transaction-event]
+
+`TransactionEvent` describes the life of [`client.transaction`](../connection/typemo-client.mdx#client.transaction): the start, a retry, the commit, and the abort. It shows which transactions were retried and why.
+
+<Snippet id="reference/observability/events/transaction-event" twoslash />
+
+An ordinary transaction produces `transaction.start` and `transaction.commit`. A transaction that failed with an error produces `transaction.start` and `transaction.abort`. The `abort` arrived with `error`, the original `Error("nope")`, and a duration in milliseconds. If the driver retries a transaction because of a transient error, `transaction.retry` is added between them.
+
+<Params title="Fields">
+<Param name="type" type={'"transaction.start" | "transaction.commit" | "transaction.abort" | "transaction.retry"'} required>
+
+The event marker.
+
+</Param>
+<Param name="transactionId" type="number" required>
+
+The process-unique transaction number. The same number is in `OperationInfo.transactionId` of the operations inside it.
+
+</Param>
+<Param name="timestamp" type="number" required>
+
+When the event happened, in epoch milliseconds.
+
+</Param>
+<Param name="attempt" type="number" required>
+
+The attempt number, and the first one is `1`.
+
+</Param>
+<Param name="connection" type="string" required>
+
+The client name.
+
+</Param>
+<Param name="durationMS" type="number | undefined" required>
+
+How much time passed since `transaction.start`. Present on `commit` and `abort`.
+
+</Param>
+<Param name="error" type="unknown" required>
+
+The error that caused the transaction to roll back or retry. It's masked by the rules of [`SubscriberSensitive`](#subscriber-sensitive). For `start` and `commit` it's `undefined`.
+
+</Param>
+</Params>
+
+For transactions, read the guide [Transactions](../../transactions/transactions.mdx).
+
+---
+
+## DriverCommandEvent [#driver-command-event]
+
+`DriverCommandEvent` is a command the driver sent to the server. You need it when one Typemo operation isn't enough, for example to see the server that ran the command, or the command's own timing. The event is tied to the operation by `operationId`. A subscriber receives such events only with `driverCommands: true`, and the client must be created with `monitorCommands: true`.
+
+<Snippet id="reference/observability/events/driver-command-event" twoslash />
+
+<Params title="Fields">
+<Param name="type" type={'"driver.command.started" | "driver.command.succeeded" | "driver.command.failed"'} required>
+
+The start, the success, or the failure of the command.
+
+</Param>
+<Param name="operationId" type="number | undefined" required>
+
+The Typemo operation that sent the command. `undefined` for commands Typemo didn't send, that is the driver's internal commands and your own code working with the driver directly.
+
+</Param>
+<Param name="requestId" type="number" required>
+
+The request number in the driver. It links `started` with `succeeded` or `failed`.
+
+</Param>
+<Param name="commandName" type="string" required>
+
+The server command name, for example `find`, `insert`, `update`.
+
+</Param>
+<Param name="databaseName" type="string" required>
+
+The database the command is addressed to.
+
+</Param>
+<Param name="address" type="string" required>
+
+The `host:port` of the server that ran the command.
+
+</Param>
+<Param name="timestamp" type="number" required>
+
+When the event happened, in epoch milliseconds.
+
+</Param>
+<Param name="durationMS" type="number | undefined" required>
+
+The duration of the command for `succeeded` and `failed`.
+
+</Param>
+<Param name="command" type="unknown" required>
+
+The command itself, masked the same way as [`OperationSummary`](#operation-summary). Present only on `started`. We got `{"find":"accounts","filter":{"title":"?"},"lsid":{…},"$db":"bank"}`. The filter values are replaced, and the driver's internal fields (`lsid`, `$clusterTime`) stayed.
+
+</Param>
+<Param name="failure" type="unknown" required>
+
+The server error on `failed`, masked.
+
+</Param>
+</Params>
+
+---
+
+## PoolEvent [#pool-event]
+
+`PoolEvent` is an event of the driver's connection pool (CMAP). It's for pool metrics: how many connections are busy and how many are waiting. A subscriber receives it with `poolEvents: true`.
+
+<Snippet id="reference/observability/events/pool-event" twoslash />
+
+<Params title="Fields">
+<Param name="type" type={'"driver.pool"'} required>
+
+The event marker.
+
+</Param>
+<Param name="name" type="string" required>
+
+The driver event name: `connectionCheckOutStarted`, `connectionCheckedOut`, `connectionCheckedIn`, `connectionPoolCleared`, and others. One `find` produced `connectionCheckOutStarted`, `connectionCheckedOut`, `connectionCheckedIn`.
+
+</Param>
+<Param name="address" type="string" required>
+
+The `host:port` of the server the pool belongs to.
+
+</Param>
+<Param name="timestamp" type="number" required>
+
+When the event happened, in epoch milliseconds.
+
+</Param>
+<Param name="event" type="unknown" required>
+
+The driver event object as is (`time`, `address`, `name`, and so on). Pool events contain no user data.
+
+</Param>
+</Params>
+
+---
+
+## InstrumentationErrorEvent [#instrumentation-error-event]
+
+`InstrumentationErrorEvent` reports a failure of observability itself that didn't stop the operation. Your `mask` function from [`SubscriberSensitive`](#subscriber-sensitive) threw an exception while preparing a value. The value became `"?"` instead, and the subscriber learns about the breakage from the event, not from a text lost in the console.
+
+<Snippet id="reference/observability/events/instrumentation-error-event" twoslash />
+
+A `mask` that throws on the path `title` produced the event `{ source: "sensitive-mask", model: "Account", path: "title" }` with the error `the "sensitive" mask of "title" threw`, and `summary.filter` became `{"title":"?"}`. The error names the path and never contains the value.
+
+<Params title="Fields">
+<Param name="type" type={'"instrumentation.error"'} required>
+
+The event marker.
+
+</Param>
+<Param name="source" type={'"sensitive-mask"'} required>
+
+Where the failure came from. Right now the only source is the `mask` function.
+
+</Param>
+<Param name="timestamp" type="number" required>
+
+When the event happened, in epoch milliseconds.
+
+</Param>
+<Param name="model" type="string | undefined" required>
+
+The model of the operation whose event was being masked, if it's known.
+
+</Param>
+<Param name="path" type="string" required>
+
+The path of the value in the database, dot-separated, an empty string outside fields.
+
+</Param>
+<Param name="error" type="unknown" required>
+
+The error with the path and without the value.
+
+</Param>
+</Params>
+
+If `mask` fails while processing the `instrumentation.error` itself, the core writes about it to `console.error` and produces no new events, so there's no endless loop. If no subscribers are left by the time of the failure, the core writes the line `[typemo] instrumentation: a sensitive mask threw; the value is "?"` to `console.error`.
+
+---
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Operation events" href="../../observability/events.mdx">
+  The guide: subscribe, count slow operations, and avoid leaking data.
+</Card>
+<Card title="Custom integration" href="../../observability/custom-integration.mdx">
+  How to write an adapter for your own monitoring system on top of these events.
+</Card>
+<Card title="@venloc/typemo-opentelemetry" href="./opentelemetry.mdx">
+  A ready-made adapter: events as spans and metrics.
+</Card>
+<Card title="client.instrument" href="../connection/typemo-client.mdx#client.instrument">
+  Registering a subscriber on one client.
+</Card>
+</Cards>

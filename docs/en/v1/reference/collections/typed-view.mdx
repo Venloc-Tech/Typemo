@@ -1,0 +1,431 @@
+---
+title: TypedView
+description: "A typed MongoDB view: define, of, isView, find, findOne, countDocuments, distinct, aggregate, ensure, and drop"
+icon: Eye
+---
+
+A **view** in MongoDB is a "virtual collection". The server stores no documents, only an aggregation pipeline over another collection, and runs it on every read. `TypedView` is a typed wrapper around such a view. You describe the view's rows with an ordinary class, like a model. Typemo checks that the pipeline really produces such rows and gives you read methods with the same types as a model.
+
+A view is read-only. So `TypedView` has `find`, `findOne`, `countDocuments`, `distinct`, and `aggregate`, but no `create`, `updateOne`, and the like. The server would refuse anyway, and a type that promised writes would be a lie. All reads return rows the way `.lean()` does: as plain objects, not as documents you can save.
+
+If you're new to views, start with the [Read a predefined selection through a view](../../collections/views.mdx) guide. This page is a reference.
+
+The examples use accounts. The `accounts` collection has three documents: Main (owner alice, balance 120, open), Old (alice, 0, closed), and Savings (bob, 500, open). The `open_accounts` view shows only open accounts and only three fields.
+
+<Snippet id="reference/collections/typed-view/intro" title="accounts/models.ts" twoslash />
+
+The view class is described as an ordinary entity. `@Schema({ collection: … })` names the view, the fields are the rows it returns, and `_id` is declared as in any model (here `Entity` provides it).
+
+---
+
+## TypedView.define [#typed-view.define]
+
+`define` describes a view but **creates nothing in the database**. The view appears on the server only after [`ensure`](#typed-view.ensure), or after [`connection.init`](../connection/connection.mdx#connection.init) and [`connection.syncAll`](../connection/connection.mdx#connection.sync-all), which call it themselves. You pass the connection, the view class, and the definition: which model to read from and which pipeline to apply.
+
+The pipeline is built with the same builder as an ordinary aggregation, with two differences. It's checked against the view class. If the pipeline doesn't produce a field of the class, the compiler points at it. And it has no `$out` or `$merge`, because a view can't write.
+
+<Snippet id="reference/collections/typed-view/typed-view-define" twoslash />
+
+<Returns type="TypedView<InstanceType<View>>">
+
+A `TypedView` object with the read methods. It has `definition` (a [`ViewInfo`](#view-info): the name, the source, the pipeline, the collation) and `entity`, the view class. The definition is frozen.
+
+</Returns>
+
+<Params>
+<Param name="connection" type="Connection" required>
+
+The connection the view belongs to. The view class is registered on it as a model (`connection.model`), so the view shows up in [`connection.models`](../connection/connection.mdx#connection.models). Syncing creates neither a collection nor indexes for it.
+
+</Param>
+<Param name="view" type="EntityClass" required>
+
+The class of a view row. The view name comes from its `@Schema({ collection })`.
+
+</Param>
+<Param name="definition.on" type="EntityClass" required>
+
+The model the view reads from. It must be in the same database.
+
+</Param>
+<Param name="definition.pipeline" type="(p) => StagedPipeline" required>
+
+A function that receives an empty builder and returns the pipeline. The pipeline's rows must contain all the fields of the view class with compatible types.
+
+</Param>
+<Param name="definition.collation" type="CollationOptions">
+
+The string collation shared by the view. For a view over a view, it must match the source's collation.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/typed-view/typed-view-define-2" />
+
+</FullType>
+
+### What Typemo puts into the stored pipeline [#stored-pipeline]
+
+The server stores the pipeline and runs it on every read, so it has to be safe. Typemo puts the same protection at the start of the pipeline as an ordinary aggregation has. If the source model has a **hidden field** ([`hidden`](../schemas/prop.mdx#hidden)), the first stage is an `$unset` of that field. The view row doesn't contain it, even if the pipeline knows nothing about it. If the source is a discriminator inheritor, a `$match` on the discriminator key is added.
+
+Say `Account` got a hidden field `pin`.
+
+<Snippet id="reference/collections/typed-view/stored-pipeline" twoslash />
+
+### The pipeline doesn't match the class [#pipeline-class-mismatch]
+
+If the pipeline doesn't produce a field of the class, the compiler rejects the definition. Here `project` keeps only `title`, and the class also requires `owner` and `balance`.
+
+<Snippet id="reference/collections/typed-view/pipeline-class-mismatch" twoslash />
+
+### Runtime errors [#runtime-errors]
+
+The compiler check can be bypassed, so the same conditions are checked at the call too. `define` throws a [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error) in four cases.
+
+- The view reads itself (`view "open_accounts" cannot read from itself`).
+- The pipeline has `$out` or `$merge`.
+- The source stores fields under other names (`dbName`).
+- The name is already defined on this connection with a different definition.
+
+The last case was verified by running it.
+
+<Snippet id="reference/collections/typed-view/runtime-errors" />
+
+Defining the same view again with the same definition is allowed, and there's no error.
+
+The compiler won't let `$out` into the pipeline, because the view builder has no `.out()` method.
+
+<Snippet id="reference/collections/typed-view/runtime-errors-2" twoslash />
+
+To **save** the pipeline's result instead of recomputing it on every read, use [`Materialized`](./materialized.mdx).
+
+---
+
+## TypedView.of [#typed-view.of]
+
+`of` returns all the views defined on a connection, in definition order. [`connection.syncAll`](../connection/connection.mdx#connection.sync-all) calls it to create them all. In your own code it's useful for utility checks.
+
+<Snippet id="reference/collections/typed-view/typed-view-of" twoslash />
+
+<Returns type="readonly TypedView<object>[]">
+
+The connection's views. If there are none, the array is empty.
+
+</Returns>
+
+<Params>
+<Param name="connection" type="Connection" required>
+
+The connection whose views you need.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/typed-view/typed-view-of-2" />
+
+</FullType>
+
+---
+
+## TypedView.isView [#typed-view.is-view]
+
+`isView` says whether a view with that collection name is defined on the connection. It tells a view from an ordinary collection. For example, syncing uses it to skip views when it creates collections and indexes.
+
+<Snippet id="reference/collections/typed-view/typed-view-is-view" twoslash />
+
+<Returns type="boolean">
+
+`true` if the collection name belongs to a defined view. The check goes by the definitions in your code, not by the server. A view on the server that you didn't define gives `false`.
+
+</Returns>
+
+<Params>
+<Param name="connection" type="Connection" required>
+
+The connection.
+
+</Param>
+<Param name="collection" type="string" required>
+
+The collection name.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/typed-view/typed-view-is-view-2" />
+
+</FullType>
+
+---
+
+## typedView.find [#typed-view.find]
+
+`find` reads the view rows that match a filter. It works like [`Model.find`](./../query/reading.mdx#model.find) and returns a query builder you can chain [`.sort`](../query/reading.mdx#sort), [`.select`](../query/reading.mdx#select), [`.limit`](../query/reading.mdx#limit), and the other methods onto. The query goes to the database on `await`. There's one difference. The result is always like the [`.lean`](../query/reading.mdx#lean) one: plain objects with all the fields of the view class.
+
+The filter is checked against the fields of the view class, not of the source. The compiler won't let through a field that isn't in the row.
+
+<Snippet id="reference/collections/typed-view/typed-view-find" twoslash />
+
+<Returns type="QueryBuilder">
+
+A query builder with a `.lean()`-like result. After `await` you get an array of rows, or an empty array if nothing matched. If the view doesn't exist on the server yet and this is the first operation on it, you don't get an empty array. You get a [`ConfigurationError`](#missing-view).
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<V>">
+
+Search conditions on the fields of the view class. Without an argument, all rows are found.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/typed-view/typed-view-find-2" />
+
+</FullType>
+
+Rows can't be changed and saved, because they aren't documents. `create` on a view doesn't compile, because there's no such method.
+
+<Snippet id="reference/collections/typed-view/typed-view-find-3" twoslash />
+
+---
+
+## typedView.findOne [#typed-view.find-one]
+
+`findOne` returns the first row that matches the filter, or `null`. As with [`find`](#typed-view.find), the result is the same as with `.lean()`. If the row must exist, add [`.orFail()`](../query/reading.mdx#or-fail). Then instead of `null` you get a [`DocumentNotFoundError`](../errors/query-errors.mdx#document-not-found-error).
+
+<Snippet id="reference/collections/typed-view/typed-view-find-one" twoslash />
+
+The closed account `Old` didn't get into the view, so `findOne` returned `null` for it.
+
+<Returns type="QueryBuilder">
+
+A query builder. After `await`, a row or `null`.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<V>">
+
+Search conditions. Without an argument, any row matches.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/typed-view/typed-view-find-one-2" />
+
+</FullType>
+
+---
+
+## typedView.countDocuments [#typed-view.count-documents]
+
+`countDocuments` counts the view rows that match a filter. Like [`Model.countDocuments`](../query/reading.mdx#model.count-documents), it counts exactly, not by estimate.
+
+<Snippet id="reference/collections/typed-view/typed-view-count-documents" twoslash />
+
+<Returns type="CountQuery">
+
+A query that gives the number of rows after `await`.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<V>">
+
+Search conditions. Without an argument, all rows are counted.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/typed-view/typed-view-count-documents-2" />
+
+</FullType>
+
+---
+
+## typedView.distinct [#typed-view.distinct]
+
+`distinct` returns the distinct values of one field across the view rows. The server doesn't promise an order for the values, and on a view it can be anything. If you need an order, sort the result yourself.
+
+<Snippet id="reference/collections/typed-view/typed-view-distinct" twoslash />
+
+<Returns type="OptionQuery<DistinctValue<V, P>[]>">
+
+A query that gives an array of the field's distinct values after `await`. The element type is inferred from the field type.
+
+</Returns>
+
+<Params>
+<Param name="path" type="FilterPaths<V>" required>
+
+A field of the view class.
+
+</Param>
+<Param name="filter" type="Filter<V>">
+
+Limits the rows the values are collected from.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/typed-view/typed-view-distinct-2" />
+
+</FullType>
+
+---
+
+## typedView.aggregate [#typed-view.aggregate]
+
+`aggregate` runs an aggregation over the view rows. The pipeline starts from the view's documents, and its fields are checked against the view class. That lets you compute totals over a ready selection without repeating its conditions.
+
+<Snippet id="reference/collections/typed-view/typed-view-aggregate" twoslash />
+
+<Returns type="AggregateQuery">
+
+An aggregation query. After `await`, an array of result rows, and the last stage of the pipeline sets their shape. For more on the aggregation query, see the [Pipeline and Model.aggregate](../aggregation/pipeline.mdx) reference.
+
+</Returns>
+
+<Params>
+<Param name="build" type="(p) => AggregateResult" required>
+
+A function that receives a pipeline builder over the view rows and returns the pipeline.
+
+</Param>
+<Param name="options" type="ModelAggregateOptions">
+
+The aggregation options: `session`, `timeoutMS`, `policy`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/typed-view/typed-view-aggregate-2" />
+
+</FullType>
+
+---
+
+## typedView.ensure [#typed-view.ensure]
+
+`ensure` makes sure the view exists on the server and matches the definition. If it doesn't exist, the method creates it. If it matches, the method leaves it as is. If the source or the pipeline differ, it changes them with the `collMod` command. As with [`ensureCollection`](./collection-manager.mdx#model.ensure-collection), any difference is an error by default, and you have to change an existing view explicitly with the `update` option.
+
+<Snippet id="reference/collections/typed-view/typed-view-ensure" twoslash />
+
+The first call with `dryRun` only reported that the view would be created. The second one created it, and the third one saw a match. A real `ensure` also notes that the view exists, so reads from it no longer check that themselves (see [Reading a view that doesn't exist](#missing-view)). `dryRun` notes nothing.
+
+<Returns type="Promise<EnsureCollectionReport>">
+
+An [`EnsureCollectionReport`](./collection-manager.mdx#ensure-collection-report) with the fields `result` (`"created"`, `"unchanged"`, or `"updated"`) and `differences`.
+
+</Returns>
+
+<Params>
+<Param name="options.update" type="boolean" default="false">
+
+Apply a changed source or pipeline with the `collMod` command. Without the option, such a difference gives a [`CollectionOptionsError`](../errors/configuration-errors.mdx#collection-options-error).
+
+</Param>
+<Param name="options.dryRun" type="boolean" default="false">
+
+Only report what would happen.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/typed-view/typed-view-ensure-2" />
+
+</FullType>
+
+### The definition changed [#definition-changed]
+
+Suppose the view is already created on the server, but with a different condition (`closed: true`), and the code says `closed: false`. Without `update`, the method refuses to change the view.
+
+<Snippet id="collections/views/update-definition" />
+
+In this situation `ensure({ dryRun: true })` returns `result: "updated"` and a difference with `option: "pipeline"` and `mutable: true`. `ensure({ update: true })` changes the view's pipeline. Both results came from running it, and after `update` the next `ensure` returned `"unchanged"`.
+
+### Collation and an ordinary collection under the name [#collation-and-named-collection]
+
+The view's collation (`collation`) can't be changed. `ensure` throws a `CollectionOptionsError`, and to fix it you have to drop the view and create it again ([`drop`](#typed-view.drop)). If an **ordinary collection** sits under the view's name, `ensure` doesn't touch it and throws an error.
+
+<Snippet id="reference/collections/typed-view/collation-and-named-collection" />
+
+---
+
+## typedView.drop [#typed-view.drop]
+
+`drop` drops a view, and only a view. If an ordinary collection sits under that name, the method refuses, so no data is lost. It doesn't touch the source's data, because a view stores only the pipeline.
+
+<Snippet id="reference/collections/typed-view/typed-view-drop" twoslash />
+
+<Returns type="Promise<boolean>">
+
+`true` if the view was dropped, and `false` if it didn't exist. If an ordinary collection sits under the name, the method throws a [`CollectionOptionsError`](../errors/configuration-errors.mdx#collection-options-error) with the text `is a collection, not a view: drop() only drops views`.
+
+</Returns>
+
+It takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/collections/typed-view/typed-view-drop-2" />
+
+</FullType>
+
+---
+
+## Reading a view that doesn't exist [#missing-view]
+
+If a view doesn't exist on the server, MongoDB doesn't say so. A read from it returns an empty result, like one from an empty collection. A defined but uncreated view would look like "nothing in it", and you'd have to hunt for a deployment error through empty answers. So the first operation on a view on a connection (`find`, `findOne`, `countDocuments`, `distinct`, or `aggregate`) checks that the view exists, and throws a [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error) if it doesn't.
+
+<Snippet id="reference/collections/typed-view/missing-view" twoslash />
+
+If an ordinary collection sits under the view's name, the error is different: `OpenAccount.find: "open_accounts" is a collection, not the view; drop it or rename the view, then create the view`.
+
+Typemo remembers a view it found. The check costs one `listCollections` request per view and connection, and later reads go without it. So a view that someone dropped behind Typemo's back after the first check reads as empty again. The server says nothing, and there's no repeated check. For a view dropped through [`drop`](#typed-view.drop), the memory is cleared, and the next operation checks again and throws an error. [`ensure`](#typed-view.ensure) and [`connection.init`](../connection/connection.mdx#connection.init), which created the view, make the check unnecessary. The check doesn't use a session, because `listCollections` is forbidden inside a transaction.
+
+---
+
+## ViewInfo [#view-info]
+
+The view definition in the form the server stores it. It's the `definition` field of `TypedView`.
+
+<TypeTable
+  type={{
+    name: { type: "string", required: true, description: "The view name (the name of its collection)." },
+    viewOn: { type: "string", required: true, description: "The collection or view it reads." },
+    pipeline: { type: "readonly PipelineStage[]", required: true, description: "The stored pipeline, with the hidden field protection and the discriminator condition already added." },
+    collation: { type: "CollationOptions", description: "The string collation of the view, if set." },
+  }}
+/>
+
+## TypedViewDefinition [#typed-view-definition]
+
+The third argument of [`TypedView.define`](#typed-view.define): `on` (the source model), `pipeline` (the pipeline function), and an optional `collation`. The fields are described in the section on [`define`](#typed-view.define).
+
+---
+
+## When not to use it [#when-not-to-use]
+
+A view is recomputed on every read, so heavy aggregations on it are slow. If you need the result often and exact freshness isn't required, save it with [`Materialized`](./materialized.mdx). The result sits on disk, you can index it, and you refresh it yourself. If you also need to write the data, use an ordinary collection and its [model](../connection/connection.mdx#connection.model).
+
+The guide with real tasks is [Read a predefined selection through a view](../../collections/views.mdx).

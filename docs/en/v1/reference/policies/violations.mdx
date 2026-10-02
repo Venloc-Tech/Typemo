@@ -1,0 +1,185 @@
+---
+title: "Policy violations"
+description: "StrictModeError and all its reasons: what each one means, which text the developer sees, and how to fix the call"
+icon: OctagonAlert
+---
+
+When an operation breaks a policy or strictness rule, Typemo doesn't send it to the server and throws a [`StrictModeError`](#strict-mode-error). The reason is in the `reason` field and is appended to the end of the message in square brackets. You can't relax the rules with options or modes. That way a typo, an empty filter, or a forgotten tenant doesn't turn into a silent loss or leak of data. Below, each reason is covered in turn: what causes it, which text you'll see, and what to change. If you're new here, read the guides of the section, starting with [What data policies are](../../policies/overview.mdx).
+
+The general description of the class and its fields is in the data errors section, under [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error). Here the reasons are covered one by one.
+
+## StrictModeError [#strict-mode-error]
+
+The error has two particular features. The `reason` field is one of thirteen values (the `StrictModeReason` type). The `path` field shows where in the input the rule is broken (`filter.nope`, `$set.email`), or is `undefined` if the whole operation breaks it. Branch on `reason`, not on the text. The text may be refined, but the `reason` value stays.
+
+<Snippet id="reference/policies/violations/strict-mode-error" twoslash />
+
+The query builder notices some violations earlier, when it builds the operation, and reports them as a [`QueryError`](../errors/query-errors.mdx#query-error). These are `undefined` in a value, empty `$and`/`$or`/`$nor`, an empty update, and `limit`/`skip` out of bounds. A `QueryError` has no `reason` field, so when you handle client input errors, catch both classes. The reasons `unknown-path`, `not-hidden`, `empty-filter`, `immutable`, `sanitize`, `tenant`, `soft-delete`, `transaction-option`, and `concurrent-session` were confirmed in a real run. The other four are intercepted by `QueryError` in ordinary calls.
+
+<TypeTable
+  type={{
+    "unknown-path": { description: "A path that isn't in the schema." },
+    "not-hidden": { description: "`+name` in a projection on a field that isn't hidden. The key would change nothing." },
+    undefined: { description: "`undefined` as a value (a `QueryError` in ordinary calls)." },
+    "empty-filter": { description: "An empty filter in a write: `updateOne`, `updateMany`, `deleteOne`, `deleteMany`, `replaceOne`, `findOneAnd*`, including inside `bulkWrite`." },
+    "empty-logical": { description: "An empty `$and`, `$or`, `$nor` (a `QueryError` in ordinary calls)." },
+    "empty-update": { description: "An empty update (a `QueryError` in ordinary calls)." },
+    immutable: { description: "A write to an immutable field." },
+    limit: { description: "A `limit` of zero or less (a `QueryError` in ordinary calls)." },
+    sanitize: { description: "An operator where a value was expected, or an unknown operator." },
+    tenant: { description: "The operation has no tenant, the tenant is empty, or the operation would go beyond it." },
+    "soft-delete": { description: "An operation the soft delete policy can't restrict." },
+    "transaction-option": { description: "`readConcern`, `writeConcern`, `readPreference`, or `timeoutMS` on an operation inside a transaction." },
+    "concurrent-session": { description: "The session is busy with another operation." },
+  }}
+/>
+
+<FullType>
+
+<Snippet id="reference/policies/violations/strict-mode-error-2" />
+
+</FullType>
+
+### unknown-path [#unknown-path]
+
+A filter, update, projection, sort, or pipeline names a path that isn't in the schema. Without this check a typo in a field name would give a filter that finds nothing, or an update that silently writes nothing. `path` starts with the place of the input: `filter`, `$set`, `projection`, `sort`.
+
+<Snippet id="reference/policies/violations/unknown-path" />
+
+The message names the place of the input once and puts the unknown field in quotes. The full path is in `path`: `filter.nope`, `filter.$or.0.nope`, `$set.nope`, `projection.nope`, `sort.nope`. An unknown name after `+` in a projection is named the same way, with the path `projection.+nope`.
+
+Take the field name from the class. If you really need the field, add it to the schema. For more, see the guide [Prevent typos in field names](../../policies/strict-paths.mdx).
+
+### not-hidden [#not-hidden]
+
+A projection contains a `+name` key for a field that's in the schema but isn't hidden. The `+name` key brings a [hidden field](../schemas/prop.mdx#hidden) into the result. An ordinary field comes anyway, so the key would change nothing, and the intent would stay unclear. Did you forget to mark the field hidden, or get the sign wrong? The compiler doesn't accept such a key. In code without types, or with a `Record<string, 0 | 1>` dictionary, the query stops before it reaches the database, and `path` is `projection.+name`.
+
+<Snippet id="reference/policies/violations/not-hidden" />
+
+Select the field without `+`, for example `select({ name: 1 })`. If the field shouldn't be returned by default, mark it `hidden` in the model. If the name after `+` isn't in the schema at all, the reason is `unknown-path`.
+
+### undefined [#undefined]
+
+`undefined` in a filter or update value is forbidden. The driver would send it as `null`, the filter would find documents without the field, and `$set` would write `null`. In ordinary calls the builder throws a `QueryError`. The texts come from a real run.
+
+<Snippet id="reference/policies/violations/undefined" />
+
+Don't pass the key at all. For "the field is missing" use `$exists: false`, and to remove a field use `$unset`.
+
+### empty-filter [#empty-filter]
+
+An empty filter in a write. That's `updateOne`, `updateMany`, `deleteOne`, `deleteMany`, `replaceOne`, `findOneAndUpdate`, `findOneAndDelete`, `findOneAndReplace`, and also such an operation inside `bulkWrite`. One typo that produced an empty filter would wipe a collection or change a random document. `path` is `undefined`. An empty filter in a read is allowed.
+
+<Snippet id="reference/policies/violations/empty-filter" />
+
+The text names the method you called and depends on the shape of the operation. For `updateMany` and `deleteMany` it says `would affect every document`. For `updateOne`, `deleteOne`, `replaceOne`, and `findOneAnd*` it says `would change or remove an arbitrary document`, because one document would be affected, but the database doesn't guarantee which. The compiler error uses the same words. Here is the text for `deleteOne`.
+
+<Snippet id="reference/policies/violations/empty-filter-2" />
+
+The cause and the fix don't depend on the shape.
+
+Pass a condition. If "all documents" is what you mean, write `Filters.all()`. The literal `{}` in `updateOne`, `updateMany`, `deleteOne`, `deleteMany`, and `replaceOne` doesn't compile, so only a filter that turned out empty at runtime reaches this error. In `findOneAnd*` the literal `{}` compiles, and the error comes only at runtime. Read [Empty filters in writes](../../writes/empty-filters.mdx) and [Don't wipe a collection with an empty filter](../../policies/filters-and-limits.mdx).
+
+#### Filters.all [#filters.all]
+
+`Filters.all()` is an explicit "all documents" for operations that reject an empty filter. It's a real filter `{ _id: { $exists: true } }`, true for every stored document. Nothing special goes into the plan, and the intent is visible in the code and in the command log. The method returns a frozen object.
+
+<Snippet id="reference/policies/violations/filters-all" twoslash />
+
+Without a type argument the result is an `AllDocumentsFilter`, a plain object that fits the filter of **any** model. So the same `Filters.all()` works for both `Users` and `Orders`. With an argument (`Filters.all<User>()`) the result is typed as `Filter<User>`. The method takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/policies/violations/filters-all-2" />
+
+</FullType>
+
+### empty-logical [#empty-logical]
+
+An empty `$and`, `$or`, or `$nor`. The server rejects such an operator, and "fixing" it by dropping it would mean finding all documents. A list of conditions is most often built from data, and an empty list looks like "no conditions". In ordinary calls the builder throws a `QueryError`.
+
+<Snippet id="reference/policies/violations/empty-logical" />
+
+Check the list before you build the filter. If there are no conditions and you need all documents, say so with `Filters.all()`. If you need none, don't run the query.
+
+### empty-update [#empty-update]
+
+An update that changes nothing after casting. That's an empty object, an operator without paths, or a pipeline without stages. It shouldn't look like a success. Usually a `QueryError` arrives, and the texts come from a real run.
+
+<Snippet id="reference/policies/violations/empty-update" />
+
+### immutable [#immutable]
+
+A write to an immutable field (the [`immutable`](../schemas/prop.mdx) field option) outside document creation. Such a field is written only on creation, and on `upsert` through `$setOnInsert`.
+
+<Snippet id="reference/policies/violations/immutable" />
+
+A whole-document replace (`replaceOne`, `findOneAndReplace`, `replaceOne` in `bulkWrite`) must match the stored document on every immutable field. The value is the same if the field exists, and absent if it doesn't. The server compares in the same operation, so the error arrives after the call to it, and the document doesn't change. `path` names the field. The texts come from a real run.
+
+<Snippet id="reference/policies/violations/immutable-2" />
+
+A whole-document replace can't carry `_id`. The `_id` of a stored document can't be changed, not even to the same value. Any `_id` in a replacement (`replaceOne`, `findOneAndReplace`) is forbidden, and the error arrives before sending.
+
+<Snippet id="reference/policies/violations/immutable-3" />
+
+Update stages that rewrite the whole document (`$replaceRoot`, `$replaceWith`, `$project`) are allowed on a model with immutable fields if the new root carries every such field over as is. For example, `createdAt: "$createdAt"` or `$mergeObjects` with the root document. Otherwise the error names the lost fields.
+
+<Snippet id="reference/policies/violations/immutable-4" />
+
+### limit [#limit]
+
+A `limit` that isn't a positive integer. In the driver `0` means "no limit", and a negative number works as its absolute value. Zero is easy to get from an empty query parameter and dump the whole collection. The builder message (`QueryError`, from a real run) prints the value together with its type.
+
+<Snippet id="reference/policies/violations/limit" />
+
+To leave the selection unlimited, don't call `limit`.
+
+### sanitize [#sanitize]
+
+A filter contains an operator where a value was expected, or a nonexistent operator. This is what replacing a value with an operator (injection) looks like, and so does a query the server would run as JavaScript. The reason also fires for the [`untrusted`](./soft-delete-and-untrusted.mdx#untrusted) check. The texts come from a real run.
+
+<Snippet id="reference/policies/violations/sanitize" />
+
+The last three texts differ by the place you named in the second argument of [`untrusted`](./soft-delete-and-untrusted.mdx#untrusted): filter, update, or projection.
+
+Build the filter yourself from validated values. Read the guide [Accept a filter from a client request](../../policies/untrusted-input.mdx).
+
+### tenant [#tenant]
+
+An operation on a model with the [`tenant`](./schema-options.mdx#tenant) policy has no tenant, the tenant is empty, or the operation would go beyond it. The texts come from a real run. `path` is present on errors that concern the tenant field. Each text names the method you called.
+
+<Snippet id="reference/policies/violations/tenant" />
+
+Set the tenant through [`PolicyContext.run`](./policy-context.mdx#policy-context.run) or [`.policy({ tenant })`](../query/options.mdx#policy). To work across all tenants you need `allTenants: true`. Read the guide [Split data by organization](../../policies/tenants.mdx).
+
+The hint in the first text names the form of the call that the operation has. For a query it's `.policy({ tenant })`, and for a write (`create`, `insertOne`, `insertMany`, `bulkWrite`, `$save`) it's the call parameters `{ policy: { tenant } }`. An empty string, a whitespace-only string, and `null` as a tenant are rejected when a scope is opened and in `.policy()`, not at the first operation. An empty tenant in the call parameters names the method you called: `create.policy`, `insertMany.policy`, `save.policy` (for `$save`), not the internal write mechanism. For `$save` of a document without a tenant the text has `Order.save`. `watch` has no `.policy` parameters of its own, so the hint names the scope: `PolicyContext.run({ allTenants: true }, () => Order.watch())`.
+
+### soft-delete [#soft-delete]
+
+An operation whose scope the soft delete policy can't determine. Right now that's `estimatedDocumentCount` without `includeDeleted`, since collection metadata counts deleted documents too.
+
+<Snippet id="reference/policies/violations/soft-delete" />
+
+Use `countDocuments()` or `.policy({ includeDeleted: true })`. Read the guide [Delete with a way to restore](../../policies/soft-delete.mdx).
+
+### transaction-option [#transaction-option]
+
+An operation inside a transaction sets `readConcern`, `writeConcern`, `readPreference` (other than `primary`), or its own `timeoutMS` when the transaction has one. Inside a transaction the settings of the transaction itself apply.
+
+<Snippet id="reference/policies/violations/transaction-option" />
+
+Set the option in the `transaction()` call. Read the guide [Transactions](../../transactions/transactions.mdx).
+
+### concurrent-session [#concurrent-session]
+
+Two operations use one session at the same time. The server doesn't support parallel operations in one session. In a transaction nothing can run in parallel, and outside one only reads can.
+
+<Snippet id="reference/policies/violations/concurrent-session" />
+
+Await each operation before starting the next. Read the guide [Manual sessions](../../transactions/sessions.mdx).
+
+## When it doesn't fit [#when-not-to-use]
+
+`reason` exists to tell an error in the calling code from an error in client input. Don't turn policy violations into a generic "try again" response. A retry changes nothing, and the error has to be fixed in the call.
+
+You can't relax a rule. There's no option that allows an unknown path, an empty filter, or an operation without a tenant. If you really need an operation outside the rules, use [`client.unsafeDriver()`](../connection/typemo-client.mdx#client.unsafe-driver), where Typemo's protections don't apply.

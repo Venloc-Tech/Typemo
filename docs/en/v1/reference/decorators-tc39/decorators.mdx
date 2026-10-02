@@ -1,0 +1,274 @@
+---
+title: "@venloc/typemo-decorators"
+description: "The TC39 decorators for Typemo schemas: Schema, Prop, Tenant, Virtual, Discriminator, Index, SearchIndex, Plugin, Pre, Post, and PostError."
+icon: AtSign
+---
+
+The `@venloc/typemo-decorators` package gives you the same decorators as the `@venloc/typemo` core, but as **standard TC39 decorators**. They need neither the `experimentalDecorators` flag nor `reflect-metadata` (`emitDecoratorMetadata` isn't needed in either mode). If you have your own `lib`, you don't have to add `esnext.decorators` to it. The names, arguments, and options are the same.
+
+The package describes nothing anew. It records what you declare in the core's own metadata builder, so the schema, model, queries, and types come out the same as with the core's decorators.
+
+How to switch to this package and what to put in `tsconfig` is covered in the guide [Use TC39 decorators](../../decorators-tc39/tc39.mdx). This page covers only how each decorator differs from the core decorator of the same name. For the full option lists, see the schemas reference, with links in each section.
+
+The documentation build doesn't compile the code blocks on this page. It checks code with legacy decorators, and this package needs a mode without `experimentalDecorators`. The behavior was verified by a run against a real database, in a package with the legacy flags off.
+
+The examples use an account model.
+
+<Snippet id="reference/decorators-tc39/decorators/intro" title="accounts/account.ts" />
+
+`create({ title: "  Main ", balance: 5 })` saved an account with the title `"Main!"`. `trim` removed the spaces, and the hook added the sign. And `create({ title: "x", balance: -1 })` threw `ValidationError: Validation failed: "balance": must be at least 0 [min]`.
+
+One rule applies to every decorator in the package: **import the package before the first schema class**. On load, the package sets `Symbol.metadata` if the environment doesn't have it yet (`Symbol.metadata ??= Symbol.for("Symbol.metadata")`). Bun and Node don't define it yet. This is the package's only global write, and it's a standard one. An ordinary `import { Prop } from "@venloc/typemo-decorators"` runs it itself.
+
+**You can't mix the packages.** A decorator from the wrong package throws `ConfigurationError` as soon as the class is declared. In a project without `experimentalDecorators`, the core's `@Prop` decorator gave `ConfigurationError: @Prop from "@venloc/typemo" is a legacy decorator, but it was applied as a TC39 decorator (experimentalDecorators is off). Use "@venloc/typemo-decorators" in a TC39 project; the two packages cannot be mixed`.
+
+Metadata of both kinds can still end up on one class or in one hierarchy, for example in a base class from a library built in the other mode. Then the first `model()` throws `ConfigurationError: Mixed: mixes legacy decorators ("@venloc/typemo", on Mixed) and TC39 decorators ("@venloc/typemo-decorators", on Mixed) in one class hierarchy; use one decorator package per project`. There's no silent merging.
+
+---
+
+## @Schema [#schema]
+
+`@Schema` declares a class a schema and takes the same options as [the core's `@Schema`](../schemas/schema.mdx#schema): `collection`, `nested`, `timeseries`, `tenant`, `softDelete`, and the rest. The compiler checks them the same way, preserving literal types.
+
+<Snippet id="reference/decorators-tc39/decorators/schema" />
+
+<Params>
+<Param name="options" type="SchemaOptions" default="{}">
+
+The schema options. They're described in the reference [`@Schema`](../schemas/schema.mdx#schema).
+
+</Param>
+</Params>
+
+Applying the decorator to something other than a class throws `ConfigurationError: @Schema is a class decorator, got <kind>`. For mixing with legacy decorators, see above. For a guide, see [Define a model](../../schemas/define-model.mdx).
+
+<FullType>
+
+<Snippet id="reference/decorators-tc39/decorators/schema-2" />
+
+</FullType>
+
+---
+
+## @Prop [#prop]
+
+`@Prop` declares a schema field. The options are the same as for [the core's `@Prop`](../schemas/prop.mdx#prop): `required`, `nullable`, `default`, `trim`, `min`, `sensitive`, and the rest. The compiler checks them against the field type in the same way.
+
+There's one difference, and it's mandatory. **The type is passed as a function**, `@Prop(() => String)`. Standard decorators have no `design:type`, and the compiler doesn't know the field type at runtime. Name it explicitly on every field.
+
+<Snippet id="reference/decorators-tc39/decorators/prop" />
+
+<Params>
+<Param name="type" type="() => TypeSpec" required>
+
+A function that returns the type, for example `() => String`, `() => [Address]`, or `() => Types.ObjectId`.
+
+</Param>
+<Param name="options" type="PropOptions<S>">
+
+The field options. They're described in the reference [`@Prop`](../schemas/prop.mdx#prop).
+
+</Param>
+</Params>
+
+The decorator learns the field type from the context, so errors show up at the moment of application. At runtime it throws `ConfigurationError` if it was applied to something other than an ordinary field. The texts come from a real run.
+
+- A `#private` field: `@Prop on private field "#x" (#private fields cannot be schema members)`.
+- A static field: `@Prop on static member "label" (static members are not schema members)`.
+- A method: `@Prop on "greet", which is a method (getters are virtuals and need no decorator)`.
+- A field with a symbol name: `@Prop on a symbol-keyed field (schema fields have string names)`.
+- No type function: `@Prop "name": the type must be a thunk () => T (for example () => String), got undefined`, and with `@Prop(String)`, `…got String`.
+
+At compile time the types reject the same cases. For static and `#private` fields and for `private`/`protected` members, the decorator fails the check, and the compiler reports `TS1240`. The text names the reason, for example `@Prop "#x": #private fields cannot be schema fields`, `@Prop "label": static fields are not schema fields`, or `@Prop "secret": not a public field (private and protected fields cannot be schema fields)`.
+
+<FullType>
+
+<Snippet id="reference/decorators-tc39/decorators/prop-2" />
+
+</FullType>
+
+---
+
+## @Tenant [#tenant]
+
+`@Tenant()` marks the tenant field. Put it next to `@Prop` on a field of type `TenantField<T>`, like [the core's `@Tenant`](../schemas/field-markers.mdx#tenant). A schema with the `tenant` option and no such mark doesn't build, so the decorator is needed in every schema split by tenant. The guide [Split data by organization](../../policies/tenants.mdx#define-tenant-field) explains why.
+
+<Snippet id="reference/decorators-tc39/decorators/tenant" />
+
+It takes no arguments and returns a field decorator.
+
+The schema build rules are shared with the core, and the errors are the same. On the first `model()`, the run gave a `ConfigurationError` of three kinds.
+
+- The `tenant` option is there, the mark isn't: `Note: the tenant field "tenantId" must be marked @Tenant() (declare it @Prop(...) @Tenant() tenantId!: TenantField<T>)`.
+- The mark is there, the option isn't: `Note: @Tenant() on "tenantId", but the schema has no tenant policy — add tenant: true (or { field }) to @Schema`.
+- There are two marks: `Note: @Tenant() marks "tenantId", "other"; only the tenant field "tenantId" may be marked`.
+
+For a field of another type, the compiler rejects it with the message `@Tenant "other": declare the field as TenantField<T>` (`TS1240`). On a `#private` and a static member, the decorator throws `ConfigurationError` with the same text as `@Prop`, for example `@Tenant on private field "#x" (#private fields cannot be schema members)`.
+
+<FullType>
+
+<Snippet id="reference/decorators-tc39/decorators/tenant-2" />
+
+</FullType>
+
+---
+
+## @Virtual [#virtual]
+
+`@Virtual` declares a virtual reference-loading field on a field of type `VirtualRef`. The options are the same as for [the core's `@Virtual`](../schemas/virtual.mdx#virtual): `ref`, `localField`, `foreignField`, `justOne`, `count`, `match`, `options`, `perDocumentLimit`.
+
+<Snippet id="reference/decorators-tc39/decorators/virtual" />
+
+<Params>
+<Param name="options" type="VirtualOptions" required>
+
+The reference options. They're described in the reference [`@Virtual`](../schemas/virtual.mdx#virtual).
+
+</Param>
+</Params>
+
+You can't apply the decorator to a non-field, a static member, a `#private` member, or a field with a symbol name. It throws `ConfigurationError`.
+
+---
+
+## @Discriminator [#discriminator]
+
+`@Discriminator` makes a class a subclass of the base class by the discriminator key. The default value is the class name. The contract is the same as for [the core's `@Discriminator`](../schemas/discriminator.mdx#discriminator).
+
+<Snippet id="reference/decorators-tc39/decorators/discriminator" />
+
+<Params>
+<Param name="value" type="string">
+
+The value of the discriminator key. The class name by default.
+
+</Param>
+</Params>
+
+---
+
+## @Index [#index]
+
+`@Index` declares a compound index, or any other kind, on a class. The fields and options are checked against the class, like [the core's `@Index`](../schemas/index-decorators.mdx#index).
+
+<Snippet id="reference/decorators-tc39/decorators/index" />
+
+<Params>
+<Param name="fields" type="IndexFields" required>
+
+The index fields with directions.
+
+</Param>
+<Param name="options" type="IndexOptions" default="{}">
+
+The index options: `unique`, `sparse`, `expireAfterSeconds`, and others. See [`@Index`](../schemas/index-decorators.mdx#index).
+
+</Param>
+</Params>
+
+---
+
+## @SearchIndex [#search-index]
+
+`@SearchIndex` describes an Atlas Search or Vector Search index. The options are the same as for [the core's `@SearchIndex`](../schemas/index-decorators.mdx#search-index). Search indexes work only with Atlas or with a configuration that supports them. This decorator only records the description.
+
+<Params>
+<Param name="options" type="SearchIndexOptions" required>
+
+The search index definition.
+
+</Param>
+</Params>
+
+---
+
+## @Plugin [#plugin]
+
+`@Plugin` attaches a schema plugin to a class when the schema is compiled. It's the same as [`Typemo.plugin`](../connection/typemo.mdx#typemo.plugin), but for one model. If the plugin's options type doesn't allow `undefined`, the options are required.
+
+<Params>
+<Param name="plugin" type="SchemaPlugin<O>" required>
+
+The schema plugin.
+
+</Param>
+<Param name="options" type="O">
+
+The plugin options.
+
+</Param>
+</Params>
+
+For a guide, see [Reuse behavior across models](../../hooks/plugins.mdx).
+
+---
+
+## @Pre [#pre]
+
+`@Pre` marks a class method as a "before the event" hook. The events and `this` are the same as for [the core's `@Pre`](../hooks/pre-post.mdx#pre). In document hooks, `this` is the document, so write `touch(this: Account)`. In operation hooks, it's the operation context.
+
+<Snippet id="reference/decorators-tc39/decorators/pre" />
+
+<Params>
+<Param name="events" type="HookEvent | [HookEvent, ...HookEvent[]]" required>
+
+One event or several.
+
+</Param>
+</Params>
+
+Only an instance method with a string name can be a hook. On a field, a getter, or a method with a symbol name, the decorator throws `ConfigurationError: @Pre: a hook must be a string-named instance method, got field`, where `field` is replaced by the kind of member, for example `getter`. The compiler doesn't accept a static hook. At runtime, `@Pre` names the reason the same way `@Prop` does: `@Pre on static member "m" (static members are not schema members)`.
+
+In document hooks, `this` is declared the same way as with the core's decorators. To work with fields, write `touch(this: Account)`, and for document methods, `touch(this: HookThis<"document.save", Account>)`. A class hook also runs on a subdocument if the class is embedded in another model. That's why the root's methods (`$getChanges()`, `$save()`) are available after a [`this.$isRoot()`](../documents/document-api.mdx#is-root) check, and `touch(this: HydratedDoc<Account>)` doesn't compile. For details, see the reference [`@Pre`](../hooks/pre-post.mdx#this-by-scope).
+
+---
+
+## @Post [#post]
+
+`@Post` marks a method as an "after the event succeeds" hook and receives the result. The rest is like [the core's `@Post`](../hooks/pre-post.mdx#post).
+
+<Params>
+<Param name="events" type="HookEvent | [HookEvent, ...HookEvent[]]" required>
+
+One event or several.
+
+</Param>
+</Params>
+
+---
+
+## @PostError [#post-error]
+
+`@PostError` marks a method as an "after the event fails" hook. It's called instead of `@Post` and receives the error. The rest is like [the core's `@PostError`](../hooks/pre-post.mdx#post-error).
+
+<Params>
+<Param name="events" type="HookEvent | [HookEvent, ...HookEvent[]]" required>
+
+One event or several.
+
+</Param>
+</Params>
+
+---
+
+## Package types [#package-types]
+
+The package also exports the types of the decorators it returns: `Tc39PropDecorator`, `Tc39TenantDecorator`, `Tc39VirtualDecorator`, `Tc39HookDecorator`, and `Tc39PropCheck` (the check of options against the field type). You need them only if you write a wrapper around a decorator and have to name its type.
+
+## When not to use it [#when-not-to-use]
+
+If your project has `experimentalDecorators` turned on, for example because another library requires it, use the core's decorators from `@venloc/typemo`. The flag applies to the whole project, and TC39 decorators won't work in it. To decide, read the guide [Use TC39 decorators](../../decorators-tc39/tc39.mdx#choose-package).
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Use TC39 decorators" href="../../decorators-tc39/tc39.mdx">
+  Installation, tsconfig, and moving over from legacy decorators.
+</Card>
+<Card title="@Prop" href="../schemas/prop.mdx#prop">
+  The full list of field options.
+</Card>
+<Card title="@Schema" href="../schemas/schema.mdx#schema">
+  The full list of schema options.
+</Card>
+</Cards>

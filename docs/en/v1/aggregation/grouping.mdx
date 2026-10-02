@@ -1,0 +1,139 @@
+---
+title: Grouping and reports
+description: "Group documents, compute sums and averages, sort values into ranges, and count repeats"
+icon: ChartColumn
+---
+
+A report almost always answers "how much" per group. How much each customer spent, how many orders came in a month, how many fall into each range of amounts. In an aggregation the [`group`](../reference/aggregation/stages.mdx#group) stage handles this. It gathers documents with the same key into one row and computes values over the group with **accumulators**, functions that fold many values into one, such as `fn.sum`, `fn.avg`, or `fn.count`.
+
+Typical reports have shortcut stages.
+
+- [`bucket`](../reference/aggregation/stages.mdx#bucket) and [`bucketAuto`](../reference/aggregation/stages.mdx#bucket-auto) sort values into ranges.
+- [`sortByCount`](../reference/aggregation/stages.mdx#sort-by-count) counts repeats.
+- [`count`](../reference/aggregation/stages.mdx#count) counts rows.
+
+The compiler makes sure only accumulators remain in a grouping and infers the type of each report row. That's why `spent` below is a `number` and not "something from the database".
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx), running an aggregation from [Your first aggregation](first-aggregation.mdx), and an order model. The `orders` collection holds five orders.
+
+- `alice`: 120 and 80, both paid, in January and February.
+- `bob`: 50, paid in February, and 200, canceled in March.
+- `carol`: 30, new, March.
+
+<Snippet id="aggregation/facets/prerequisites" title="orders/order.ts" twoslash />
+
+## Quick start [#quick-start]
+
+The grouping's `_id` is what you group by. The other fields are accumulators.
+
+<Snippet id="aggregation/grouping/quick-start" twoslash />
+
+For ranges of amounts there's `bucket`, and for counting repeats there's `sortByCount`. We'll go through each case below.
+
+## Count by group [#group-counts]
+
+A manager needs a summary per customer: the number of orders, the total, the average, and the largest order. `_id` is the group key, and the compiler won't accept the stage without it. Every other field is an accumulator.
+
+<Snippet id="aggregation/grouping/group-counts" twoslash />
+
+Look at the type. After `group` the row has only `_id` and your accumulators, and `placedAt` and `status` are gone. Every accumulator is listed in the [Accumulators](../reference/aggregation/accumulators.mdx) reference.
+
+## Group by several fields and by date [#group-by-fields]
+
+A group key can be a compound object or a computed value. You need a compound one when one field isn't enough, such as the customer and the status together. And to compute revenue by month, you compute the key from the date with [`fn.dateToString`](../reference/aggregation/expr-date.mdx#fn.date-to-string).
+
+<Snippet id="aggregation/grouping/group-by-fields" twoslash />
+
+For a compound key, write `_id: { customer: f.customer, status: f.status }`, and the rows look like `{ _id: { customer: "bob", status: "paid" }, n: 1 }`. You can sort by part of such a key with a path: `.sort({ "_id.customer": 1 })`.
+
+## Compute everything in one row [#total-row]
+
+When there's one group for the whole set, the key is `null`. That's how you compute totals such as overall revenue or the number of orders.
+
+<Snippet id="aggregation/grouping/total-row" twoslash />
+
+If there are no documents at all, no group is created, and you get an empty array, not a row of zeros. That's how the server behaves, and keep it in mind when you show totals.
+
+## Collect values into a list [#collect-to-list]
+
+Accumulators aren't only numeric. [`fn.push`](../reference/aggregation/accumulators.mdx#fn.push) collects a group's values into an array, and [`fn.addToSet`](../reference/aggregation/accumulators.mdx#fn.add-to-set) does the same without repeats. [`fn.first`](../reference/aggregation/accumulators.mdx#fn.first) and [`fn.last`](../reference/aggregation/accumulators.mdx#fn.last) take the first and the last value. But "first" depends on the order of the incoming documents, so put a [`sort`](../reference/aggregation/stages.mdx#sort) before them. If you need the order inside the grouping itself, there's [`fn.top`](../reference/aggregation/accumulators.mdx#fn.top) with its own `sortBy`.
+
+<Snippet id="aggregation/grouping/collect-to-list" twoslash />
+
+In `push` the elements follow the order of the incoming documents. `addToSet` has no order at all, so don't count on one. Field references in `sortBy` come from `f` rather than being written as strings, and the compiler checks the path.
+
+## Sort into ranges [#buckets]
+
+To see whether the shop has many large orders, you sort values into **buckets**, ranges with given boundaries. [`bucket`](../reference/aggregation/stages.mdx#bucket) takes a `groupBy` expression and `boundaries`, where the lower boundary is included and the upper one isn't. You can add a `default` for values that fall into no range. Each row's `_id` is the bucket's lower boundary.
+
+<Snippet id="aggregation/grouping/buckets" twoslash />
+
+The boundaries go in ascending order, and their type matches the type of `groupBy`, so the compiler won't accept strings instead of numbers. Without `default`, the server rejects documents that fall into no range: `ServerError: $switch could not find a matching branch for an input, and no default was specified. (code 7158303 Location7158303)`. If the values aren't bounded, you need `default`.
+
+And if you don't know the boundaries and want to split the values into equal buckets, use [`bucketAuto`](../reference/aggregation/stages.mdx#bucket-auto). You give the number of buckets, and the server picks the boundaries itself. `_id` is then an object `{ min, max }`.
+
+<Snippet id="aggregation/grouping/buckets-2" twoslash />
+
+## Count repeats [#count-duplicates]
+
+To find out which status occurs most often, you don't need a whole `group` with a sort. [`sortByCount`](../reference/aggregation/stages.mdx#sort-by-count) does it all at once. It groups by an expression, counts, and sorts by the counter in descending order. A row looks like `{ _id, count }`.
+
+<Snippet id="aggregation/grouping/count-duplicates" twoslash />
+
+The order of groups with the same counter, like `cancelled` and `new` here, is undefined. If it matters, add a [`sort`](../reference/aggregation/stages.mdx#sort) by a second field. And the [`count`](../reference/aggregation/stages.mdx#count) stage counts the incoming rows, and you give it the name of the result field.
+
+<Snippet id="aggregation/grouping/count-duplicates-2" twoslash />
+
+If you need one number and no other stages, [`countDocuments`](../reference/query/reading.mdx#model.count-documents) is simpler.
+
+## How to choose [#how-to-choose]
+
+Ask yourself what the key of the result is.
+
+- **A field's value or a calculation** (a customer, a month, a status): you need `group`.
+- **A range of values**: `bucket` if you know the boundaries, or `bucketAuto` if you need equal parts.
+- **Only the number of repeats of each value**: `sortByCount` is enough.
+- **One number for the whole set**: `group` with a `null` key.
+
+## When not to use it [#when-not-to-use]
+
+For one counter by a filter, use [`countDocuments`](../reference/query/reading.mdx#model.count-documents), and for the unique values of a field, [`distinct`](../reference/query/reading.mdx#model.distinct). They do without a pipeline. And if you need a report all the time and it takes long to compute, save the result in a [materialized view or with `$out`](output.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**A calculation instead of an accumulator.** In `group`, every field except `_id` has to be an accumulator. A plain function like `fn.add` computes over one document and doesn't fit here. The compiler names the reason right in the error.
+
+<Snippet id="aggregation/grouping/troubleshooting" twoslash />
+
+The error looks like this: `Property 'error' is missing in type '{ readonly _id: …; readonly plusOne: Expr<number>; }' but required in type 'PathError<"$group field \"plusOne\" needs an accumulator (fn.sum, fn.avg, fn.push, fn.first, fn.count, ...)">'`. Look at the end. It holds the field name (`plusOne`), the stage, and a list of suitable accumulators. Wrap the value in an accumulator, for example `fn.sum(fn.add(f.total, 1))`.
+
+The same rule applies to `output` in `bucket` and `bucketAuto`. And the other way around, `fn.push`, `fn.count`, and other accumulator-only operators won't compile in `project` and `addFields`.
+
+**A forgotten `_id`.** The group key is required, even when there's one group, and then you write `_id: null`. Without it the stage won't compile, with the error `Property '_id' is missing in type '{ readonly spent: DualExpr<number>; }' but required in type '{ readonly _id: unknown; }'`.
+
+<Snippet id="aggregation/grouping/troubleshooting-2" twoslash />
+
+**Fields you need are gone after grouping.** After `group` the row keeps only `_id` and the accumulators. If the next stage reads `status` and you didn't keep it, the compiler says there's no such field. Add it to the grouping as an accumulator, for example `fn.first(f.status)`, or make it part of the key.
+
+## Full example [#full-example]
+
+<Snippet id="aggregation/grouping/full-example" title="reports/sales.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Joins" href="./joins.mdx">
+  Pull data from another collection into a report.
+</Card>
+<Card title="Several reports in one query" href="./facets.mdx">
+  Compute a summary and ranges in one pass over the data.
+</Card>
+<Card title="Window functions" href="./windows.mdx">
+  Running totals and rankings without losing the individual rows.
+</Card>
+<Card title="Accumulators" href="../reference/aggregation/accumulators.mdx">
+  Every accumulator with its types and edge cases.
+</Card>
+</Cards>

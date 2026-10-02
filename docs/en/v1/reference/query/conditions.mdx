@@ -1,0 +1,343 @@
+---
+title: Chained conditions
+description: "where, and, or, nor, merge, and the where(path) chain methods: build a filter in pieces and see how the result type narrows"
+icon: ListFilter
+---
+
+A filter doesn't have to be one object. You can add conditions one at a time to the query that [`find`](./reading.mdx#model.find) returned: [`.where`](#where), [`.and`](#and), [`.or`](#or), [`.nor`](#nor), [`.merge`](#merge). That helps when conditions appear in different places in the code. One function adds a restriction for the user's permissions, another adds a filter from URL parameters. `.where("field")` also gives you a method chain like `.gte(18).lt(65)` that writes the conditions on a single field.
+
+If you're new to this, read the guide [Filters](../../queries/filters.mdx) first. This page is the reference. The operators themselves (`$gte`, `$in`, and others) are described in the reference [Filter operators](./filter-operators.mdx).
+
+All the examples use one member model. It has a field with a finite set of values (`role`), an optional string, an optional number, and an array.
+
+<Snippet id="reference/query/conditions/intro" title="models/member.ts" twoslash />
+
+The collection holds three members. Alice has the role `admin`, the nickname `al`, is 30 years old, and has the tags `admin` and `dev`. Bob has the role `user`, no nickname, is 17, and has the tag `dev`. Carol has the role `editor`, the nickname `cc`, is 30, and has no tags. The results in the `// →` comments are the names of the members found, in alphabetical order.
+
+All the methods on this page belong to the query builder, not the model. None of them changes the builder it's called on, and each returns a new one. Conditions added by different methods are joined with "and". The `filter()` method returns the finished combined filter, and in the examples below it shows what came out.
+
+---
+
+## .where [#where]
+
+`.where` adds conditions to the query. What it does depends on the argument. It takes an object as a whole filter, and a string with a path as the start of a chain of conditions on one field.
+
+### .where(filter) [#where-filter]
+
+With an object, `.where` works like the filter in [`find`](./reading.mdx#model.find). The conditions are added to those already set and joined with "and". If both filters have the same key, the conditions don't replace each other, and both must hold.
+
+<Snippet id="reference/query/conditions/where-filter" twoslash />
+
+In the second query nobody can be both under 18 and exactly 30, so the answer is empty. The "last word" doesn't win.
+
+<Returns type="QueryBuilder">
+
+A new builder with the combined filter. The result type doesn't change.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+Conditions, the same as in [`find`](./reading.mdx#model.find), and checked the same way. An unknown field, a value of the wrong type, `undefined`, and an operator in place of a value aren't allowed. If you pass something that isn't an object, you get a `QueryError` with the text `filter: an object`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/conditions/where-filter-2" />
+
+</FullType>
+
+### .where(path) [#where-path]
+
+With a path, `.where` starts a chain of conditions on one field. The chain methods (`equals`, `gte`, `in`, and others, described below) add operators to that field. A chain helps when the bounds of a range come from different sources. And `.where("age").gte(18).lt(65)` reads better than `{ age: { $gte: 18, $lt: 65 } }`.
+
+<Snippet id="reference/query/conditions/where-path" twoslash />
+
+The operators of one field pile up in one object. Notice that `$gte` and `$lt` ended up together in `age`. If you repeat an operator for this field, it doesn't replace the first one but is added as a separate condition joined with "and".
+
+<Snippet id="reference/query/conditions/where-path-2" twoslash />
+
+The chain ends as soon as you call another builder method. `.sort`, `.limit`, `.plain`, and so on return an ordinary builder. A new `.where(path)` starts a chain on another field.
+
+<Snippet id="reference/query/conditions/where-path-3" twoslash />
+
+<Returns type="WhereBuilder">
+
+A builder with the same methods as the ordinary one, plus the field chain methods: [`equals`](#equals), [`ne`](#ne), [`in`](#in), [`nin`](#nin), [`gt`, `gte`, `lt`, `lte`](#gt-gte-lt-lte), [`exists`](#exists), [`regex`](#regex), [`mod`](#mod), [`size`](#size), [`all`](#all), [`elemMatch`](#elem-match).
+
+</Returns>
+
+<Params>
+<Param name="path" type="path to a model field" required>
+
+The field the conditions are written on. The compiler suggests the available paths, including nested ones through a dot. An empty string gives a `QueryError` with the text `where: an empty path`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/conditions/where-path-4" />
+
+</FullType>
+
+### When not to use it [#where.when-not-to-use]
+
+There are no chain methods for geo operators (`$near`, `$geoWithin`, and others). Use `.where(filter)` with an object, for example `.where({ place: { $near: … } })`. Operators missing from the chain (`$type`, `$not`, `$expr`, `$jsonSchema`, the bitwise ones) are also written as an object. They are described in the reference [Filter operators](./filter-operators.mdx).
+
+---
+
+## .and [#and]
+
+`.and` requires all the conditions of the list to hold. The list can't be empty. You don't need it for conditions on different fields, because `.where` with an object joins them with "and" itself. `.and` is useful when the list of conditions is assembled in code from parts.
+
+<Snippet id="reference/query/conditions/and" twoslash />
+
+<Returns type="QueryBuilder">
+
+A new builder. The condition is added to those already set and joined with them by "and".
+
+</Returns>
+
+<Params>
+<Param name="clauses" type="NonEmptyArray<Filter<T>>" required>
+
+A list of filters, each checked like a filter in [`find`](./reading.mdx#model.find). An empty list gives a `QueryError` with the text `and: $and must be a non-empty array (at "$and")`. The server rejects an empty `$and`, and a list built from data can turn out empty by accident.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/conditions/and-2" />
+
+</FullType>
+
+---
+
+## .or [#or]
+
+`.or` requires at least one condition of the list to hold. It's joined with the query's other conditions by "and", so it narrows the result instead of widening it.
+
+<Snippet id="reference/query/conditions/or" twoslash />
+
+In the second query the condition `age: 30` stayed in force. `.or` didn't replace it but was added to it. Bob matches the `.or`, but he isn't 30, so he didn't make it into the result.
+
+Two `.or` calls in a row don't merge into one list. They work together through "and", and a member must match both.
+
+<Snippet id="reference/query/conditions/or-2" twoslash />
+
+<Returns type="QueryBuilder">
+
+A new builder.
+
+</Returns>
+
+<Params>
+<Param name="clauses" type="NonEmptyArray<Filter<T>>" required>
+
+A list of filters. An empty list gives a `QueryError` with the text `or: $or must be a non-empty array (at "$or")`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/conditions/or-3" />
+
+</FullType>
+
+---
+
+## .nor [#nor]
+
+`.nor` requires that none of the conditions of the list holds.
+
+<Snippet id="reference/query/conditions/nor" twoslash />
+
+<Returns type="QueryBuilder">
+
+A new builder. The condition is joined with the others by "and".
+
+</Returns>
+
+<Params>
+<Param name="clauses" type="NonEmptyArray<Filter<T>>" required>
+
+A list of filters. An empty list gives a `QueryError`, as with [`.and`](#and).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/conditions/nor-2" />
+
+</FullType>
+
+---
+
+## .merge [#merge]
+
+`.merge` takes the conditions of another query or filter and adds them to the current one. That lets you assemble ready-made pieces of queries, for example a shared "active only" query, and apply it to different queries.
+
+<Snippet id="reference/query/conditions/merge" twoslash />
+
+Only the conditions are carried over. The other query's sort, limits, and field selection aren't copied.
+
+<Returns type="QueryBuilder">
+
+A new builder with the combined conditions.
+
+</Returns>
+
+<Params>
+<Param name="source" type="QueryOf<T> | Filter<T>" required>
+
+A query of **the same model**, or a filter. A query of another model is accepted neither by the compiler nor at run time, because conditions on the fields of one model make no sense for another.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/conditions/merge-2" />
+
+</FullType>
+
+### A query of another model [#query-other-model]
+
+If the query belongs to another model, the compiler refuses, and at run time Typemo throws a `QueryError`.
+
+<Snippet id="reference/query/conditions/query-other-model" twoslash />
+
+<Snippet id="reference/query/conditions/query-other-model-2" />
+
+---
+
+## .filter [#filter]
+
+`.filter` returns all the query's conditions as one filter. It includes what you passed to [`find`](./reading.mdx#model.find) and what you added through [`.where`](#where), [`.and`](#and), [`.or`](#or), [`.nor`](#nor), and [`.merge`](#merge). It sends nothing to the database. It's handy for looking at what exactly came together, or for passing the finished filter to another query, for example to [`.merge`](#merge).
+
+<Snippet id="reference/query/conditions/filter" twoslash />
+
+<Returns type="PlanDocument">
+
+A filter object in the form the conditions were set, before values are cast to the model's types and before policy conditions (tenant, soft delete). If there were no conditions, it's an empty object `{}`. The object is frozen and can't be changed.
+
+</Returns>
+
+It takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/query/conditions/filter-2" />
+
+</FullType>
+
+### The filter before type casting [#filter-before-cast]
+
+`.filter` doesn't cast values to the model's types, so a string stays a string. For `Members.findById("6abd…")` the filter will be `{ _id: "6abd…" }` with a string, not an `ObjectId`. Casting and path checks happen later, when the query runs. So a successful `.filter()` doesn't mean the query will pass the checks. A typo in a field name shows up at `await`.
+
+---
+
+## The where(path) chain [#where-path-chain]
+
+After `.where("field")`, the chain methods are available. Each adds one operator to that field and returns the chain, so you can call them in a row. The operand types are inferred from the field type. A numeric field takes numbers, and `.gte` or `.mod` don't fit a string field.
+
+### .equals [#equals]
+
+The field equals the value, like [`$eq`](./filter-operators.mdx#eq). For a field with a finite set of values it narrows the result type, see [How the type narrows](#type-narrowing).
+
+<Snippet id="reference/query/conditions/equals" twoslash />
+
+### .ne [#ne]
+
+The field doesn't equal the value, like [`$ne`](./filter-operators.mdx#ne). Documents without this field match too. For fields with a finite set of values it narrows the type.
+
+<Snippet id="reference/query/conditions/ne" twoslash />
+
+### .in [#in]
+
+The field equals one of the values in the list, like [`$in`](./filter-operators.mdx#in). It narrows the type. After `.in(["admin", "editor"])`, the `role` field in the result has the type `"admin" | "editor"`.
+
+<Snippet id="reference/query/conditions/in" twoslash />
+
+### .nin [#nin]
+
+The field equals none of the values in the list, like [`$nin`](./filter-operators.mdx#nin). It narrows the type by removing the listed values.
+
+<Snippet id="reference/query/conditions/nin" twoslash />
+
+### .gt, .gte, .lt, .lte [#gt-gte-lt-lte]
+
+Greater than, greater than or equal, less than, less than or equal: [`$gt`](./filter-operators.mdx#gt-gte-lt-lte) and the other three. They take a value with an order, that is, a number, a string, a date, or an identifier. On a field without an order, such as a boolean, they don't compile. They don't change the result type.
+
+<Snippet id="reference/query/conditions/gt-gte-lt-lte" twoslash />
+
+### .exists [#exists]
+
+The field is in the document (`exists()` and `exists(true)`) or isn't (`exists(false)`), like [`$exists`](./filter-operators.mdx#exists). After `exists()`, an optional field becomes required in the result type.
+
+<Snippet id="reference/query/conditions/exists" twoslash />
+
+The type narrows only for optional top-level fields and removes only `undefined`. A field that can be `null` stays that way, because `{ $exists: true }` also finds documents where the field equals `null`.
+
+### .regex [#regex]
+
+The string matches a regular expression, like [`$regex`](./filter-operators.mdx#regex). The method takes a `RegExp` or a pattern string and works only on string fields.
+
+<Snippet id="reference/query/conditions/regex" twoslash />
+
+For a numeric field the method doesn't compile. If such a call comes from code without types, Typemo throws a `StrictModeError` at run time with the text `$regex applies to strings only (at "age.$regex") [sanitize]`.
+
+### .mod [#mod]
+
+The remainder of dividing the number by `divisor` equals `remainder`, like [`$mod`](./filter-operators.mdx#mod). Numeric fields only.
+
+<Snippet id="reference/query/conditions/mod" twoslash />
+
+### .size [#size]
+
+The array has exactly `n` elements, like [`$size`](./filter-operators.mdx#size). Arrays only.
+
+<Snippet id="reference/query/conditions/size" twoslash />
+
+### .all [#all]
+
+The array contains all the values of the list, like [`$all`](./filter-operators.mdx#all). Arrays only.
+
+<Snippet id="reference/query/conditions/all" twoslash />
+
+### .elemMatch [#elem-match]
+
+A single array element matches all the conditions at once, like [`$elemMatch`](./filter-operators.mdx#elem-match). Arrays only. The operand is a filter of the nested document or an object of operators over a scalar element.
+
+<Snippet id="reference/query/conditions/elem-match" twoslash />
+
+<FullType label="Full types of the chain methods">
+
+<Snippet id="reference/query/conditions/elem-match-2" />
+
+</FullType>
+
+---
+
+## How the type narrows [#type-narrowing]
+
+A condition doesn't only select documents, it also tells the compiler which values a field can take in the result. After `.where("role").in(["admin", "editor"])`, the type of `role` in every row is `"admin" | "editor"`, not all three roles. The compiler will treat code that checks `role === "user"` as an error.
+
+The methods [`equals`](#equals), [`ne`](#ne), [`in`](#in), [`nin`](#nin), and [`exists`](#exists) narrow the type. They share the same rules. Only a top-level field whose values form a finite set (a union of literals, `boolean`, `enum` values) narrows. A `string` or `number` field doesn't narrow. After `.equals("Bob")` the type of `name` would stay the literal `"Bob"`, and that is noise with no information. An array field is compared by its elements and doesn't narrow.
+
+<Snippet id="reference/query/conditions/type-narrowing" twoslash />
+
+The narrowing is stored in the query and applied to the final result type, so the order of calls doesn't matter. `.select` after `.where` doesn't lose the narrowing.
+
+Conditions set by a filter object rather than a chain (`find({ role: "admin" })`, [`.where(filter)`](#where-filter)) don't narrow the type.
+
+## When not to use a chain [#when-not-to-use]
+
+If a condition arrives as a ready object, from query parameters or from configuration, there's no point in breaking it into a chain. Pass it to [`.where(filter)`](#where-filter) or straight to [`find`](./reading.mdx#model.find). A chain is for when you write conditions in code and want to narrow the type or write a range more readably.

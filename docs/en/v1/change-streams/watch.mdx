@@ -1,0 +1,199 @@
+---
+title: Watch for changes
+description: "Receive events about writes to a collection, keep only the ones you need, and resume where you stopped without losing any"
+icon: Radio
+---
+
+Sometimes another part of the system needs to learn about a data change right away, without polling the database on a timer. Open a **change stream** for that. MongoDB sends an event for every insert, update, replace, and delete in the collection. That's how you clear a cache, send notifications, update an external search index, or put an event on a queue.
+
+In Typemo a change stream is [`Model.watch`](../reference/change-streams/watch.mdx#model.watch). The events are typed, and the compiler knows which fields an insert has and which a delete has.
+
+If you're new to MongoDB, remember two limits. A change stream exists only on a **replica set** (several MongoDB servers holding copies of the same data) or a sharded cluster. A standalone `mongod` doesn't have one. And a stream sees only what happened **after** it was opened. It won't show you the past. On the other hand, it's already open by the time `await Model.watch()` finishes. An event right after that won't get lost, even if you start reading later. The section "Don't miss the first events" covers this.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the account model from `accounts/account.ts`. The model has document images turned on (`changeStreamPreAndPostImages`). Without them MongoDB doesn't keep the state "before the change", and the section about images won't work.
+
+<Snippet id="change-streams/watch/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Open a stream, write something, and read the event. [`.next`](../reference/change-streams/watch.mdx#next) waits for the next event, and [`.close`](../reference/change-streams/watch.mdx#close) closes the stream.
+
+<Snippet id="change-streams/watch/quick-start" twoslash />
+
+In an app you read events with a `for await` loop and filter out the ones you need right on the server.
+
+<Snippet id="change-streams/watch/quick-start-2" twoslash />
+
+We'll go through each step on real tasks below.
+
+## Don't miss the first events [#catch-first-events]
+
+By the time `await Accounts.watch()` returns, the cursor already exists on the server. So a write right after `watch` lands in the stream, even if you start reading later. The event waits, and the very first read returns it.
+
+<Snippet id="change-streams/watch/catch-first-events" twoslash />
+
+[`.tryNext`](../reference/change-streams/watch.mdx#try-next) returns `null` only when there really is no event. If an event is already in the stream, you get it, even on the first read after opening. So scripts and tests that write right after `watch` lose nothing. You don't need to call `tryNext` "to open the cursor".
+
+The boundary is somewhere else. Events that happened **before** `watch` aren't in the stream. You can resume where you stopped only from a saved token, as described in "Don't lose events after a stop".
+
+## React to every change [#react-to-changes]
+
+Say you need to clear a cache whenever an account changes. Open a stream with no arguments and handle the events in a [`for await`](../reference/change-streams/watch.mdx#async-iterator) loop. An event has the type [`ChangeEvent`](../reference/change-streams/watch.mdx#change-event), a union told apart by `operationType`. Check the kind of event first, and only then does the compiler open up its fields.
+
+<Snippet id="change-streams/watch/react-to-changes" title="accounts/cache-invalidation.ts" twoslash />
+
+The `insert`, `update`, `replace`, and `delete` branches are document events, and each has `documentKey._id`. The `default` branch gets a [`CollectionEvent`](../reference/change-streams/watch.mdx#collection-event), an event of the collection itself, such as a drop or a rename. These have no document. Don't ignore them. After the collection is dropped, the stream ends and the loop exits.
+
+The loop owns the stream. A `break`, a `return`, or an error inside the loop closes the stream for you. You need to call `close` yourself only when you read the stream by hand.
+
+## Filter the events you need [#filter-events]
+
+A subscriber rarely needs every event. It's better to drop the rest on the server, so they never cross the network. For that, `watch` takes a function where you describe `$match` stages. The condition language is the same as in query filters, except the fields are fields of the event, such as `operationType`, `fullDocument.<field>`, or `updateDescription.updatedFields.<field>`.
+
+<Snippet id="change-streams/watch/filter-events" title="accounts/big-deposits.ts" twoslash />
+
+The server didn't send the event about `carl`, because a balance of 1 isn't greater than 5. As long as the stream has only `$match` stages, the events stay typed. But the condition doesn't narrow the type. A `match` on `"insert"` doesn't tell the compiler there won't be other events, so keep the `operationType` check.
+
+You can also add stages that change the shape of an event, like `$project` or `$addFields`. Then the stream rows are yours, not Typemo events. Typemo doesn't convert them or turn them into documents, and hidden fields come with a limit described in the section on hidden fields. See the reference for [`Model.watch`](../reference/change-streams/watch.mdx#model.watch) and for the pipeline builder [`Pipeline.watch`](../reference/aggregation/pipeline.mdx#pipeline.watch).
+
+## Find out what changed [#what-changed]
+
+An update event doesn't carry the whole document. It says **what** changed. [`updateDescription`](../reference/change-streams/watch.mdx#update-description) holds the changed fields with their new values and a list of the removed ones. That's usually enough to react to the field you care about without reading the document.
+
+<Snippet id="change-streams/watch/what-changed" title="accounts/balance-alerts.ts" twoslash />
+
+The paths here use the model's code names, not the names in the database. And `150` is the result of `$inc`. The server sends the new value, not the increment.
+
+## Get the whole document [#full-document]
+
+If your reaction needs the whole document, ask for it with the [`fullDocument`](../reference/change-streams/watch.mdx#model-watch-options) option. With `"updateLookup"` the server reads the document at the moment it sends the event.
+
+There's a catch. You get the **current** state of the document, not the state right after this update. If the document was changed or deleted in the meantime, you get a later version or `null`. That's why with `updateLookup` the type of `fullDocument` is "a document or `null`".
+
+<Snippet id="change-streams/watch/full-document" title="accounts/search-index.ts" twoslash />
+
+When you need the state **exactly after** this update, use images: `fullDocument: "required"` or `"whenAvailable"`. The document then comes from the image store, which the server keeps when the model has `changeStreamPreAndPostImages` turned on. You get the state **before** the change the same way, with the [`fullDocumentBeforeChange`](../reference/change-streams/watch.mdx#before-and-after) option.
+
+<Snippet id="change-streams/watch/full-document-2" title="accounts/history.ts" twoslash />
+
+With `"required"` the compiler knows the documents are there, and there's no `null` in the type. With `"whenAvailable"` an image may be missing, and the type accounts for that.
+
+## Don't lose events after a stop [#resume-after-stop]
+
+A process gets restarted, crashes, or a subscriber is redeployed. Meanwhile the collection keeps changing, and a new stream won't show those changes. To pick up where you left off, save the **resume token** [`stream.resumeToken`](../reference/change-streams/watch.mdx#resume-token). Next time you open the stream, pass it in [`resumeAfter`](../reference/change-streams/watch.mdx#model-watch-options), and the server continues after the last event you read.
+
+A token lives for a limited time, as long as the event is still in the server's operation log. So save it after every event you handle, or after every batch.
+
+<Snippet id="change-streams/watch/resume-after-stop" title="accounts/durable-feed.ts" twoslash />
+
+Here's the same thing on live data. The first stream read one event and closed, and the second one continued after it and got the next one.
+
+<Snippet id="change-streams/watch/resume-after-stop-2" twoslash />
+
+You don't have to handle a short connection drop yourself. The `mongodb` driver reopens the stream from the last token on its own. You need the token when the **process** stops.
+
+If the stream ended with an `invalidate` event because the collection was dropped, `resumeAfter` won't work anymore. The server answers `ServerError: Attempting to resume a change stream using 'resumeAfter' is not allowed from an invalidate notification (code 260 InvalidResumeToken)`. Use `startAfter` with the token of that event, and the stream continues when the collection appears again.
+
+## Pass a stream to your own function [#pass-stream]
+
+Sometimes several subscribers read the streams of different models the same way, and you want to move the shared code into a function. [`ModelChangeStream`](../reference/change-streams/watch.mdx#model-change-stream) takes the event type as a parameter. So the function stays generic and keeps the types. It returns the same events the stream itself would.
+
+<Snippet id="change-streams/watch/pass-stream" title="accounts/read-events.ts" twoslash />
+
+`first` has the event type that accounts for the stream options, that is `ChangeEvent<Account, …>`, or `undefined`, because the index may fall outside the array. The `operationType` check narrows it the same way as in the other examples.
+
+## Stop watching [#stop-subscription]
+
+An open stream holds a connection, and the process won't exit while the stream is alive. There are three ways to close it.
+
+- Leave the `for await` loop with `break` or `return`.
+- Call [`stream.close`](../reference/change-streams/watch.mdx#close).
+- Wait for `invalidate`.
+
+Closing the stream from outside while the loop waits for an event isn't an error. The loop ends quietly. So when your app shuts down, call `close`, and the loop in the background task finishes on its own.
+
+<Snippet id="change-streams/watch/stop-subscription" title="accounts/feed-lifecycle.ts" twoslash />
+
+To check whether there's an event right now without waiting, call [`stream.tryNext`](../reference/change-streams/watch.mdx#try-next). It returns an event or `null`.
+
+## Hidden fields and secrets [#hidden-fields-and-secrets]
+
+A field marked `hidden` doesn't get into an event. The server removes it from `fullDocument` and `fullDocumentBeforeChange`, and Typemo strikes its path out of `updateDescription`. A change stream subscriber is a common place for leaks. An event goes to a queue, a log, or an external service, and a password hash shouldn't end up there only because someone subscribed.
+
+If you really need the field, name it in `include`: `Accounts.watch({ include: ["pin"] })`. A path that doesn't lead to a hidden field of the model throws a `QueryError`. Otherwise a typo would turn into data silently going missing.
+
+There's a limit. Typemo doesn't convert a stream with stages other than `$match`, so it has no way to strike the paths of hidden fields out of `updateDescription`. That's why, for a model with hidden fields, such a stream won't open until you list those fields in `include`. Drop the `$project`, or name the hidden fields explicitly.
+
+## How to choose what to ask the server for [#how-to-choose]
+
+Ask yourself **what the subscriber will do with the event**.
+
+- **Knowing that the record with this `_id` changed is enough**, for example to clear a cache or queue a job: use a stream without options. It's the cheapest, and the server reads no documents.
+- **You need the changed fields**: `updateDescription` is enough.
+- **You need the whole document, and the current state will do**: `fullDocument: "updateLookup"`. There's nothing to configure on the collection, but every update costs an extra read, and the version may be a later one.
+- **You need the state exactly at the moment of the change** for a log, a sync, or an audit: turn on `changeStreamPreAndPostImages` in the model and use `"required"` or `"whenAvailable"`.
+
+## When not to use it [#when-not-to-use]
+
+You don't need a stream to read the data for a period. A stream shows only the future, and for the past there's an ordinary [`find`](../reference/query/reading.mdx#model.find) on a time field. A single process that does the writes itself doesn't need one either. It's simpler to call the reaction right where the write happens. And a single server without a replica set has no streams at all.
+
+If an event has to go into a change log together with the author of the operation, see [Keep an audit log](../policies/audit.mdx). A change stream doesn't know who made the write.
+
+## Troubleshooting [#troubleshooting]
+
+**Events from before `watch` don't arrive.** You wrote a document, then opened a stream and are waiting for the event, and `next` waits forever. The cursor is created at the moment of `watch`, and anything earlier never gets into the stream.
+
+<Snippet id="change-streams/watch/troubleshooting" twoslash />
+
+You can get the past only by resuming from a saved token with `resumeAfter`.
+
+**An option is rejected before the stream opens.** A typo in an option name or a value of the wrong kind doesn't turn into a stream with default settings. `watch` checks the options before it contacts the server and throws a [`QueryError`](../reference/errors/query-errors.mdx#query-error) naming the option.
+
+<Snippet id="change-streams/watch/troubleshooting-2" />
+
+Zero for `batchSize` and `maxAwaitTimeMS` is an error too. The driver reads zero as "the server default", and an empty setting can produce that zero by accident. If you want the default, don't pass the option.
+
+**`fullDocument` is `null` or not what you wrote.** With `"updateLookup"` the server reads the document when it sends the event, not when the update happens. If the document was changed or deleted in between, you get a later version or `null`. Read the events faster than the data changes, or switch to images. `fullDocument: "required"` returns the state exactly after this update.
+
+**The stream fails on the first update because there's no image.** With `fullDocumentBeforeChange: "required"` or `fullDocument: "required"`, a stream on a collection without `changeStreamPreAndPostImages` opens without an error. But it fails and closes on the very first update.
+
+<Snippet id="change-streams/watch/troubleshooting-3" />
+
+Turn on `changeStreamPreAndPostImages: true` in the model's `@Schema` and bring the collection in line, as described in [Create collections with options](../collections/create.mdx). Or use `"whenAvailable"`, and you get `null` when there's no image.
+
+**The stream of a model with tenants won't open.** For a model with the `tenant` policy, `watch()` fails with a `StrictModeError` whose reason is `tenant`. A delete event carries no document that could tie it to a tenant, so Typemo can't limit the stream to one tenant.
+
+The error text itself tells you the way out: `watch inside PolicyContext.run({ allTenants: true }, () => Order.watch()) and filter the events yourself`. Open the stream explicitly for all tenants with `PolicyContext.run({ allTenants: true }, () => Model.watch())` and filter the events yourself. See [Split data by organization](../policies/tenants.mdx).
+
+**The loop ended and no more events come.** A `for await` loop ends together with the stream: when `close` is called, when `invalidate` arrives after the collection is dropped, or when you leave the loop. A closed stream can't be read, and `next` and `tryNext` throw `DriverError: ChangeStream is closed`. Open a new stream and resume from the token.
+
+## Full example [#full-example]
+
+Here it all comes together: filtering events, images, saving the token, and stopping. Code that isn't part of Typemo and that you write yourself is marked `__…__`.
+
+<Snippet id="change-streams/watch/full-example" title="accounts/audit-feed.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose a change stream had no `for await`, `tryNext`, or `resumeToken`, and the events weren't typed. In Typemo the events are typed by the kind of operation, documents come with code names and without hidden fields, and you read the stream with a `for await` loop. The stream options are checked, and an unknown option throws a `QueryError` instead of being silently ignored.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Model.watch and events" href="../reference/change-streams/watch.mdx">
+  Every stream option, the methods of `ModelChangeStream`, and the event types, with exact types and errors.
+</Card>
+<Card title="Split data by organization" href="../policies/tenants.mdx">
+  How the tenant policy affects change streams, and how to open a stream for all tenants.
+</Card>
+<Card title="Create collections with options" href="../collections/create.mdx">
+  How to create a collection with document images, so that `required` and `fullDocumentBeforeChange` work.
+</Card>
+<Card title="Keep an audit log" href="../policies/audit.mdx">
+  A change log with the author of each operation, for when a change stream isn't enough.
+</Card>
+</Cards>

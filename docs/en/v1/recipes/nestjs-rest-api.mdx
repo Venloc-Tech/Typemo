@@ -1,0 +1,139 @@
+---
+title: A REST API with NestJS
+description: "Full CRUD for accounts on NestJS and Typemo: a module, a service with a transaction, a controller with pipes, error responses, a tenant, and an e2e test"
+icon: Server
+---
+
+Let's build a REST API for an organization's accounts on NestJS out of the features of `@venloc/typemo-nestjs`.
+
+- Models from a class.
+- A schema check of the request body and parsing the id from the URL.
+- A money transfer in a transaction.
+- A tenant from a request header.
+- Responses to database errors.
+
+At the end there's an e2e test that checks every response on this page. The same API on plain functions, without a framework, is covered in the recipe [A REST API for bank accounts](./rest-api.mdx).
+
+## What you need [#prerequisites]
+
+- An app on NestJS 12 with Express, and the packages from [Connect Typemo to NestJS](../integrations/nestjs/setup.mdx).
+- MongoDB running as a replica set (several MongoDB servers holding copies of the same data, though one server is enough for transactions). Transactions run on it.
+- The organization in the `x-org` header. In a real app, authentication puts it there.
+
+## Quick start [#quick-start]
+
+Five routes and a transfer.
+
+<Snippet id="recipes/nestjs-rest-api/quick-start" />
+
+Next we go through each file of the app in turn, then the requests with their responses, and the test.
+
+## Describe an account [#define-account]
+
+An account belongs to an organization. The `tenantId` field is marked as the tenant, and the policy filters and fills it from the request context on its own. The default status is `open`. A closed account isn't deleted, so the history of transfers keeps both ends.
+
+<Snippet id="recipes/nestjs-rest-api/define-account" title="accounts/account.ts" twoslash />
+
+## Write the service [#write-service]
+
+The service works with the model and knows nothing about HTTP. The transfer is marked [`@Transactional()`](../reference/integrations/nestjs.mdx#transactional), so the debit and the credit happen together or not at all. Both operations are atomic `$inc`s with the condition "the account is open", and `.orFail()` turns a closed or foreign account into an error that rolls back the transaction.
+
+<Snippet id="recipes/nestjs-rest-api/write-service" title="accounts/accounts.service.ts" twoslash />
+
+The service has no organization filter. The tenant policy adds it to every operation built inside the request.
+
+## Write the controller [#write-controller]
+
+The controller parses the input and calls the service.
+
+- [`ValidateBodyPipe`](../reference/integrations/nestjs.mdx#validate-body-pipe) checks the body against the account schema, and `pick` leaves the client only `title` and `balance`. The server sets the organization and the status.
+- [`ParseIdPipe`](../reference/integrations/nestjs.mdx#parse-id-pipe) parses the id from the URL.
+- We check the query string by hand. The status is one of two values, and `limit` is from 1 to 100.
+
+<Snippet id="recipes/nestjs-rest-api/write-controller" title="accounts/accounts.controller.ts" twoslash />
+
+The body of a transfer is a command, not a document, so `ValidateBodyPipe` doesn't fit here. A `ParseIdPipe` created right on the model parses the ids, and we check the amount ourselves.
+
+## Assemble the app [#assemble-app]
+
+The accounts module registers the model. The root module connects the client and creates the collection on startup. `main.ts` wires up the error filter and the tenant interceptor.
+
+<Snippet id="recipes/nestjs-rest-api/assemble-app" title="main.ts" twoslash />
+
+## Requests and responses [#requests-and-responses]
+
+Every response below comes from the app in this recipe. Unless stated otherwise, the `x-org` header holds the organization `acme`.
+
+Let's open an account. The response is the created document. The policy set the organization, and the status is the default.
+
+<Snippet id="recipes/nestjs-rest-api/requests-and-responses" />
+
+You can't set the organization yourself, because `tenantId` isn't in `pick`.
+
+<Snippet id="recipes/nestjs-rest-api/requests-and-responses-2" />
+
+Let's transfer 30 from `Main` to `Savings`, opened with a zero balance, and look at the list.
+
+<Snippet id="recipes/nestjs-rest-api/requests-and-responses-3" />
+
+A transfer of 500 from `Savings` breaks `min: 0`. The core rejects the update, the transaction rolls back, and the balance of `Savings` stays 30.
+
+<Snippet id="recipes/nestjs-rest-api/requests-and-responses-4" />
+
+You can rename an account, but you can't change the balance through `PATCH`.
+
+<Snippet id="recipes/nestjs-rest-api/requests-and-responses-5" />
+
+Let's close `Savings` and transfer to it. `.orFail()` didn't find an open account, and the debit from `Main` rolled back.
+
+<Snippet id="recipes/nestjs-rest-api/requests-and-responses-6" />
+
+Another organization doesn't see these accounts, and a bad id or a bad status gives a 400.
+
+<Snippet id="recipes/nestjs-rest-api/requests-and-responses-7" />
+
+## Check it with a test [#verify-with-test]
+
+The e2e test starts the app on a test database ([`TypemoTestingModule`](../reference/integrations/nestjs.mdx#typemo-testing-module.for-root)) and repeats the requests above.
+
+<Snippet id="recipes/nestjs-rest-api/verify-with-test" title="test/accounts.e2e-spec.ts" twoslash />
+
+## How to choose [#how-to-choose]
+
+Should you check the body with a pipe or by hand? A body that is a document, as when opening or renaming an account, is checked by `ValidateBodyPipe`. It uses the same schema as the write, so the rules can't drift apart. A command body like a transfer, and the query string, aren't documents. Check them yourself or with your own validator. The sign is simple. If the body's fields are the entity's fields, you have a document.
+
+## When not to use it [#when-not-to-use]
+
+If the API only reads, like reports or a storefront, you don't need the transaction or `ValidateBodyPipe`. And a list is better served page by page by key through [`keysetPage`](../reference/query/keyset.mdx#model.keyset-page), as in the recipe [A REST API for bank accounts](./rest-api.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**The organization came in the request body.** Without `pick` or `omit: ["tenantId"]`, the client can send `tenantId`. The tenant policy still won't write another organization, and the request gets a 400 `{ "message": "Not allowed", "reason": "tenant", "path": "tenantId" }`. But a 422 from the pipe tells the client directly that this field isn't theirs.
+
+**A transfer to a closed account debited the money.** The `status: "open"` condition and `.orFail()` must be in both operations of the transfer, and the transfer itself inside `@Transactional()`. Otherwise the debit goes through before the credit fails to find the account.
+
+**A list without a limit.** A `limit` from the query string without a check turns into `NaN` or zero. Check the range before the query, as in the controller.
+
+## Full example [#full-example]
+
+All the code is already laid out above, file by file: [the model](#define-account), [the service](#write-service), [the controller](#write-controller), [the modules and `main.ts`](#assemble-app), and [the test](#verify-with-test). The same code, with a check of every response, lives in the tests of the `@venloc/typemo-nestjs` package (`test/e2e/recipe.test.ts`).
+
+<Callout type="migration" title="Coming from @nestjs/mongoose">
+
+In an app on `@nestjs/mongoose`, the organization filter, the DTO check, and mapping a uniqueness error to 409 are written by hand in every place. Here they're a policy, a pipe, and a filter, and only the work with data stays in the service.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Errors, ids, and the request body" href="../integrations/nestjs/http.mdx">
+  The filter and the pipes in detail.
+</Card>
+<Card title="Transactions and policies per request" href="../integrations/nestjs/transactions-and-policies.mdx">
+  How `@Transactional` and the tenant from the request work.
+</Card>
+<Card title="A multi-tenant app" href="./multi-tenant.mdx">
+  A tenant, soft delete, and an audit log without a framework.
+</Card>
+</Cards>

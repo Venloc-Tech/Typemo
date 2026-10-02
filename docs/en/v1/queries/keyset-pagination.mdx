@@ -1,0 +1,175 @@
+---
+title: Keyset pagination
+description: "Page through long lists without skip: a next-page token, signing it, and infinite scroll"
+icon: ArrowRightToLine
+---
+
+**Keyset pagination** returns a page as "the rows after the last one you saw" instead of "skip N rows". A page costs the same at any depth. And records added or deleted between requests are neither repeated nor lost.
+
+Typemo has one method for this, [`Model.keysetPage`](../reference/query/keyset.mdx#model.keyset-page). It returns a page and a **token**, a string that remembers where the page ended. You request the next page with that token.
+
+If you're new to MongoDB, keep one idea in mind. To skip `n` documents, the database still reads them and throws them away, so deep pages through [`.skip`](../reference/query/reading.mdx#skip) are slow. Keyset pagination asks the database for the rows after a specific value, and an index answers right away.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and a post model. The fields are picked to show both the ones that work as a key (required) and one that doesn't (the optional `draft`).
+
+<Snippet id="queries/keyset-pagination/prerequisites" title="posts/post.ts" twoslash />
+
+The collection has seven posts, created in alphabetical order. `A` has 50 views, `B` and `C` have 40 each, `D` has 30, `E` has 20, and `F` and `G` have 10 each. The `// →` comments list the post titles in page order.
+
+## Quick start [#quick-start]
+
+The first page and the one after it.
+
+<Snippet id="queries/keyset-pagination/quick-start" twoslash />
+
+We'll go through the method on real tasks below. Every option and the result are described in the [Keyset pagination](../reference/query/keyset.mdx) reference.
+
+## Get the first and the next page [#first-and-next-page]
+
+The sort is passed as a list of `[field, direction]` pairs, not as an object. The key order of a JavaScript object doesn't always match the order you wrote, and here the order of the keys decides the order of the page. The `limit` option sets the page size. You request the first page without `after`, and for the next ones you take `after` from the `nextCursor` of the previous page.
+
+Notice that posts `B` and `C`, with their 40 views, appear on the page as `C`, `B`. Typemo adds `_id` as the last sort key itself, with the same direction as the key before it. The order becomes total, no two rows ever share "the same position", and the page boundary is always unambiguous. `desc` applies to `_id` too, so the newer post `C` comes before `B`.
+
+A page is an object with three fields.
+
+- `items`: the rows.
+- `nextCursor`: the token of the next page, or `null`.
+- `hasMore`: whether there's a next page.
+
+The last page looks like this.
+
+<Snippet id="queries/keyset-pagination/first-and-next-page" twoslash />
+
+To tell that the list has ended, Typemo asks for one row more than `limit`. So even a last page of exactly `limit` rows reports that nothing follows, and you don't have to make an extra empty request. An empty result isn't an error. It gives `{ items: [], nextCursor: null, hasMore: false }`.
+
+## Send a page to the client [#send-page]
+
+The token comes from the client and goes back to the client. So an ordinary service function takes the token as a string and returns the page and the next token. By default the rows are documents. For a response to the client, turn each one into an [ordinary object](./reading-data.mdx#send-to-client) with [`$toPlain()`](../reference/documents/document-api.mdx#to-plain).
+
+<Snippet id="queries/keyset-pagination/send-page" title="posts/posts.service.ts" twoslash />
+
+The client puts `next` into the URL of the next request and gets the next page. When `next` becomes `null`, it shows that the list has ended.
+
+A corrupted token from the client throws a [`KeysetTokenError`](../reference/query/keyset.mdx#keyset-token-error). That's an input error, not a server failure, and the function above answers it as a bad request. Typemo checks the whole token before building a query from it: the length and alphabet, the structure, whether the keys and directions match your sort, and the type of each value. A truncated token gives this error.
+
+<Snippet id="queries/keyset-pagination/send-page-2" />
+
+If you don't need document methods, pass `lean: true`. The rows then come as a `.lean()` result, with `ObjectId` and `bigint`, and you'll still have to convert them for a response to the client.
+
+## Scroll endlessly [#infinite-scroll]
+
+With infinite scroll the client requests a page and shows it. When the user reaches the end, the client requests the next one with the last `next`. On the server, for example in a background job that walks the whole list, it's a loop over the token.
+
+<Snippet id="queries/keyset-pagination/infinite-scroll" title="posts/export-posts.ts" twoslash />
+
+All seven posts came out exactly once, and every request cost the same. For exporting the whole collection, though, a [cursor](./large-results.mdx) fits better. It reads the documents in one query and doesn't pass a token back and forth.
+
+## Page through a filtered list [#page-with-filter]
+
+The `filter` option sets which documents to page through. It's checked the same way as a filter in [`find`](../reference/query/reading.mdx#model.find), and it applies to **every** page. So a token doesn't open access to documents outside the filter. By tampering with the token, a client can shift the position, but it won't see anyone else's data.
+
+<Snippet id="queries/keyset-pagination/page-with-filter" twoslash />
+
+The filter and the sort must stay the same on every page of one list. The token remembers the sort keys and directions, so it won't work with a different sort. You'll get a `KeysetTokenError` with the text `keysetPage: invalid cursor — it was made for another sort`. The token doesn't remember the filter, though. If you change the filter between pages, the position stays the same, but the set of documents is different.
+
+## Check that no records get lost [#check-no-lost-records]
+
+The main difference from `.skip` shows when a record is added to the top of the list between page requests. Take a page of two posts and add `Z` with 100 views, the most popular one.
+
+<Snippet id="queries/keyset-pagination/check-no-lost-records" twoslash />
+
+The token remembers a position, not a page number, so the second page continues from `B`. No record was repeated or lost.
+
+With `.skip(2)` it's different. The order is the same, views descending and then `_id` descending, and the first page is `A` and `C`. But after `Z` appears, the second page with `.skip(2)` starts at `C` and gives `C` and `B`. The new record shifted the others, and the reader sees `C` twice.
+
+## Page by creation or update time [#page-by-time]
+
+A "newest first" feed and a "recently changed" list are sorted by time. If a model extends [`Timestamped`](../reference/schemas/base-classes.mdx#timestamped), the `createdAt` and `updatedAt` fields work as a key, even though the schema doesn't mark them required. The core fills them in on every insert, so they're never empty. Say the notes `s1`…`s5` were created one after another.
+
+<Snippet id="queries/keyset-pagination/page-by-time" title="notes/notes.service.ts" twoslash />
+
+Ordering by `updatedAt` moves around. `updatedAt` changes on every write, and a freshly changed note jumps straight to the top of the list. For a feed that shouldn't jump under the user's finger, page by `createdAt`. If notes share a `createdAt`, the page boundary is decided by `_id`, which Typemo puts as the last key, so nothing repeats or goes missing.
+
+## Sign the token [#sign-token]
+
+The token isn't encrypted. It's the key values of the page's last row written into a string, and any client can read and change them. As long as the query filter applies to every page, a forged token gives no access to anyone else's data and at most shifts the position.
+
+If the client mustn't shift the position either, sign the tokens. The client option `keysetSecret`, with a key of at least 32 bytes, turns the token into `payload.signature`, where the signature is an HMAC-SHA256 of the payload.
+
+<Snippet id="queries/keyset-pagination/sign-token" title="db/client.ts" twoslash />
+
+The key in the example is deliberately fake. Take the real one from your environment's secrets, not from code.
+
+The signature is checked before the token is parsed, and the comparison takes the same time no matter how many characters match. With signing on, Typemo rejects an unsigned token and a modified token. The other way around, a signed token won't pass on a client without the key either.
+
+<Snippet id="queries/keyset-pagination/sign-token-2" />
+
+You can rotate the key without a break. `keysetSecret` also takes a list, where the first key signs and any key in the list verifies. That way tokens issued with the old key survive until the switch is over.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether the user needs to jump to an arbitrary page or see the total number of pages**.
+
+- **No, they scroll forward**, as in a feed or a log: use `keysetPage`. A page costs the same at any depth and doesn't lose records.
+- **You need "page 17 of 40"**: use [`.skip`](../reference/query/reading.mdx#skip) with [`.limit`](../reference/query/reading.mdx#limit) and [`countDocuments`](../reference/query/reading.mdx#model.count-documents), as described in [Sorting and paging](./sorting-and-pages.mdx). Deep pages will be slower, though, and records added between requests will shift the boundaries.
+
+## When not to use it [#when-not-to-use]
+
+`keysetPage` pages only forward and doesn't know the total number of pages. It can't jump to page 17 or show "page 3 of 40".
+
+Only required top-level fields without `null` and with an order can be a key: numbers, strings, dates, ids. `_id` works too, and on models with `Timestamped` also `createdAt` and `updatedAt`. If the list must be ordered by an optional or computed value, this method won't do. For a computed order use an [aggregation](../aggregation/first-aggregation.mdx), and to walk the whole collection rather than show a page, a [cursor](./large-results.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**An optional field in the key.** You decided to sort by a field that a document may not have. A missing value has no place in the order, so such a field can't be a key. The compiler rejects it, and at runtime Typemo throws a [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configuration-error).
+
+<Snippet id="queries/keyset-pagination/troubleshooting" twoslash />
+
+<Snippet id="queries/keyset-pagination/troubleshooting-2" />
+
+Make the field required and remove `null` from it, or sort by another field.
+
+**A token from another sort.** A client sent a token issued for a sort by `views`, and now you page by `title`. Typemo rejects it.
+
+<Snippet id="queries/keyset-pagination/troubleshooting-3" />
+
+When you change the sort of a list, start from the first page without `after` and reset the tokens on the client.
+
+**`limit` is zero.** The page size came from a request parameter and turned out to be zero. Typemo throws a `QueryError`, the same as [`.limit`](../reference/query/reading.mdx#limit).
+
+<Snippet id="queries/keyset-pagination/troubleshooting-4" />
+
+Check and cap the page size before the call, as in [Accept a page number from the URL](./sorting-and-pages.mdx#page-number-from-url).
+
+**The token got lost between requests.** On every request you call `keysetPage` without `after` and get the same first page. You have to hand `nextCursor` to the client and get it back, because the pages themselves remember nothing between requests.
+
+## Full example [#full-example]
+
+A post feed service that returns a page with a token and turns a token error into a bad request. Signing is turned on in the client, as in the section above. Code that isn't part of Typemo and that you write yourself is marked `__…__`.
+
+<Snippet id="queries/keyset-pagination/full-example" title="posts/posts.service.ts" twoslash />
+
+<Callout type="migration">
+
+Mongoose has no built-in keyset pagination. People usually write it by hand with `$or` over the keys and glue the token together themselves. In Typemo there's [`Model.keysetPage`](../reference/query/keyset.mdx#model.keyset-page) for this. `_id` is added as the last key automatically, the whole token is checked, and signing is one client option.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Keyset pagination" href="../reference/query/keyset.mdx">
+  Every `keysetPage` option, the result, the `Keyset` helpers, and `KeysetTokenError`.
+</Card>
+<Card title="Sorting and paging" href="./sorting-and-pages.mdx">
+  Paging with `.skip` and `.limit` when you need page numbers.
+</Card>
+<Card title="Large results" href="./large-results.mdx">
+  Walk the whole collection with a cursor instead of pages.
+</Card>
+<Card title="Client options" href="../reference/connection/typemo-client.mdx#client-options">
+  `keysetSecret` and the other client options.
+</Card>
+</Cards>

@@ -1,0 +1,197 @@
+---
+title: Error handling
+description: "Catch a Typemo error by its class, answer the client with the right status code, and keep secrets out of the error text"
+icon: TriangleAlert
+---
+
+Catch Typemo errors by class, not by text. Every situation has its own class, and its fields tell you exactly what happened. The error arrives right away and to the point. Typemo doesn't swallow a typo in a field name or turn a wrong value into an empty one. It stops the operation with a clear refusal.
+
+All the handler at the edge of your application has to do is turn that refusal into the right response. "No such account" becomes 404, "the name is already taken" becomes 409, "the form is filled in wrong" becomes 422. We'll show how below. Each class on its own, with its fields and exact texts, is described in the [Errors](../reference/errors/index.mdx) reference.
+
+## What you need [#prerequisites]
+
+A connected client from `db/client.ts` and the account model from `accounts/account.ts`.
+
+<Snippet id="connection/driver-access/prerequisites" title="db/client.ts" twoslash />
+
+<Snippet id="errors/handling/prerequisites" title="accounts/account.ts" twoslash />
+
+The response classes of your own application (404, 409) are marked `__NotFound__` in the examples. That's your code, not part of Typemo.
+
+## Quick start [#quick-start]
+
+Every Typemo error descends from [`TypemoError`](../reference/errors/hierarchy.mdx#typemo-error). One `instanceof` separates a refusal from the library from someone else's failure, and a check against a specific class picks the reaction.
+
+<Snippet id="errors/handling/quick-start" twoslash />
+
+The last branch, `throw error`, passes up everything that has nothing to do with the library. There's no reason to hide someone else's error. Below we'll go through the usual tasks: how to hand an error to the client, how to spot a retryable error, and how not to leak a secret.
+
+## Catch by class [#catch-by-class]
+
+The classes form a tree, so the order of checks matters: from specific to general. [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicate-key-error), [`ServerValidationError`](../reference/errors/server-errors.mdx#server-validation-error), and [`WriteConflictError`](../reference/errors/server-errors.mdx#write-conflict-error) descend from [`ServerError`](../reference/errors/server-errors.mdx#server-error), and [`KeysetTokenError`](../reference/errors/query-errors.mdx#keyset-token-error) descends from [`QueryError`](../reference/errors/query-errors.mdx#query-error). Put the parent check first, and it catches the child. The child's branch then never runs.
+
+So check the specific class first, then its parent, and the general [`TypemoError`](../reference/errors/hierarchy.mdx#typemo-error) at the very end. The whole tree is drawn on the [Error hierarchy](../reference/errors/hierarchy.mdx) page.
+
+Don't compare `error.name` with a string. `instanceof` takes inheritance into account, and the name doesn't. And don't parse `error.message`. That text is written for people and may get more precise over time. Base your decisions on the class and its fields (`reason`, `code`, `path`).
+
+## Answer the client with an HTTP status [#http-status]
+
+At the edge of your application, in a request handler or the entry point of a service, any error turns into a response to the client. Do it once in a shared function and call it from every handler. Then the responses look the same, and the decisions about status codes live in one place.
+
+The library doesn't decide which status fits which situation. That's up to your application. Here's a sensible scheme.
+
+- Bad input: 400 and 422.
+- No such document: 404.
+- A conflict with existing data: 409.
+- The database is unavailable: 503.
+- Everything else: 500 with a generic text and no details.
+
+<Snippet id="errors/handling/http-status" title="errors/to-http.ts" twoslash />
+
+Real errors produced these responses.
+
+- An account without an owner: 422 with the list `[{ path: "owner", reason: "required", message: "the field is required" }]`.
+- `findOne(...).orFail()` with no result: 404.
+- A title that's already taken: 409 with `details: ["title"]`.
+- An owner given as a number, a filter with an unknown field, a corrupted page token: 400.
+- A version conflict: 409.
+- A plain `Error` from your code: 500.
+
+The body of the 422 response comes from [`error.toJSON()`](../reference/errors/data-errors.mdx#response), not from the error itself. `toJSON` leaves out the values of the violations, which can be large or secret. For a 409 the field names from `keyPattern` are enough. It's better not to send the taken value itself back to the client.
+
+Log an error from your own code (500) in full, and return a generic text to the client. The details are for the developer, not for the user.
+
+## Don't show too much [#show-less]
+
+Error texts are detailed on purpose, so a developer has enough to diagnose the problem. They contain the model name, the path, and the value. That's why you don't hand the raw `error.message` to the client. It can reveal how the schema is built and the data itself. Send the ready-made fields (`toJSON`) or a short text of your own.
+
+Secret fields have their own protection. If a field is marked `sensitive` in the schema, its value is replaced with `[hidden]` in uniqueness and cast errors, not only in the audit log. Here's the text an `email` field with `sensitive: "hide"` produced.
+
+<Snippet id="errors/handling/show-less" />
+
+The `keyValue` of this error was `{ email: "[hidden]" }`. The full server text in `serverMessage` is masked the same way, and `cause` held the same masked copy. The secret ends up in neither the message, nor the fields, nor the chain of causes. The driver's original is available only inside the library.
+
+### The cause of a failure [#failure-cause]
+
+`cause` holds the error that led to the current one: an error from the driver, from your function, or from a cast. Log it together with the top-level error. The Typemo class tells you what happened, and `cause` tells you why.
+
+<Snippet id="errors/handling/failure-cause" twoslash />
+
+## Server errors [#server-errors]
+
+Server refusals are sorted into classes by their code.
+
+- A uniqueness violation.
+- A refusal from the collection validator.
+- A write conflict.
+- The general [`ServerError`](../reference/errors/server-errors.mdx#server-error) for everything else.
+
+The codes the library reacts to are collected in [`ServerErrorCodes`](../reference/errors/server-errors.mdx#server-error-codes), so your code reads `ServerErrorCodes.DuplicateKey` instead of the number 11000. The driver's original error is always in `cause`.
+
+The general `ServerError` arrives for any code that has no class of its own. For example, a hint for an index that doesn't exist gave `code: 2` and `codeName: "BadValue"` with the message `hint provided does not correspond to an existing index (code 2 BadValue)`. The message is short on purpose and holds only the reason and the code. The full server text, which can include the query plan and values, is in `serverMessage` and in `cause`. Log it, but don't hand it to the client. Most often an error like this means your query is wrong, not that the server is having a temporary hiccup, and retrying it is pointless.
+
+## Retryable errors [#retryable-errors]
+
+The server and the driver attach **labels** to errors that hint at what you can do. The one that matters most to an application is `TransientTransactionError`: "the whole transaction can be run again". Inside [`connection.transaction`](../reference/transactions/transactions.mdx#transaction) the driver does the retry, and you don't write anything. With two temporary failures, the transaction function ran three times and the write was committed. You only read the labels yourself when you control a transaction by hand.
+
+<Snippet id="errors/handling/retryable-errors" twoslash />
+
+Every label is listed in the [`ErrorLabels`](../reference/errors/server-errors.mdx#error-labels) reference. Don't blindly retry an error that has no label. A uniqueness violation will repeat with the same result, and a non-idempotent write will run twice.
+
+You don't have to parse labels and codes yourself. Ask [`ErrorClassifier`](../reference/errors/hierarchy.mdx#error-classifier) instead. `ErrorClassifier.isRetryable(error)` tells you whether retrying the same operation will help, and `ErrorClassifier.isTransient(error)` whether the whole transaction can be run again. The classifier accepts any value, even a driver error that came in around the models. For a uniqueness violation or a cast error it answers "no", because a retry with the same data changes nothing.
+
+## Bulk writes [#bulk-write]
+
+A bulk write (`insertMany`, `bulkWrite`) isn't atomic. On a partial failure you get a [`BulkWriteError`](../reference/errors/server-errors.mdx#bulk-write-error). It tells you which writes failed (the position in your input, the code, the parsed error) and what was written after all. What happens next depends on the task. You can tell the user which rows were rejected and accept the rest, or roll everything back.
+
+<Snippet id="errors/handling/bulk-write" twoslash />
+
+The indexes in `writeErrors` count positions in your input, not in the way the driver split the batch internally. The row with index 1 is `rows[1]`. Without `ordered: false` the bulk write would have stopped at the first error.
+
+## The write succeeded but a hook failed [#write-ok-hook-failed]
+
+After a successful write, [post hooks](../hooks/order-and-errors.mdx) may run: an email, a log entry, a cache update. If such a hook throws, the calling code gets a [`PostHookError`](../reference/errors/hierarchy.mdx#post-hook-error), not the hook's original error. The wrapper exists for one reason. Its `applied` is always `true`, meaning the write is already in the database. Retry the call without looking at the error, and the document gets written a second time.
+
+<Snippet id="errors/handling/write-ok-hook-failed" twoslash />
+
+What to do next is up to your application. Usually you log the hook failure and answer the client with success, since the write went through. Inside a [transaction](../transactions/transactions.mdx) there's no wrapper. A failed post hook rolls back the write, and you get the hook's error exactly as it was thrown.
+
+## Application startup [#startup]
+
+At startup an application usually calls [`connection.init()`](../reference/connection/connection.mdx#connection.init) to create missing collections and indexes. If something goes wrong, you get a [`SyncError`](../reference/errors/configuration-errors.mdx#sync-error). It collects **all** the failures at once. One failed index doesn't stop the others from being checked, so a single run shows you the whole list of problems instead of making you fix them one at a time.
+
+<Snippet id="errors/handling/startup" twoslash />
+
+Carrying on with a database that doesn't match the schema is a bad idea. The errors will surface later, in unexpected places. That's why the example logs the problems and rethrows the error, stopping the startup.
+
+## Errors while iterating a cursor [#cursor-errors]
+
+When you iterate a large result, the function you pass to `eachAsync` may throw. Without `continueOnError`, the very first error stops the iteration and arrives as is. With `continueOnError: true`, the iteration reads through to the end and the errors are collected in an [`EachAsyncError`](../reference/errors/query-errors.mdx#each-async-error). They're all in `error.errors` in document order, and the first one is also in `cause`. For more on iteration, see [Large results](../queries/large-results.mdx).
+
+## How to choose [#how-to-choose]
+
+Ask yourself: **what can this level of code do about this error?**
+
+- **Nothing meaningful, only tell the client**: don't catch it in the service. Let it rise to the shared handler where `toHttp` lives.
+- **There's a real reaction**: catch it on the spot. Retry, take another value, start over. For example, "the name is taken, suggest another one" or "the page token is corrupted, return the first page".
+
+Here's a quick self-check. If the code after `catch` keeps doing something meaningful, you picked the right place. If it only rethrows the error, the `catch` is unnecessary.
+
+## When not to use it [#when-not-to-use]
+
+There's no point catching library errors where the refusal is the answer. A migration script should fail on the first error, not carry on with incomplete data. You also don't need to check input by hand before a call for the sake of a nicer error. The model's schema checks it and returns a [`ValidationError`](../reference/errors/data-errors.mdx#validation-error) with every violation at once.
+
+## Troubleshooting [#troubleshooting]
+
+**The child's branch never runs.** The handler catches `ServerError` before `DuplicateKeyError`, and duplicates fall into the general branch with a 500.
+
+<Snippet id="errors/handling/troubleshooting" twoslash />
+
+`DuplicateKeyError` descends from `ServerError`, so the first check catches both cases and the second is never reached. Order the checks from specific to general.
+
+**The error text ended up in the response.** The client got `Cast to string failed at path "owner" for 5 (number)…` in the response body. That message is for the developer and contains field names and values. Send the client your own text or the result of `toJSON()`, and write the message to the log.
+
+**Two identical documents in the collection after a `PostHookError`.** The handler caught any error from `create` and retried the call, but what came in was a `PostHookError`, and by then the write was already in the database. Check `error instanceof PostHookError` (or `ErrorClassifier.classify(error).kind === "post-hook"`) before the general retry, and don't retry the call. This error's `applied` is always `true`.
+
+**A check by name doesn't fire.** `error.name === "DuplicateKeyError"` doesn't recognize subclasses and breaks when a class is renamed. Use `instanceof`, which follows the class tree.
+
+**A duplicate gets through even though there's a check before the write.** The code first calls `findOne({ title })` and then creates the record, and two concurrent requests still create a duplicate. Another request can slip in between the check and the write, and only the index guarantees uniqueness. Write straight away and catch [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicate-key-error).
+
+<Snippet id="errors/handling/troubleshooting-2" twoslash />
+
+The index appears after [`connection.init`](../reference/connection/connection.mdx#connection.init). Without it, the duplicate is written with no error at all.
+
+## Full example [#full-example]
+
+Here's everything together in one file. The service function throws library errors as they are, and the shared handler turns them into a response. Code that isn't part of Typemo is marked `__…__`.
+
+<Snippet id="errors/handling/full-example" title="accounts/accounts.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose a driver error turned into an ordinary object with properties like `code` and `keyValue`, and some fields got lost in the copy. In Typemo every server refusal has its own class. `code`, `codeName`, and the labels are copied onto the error, and the driver's error itself sits untouched in `cause`. `ValidationError` and `CastError` don't hold a reference to the model, so an error in the log doesn't drag the whole model along with it.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Errors" href="../reference/errors/index.mdx">
+  Each class on its own: when it's thrown, which fields it carries, and which texts it produces.
+</Card>
+<Card title="Transactions" href="../transactions/transactions.mdx">
+  How a transaction retries on temporary failures and what to do with errors inside it.
+</Card>
+<Card title="Hook order and errors" href="../hooks/order-and-errors.mdx">
+  What the calling code sees when a hook fails before the write, after it, and inside a transaction.
+</Card>
+<Card title="Sync indexes" href="../collections/index-sync.mdx">
+  How to bring the database in line with the schema at startup and what to do with a `SyncError`.
+</Card>
+<Card title="Large results" href="../queries/large-results.mdx">
+  Iterating a cursor and `eachAsync` with `continueOnError`, where `EachAsyncError` comes from.
+</Card>
+<Card title="Keyset pagination" href="../queries/keyset-pagination.mdx">
+  A page token from the client and the `KeysetTokenError` you get when the token is corrupted.
+</Card>
+</Cards>

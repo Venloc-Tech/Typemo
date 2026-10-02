@@ -1,0 +1,378 @@
+---
+title: Model.watch and events
+description: "How to open a change stream on a collection with Model.watch, its options, ModelChangeStream, and the event types you receive"
+icon: Radio
+---
+
+A **change stream** is a persistent connection to MongoDB. Through it the database itself sends you an event for every write to a collection: an insert, an update, a replace, a delete. You need a stream when another part of the system must learn about a change without polling the database. For example, to clear a cache, send a notification, update a search index, or put an event on a queue. [`Model.watch`](#model.watch) opens such a stream for the model's collection and returns a [`ModelChangeStream`](#model-change-stream). You read events from it with a `for await` loop or one at a time.
+
+If you're new to change streams, read the guide [Watch for changes](../../change-streams/watch.mdx) first. This page is the reference.
+
+Change streams work only on a replica set (several MongoDB servers holding copies of the same data, though a single server is enough) or a sharded cluster. A standalone `mongod` doesn't support them. The documentation's test database is a replica set.
+
+All the examples use one account model. It has a required owner and balance, a hidden `pin`, and the `changeStreamPreAndPostImages` option. The option makes the database keep the documents from before and after a change, and without it the state before a change isn't available (see [`fullDocumentBeforeChange`](#model-watch-options)).
+
+<Snippet id="reference/change-streams/watch/intro" title="accounts/account.ts" twoslash />
+
+The results in the `// →` comments come from a replica set. Identifiers are shortened to `"…"`, and the event's service fields (`_id`, `clusterTime`, `wallTime`, `ns`) are left out where they don't matter.
+
+---
+
+## Model.watch <Badge variant="requires">replica set</Badge> [#model.watch]
+
+`Model.watch` opens a change stream on the model's collection. The stream sees only what happened **after** it was opened. It doesn't send earlier events.
+
+By the time `await Model.watch()` returns, the cursor on the server is already open. Anything written right after goes into the stream, even if the first read comes later. The stream keeps such an event and hands it to the first `next`, `tryNext`, or step of the `for await` loop. You don't need a separate `tryNext` call to open the cursor. If the server refuses to open the stream, the error comes from `watch` itself, not from the first read. The token `resumeAfter: { _data: "00" }`, for example, gives `ServerError: KeyString format error: Unknown type: 0 (code 50811 Location50811)` right at `await Model.watch(…)`.
+
+The method has three call forms. With no arguments, or with one [`ModelWatchOptions`](#model-watch-options) object, you get a stream of all events of the collection. With a function, you pick the events yourself with `$match` stages. The filter language is the same as in queries, but the fields come from the event, and the stream stays typed. If the function adds other stages (`$project`, `$addFields`), the shape of the event changes, and the stream rows are yours, not typed events.
+
+<Snippet id="reference/change-streams/watch/model-watch" twoslash />
+
+<Returns type="Promise<ModelChangeStream<ChangeEvent<T, O>>>">
+
+An open [`ModelChangeStream`](#model-change-stream). An event is a union of [`ChangeEvent`](#change-event) types with the discriminator `operationType`. Until you check `operationType`, only the common fields are available. The type takes the options into account. The `fullDocument` and `fullDocumentBeforeChange` fields appear in the type, and can be `null`, exactly when the options ask for them.
+
+</Returns>
+
+<Params>
+<Param name="build" type="(pipeline) => pipeline">
+
+The function receives an empty change stream pipeline and returns it with stages added. If all the stages are `$match`, events stay typed and go through the usual conversion (documents under code names, hidden fields removed). The allowed stages are `$match`, `$project`, `$addFields`, `$set`, `$unset`, `$replaceRoot`, `$replaceWith`, `$redact`, and, as the last one, `$changeStreamSplitLargeEvent`. The pipeline is built by the same builder described in [`Pipeline.watch`](../aggregation/pipeline.mdx#pipeline.watch).
+
+</Param>
+<Param name="options" type="ModelWatchOptions">
+
+Stream settings, see [`ModelWatchOptions`](#model-watch-options). If you pass something that isn't an object, `watch` throws a `QueryError` with the text `watch: options must be an object`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/change-streams/watch/model-watch-2" />
+
+</FullType>
+
+### Only the events you need [#needed-events]
+
+The function in the first argument picks events on the server side, so the extra ones don't travel over the network. Event fields in the filter are named as in the event: `operationType`, `fullDocument.<field>`, `updateDescription.updatedFields.<field>`. Write document fields with the model's code names, even if the database stores them under other names (`dbName`).
+
+<Snippet id="reference/change-streams/watch/needed-events" twoslash />
+
+The server didn't send the event about `carl`, because a balance of 1 isn't greater than 5. That's why the event about `dora` came first. Inside the `if`, the compiler knows it's an insert and that `fullDocument` is an account document.
+
+### Documents as model instances [#documents-as-instances]
+
+With `hydrate: true`, documents in events arrive as instances of the model class with methods (`$save`, `$toPlain`), as an ordinary query would return them. Without the option, documents are plain objects.
+
+<Snippet id="reference/change-streams/watch/documents-as-instances" twoslash />
+
+### Hidden fields [#hidden-fields]
+
+Fields with `hidden` don't get into events, the same way they don't get into the result of [`find`](../query/reading.mdx#model.find). The server removes them from `fullDocument` and `fullDocumentBeforeChange`, and Typemo removes the paths of hidden fields from the update description. A secret won't leak into a message queue only because someone subscribed to changes. To receive a hidden field, name it in [`include`](#model-watch-options).
+
+<Snippet id="reference/change-streams/watch/hidden-fields" twoslash />
+
+### A different event shape [#other-event-shape]
+
+Stages that change the event shape (`$project`, `$addFields`, and others) are allowed. But such a stream has no conversion. Rows arrive as the server sent them, and the row type is inferred from the pipeline. Two things are forbidden, because without the conversion they can't be done safely. The first is `hydrate: true`, which needs events in their original shape. The second is a model with hidden fields. A stream with non-`$match` stages is rejected for it until the hidden fields are listed in `include`, otherwise their values would leak through `updateDescription`.
+
+<Snippet id="reference/change-streams/watch/other-event-shape" twoslash />
+
+### Errors [#errors]
+
+Options are checked at run time, before the stream opens, and the error arrives as a `QueryError`. Plain JavaScript and cast types get the same answer as the compiler. Before the server is contacted, Typemo rejects an unknown key, a wrong `fullDocument` or `fullDocumentBeforeChange` value, a wrong option type, and a `batchSize` or `maxAwaitTimeMS` that isn't a positive integer. More on this in the section [`ModelWatchOptions`](#options-check). The error texts come from a real run.
+
+<Snippet id="reference/change-streams/watch/errors" />
+
+For a model whose schema stores fields under other names (`dbName`), only `$match` stages are allowed. Typemo translates paths in them, there's no such translation in other stages, and a silently wrong path is worse than an error. Such an attempt throws `ConfigurationError`. For a model with a tenant policy, a stream without explicit permission is rejected as a `StrictModeError` with the reason `tenant`. A delete event carries no document that could assign it to a tenant.
+
+<Snippet id="reference/change-streams/watch/errors-2" />
+
+`watch` has no `.policy()` of its own, so the `allTenants` permission is set by the context, and the hint in the error text names exactly that form. `PolicyContext.run({ allTenants: true }, () => Model.watch())` opens the stream, and you filter the events by tenant yourself. The policy details are in the guide [Split data by organization](../../policies/tenants.mdx).
+
+### When not to use it [#when-not-to-use]
+
+You don't need a stream for a one-off selection of changes over a period, because it shows only the future. Without a replica set, change streams don't work at all. Use a "modified" field and an ordinary [`find`](../query/reading.mdx#model.find). If events must be saved and the stream must continue from where it stopped after a process restart, store the [`resumeToken`](#resume-token) and open the stream with [`resumeAfter`](#model-watch-options).
+
+---
+
+## ModelWatchOptions [#model-watch-options]
+
+`ModelWatchOptions` is the stream settings object. It says which documents to attach to an event, where to start, and how to read. All fields are optional. An unknown field throws a `QueryError` with the text `watch: unknown option "…"`, because a typo in an option name must not silently give you a stream with default settings.
+
+<Params>
+<Param name="fullDocument" type="&quot;default&quot; | &quot;updateLookup&quot; | &quot;whenAvailable&quot; | &quot;required&quot;">
+
+Whether you need the document **after** an update. By default an update event carries only `updateDescription`, which fields changed, and not the document itself. `"updateLookup"` makes the server read the current document at the moment it sends the event. That is the **current** state, not the state right after this update, so if there was a later change you get the later version, and after a delete you get `null`. `"whenAvailable"` and `"required"` take the document exactly in its state after this update from the image store. The collection must be created with `changeStreamPreAndPostImages`. Without images, `"required"` ends the stream with a `ServerError` when it reads the first update. In the event type, `fullDocument` is a document for `"required"`, `Document | null` for `"updateLookup"` and `"whenAvailable"`, and `undefined` without the option.
+
+</Param>
+<Param name="fullDocumentBeforeChange" type="&quot;off&quot; | &quot;whenAvailable&quot; | &quot;required&quot;">
+
+Whether you need the document **before** the change (for an update, a replace, and a delete). The server keeps it only in a collection created with `changeStreamPreAndPostImages`, which is an option of the [`@Schema`](../schemas/schema.mdx) schema. Without an image, `"required"` ends the stream with a `ServerError`, and `"whenAvailable"` gives `null`. In the event type it's a document for `"required"`, `Document | null` for `"whenAvailable"`, and `undefined` otherwise.
+
+</Param>
+<Param name="hydrate" type="boolean" default="false">
+
+Documents in events arrive as instances of the model class, not as plain objects. For this the pipeline must consist only of `$match`.
+
+</Param>
+<Param name="include" type="readonly string[]">
+
+Paths of hidden fields to keep in the event. A path that isn't one of the model's hidden paths throws a `QueryError`, otherwise a silent lack of effect would hide a typo.
+
+</Param>
+<Param name="resumeAfter" type="ResumeToken">
+
+Continue after the event with this token (its `_id` or [`stream.resumeToken`](#resume-token)). The token must be an object, otherwise `QueryError: watch: resumeAfter must be a resume token (the _id of an event), got "tok" (string)`. After an `invalidate` event the token doesn't work, and the server answers `ServerError: Attempting to resume a change stream using 'resumeAfter' is not allowed from an invalidate notification (code 260 InvalidResumeToken)`. Use `startAfter`.
+
+</Param>
+<Param name="startAfter" type="ResumeToken">
+
+Start after the event with this token, including after `invalidate`.
+
+</Param>
+<Param name="startAtOperationTime" type="Timestamp">
+
+Start from this cluster time. Only a `Timestamp` object is accepted, otherwise `QueryError: watch: startAtOperationTime must be a Timestamp, got 5 (number)`.
+
+</Param>
+<Param name="maxAwaitTimeMS" type="number">
+
+How long the server waits for new events in one exchange with the client before it answers with an empty batch. It must be a positive integer. The driver reads zero as "the server default", so `0` is rejected with a `QueryError`. If you want the default, don't pass the option.
+
+</Param>
+<Param name="batchSize" type="number">
+
+How many events the server returns in one batch. It must be a positive integer, as with `maxAwaitTimeMS`. `0`, fractional numbers, and strings are rejected.
+
+</Param>
+<Param name="showExpandedEvents" type="boolean" default="false">
+
+Also send events about structure changes: `create`, `createIndexes`, `dropIndexes`, `modify`, and others. They are described in [`CollectionEvent`](#collection-event).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/change-streams/watch/model-watch-options" />
+
+</FullType>
+
+### Checking the options [#options-check]
+
+Every option value is checked at run time, before the server is contacted. An option of the wrong type or with an invalid value gives a `QueryError`. It names the option, the expected value, and what arrived, with its type. The texts were checked by a run.
+
+<Snippet id="reference/change-streams/watch/options-check" />
+
+`showExpandedEvents` (a boolean) and `startAfter` (a token object) are checked the same way. A stream has no room for an "almost right" setting. A wrong option would quietly give you a stream that behaves differently from what you asked for.
+
+### The document before and after [#before-and-after]
+
+The images are turned on together. `updateLookup` gives the current document, and `fullDocumentBeforeChange` gives the state before the change. Read the update event before the next change, otherwise `updateLookup` returns a later version. After the balance was updated to 20 the document is still alive, so `fullDocument` contains it in the example.
+
+<Snippet id="reference/change-streams/watch/before-and-after" twoslash />
+
+If the document had been deleted before the event was read, `fullDocument` would be `null`, and `fullDocumentBeforeChange` would keep the old state. That's the point of the "before" image.
+
+### Error: there is no image [#no-pre-image]
+
+`fullDocumentBeforeChange: "required"` on a collection without `changeStreamPreAndPostImages` opens without an error, but the very first update ends the stream. An insert event doesn't need an image and arrives normally. The error appears on an update, a replace, or a delete, when the next event is read.
+
+<Snippet id="change-streams/watch/troubleshooting-3" />
+
+The full server text, with the execution plan, is in [`serverMessage`](../errors/server-errors.mdx#server-error).
+
+After this error the stream is closed. Turn on `changeStreamPreAndPostImages` in the schema and create or update the collection (see the guide [Create collections with options](../../collections/create.mdx)). The other way out is to use `"whenAvailable"`.
+
+---
+
+## ModelChangeStream [#model-change-stream]
+
+`ModelChangeStream<E>` is the stream that `Model.watch` returned. It's a thin typed wrapper over the driver's stream. Each event goes through the conversion (code names, hidden fields removed, documents plain or model instances), and driver errors arrive in the Typemo hierarchy. You can read events two ways: with a [`for await`](#async-iterator) loop, or one at a time through [`.next`](#next) and [`.tryNext`](#try-next).
+
+The event type is a class parameter, so a function over a stream of any model stays generic and compiles without workarounds, for example `const take = async <E>(stream: ModelChangeStream<E>, count: number): Promise<E[]> => …`. The event types from `watch` with options reach such a function intact. There's an example in the guide [Watch for changes](../../change-streams/watch.mdx#pass-stream).
+
+After a temporary connection loss the driver restores the stream by itself, reopening it from the last token. You can continue a stream after it's closed, or after a process restart, by passing the [`resumeToken`](#resume-token) in `resumeAfter` of a new stream.
+
+<FullType>
+
+<Snippet id="reference/change-streams/watch/model-change-stream" />
+
+</FullType>
+
+### .next [#next]
+
+`.next` waits for the next event and returns it. If there are no events, the call waits with no time limit while the stream is open.
+
+<Returns type="Promise<E>">
+
+The event in its typed shape. You get a driver error as an error of the Typemo hierarchy (`ServerError`, `DriverError`). On a closed stream, `.next` throws a `DriverError` with the text `ChangeStream is closed`.
+
+</Returns>
+
+It takes no arguments.
+
+### .tryNext [#try-next]
+
+`.tryNext` checks whether there's an event right now and waits no longer than one exchange with the server. Use it to poll the stream in a loop alongside other work. It returns an event or `null`. You don't need it to open the cursor, which is already open in [`Model.watch`](#model.watch). If the stream holds an event that happened after it was opened, the very first `tryNext` returns it, not `null`.
+
+<Snippet id="reference/change-streams/watch/try-next" twoslash />
+
+<Returns type="Promise<E | null>">
+
+An event, or `null` if there's no event yet. On a closed stream it throws a `DriverError` with the text `ChangeStream is closed`.
+
+</Returns>
+
+It takes no arguments.
+
+### .close [#close]
+
+`.close` closes the stream and frees the cursor on the server. Calling it again is harmless. A `for await` that is reading at that moment ends without an error, because closing is the normal way to stop a stream. An unclosed stream holds a connection and keeps the process from exiting.
+
+<Returns type="Promise<void>">
+
+Completes when the stream is closed.
+
+</Returns>
+
+It takes no arguments.
+
+### .resumeToken [#resume-token]
+
+The token you can continue from, after the last event read. Before the first event it's the server's token for the current moment, and continuing from it skips nothing.
+
+<Snippet id="reference/change-streams/watch/resume-token" twoslash />
+
+The token is an ordinary object of the form `{ _data: "…" }`. To continue after a process restart, save it in a separate collection or a file and pass it back as is.
+
+### .closed [#closed]
+
+`true` when the stream is closed: by a `.close` call, by leaving the `for await` loop, or by an `invalidate` event.
+
+### [Symbol.asyncIterator] [#async-iterator]
+
+You can read the stream with a `for await` loop. The loop owns the stream, so leaving it (`break`, `return`, an error) closes the stream. If the stream is closed from outside while the loop waits for an event, the loop ends without an error. The loop rethrows a driver error.
+
+<Snippet id="reference/change-streams/watch/async-iterator" twoslash />
+
+The loop reads the stream once. You can't resume reading a closed stream, so open a new one with `resumeAfter`.
+
+---
+
+## ChangeEvent [#change-event]
+
+`ChangeEvent<T, O>` is the union of all events of the stream of model `T` with options `O`. The discriminator is the `operationType` field. After the check `if (event.operationType === "update")`, the compiler knows the exact shape of the event and its other fields. That's the only way to reach `fullDocument` or `updateDescription`, because events of different kinds have different ones, and the common type doesn't contain them.
+
+<Snippet id="reference/change-streams/watch/change-event" twoslash />
+
+The `default` branch gets a [`CollectionEvent`](#collection-event), the events of the collection itself, which have no document. The fields common to all events are described in [`ChangeEventBase`](#other-types).
+
+<FullType>
+
+<Snippet id="reference/change-streams/watch/change-event-2" />
+
+</FullType>
+
+## InsertEvent [#insert-event]
+
+An inserted document. `operationType` is `"insert"`, `documentKey._id` is the identifier, and `fullDocument` is the whole document (under code names, without hidden fields, a plain object or a model instance with `hydrate`).
+
+<FullType>
+
+<Snippet id="reference/change-streams/watch/insert-event" />
+
+</FullType>
+
+## UpdateEvent [#update-event]
+
+An update of a document, by operators (`$set`, `$inc`, and others) or by a pipeline. The event itself carries a **description of the change**, [`updateDescription`](#update-description). The whole document arrives only if you asked for it with options. That's why `fullDocument` and `fullDocumentBeforeChange` in the update type depend on the options, and without them they're `undefined`.
+
+<Snippet id="reference/change-streams/watch/update-event" twoslash />
+
+The update changed both `balance` and the hidden `pin`, but only `balance` is left in `updatedFields`. Typemo removed the path of the hidden field.
+
+<FullType>
+
+<Snippet id="reference/change-streams/watch/update-event-2" />
+
+</FullType>
+
+## ReplaceEvent [#replace-event]
+
+A replace of the whole document ([`replaceOne`](../writes/writes.mdx#replace-one), [`findOneAndReplace`](../writes/writes.mdx#find-one-and-replace)). The new document always arrives, and the state before the replace arrives with the `fullDocumentBeforeChange` option.
+
+<FullType>
+
+<Snippet id="reference/change-streams/watch/replace-event" />
+
+</FullType>
+
+## DeleteEvent [#delete-event]
+
+A deleted document. The server sends only its `_id` in `documentKey`, and the state before the delete arrives with the `fullDocumentBeforeChange` option. Without the "before" image, a delete event doesn't tell you whose account it was.
+
+<Snippet id="reference/change-streams/watch/delete-event" twoslash />
+
+<FullType>
+
+<Snippet id="reference/change-streams/watch/delete-event-2" />
+
+</FullType>
+
+## CollectionEvent [#collection-event]
+
+Events of the collection itself, without a document. These are `drop` (the collection was dropped), `rename`, `dropDatabase`, and `invalidate` (the stream ended). With [`showExpandedEvents`](#model-watch-options) you also get `create`, `createIndexes`, `dropIndexes`, `modify`, `shardCollection`, `reshardCollection`, and `refineCollectionShardKey`. `rename` has a `to` field with the new name. After `drop` the server sends `invalidate` and closes the stream, and `stream.closed` becomes `true`. You can continue such a stream only through `startAfter`.
+
+<Snippet id="reference/change-streams/watch/collection-event" twoslash />
+
+<FullType>
+
+<Snippet id="reference/change-streams/watch/collection-event-2" />
+
+</FullType>
+
+## UpdateDescription [#update-description]
+
+`UpdateDescription` describes what the update changed. Its paths are written with the model's code names, not database names, and hidden fields are removed. Paths of nested fields are dot-separated, and array elements carry a position number, for example `"profile.name"` and `"items.0.qty"`.
+
+<Params title="Fields">
+<Param name="updatedFields" type="Readonly<Record<string, unknown>>" required>
+
+Changed paths with their new values. If the update touched a parent of a hidden field, the entry stays, and the hidden fields are taken out of its value, as [`find`](../query/reading.mdx#model.find) would show it.
+
+</Param>
+<Param name="removedFields" type="readonly string[]" required>
+
+Paths removed from the document (`$unset`).
+
+</Param>
+<Param name="truncatedArrays" type="readonly { field: string; newSize: number }[]">
+
+Arrays that were truncated, and their new size.
+
+</Param>
+<Param name="disambiguatedPaths" type="Readonly<Record<string, readonly (string | number)[]>>">
+
+Paths where a field name matches a number and it's unclear whether it's a field or a position. They are broken down into segments.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/change-streams/watch/update-description" />
+
+</FullType>
+
+---
+
+## Other types [#other-types]
+
+`ChangeEventBase` holds the fields common to all events. These are `_id` (the resume token of this event), `ns` (the database and collection), and the optional `clusterTime` and `wallTime`. Transaction events add `txnNumber` and `lsid`.
+
+`EventDoc<T, O>` is the shape of a document in an event. It's what [`find`](../query/reading.mdx#model.find) (or `find().lean()`) would return, and with `hydrate: true`, a model document. `PostImage<D, O>` and `PreImage<D, O>` are the type of `fullDocument` and `fullDocumentBeforeChange` for options `O`. `EventOf<T, K, O>` is an event of one kind, for example `EventOf<Account, "update">`. `DocumentOperationType` is `"insert" | "update" | "replace" | "delete"`. `FullDocumentOption` and `FullDocumentBeforeChangeOption` are the allowed values of the options with the same names. You rarely write these types by hand. More often you see them in editor hints.
+
+A change stream at the aggregation pipeline level is described in the reference [`Pipeline` and `Model.aggregate`](../aggregation/pipeline.mdx) (`Pipeline.watch`) and in the section [Stages](../aggregation/stages.mdx) (`$changeStream`).

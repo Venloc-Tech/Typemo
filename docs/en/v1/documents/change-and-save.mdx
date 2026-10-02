@@ -1,0 +1,136 @@
+---
+title: Change and save a document
+description: "Change a document's fields, arrays, and nested objects with ordinary code, see what changed, and save only that"
+icon: Save
+---
+
+Changing a document is easy. Load it, change the fields with ordinary code, and call [`$save`](../reference/documents/document-api.mdx#save). Typemo finds what changed on its own and sends only that to the database. You don't build the update by hand or remember which fields you touched.
+
+It works because the document keeps track of itself. A document is what you get from `find`, `create`, and `Model.new`. It's an instance of your class whose arrays, `Map`s, and nested objects are replaced with typed collections that log their changes. By comparing that log with the original values, [`$save`](../reference/documents/document-api.mdx#save) builds the shortest update: `$set` for fields, `$push` for new array elements, `$unset` for removed `Map` keys.
+
+## What you need [#prerequisites]
+
+An order with a customer, tags, lines, an address, and a `Map` of fees. The model is in the [reference](../reference/documents/document-api.mdx), and the connection is in [Connect to the database](../connection/connect.mdx).
+
+<Snippet id="documents/change-and-save/prerequisites" title="models/order.ts" twoslash />
+
+## Quick start [#quick-start]
+
+There are three ways to change a document, and they all end up in one `$save`: assign a scalar, call a collection method, or set a path with [`$set`](../reference/documents/document-api.mdx#set).
+
+<Snippet id="documents/change-and-save/quick-start" twoslash />
+
+Below we cover what goes to the database, how to see it, and what to do when something goes wrong.
+
+## Change fields and save [#change-fields-and-save]
+
+Most of the time you need to change a few fields of a loaded document. Assign the new values and call `$save`. The value is assigned as is, and casting to the field type and validation happen on save.
+
+If you assign a value of another type, you find out from a [`CastError`](../reference/errors/data-errors.mdx#cast-error) on `$save` or `$validate`. Breaking a field rule like `min` or `required` gives a [`ValidationError`](../reference/errors/data-errors.mdx#validation-error). If you want the error right away, use [`$set`](../reference/documents/document-api.mdx#set). It casts the value when called and throws a `CastError` on the right line.
+
+<Snippet id="documents/change-and-save/change-fields-and-save" twoslash />
+
+The `__v` version didn't change. Changing a scalar field doesn't change the document's structure, so Typemo doesn't bump the version. When the version changes and why it exists at all is covered in [Don't lose concurrent changes](./versions.mdx).
+
+## Change an array, a Map, or a nested object [#change-collections]
+
+You change arrays and `Map`s with **methods**: `push`, `pull`, `set`, `delete`, and others. You change a nested object by assigning its fields. Writing by index and to `length` is closed off by the types. A write like that doesn't say what you meant, and a method does. The full list of methods and the operators they turn into is in the [Typed collections](../reference/documents/typed-collections.mdx) reference.
+
+<Snippet id="documents/change-and-save/change-collections" twoslash />
+
+Each change here became its own operation instead of overwriting the document. So two clients that changed different tags of the same order won't overwrite each other. [`$getChanges`](../reference/documents/document-api.mdx#get-changes) shows exactly what goes to the database. It's the subject of the next section.
+
+## See what changed [#view-changes]
+
+To find out what changed without saving, ask the document itself. [`$isModified`](../reference/documents/document-api.mdx#is-modified) answers yes or no for the whole document or for one path. [`$getChanges`](../reference/documents/document-api.mdx#get-changes) shows the update itself: operators, paths, and values, with the field names of your class.
+
+<Snippet id="documents/change-and-save/view-changes" twoslash />
+
+Typemo compares values instead of remembering assignments. If you changed `customer` and then set it back, the document is no longer modified, and `$save` sends nothing.
+
+`NaN` is compared the same way. If another program wrote it into a field, it counts as equal to itself. A read document with such a field isn't "modified" (`$isModified()` returns `false`, `$getChanges()` returns an empty object), and `$save` won't send that `NaN` back.
+
+`$getChanges` is handy in debugging, when you can't tell why a save is so big, and in tests. It never throws. If `$save` would refuse, for example because an array was replaced by assignment, the reason shows up under the `$problems` key of the result. It holds the path and the text of the error the save would throw. That way you see a future refusal in advance, along with the rest of the update.
+
+## Save a document with no changes [#save-unchanged]
+
+Calling `$save` on a document without changes is safe. Not a single command goes to the database, and the method successfully returns the same document. So you don't need to check `$isModified` before every save.
+
+There's one exception, and it isn't about the database. `document.save` hooks are called for a document without changes too. If a hook should run only on edits, start it with `if (!this.$isModified()) return;`.
+
+<Snippet id="documents/change-and-save/save-unchanged" twoslash />
+
+## Save in a transaction [#save-in-transaction]
+
+If several writes must apply together or not at all, wrap them in [`client.transaction`](../reference/connection/typemo-client.mdx#client.transaction). `$save` inside the callback joins the transaction on its own, so you don't pass a session. On a rollback, the changes disappear from the database.
+
+<Snippet id="documents/change-and-save/save-in-transaction" twoslash />
+
+Notice that the `inside` document kept the `"bob"` edit in memory, even though the database doesn't have it. That's why documents inside a transaction are read again, as here, instead of using ones loaded earlier. The callback may run several times, and an edit to a document loaded in advance would be applied again. There's more in [Transactions](../transactions/transactions.mdx).
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether you have a loaded document and whether you also need the result in memory**.
+
+- **The document is loaded, and you keep working with it** (show it, compute with it, send it): change it and call [`$save`](../reference/documents/document-api.mdx#save).
+- **The document isn't loaded, and you only need to change the record**: use [`updateOne`](../reference/writes/writes.mdx#update-one). It's one query instead of a read and a write.
+- **You need an atomic change on the database side**, like a counter with `$inc`, and the document is already in hand: there's [`$updateOne`](../reference/documents/document-api.mdx#update-one). It doesn't touch the copy in memory.
+
+## When not to use it [#when-not-to-use]
+
+For bulk changes, like every order of a customer, don't load documents one by one. Use [`updateMany`](../reference/writes/writes.mdx#update-many). Counters that many clients change at once are safer to change with the [`$inc`](../reference/writes/update-operators.mdx) operator in [`updateOne`](../reference/writes/writes.mdx#update-one) than with "read, add, save". Between the read and the write, another client can change the value.
+
+## Troubleshooting [#troubleshooting]
+
+**An array replaced by assignment.** You can't give an array or a `Map` a new value with `=`.
+
+<Snippet id="documents/change-and-save/troubleshooting" twoslash />
+
+If you get around that with a type cast, `$save` refuses to write. Typemo doesn't know whether you meant to replace the contents, add to them, or made a mistake. [`$getChanges`](../reference/documents/document-api.mdx#get-changes) won't throw. It shows the same text in `$problems`.
+
+<Snippet id="documents/change-and-save/troubleshooting-2" />
+
+To replace the contents completely, use [`$set("tags", […])`](../reference/documents/document-api.mdx#set) or [`tags.replace([…])`](../reference/documents/typed-collections.mdx#strict-array.replace). To add to them, use [`tags.push`](../reference/documents/typed-collections.mdx#strict-array.push).
+
+**A wrong value shows up only on save.** A plain assignment doesn't cast the value right away. If you assigned an unsuitable value to a field in code without type checks, the error appears only on [`$save`](../reference/documents/document-api.mdx#save) or [`$validate`](../reference/documents/document-api.mdx#validate), not on the assignment line as with [`$set`](../reference/documents/document-api.mdx#set). The error class is the same at any depth, [`CastError`](../reference/errors/data-errors.mdx#cast-error), and it happens before any validation. Field constraints like `min` and `enum` aren't checked, since there's nothing to check yet, and nothing goes to the database.
+
+<Snippet id="documents/change-and-save/troubleshooting-3" />
+
+If the value comes from outside, assign it with `$set`, and the error appears right on the line that caused it. Or check it in advance with [`Model.validate`](../reference/documents/model-document-methods.mdx#model.validate).
+
+**Saving failed after a delete.** A document deleted through [`$deleteOne`](../reference/documents/document-api.mdx#delete-one) can't be saved. Neither can a document deleted by another client.
+
+<Snippet id="documents/change-and-save/troubleshooting-4" />
+
+The first error means you deleted the document yourself in this program. The second means the record is no longer in the database. Create the document again with [`Model.new`](../reference/documents/model-document-methods.mdx#model.new), or read the current one.
+
+## Full example [#full-example]
+
+A service function changes an order's customer, adds a tag and a line, and saves it all in one call to the database.
+
+<Snippet id="documents/change-and-save/full-example" title="orders/orders.service.ts" twoslash />
+
+## Coming from Mongoose [#from-mongoose]
+
+<Callout type="migration">
+
+In Mongoose, changing an array by index or a nested value had to come with `doc.markModified(path)`, or `save()` might write nothing. In Typemo, writing by index is closed off by the types, and collection methods are tracked on their own. You need `$markModified` only for values changed in place, like the bytes of a `Binary`. `doc.save()` is called `$save()` here, and `doc.isModified()` is `$isModified()`.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Arrays and Maps in a document" href="./typed-collections.mdx">
+  Which collection method gives which MongoDB operator, and what's forbidden.
+</Card>
+<Card title="Send a document to the client" href="./serialization.mdx">
+  How to send a document to the client with `$toObject`, `$toPlain`, and `$toJSON`.
+</Card>
+<Card title="Don't lose concurrent changes" href="./versions.mdx">
+  What happens if the document changed after you read it.
+</Card>
+<Card title="Document API" href="../reference/documents/document-api.mdx">
+  Every document method with all its parameters and errors.
+</Card>
+</Cards>

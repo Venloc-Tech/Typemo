@@ -1,0 +1,836 @@
+---
+title: Document API
+description: "Every $ method of a document: save, change, validate, serialize, populate, and delete"
+icon: FileText
+---
+
+This page collects every `$` method of the document you get from `await Model.find()`, `create`, and `Model.new`. It's an instance of your class where arrays, subdocuments, and Maps are replaced by [typed collections](./typed-collections.mdx), and methods with the `$` prefix sit next to the fields. The prefix protects names. Your model can have a `save` field, and the `$save` method won't take its place.
+
+If you're new here, read the [Change and save a document](../../documents/change-and-save.mdx) and [Document lifecycle](../../documents/lifecycle.mdx) guides first. This page is a reference, the place you return to for a detail.
+
+All the examples build on one order. It has a required field, an array of strings, an array of subdocuments, a nested object, a Map, and a hidden field.
+
+<Snippet id="documents/change-and-save/prerequisites" title="models/order.ts" twoslash />
+
+Here is Alice's order, the one the results come from. The customer is `alice`, the tag is `gift`, there is one line `A1` with a quantity of 2, the city is `Oslo`, and the `delivery` fee is 5. Identifiers in the results are shortened to `"…"`, because the database issues new ones on every run.
+
+The methods of collections inside a document (`tags.push`, `lines.create`, `fees.set`) and the methods of a subdocument aren't here. [Typed collections](./typed-collections.mdx) describes them.
+
+---
+
+## $save [#save]
+
+`$save` writes the document to the database. It inserts a new document and updates a loaded one. It's the main way to save edits when you work with a document as an object: read it, change fields, call `$save`.
+
+The method doesn't send the whole document. Typemo tracks changes since the load or the last save ([`$getChanges`](#get-changes) shows which ones) and builds the shortest update from them. That means `$set` for changed fields, `$push` for new array elements, and `$unset` for removed Map keys. If there is nothing to change, nothing goes to the database, and `$save` still succeeds.
+
+Before the write, the document goes through [`$validate`](#validate) and the `document.save` hooks run. For a document with a `__v` field (a `Versioned` class), the update also checks the version. The [Don't lose concurrent changes](../../documents/versions.mdx) guide has the details.
+
+<Snippet id="reference/documents/document-api/save" twoslash />
+
+<Returns type="Promise<this>">
+
+The same document, not a copy. After `await` it's no longer new ([`$isNew`](#is-new) returns `false`), and change tracking starts over. If `Versioned` raised the version, the fresh value is in `order.__v`.
+
+</Returns>
+
+<Params>
+<Param name="options" type="SaveOptions">
+
+Optional write settings. They are covered below in the [SaveOptions](#save-options) section: session, timeout, permission to lose unknown fields, and the policy context.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/save-2" />
+
+</FullType>
+
+### What goes to the database [#what-is-sent]
+
+The shape of the update depends on what you did with the collections. `push` gives `$push`, `pull` gives `$pullAll`, and editing a field inside a line gives `$set` on a path with an index. The full "method to operator" table is in the [Typed collections](./typed-collections.mdx) reference. You can check the result before writing with [`$getChanges`](#get-changes).
+
+### Saving inside a transaction [#save-in-transaction]
+
+Inside [`client.transaction`](../connection/typemo-client.mdx#client.transaction), `$save` joins the transaction by itself, so you don't pass a session. If the transaction rolls back, the document's changes in the database roll back too. The edits in the in-memory document stay, so on a retry the callback must read the document again instead of using one loaded earlier. The [Transactions](../../transactions/transactions.mdx) guide has more.
+
+### Errors [#save.errors]
+
+`$save` first casts values assigned with plain assignment (`order.customer = 5`) to the field type. If a value can't be cast, it throws [`CastError`](../errors/data-errors.mdx#cast-error). Field constraints aren't checked at this point, and nothing goes to the database.
+
+<Snippet id="reference/documents/document-api/save-errors" />
+
+After casting, `$save` throws [`ValidationError`](../errors/data-errors.mdx#validation-error) if the document fails the checks. The texts and paths are described in the [`$validate`](#validate) section.
+
+<Snippet id="reference/documents/document-api/save-errors-2" />
+
+[`UnknownFieldsError`](../errors/data-errors.mdx#unknown-fields-error) arrives when a save would rewrite a subdocument together with fields the schema lacks. The [Handle fields that aren't in the schema](../../documents/unknown-fields.mdx) guide covers it. [`DirectWriteError`](../errors/data-errors.mdx#direct-write-error) and [`PartialArrayError`](../errors/data-errors.mdx#partial-array-error) report a write that bypasses the collection's methods and an edit of a partially loaded array. [`VersionError`](../errors/query-errors.mdx#version-error) means the document was changed after you read it.
+
+`$save` refuses to write a document already deleted through [`$deleteOne`](#delete-one).
+
+<Snippet id="documents/lifecycle/troubleshooting" />
+
+If someone else deleted the document, `$save` reaches the database, doesn't find the record, and throws [`DocumentNotFoundError`](../errors/query-errors.mdx#document-not-found-error).
+
+<Snippet id="documents/lifecycle/hydrate-external-2" />
+
+There are two reasons in parentheses because the record may still be in the collection but fall outside the model's policy scope (another tenant, soft delete). For `$save`, such a document is "not found" too.
+
+### When not to use it [#save.when-not-to-use]
+
+To change many documents with one query, or a document without loading it, use [`updateOne`](../writes/writes.mdx#update-one) and [`updateMany`](../writes/writes.mdx#update-many). To save many loaded documents in one ordered write, use [`Model.bulkSave`](../writes/writes.mdx#bulk-save). And to change this very document by `_id` through the shared operation pipeline without touching the in-memory copy, there is [`$updateOne`](#update-one).
+
+---
+
+## $set [#set]
+
+`$set` assigns a value by path and casts it to the field type right away. For scalar fields plain assignment like `order.customer = "bob"` is enough. You need `$set` where assignment is unavailable or unreliable: when you replace a whole container (an array, a Map, a subdocument) that the type doesn't let you write directly, and when you want to reach a nested field in one line.
+
+The path is written with dots. `"address.city"` leads into a nested object, `"tags.0"` to an array element by index, and `"fees.delivery"` to a Map value by key. MongoDB's positional signs (`$`, `$[]`) don't exist here, because the document knows its own elements. The compiler suggests the valid paths and checks the value type.
+
+<Snippet id="reference/documents/document-api/set" twoslash />
+
+<Returns type="this">
+
+The same document, so you can chain `$set` calls, as above. The cast value is in the document right away, and the change reaches the database on the next [`$save`](#save).
+
+</Returns>
+
+<Params>
+<Param name="path" type="DocumentPaths<T>" required>
+
+The path to the field. It's a field name, a dotted path into nested objects and subdocuments, an array element index (`tags.0`, `lines.0.qty`), or a Map key (`fees.delivery`). An empty string and a path to a service field aren't accepted.
+
+</Param>
+<Param name="value" type="FieldInput<DocumentValue<T, P>>" required>
+
+The new value. It accepts everything [`create`](../writes/writes.mdx#create) accepts for this field. An array takes a plain array, a subdocument takes a plain object, and an `ObjectId` field takes its string form. `undefined` and `null` aren't accepted for an optional field without `nullable`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/set-2" />
+
+</FullType>
+
+### Replacing a container [#replace-container]
+
+You can't replace an array, a Map, or a subdocument by assignment. `order.tags = ["x"]` doesn't compile, and an assignment that bypasses the types gets rejected by `$save` with [`DirectWriteError`](../errors/data-errors.mdx#direct-write-error). `$set` is the allowed route. It casts the value and makes the new container tracked.
+
+<Snippet id="reference/documents/document-api/replace-container" twoslash />
+
+### Errors [#set.errors]
+
+A value that can't be cast to the field type throws [`CastError`](../errors/data-errors.mdx#cast-error) immediately, not on save.
+
+<Snippet id="reference/documents/document-api/set-errors" />
+
+In untyped code, a path that isn't in the schema gives the same `CastError` with the reason `unknown-key`.
+
+<Snippet id="reference/documents/document-api/set-errors-2" />
+
+An empty path throws [`QueryError`](../errors/query-errors.mdx#query-error) `$set: a path`. The `_id` field of an existing document is immutable, so `$set("_id", …)` throws [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error).
+
+<Snippet id="reference/documents/document-api/set-errors-3" />
+
+### When not to use it [#set.when-not-to-use]
+
+For a scalar field, the assignment `order.customer = "bob"` is enough. It's shorter and tracked the same way. If you already hold the index of an array element, call [`tags.set(index, value)`](./typed-collections.mdx#strict-array.set) instead of `$set("tags.0", …)`. Both write the same operator.
+
+---
+
+## $get [#get]
+
+`$get` reads a value by path and applies the field's `get` function if there is one. It helps when the path is known only at runtime (say, it came from settings) and when you need the value through the field's getter, not the raw one.
+
+For an existing path the method returns the value, and for a path without a value it returns `undefined`. It doesn't forgive a path that isn't in the schema. A typo in a field name won't turn into "no value".
+
+<Snippet id="reference/documents/document-api/get" twoslash />
+
+<Returns type="HydratedField<DocumentValue<T, P>> | undefined">
+
+The value at the path in the form the document stores it. For `"tags"` it's a [`StrictArray`](./typed-collections.mdx#strict-array), for `"address"` a subdocument, and for a scalar the scalar itself. If there is no value, it returns `undefined`.
+
+</Returns>
+
+<Params>
+<Param name="path" type="DocumentPaths<T>" required>
+
+The path to the field in the same notation as [`$set`](#set): dotted, with indexes and Map keys.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/get-2" />
+
+</FullType>
+
+### Errors [#get.errors]
+
+A path that isn't in the schema throws [`QueryError`](../errors/query-errors.mdx#query-error). If the path is written as a literal, the compiler stops you earlier.
+
+<Snippet id="reference/documents/document-api/get-errors" />
+
+### When not to use it [#get.when-not-to-use]
+
+Read a field known at coding time as a property, `order.customer`. A property doesn't apply the `get` function, while `$get` does. If a field has a `get` and you need the transformed value, use `$get` or [`$toObject({ getters: true })`](#to-object).
+
+---
+
+## $isNew [#is-new]
+
+`$isNew` tells whether the document has been inserted into the database. While a document is created through [`Model.new`](./model-document-methods.mdx#model.new) and not saved, the method returns `true`. After the first successful [`$save`](#save), and for any document read from the database, it returns `false`.
+
+The answer decides what `$save` does (insert or update) and which checks run. For example, you can't change `_id` and `immutable` fields on an existing document.
+
+<Snippet id="reference/documents/document-api/is-new" twoslash />
+
+<Returns type="boolean">
+
+`true` until the document is inserted into the database. `false` after the insert and for documents that were read.
+
+</Returns>
+
+Takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/is-new-2" />
+
+</FullType>
+
+A document deleted through [`$deleteOne`](#delete-one) doesn't become new again. It stays "deleted", and its `$save` is rejected. The [Document lifecycle](../../documents/lifecycle.mdx) guide covers the states in more detail.
+
+---
+
+## $isRoot [#is-root]
+
+`$isRoot` answers whether this is a root document. For a model document it always returns `true`, and for a [subdocument](./typed-collections.mdx#subdocument) `false`. The answer itself is obvious, and the method exists for its type. It's a guard that narrows `this` in a document hook.
+
+A document hook declared in a class runs on model documents and also on subdocuments, if the class is embedded in another model. So `this` in such a hook has the type `HydratedDoc<T> | Subdocument<T>` ([`HookThis`](../hooks/pre-post.mdx#hook-this)), and the root methods (`$getChanges`, `$save`, `$populate`) aren't on it. After `if (this.$isRoot())` the compiler knows it's a `HydratedDoc<T>`, and the methods become available.
+
+<Snippet id="reference/documents/document-api/is-root" twoslash />
+
+<Returns type="this is HydratedDoc<T>">
+
+`true` for a root document, `false` for a subdocument.
+
+</Returns>
+
+Takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/is-root-2" />
+
+</FullType>
+
+---
+
+## $isModified [#is-modified]
+
+`$isModified` answers whether the document changed since the last load or the last save. It's useful when something should happen only if there are edits: show "unsaved changes", skip needless work, or check in a hook whether a specific field was touched.
+
+Without an argument the method looks at the whole document. With a path it looks only at that path and everything under it. `$isModified("lines")` returns `true` if any line changed, while `$isModified("lines.0.qty")` returns `true` only for that field. Returning to the old value counts too. If you changed `customer` and set the original back, the method gives `false`, because Typemo compares values and doesn't remember the fact of an assignment.
+
+<Snippet id="reference/documents/document-api/is-modified" twoslash />
+
+<Returns type="boolean">
+
+`true` if the document (or the given path, or anything under it) differs from its state at the last load or save. For a new, unsaved document the result is `true`.
+
+</Returns>
+
+<Params>
+<Param name="path" type="DocumentPaths<T>">
+
+Limits the check to one path. It's written the same way as in [`$set`](#set).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/is-modified-2" />
+
+</FullType>
+
+The method can't see an in-place edit that Typemo is unable to compare (for example, bytes inside a `Binary`). For that case there is [`$markModified`](#mark-modified).
+
+---
+
+## $markModified [#mark-modified]
+
+`$markModified` makes Typemo write a path on the next [`$save`](#save), even if change tracking didn't notice it. You rarely need the method, since assignments, collection methods, and `$set` are tracked on their own. The exception is a value you change **in place** without assigning it again, such as bytes inside a `Binary` field.
+
+Typemo compares the value with what it was at load time. If a byte changed inside the same `Binary` object, the object stays the same, and the comparison finds nothing. The mark says the path must be written in full.
+
+The `files` collection holds a `logo` file with three bytes of data.
+
+<Snippet id="reference/documents/document-api/mark-modified" twoslash />
+
+<Returns type="this">
+
+The same document. The mark stays until the nearest successful [`$save`](#save).
+
+</Returns>
+
+<Params>
+<Param name="path" type="DocumentPaths<T>" required>
+
+The path to write in full. It's written the same way as in [`$set`](#set).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/mark-modified-2" />
+
+</FullType>
+
+### Errors [#mark-modified.errors]
+
+A path that isn't in the schema throws [`QueryError`](../errors/query-errors.mdx#query-error).
+
+<Snippet id="reference/documents/document-api/mark-modified-errors" />
+
+---
+
+## $getChanges [#get-changes]
+
+`$getChanges` shows the update the next [`$save`](#save) would send, and does nothing to the database or the document. It helps with debugging ("why is the save slow?", "what actually changed?"), in tests, and in change logs.
+
+The result is an object of the form "operator, path, value" in **class field names**, not database names. If there are no changes, it returns `{}`. The result is frozen, so you can keep it. The method never throws. If `$save` would refuse, the reason is under the `$problems` key (see [below](#problems)), and the rest of the update comes back as usual.
+
+<Snippet id="reference/documents/document-api/get-changes" twoslash />
+
+<Returns type="DocumentChanges">
+
+A frozen object with operators (`$set`, `$push`, `$unset`, `$pull`, and others), paths, and values. An empty `{}` means `$save` will send nothing. For a new document, `$set` holds all the fields. If a save would be rejected, the object gets a `$problems` key. It isn't an operator but a list of "path, error text" pairs.
+
+</Returns>
+
+Takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/get-changes-2" />
+
+</FullType>
+
+### Values aren't cast ahead of time [#no-early-cast]
+
+The result holds what is in the document right now. If you wrote a value of the wrong type into a field behind the compiler's back (`(order as any).customer = 5`), `$getChanges` shows `5` as it is. Casting and `CastError` come later, on [`$save`](#save) or [`$validate`](#validate).
+
+### Problem paths: $problems [#problems]
+
+`$getChanges` doesn't throw, even when [`$save`](#save) would refuse. Instead the result gets a `$problems` key: an object of "path, text of the error `$save` will throw". The rest of the update comes back as usual. That keeps the preview safe for debugging and logs, and you see the reason for a future refusal in advance.
+
+The key appears in three cases.
+
+- A container (an array, a Map, a subdocument) was replaced by assignment or written by index around its methods: [`DirectWriteError`](../errors/data-errors.mdx#direct-write-error).
+- A save would rewrite a stored subdocument together with fields the schema doesn't know: [`UnknownFieldsError`](../errors/data-errors.mdx#unknown-fields-error).
+- The `__v` version key was changed by hand: [`QueryError`](../errors/query-errors.mdx#query-error).
+
+<Snippet id="reference/documents/document-api/problems" twoslash />
+
+The `customer` edit went into `$set`, and the array replaced by assignment is recorded in `$problems`. `$save` on such a document would throw [`DirectWriteError`](../errors/data-errors.mdx#direct-write-error) with the same text.
+
+<Snippet id="documents/change-and-save/troubleshooting-2" />
+
+A write by index names the position: `"lines" was changed around its methods: position 0 was assigned directly (use set(0, value))`. For a `__v` changed by hand the text differs: `Order.__v is the version key: the core maintains it; it cannot be changed by hand`. To let the save through, fix the path it names. Call a collection method or [`$set`](#set).
+
+---
+
+## $validate [#validate]
+
+`$validate` checks the whole document against the schema and writes nothing to the database. You need it when you must learn about errors before saving: show the user a list of form problems, validate a document in a hook, or assert in a test.
+
+The method doesn't stop at the first error. All the problems found are collected into one [`ValidationError`](../errors/data-errors.mdx#validation-error) with an `issues` list, where each item has a path, a reason, and a message. The order follows how the fields are declared in the class, not how you edited them. The method waits for async field validators (`validate` in `@Prop`). [`$save`](#save) makes the same call before writing.
+
+<Snippet id="reference/documents/document-api/validate" twoslash />
+
+<Returns type="Promise<void>">
+
+Nothing. Successful completion means the document is correct. The method doesn't change the document.
+
+</Returns>
+
+Takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/validate-2" />
+
+</FullType>
+
+### Errors [#validate.errors]
+
+Any problem brings a `ValidationError` with every item found.
+
+<Snippet id="reference/documents/document-api/validate-errors" />
+
+The full list of reasons (`required`, `min`, `max`, `enum`, `validator`, and others) and the structure of `issues` are described in the [`ValidationError`](../errors/data-errors.mdx#validation-error) reference. Values assigned with plain assignment (`order.customer = 5`) are cast on this same call. If a value can't be cast, the call throws [`CastError`](../errors/data-errors.mdx#cast-error) rather than `ValidationError`, and it happens before any validation. Field constraints aren't checked until the value has the right type.
+
+<Snippet id="reference/documents/document-api/save-errors" />
+
+The [Validate a document before saving](../../documents/validation.mdx) guide explains how one differs from the other.
+
+### When not to use it [#validate.when-not-to-use]
+
+To validate a plain object that has no document yet, use [`Model.validate`](./model-document-methods.mdx#model.validate). It accepts data and returns the cast value with default values filled in.
+
+---
+
+## $deleteOne [#delete-one]
+
+`$deleteOne` deletes the document from the database by `_id`. You need it when you already hold the document and must remove it, for example an order the user has open.
+
+The method goes the same way as the model's [`deleteOne`](../writes/writes.mdx#delete-one). The `document.deleteOne` hooks run, the model's policies apply (soft delete, tenant), and the audit is written. After a successful delete the document is marked deleted, and its [`$save`](#save) and a repeated `$deleteOne` refuse to work.
+
+<Snippet id="reference/documents/document-api/delete-one" twoslash />
+
+<Returns type="Promise<DeleteResult>">
+
+The delete result. `deletedCount` is 1 if the record was deleted, and 0 if it was already gone or the document hadn't been inserted.
+
+</Returns>
+
+<Params>
+<Param name="options" type="SaveOptions">
+
+The session, timeout, and write policy context, as in [`$save`](#save). The `dropUnknownFields` option has no effect on a delete.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/delete-one-2" />
+
+</FullType>
+
+### Errors [#delete-one.errors]
+
+A repeated call on the same object throws [`QueryError`](../errors/query-errors.mdx#query-error).
+
+<Snippet id="reference/documents/document-api/delete-one-errors" />
+
+A document that isn't saved yet has nothing to delete. The method returns `deletedCount: 0` and throws nothing.
+
+### When not to use it [#delete-one.when-not-to-use]
+
+If the document isn't loaded and you know only its `_id`, use [`deleteOne`](../writes/writes.mdx#delete-one) or [`findByIdAndDelete`](../writes/writes.mdx#find-by-id-and-delete). You don't need to read the document to delete it.
+
+---
+
+## $updateOne [#update-one]
+
+`$updateOne` updates **this** document by `_id` with an update document of operators (`$set`, `$inc`, and others) and doesn't save the edits made in memory. You need it when a change must be atomic and run on the database side. For example, increment a counter instead of reading the value, adding, and writing back.
+
+The update goes through the whole model pipeline: type casting, validators, policies, audit, and the `document.updateOne` hooks. In the hook, `this` is the document, and query hooks don't fire. The in-memory document is **not changed**. To see the result, read it again.
+
+<Snippet id="reference/documents/document-api/update-one" twoslash />
+
+<Returns type="Promise<UpdateResult<IdOf<T>>>">
+
+The update result. `matchedCount` and `modifiedCount` show whether the document was found and whether it changed.
+
+</Returns>
+
+<Params>
+<Param name="update" type="Update<T, true>" required>
+
+An update document of operators. The compiler checks it (model fields, value types), and so does the library at runtime. The operators are described in the [Update operators](../writes/update-operators.mdx) reference.
+
+</Param>
+<Param name="options" type="SaveOptions">
+
+The session, timeout, and write policy, as in [`$save`](#save).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/update-one-2" />
+
+</FullType>
+
+### Errors [#update-one.errors]
+
+A field that isn't in the model throws [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error).
+
+<Snippet id="reference/documents/document-api/update-one-errors" />
+
+An empty update throws [`QueryError`](../errors/query-errors.mdx#query-error) `update: an empty update changes nothing`. A document that isn't saved yet can't be updated.
+
+<Snippet id="reference/documents/document-api/update-one-errors-2" />
+
+### When not to use it [#update-one.when-not-to-use]
+
+Save edits made in memory through [`$save`](#save). If the document isn't loaded, call the model's [`updateOne`](../writes/writes.mdx#update-one).
+
+---
+
+## $populate [#populate]
+
+`$populate` loads related documents by reference and puts them in place of the identifiers. You need it when the document is already loaded and the reference turned out to be needed later. The method returns **the same document**, but with a type where the field is already expanded, so work with the returned value.
+
+The path and parameters are checked the same way as for the query's [`.populate`](../populate/populate.mdx#populate). You can also pass a list of paths and objects (`$populate(["author", { path: "tags", select: { label: 1 } }])`). They all load in one call, and the result type shows every loaded field.
+
+A loaded path can be loaded again. The call reads the relation anew and replaces the previous value together with its `select` and nested paths. The compiler rejects a path below an already loaded field (`author.posts` after `author`). Pass the nested relation through the `populate` option, or bring the identifiers back with [`$depopulate`](#depopulate). The [Populate a document you already have](../../populate/document-populate.mdx) guide has a detailed walkthrough with types and errors.
+
+In the examples below the database holds a customer `Ann` and a shipment titled `T` that references the customer in its `customer` field.
+
+<Snippet id="reference/documents/document-api/populate" twoslash />
+
+<Returns type="Promise<HydratedDocWith<T, { … }>>">
+
+The same document, whose field at the path gets an expanded type. In the example `customer` is a `Customer` document, or `null` if there is no customer, but never an identifier.
+
+</Returns>
+
+<Params>
+<Param name="path" type="string | { path, select, match, options, populate, … } | (string | { path, … })[]" required>
+
+The path to the reference as a string, an object with parameters (`select`, `match`, a nested `populate`, `transform`, and others), or a list of such paths and objects. The allowed parameters are the same as for the query.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/populate-2" />
+
+</FullType>
+
+Three methods work alongside it. [`$depopulate`](#depopulate) puts the identifiers back, [`$populated`](#populated) reports the original identifiers, and [`$assertPopulated`](#assert-populated) asserts that a path is already expanded.
+
+---
+
+## $depopulate [#depopulate]
+
+`$depopulate` puts identifiers back in place of expanded documents, for all fields at once or for one. You need it before saving a document with an expanded reference, and when the same field must be expanded again with other parameters.
+
+The method changes the document in place and returns it with a type where the field is a reference again. Work with the returned value.
+
+<Snippet id="reference/documents/document-api/depopulate" twoslash />
+
+<Returns type="HydratedDoc<T> | HydratedDocWith<T, { … }>">
+
+The same document with a type where the expanded fields are references again.
+
+</Returns>
+
+<Params>
+<Param name="key" type="DataKeys<T>">
+
+The field to collapse. Without an argument, all expanded fields are collapsed.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/depopulate-2" />
+
+</FullType>
+
+---
+
+## $populated [#populated]
+
+`$populated` returns a copy of the identifiers that stood in place of the expanded field. With it you can find out whether a field is expanded, and fetch the identifiers after the expansion. If you need the same thing together with type narrowing, there is the [`isPopulated`](../populate/populate-types.mdx#is-populated) function.
+
+For a document field it returns one value, and for an array of references a list. For a path inside subdocuments you get one value per subdocument. If the path isn't expanded, the method returns `undefined`.
+
+<Snippet id="reference/documents/document-api/populated" twoslash />
+
+<Returns type="unknown">
+
+A copy of the identifiers that stood in place of the expanded values, or `undefined` if the path isn't expanded.
+
+</Returns>
+
+<Params>
+<Param name="path" type="string" required>
+
+The path to the field with the reference.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/populated-2" />
+
+</FullType>
+
+---
+
+## $assertPopulated [#assert-populated]
+
+`$assertPopulated` asserts that a path is expanded and returns the same document with a type where the field looks expanded. You need it when the expansion happened somewhere the compiler can't see (in a hook or another function), and you need the expanded type afterwards.
+
+Nothing is loaded. The method only checks that the field holds expanded values. A reference that found nothing during the expansion and became `null` counts as expanded. The method accepts the same list of paths and objects as [`$populate`](#populate). `$assertPopulated(["customer", { path: "items", select: { sku: 1 } }])` checks every list item, and for an object with a nested `populate` it checks the nested path too.
+
+<Snippet id="reference/documents/document-api/assert-populated" twoslash />
+
+<Returns type="HydratedDocWith<T, { … }>">
+
+The same document with a type where the fields at the paths are expanded.
+
+</Returns>
+
+<Params>
+<Param name="path" type="string | { path, select, populate, … } | (string | { path, … })[]" required>
+
+A path as a string, an object with the parameters the expansion ran with (they determine the shape of the expanded type), or a list of them.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/assert-populated-2" />
+
+</FullType>
+
+### Errors [#assert-populated.errors]
+
+If the path isn't expanded, the method throws [`QueryError`](../errors/query-errors.mdx#query-error).
+
+<Snippet id="reference/documents/document-api/assert-populated-errors" />
+
+If a function must accept a document both with and without the loaded relation, use [`isPopulated`](../populate/populate-types.mdx#is-populated) instead of `$assertPopulated`. The type checks are covered in the [Make sure a reference is populated](../../populate/type-checks.mdx) guide.
+
+---
+
+## $is [#is]
+
+`$is` checks the type in the discriminator hierarchy and narrows the document to a subclass. You need it when one collection holds documents of different kinds and you must reach the fields of a specific one.
+
+The method returns `true` if the document was read as this class or as one of its subclasses. For a class outside the hierarchy it throws an error rather than returning `false`, because that is almost always a typo. The narrowed document is typed as the default read of the class, and hidden fields aren't visible in it. The projection and populate of the base document don't carry over to the narrowed type.
+
+<Returns type="boolean">
+
+`true` if the document belongs to the class. Then TypeScript narrows the type.
+
+</Returns>
+
+<Params>
+<Param name="cls" type="abstract new () => object" required>
+
+A discriminator class or the root class of the hierarchy.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/is" />
+
+</FullType>
+
+### Errors [#is.errors]
+
+A class outside the document's hierarchy throws [`QueryError`](../errors/query-errors.mdx#query-error).
+
+<Snippet id="reference/documents/document-api/is-errors" />
+
+The [Inheritance and discriminators](../../schemas/discriminators.mdx) guide covers inheritance and discriminators.
+
+---
+
+## $session [#session]
+
+`$session` reads or sets the document's session, the one it was loaded in and the one [`$save`](#save) uses by default. You need it when a document lives longer than one operation and must be moved to another session or detached from its session.
+
+Without an argument the method returns the driver session or `undefined`. With an argument it sets the session, and `null` detaches it, in which case the method returns the document itself. A document loaded inside [`client.transaction`](../connection/typemo-client.mdx#client.transaction) gets that transaction's session.
+
+<Snippet id="reference/documents/document-api/session" twoslash />
+
+<Returns type="ClientSession | undefined | this">
+
+Without an argument, the session or `undefined`. With an argument, the same document.
+
+</Returns>
+
+<Params>
+<Param name="session" type="ClientSession | null">
+
+The document's new session. `null` detaches the current one.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/session-2" />
+
+</FullType>
+
+The [Manual sessions](../../transactions/sessions.mdx) guide has more on sessions.
+
+---
+
+## $locals [#locals]
+
+`$locals` returns an object for application data attached to the document. It isn't saved and doesn't appear in any form of the document. It lets you pass a value between the hooks of one document or mark a document for the duration of processing.
+
+Every call returns **the same object**, so you can accumulate values in it.
+
+<Snippet id="reference/documents/document-api/locals" twoslash />
+
+<Returns type="Record<string, unknown>">
+
+A mutable object shared by the document, empty at first.
+
+</Returns>
+
+Takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/locals-2" />
+
+</FullType>
+
+---
+
+## $toObject [#to-object]
+
+`$toObject` returns the document's data as plain objects and arrays, without change tracking and without methods. You need it when the data must be passed on and not tied to the document: put it in a cache, compare it, change a copy.
+
+MongoDB types stay as they are. `_id` is an `ObjectId`, int64 is a `bigint`, `Decimal128` is a `Decimal128`, and a Map is a plain `Map`. So you can't give the result to `JSON.stringify`, which throws on a `bigint`. For a client there are [`$toPlain`](#to-plain) and [`$toJSON`](#to-json). `$toObject` returns loaded hidden fields by default.
+
+<Snippet id="reference/documents/document-api/to-object" twoslash />
+
+<Returns type="ToObjectResult<T, O>">
+
+The plain data of the document. If `transform` is set, the result is whatever that function returned.
+
+</Returns>
+
+<Params>
+<Param name="options" type="ToObjectOptions">
+
+Serialization options ([ToObjectOptions](#to-object-options)): `getters`, `virtuals`, `hidden`, `mask`, and `transform`. For `$toObject`, `hidden` defaults to `true`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/to-object-2" />
+
+</FullType>
+
+The [Send a document to the client](../../documents/serialization.mdx) guide explains which form to choose. The "MongoDB type to its form in each shape" table is in the [Value forms](../values/value-forms.mdx) reference.
+
+---
+
+## $toPlain [#to-plain]
+
+`$toPlain` returns the form that is ready for a client. It turns MongoDB values that don't survive JSON into strings and keeps native JavaScript types. Identifiers, int64, `Decimal128`, and UUID become strings. `Date`, `RegExp`, and `Map` are kept, bytes become `Uint8Array`, and a vector becomes `number[]`. The result fits API responses and caches, because `JSON.stringify` won't meet a `bigint` in it.
+
+Hidden fields **don't make it** into the result by default. To include them, pass `{ hidden: true }`. The result isn't tied to the document, and editing the copy doesn't affect the document.
+
+<Snippet id="reference/documents/document-api/to-plain" twoslash />
+
+<Returns type="ToPlainResult<T, O>">
+
+The plain data of the document, ready for a client. If `transform` is set, the result is whatever that function returned.
+
+</Returns>
+
+<Params>
+<Param name="options" type="ToObjectOptions">
+
+The same options as in [`$toObject`](#to-object). For `$toPlain`, `hidden` defaults to `false`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/to-plain-2" />
+
+</FullType>
+
+See the [Send a document to the client](../../documents/serialization.mdx) guide for more. You get the same form without loading a document through the query's [`.plain()`](../query/reading.mdx#plain).
+
+---
+
+## $toJSON [#to-json]
+
+`$toJSON` returns the **JSON form**, where everything JSON lacks is turned into strings. It differs from [`$toPlain`](#to-plain) where JSON and JavaScript diverge. `Date` becomes an ISO string, `RegExp` becomes the string `"/src/flags"`, `Map` becomes a plain object, and bytes become a base64 string.
+
+`JSON.stringify(document)` calls this method, so you can pass a document straight to `res.json(doc)` and similar functions. Hidden fields don't make it into the result.
+
+<Snippet id="reference/documents/document-api/to-json" twoslash />
+
+<Returns type="ToJsonResult<T, O>">
+
+The JSON data of the document. If `transform` is set, the result is whatever that function returned.
+
+</Returns>
+
+<Params>
+<Param name="options" type="ToObjectOptions">
+
+The same options as in [`$toObject`](#to-object). `hidden` defaults to `false`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/document-api/to-json-2" />
+
+</FullType>
+
+---
+
+## SaveOptions [#save-options]
+
+`SaveOptions` are optional settings for [`$save`](#save), [`$deleteOne`](#delete-one), and [`$updateOne`](#update-one). [`Model.bulkSave`](../writes/writes.mdx#bulk-save) accepts them too.
+
+<TypeTable
+  type={{
+    session: { description: "An explicit session. `null` runs the write outside a transaction, even if the call is inside `client.transaction`. If not set, the document's session ([`$session`](#session)) is used, then the session of the current transaction.", type: "ClientSession | null" },
+    timeoutMS: { description: "The client-side operation timeout (driver CSOT), in milliseconds.", type: "number" },
+    dropUnknownFields: { description: "Lets the save rewrite stored subdocuments without the fields the schema lacks. Those fields disappear from the database. Without this option, such a save throws [`UnknownFieldsError`](../errors/data-errors.mdx#unknown-fields-error), and nothing goes to the database.", type: "boolean" },
+    policy: { description: "The policy context of this write (tenant, actor, soft delete), on top of the context the method was called in.", type: "PolicyValues" },
+  }}
+/>
+
+---
+
+## ToObjectOptions [#to-object-options]
+
+`ToObjectOptions` are the options for [`$toObject`](#to-object), [`$toPlain`](#to-plain), and [`$toJSON`](#to-json). You set them on every call, and there are no schema-level defaults. Options that change the shape of the result (`hidden`, `virtuals`, `mask`, `transform`) change its type too.
+
+<TypeTable
+  type={{
+    getters: { description: "Apply the fields' `get` functions. The result type doesn't change, because `get` maps a value to the same type.", type: "boolean" },
+    virtuals: { description: "Add the class's virtual getter fields (`Computed`, `VirtualValue`).", type: "boolean", default: "false" },
+    hidden: { description: "Include loaded hidden (`Hidden`) fields. It works at any depth: in subdocuments, arrays, and Maps of subdocuments.", type: "boolean", default: "true for $toObject, false for $toPlain and $toJSON" },
+    mask: { description: "Masks the returned copy. Keys are result paths, and values are `\"mask\"` (`\"?\"` is substituted) or a mask function from `Mask.*`. The document itself and the next `$save` aren't affected. It applies before `transform`. See the [Masks](../query/masks.mdx#mask) reference for more.", type: "object" },
+    transform: { description: "The final function. Its result becomes the result of the method.", type: "(result) => R" },
+  }}
+/>
+
+---
+
+## Other methods [#other-methods]
+
+The methods of the collections themselves inside a document (`push`, `pull`, `set`, `create`, `id`) and the methods of a subdocument (`$parent`, `$fullPath`, `$ownerDocument`) are described in the [Typed collections](./typed-collections.mdx) reference. The model methods that create and validate documents (`Model.new`, `Model.hydrate`, `Model.castObject`, `Model.validate`) are collected in the [Model methods for documents](./model-document-methods.mdx) reference. Unknown fields and `unknownFieldsOf` are in the [Unknown fields](./unknown-fields.mdx) reference.

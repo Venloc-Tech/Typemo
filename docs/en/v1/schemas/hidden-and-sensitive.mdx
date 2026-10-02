@@ -1,0 +1,171 @@
+---
+title: Hidden and sensitive fields
+description: "Keep a password hash out of responses and a card number out of the audit log, events, and errors"
+icon: EyeOff
+---
+
+Almost every model has data that the database and the application need but that shouldn't travel any further: a password hash, a reset token, a card number. "Further" comes in two kinds, so Typemo has two options.
+
+- [`hidden`](../reference/schemas/prop.mdx#hidden) keeps a field out of **query results**. Until you ask for it explicitly, it isn't read from the database and doesn't get into a response.
+- [`sensitive`](../reference/schemas/prop.mdx#sensitive) hides the value in **side channels**: the audit log, observability events (and through them, traces), and error texts.
+
+Neither one changes the data in the database itself.
+
+If "audit" and "observability event" don't mean much to you yet, one thing is enough. They're records of what the application did. They live longer and travel further than the response to a single request, and secrets end up in them more often than you'd think.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the service's user model from `users/user.ts`. The model grows as the page goes on: first one hidden field, then sensitive ones.
+
+## Quick start [#quick-start]
+
+A hidden field is `hidden: true` in [`@Prop`](../reference/schemas/prop.mdx#prop) and the `Hidden<T>` type on the field. A normal read returns it neither in the type nor in the data, and a `+` before the name in [`select`](../reference/query/reading.mdx#select) brings it back.
+
+<Snippet id="schemas/hidden-and-sensitive/quick-start" title="users/user.ts" twoslash />
+
+A sensitive field is `sensitive` with the value `"show"`, `"mask"`, `"hide"`, or a ready-made mask from [`Mask`](../reference/query/masks.mdx#mask-presets). The data and query results stay real, while the audit log, events, and errors get a safe copy.
+
+<Snippet id="schemas/hidden-and-sensitive/quick-start-2" title="users/user.ts" twoslash />
+
+Below we'll go through both mechanisms on real tasks.
+
+## Don't read a field from the database [#skip-field-on-read]
+
+A user signs in with a password, and the application needs their hash. But the user list in the admin panel shouldn't even load that hash. With `hidden: true` the field isn't read by default. The query adds an exclusion of the field to the projection, so the value doesn't travel over the network or land in the application's memory. The field isn't in the result type either, so `row.passwordHash` on a normal result won't compile.
+
+<Snippet id="schemas/hidden-and-sensitive/skip-field-on-read" title="users/users.service.ts" twoslash />
+
+For writes and filters, a hidden field stays an ordinary field. You can create it, update it, and search by it. Only reading it back takes an explicit request. Responses need the protection, not your logic. Checking whether a user with this hash exists is legitimate. A stray `find()` in a handler handing the hash to the client is not.
+
+A freshly created document holds the value you gave it. It's already in memory, and the document type shows the field (`HydratedDocWith<User, { passwordHash?: string }>`). But `$toPlain()` won't include it here either.
+
+<Snippet id="schemas/hidden-and-sensitive/skip-field-on-read-2" title="users/users.service.ts" twoslash />
+
+## Read a hidden field [#read-hidden-field]
+
+To read the hash at sign-in, put a `+` before the field name in `select`. The sign doesn't turn the selection into an inclusion. You get all the regular fields plus the hidden one. The field shows up in the result type too.
+
+<Snippet id="schemas/hidden-and-sensitive/read-hidden-field" title="users/auth.ts" twoslash />
+
+You can also name the field in a regular inclusion, `select({ passwordHash: 1 })`. The hidden field is read then too, but the response holds only it and `_id`. For more on selecting fields, see [Projections and the result type](../queries/projections.mdx#read-hidden-field).
+
+## Send a hidden field to the client [#expose-hidden-field]
+
+Reading a field doesn't mean sending it out. What leaves the application, [`.plain()`](../reference/query/reading.mdx#plain) and [`$toPlain()`](../reference/documents/document-api.mdx#to-plain), contains no hidden fields, even if you loaded them with `+`. A query with `+passwordHash` is sometimes needed inside the server, and its result then goes to a shared serializer. Without this rule, one extra line would send the hash to the client.
+
+<Snippet id="schemas/hidden-and-sensitive/expose-hidden-field" title="users/auth.ts" twoslash />
+
+The `{ hidden: true }` option exists on `$toPlain`, `$toJSON`, and `.plain()`. `.lean()` returns what you loaded, without the output rules, because it's meant for internal work. [Reading data](../queries/reading-data.mdx#send-to-client) explains how these results differ.
+
+## A hidden field in an aggregation [#hidden-in-aggregation]
+
+An aggregation bypasses the model document, so the protection is built into [`Pipeline`](../reference/query/reading.mdx) itself. Before the first stage the core adds an `$unset` of the hidden paths, and no stage and no result row sees them. Pulled-in collections (`$lookup`, `$unionWith`, `$graphLookup`) are protected the same way. If you need the field on purpose, name it in `include`.
+
+The server accepts some stages only in first position: `$search`, `$searchMeta`, `$vectorSearch`, `$geoNear`, `$collStats`, `$indexStats`, and other service stages. If the pipeline starts with such a stage, the `$unset` goes right after it. The stage stays first, and the hidden fields are absent both further on and in the result. A `geoNear` pipeline of a model with a hidden field goes to the server as `[{ $geoNear: … }, { $unset: ["passwordHash"] }]`, and the rows don't have the field.
+
+<Snippet id="schemas/hidden-and-sensitive/hidden-in-aggregation" title="users/report.ts" twoslash />
+
+## Keep a value out of the audit log, events, and errors [#sensitive-value]
+
+The user now has an email and a password reset token, and the model keeps an audit log (`audit: true` in [`@Schema`](../reference/schemas/schema.mdx#audit)). The **audit log** is a separate collection. Every write to the model leaves a record in it of what was written and with which filter. Leave everything as is, and the email and token land in the log in plain text. And the log is read more often and more widely than the data itself.
+
+`sensitive` has four values.
+
+- `"show"` shows the real value.
+- `"mask"` replaces it with a `?`.
+- `"hide"` replaces **the whole condition or value of the field** with `[hidden]`. The key stays, so you can see the field was there, but operators like `$gt` aren't visible.
+- A ready-made [`Mask.*`](../reference/query/masks.mdx#mask-presets) mask, or your own function in the form `{ mask: (value) => … }`. The value type is inferred from the field.
+
+<Snippet id="schemas/hidden-and-sensitive/sensitive-value" title="users/user.ts" twoslash />
+
+Notice the fields without a mark. `name` went into the log as is. `passwordHash` has only `hidden`, no `sensitive`, and in side channels a hidden field without a mark looks like `"mask"`. If a field can't go out in a response, it has no business in the log either. A mark on the field overrides this rule, and `sensitive: "show"` on a hidden field shows the value.
+
+The log lives in the `<collection>_audit` collection, that is, the model's collection name with `_audit` appended, or in the one set in `audit: { collection }`. Masking applies not only to documents. The filter and the update are written by the same rules. Here's the record of an update by a hidden field.
+
+<Snippet id="schemas/hidden-and-sensitive/sensitive-value-2" title="users/user.ts" twoslash />
+
+The log isn't a subscriber. Unmarked fields in it stay real, and an error in a mask function becomes an audit error, so the write is rolled back.
+
+An audit record describes the operation as it was called. `updateMany({ status: "open" }, …)` leaves the filter `{ status: "open" }` and the `matchedCount` and `modifiedCount` counters in the log, not the identifiers of the affected documents. If you need the history of a single document, write by `_id` (`updateOne({ _id }, …)`, `$save`). Or first read the identifiers in a transaction and write by `{ _id: { $in: ids } }`. The whole audit setup is described in [Keep an audit log](../policies/audit.mdx).
+
+## Values in observability events [#values-in-events]
+
+**Observability events** are messages Typemo sends to subscribers registered with [`client.instrument`](../reference/connection/typemo-client.mdx#client.instrument): an operation starting, an error, a transaction. OpenTelemetry and Sentry work through them. In the operation summary (`summary`) filters and updates are masked, and field marks have the final say.
+
+For values without a mark, the subscriber picks the mode with its own `sensitive` option. The default is `"mask"`, and any unmarked value in a filter becomes `?`. Below is the same query as three subscribers see it. The `card` field is marked `Mask.card()`, so it looks the same to all of them.
+
+<Snippet id="schemas/hidden-and-sensitive/values-in-events" title="observability/logging.ts" twoslash />
+
+Fields inside subdocuments, arrays, and Maps, and paths with `dbName`, work the same way. The mask is built from both names of the field, in code and in the database. A field marked `"show"` is always visible, even if the subscriber uses `"mask"`.
+
+## Values in errors [#values-in-errors]
+
+A field's value also ends up in error texts: "couldn't cast", "constraint violated", "duplicate key". An error outlives the request. It gets written to a log and sent to an error tracker, so it also follows the field marks. A cast error for a marked field shows `?` or `[hidden]` instead of the value.
+
+A mask function is called only for a value of the declared type. If a value of another type arrives, such as a number in a string field, a `?` is put in instead of the call, and the error itself doesn't break. In a [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicate-key-error), the key values in `keyValue` and in the text are masked. A unique index most often sits on exactly that kind of secret field, like a passport number or a token. `init()` creates the index, so the example calls it before the write.
+
+<Snippet id="schemas/hidden-and-sensitive/values-in-errors" title="users/user.ts" twoslash />
+
+The `cause` of such an error is a masked copy of the driver's error, not the original. Error trackers serialize the whole `cause` chain, and a raw value in it would be a leak.
+
+## How to choose [#how-to-choose]
+
+Ask yourself: **where must the value not end up?**
+
+- **In a response to the client, and in the application's memory when it isn't needed**: `hidden`.
+- **In logs, traces, and error messages**: `sensitive`.
+
+A real secret needs both. A password hash gets `hidden: true`, and it picks up `sensitive` on its own, since a hidden field without a mark is masked. You need a separate mark only if you want different behavior. For example, `"hide"` instead of `?`, or a mask that keeps part of the value, say the last four digits of a card.
+
+Pick the `sensitive` mode by what the reader of the log needs to understand. `"mask"` says there was a value here. `"hide"` hides even the shape of the condition. A ready-made mask keeps a part that's useful for analysis: an email's domain, a card's tail, a hash you can match records by.
+
+## When not to use it [#when-not-to-use]
+
+Neither `hidden` nor `sensitive` encrypts anything. In the database the field is plain text, and anyone who reads the database directly will see it. For real protection, encrypt on the application side and store an already encrypted value in the field.
+
+`sensitive` doesn't remove a field from results. If the value must not reach the client, you need `hidden`. If the client needs only part of the value, use a [response mask](../queries/response-masks.mdx). And don't put `hidden` on a field that every query reads, or you'll have to write `+` in every call.
+
+## Troubleshooting [#troubleshooting]
+
+**A hidden field without `Hidden<T>` doesn't compile.** The option and the type must go together, and the compiler checks that both ways. If a field with `hidden: true` is declared with a regular type, the error appears right on the decorator.
+
+<Snippet id="schemas/hidden-and-sensitive/troubleshooting" twoslash />
+
+The other direction works the same way: `Hidden<T>` without `hidden: true` won't compile either. The result type can't drift away from what the query does.
+
+**A hidden field is loaded, but it's not in the response.** You added `+passwordHash`, saw `doc.passwordHash` in the debugger, but the field isn't in the response to the client. Nothing got lost. [`.plain()`](../reference/query/reading.mdx#plain) and [`$toPlain()`](../reference/documents/document-api.mdx#to-plain) don't include hidden fields without `{ hidden: true }`. Add the option only where you really intend to send the field out.
+
+**A mask function on a subdocument.** `{ mask: … }` works with a field's value, and a subdocument's value is a whole object. Typemo refuses as early as when you describe the model, not during a write.
+
+<Snippet id="schemas/hidden-and-sensitive/troubleshooting-2" />
+
+Put `"mask"` or `"hide"` on the subdocument as a whole, and all its contents get masked. Or mark the fields you need inside it.
+
+## Full example [#full-example]
+
+Here's everything together in one file: a model with a hidden hash, a sensitive email and token, password sign-in, and a response to the client. Code that isn't part of Typemo is marked `__…__`.
+
+<Snippet id="schemas/hidden-and-sensitive/full-example" title="users/users.service.ts" twoslash />
+
+<Callout type="migration">
+
+The `hidden` option replaces Mongoose's `select: false`. The difference is that a hidden field isn't in the result type either, and it won't show up in `.plain()` or `$toPlain` even if you loaded it. To send the field out, you have to ask for it twice: `+` on read and `{ hidden: true }` on output. Mongoose has no `sensitive` option. Masking values in logs, events, and errors is a separate Typemo mechanism.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Keep an audit log" href="../policies/audit.mdx">
+  What goes into the log, how to read its records, and what to do if a log write fails.
+</Card>
+<Card title="Response masks" href="../queries/response-masks.mdx">
+  How to send the client a safe part of a value instead of the whole thing.
+</Card>
+<Card title="@Prop" href="../reference/schemas/prop.mdx">
+  Every field option, including `hidden` and `sensitive`, with exact types and errors.
+</Card>
+<Card title="Field marker types" href="../reference/schemas/field-markers.mdx">
+  `Hidden`, `Immutable`, and other marker types that tie options to the result type.
+</Card>
+</Cards>

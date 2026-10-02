@@ -1,0 +1,151 @@
+---
+title: Geo queries
+description: "Store points on a map, find the nearest places and the documents inside an area, and count them within a radius with GeoJSON, $near, and $geoWithin"
+icon: MapPin
+---
+
+Sometimes you need to find places on a map: the ones nearest to the user, inside a city, or along a route. For that, store coordinates in the **GeoJSON** format and use the geo filter operators.
+
+- [`$near`](../reference/query/filter-operators.mdx#near) finds the nearest places.
+- [`$geoWithin`](../reference/query/filter-operators.mdx#geo-within) finds places inside an area.
+- [`$geoIntersects`](../reference/query/filter-operators.mdx#geo-intersects) finds shapes that intersect a given one.
+
+For "nearest" the database needs a `2dsphere` index. For the other queries it only speeds up the search and isn't required.
+
+**GeoJSON** is the standard way to write a shape on a map as an object. For example, `{ type: "Point", coordinates: [2.35, 48.86] }` is a point. The coordinates go in the order **longitude, then latitude**, not the other way around. Mixing them up is the most common mistake, and the database won't notice it as long as the numbers stay within the allowed limits. So you don't have to build these objects by hand, Typemo has a [`GeoJson`](../reference/query/filter-operators.mdx#geo-json) helper. It builds a point, a line, and a polygon, and checks the coordinates before contacting the database.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the place model from `places/place.ts`. The `2dsphere` index was created by an [index sync](../collections/index-sync.mdx), since Typemo doesn't create indexes on its own. The collection has three places.
+
+- Louvre: `[2.3376, 48.8606]`.
+- Eiffel Tower: `[2.2945, 48.8584]`.
+- Berlin Gate: `[13.3777, 52.5163]`.
+
+<Snippet id="queries/geo/prerequisites" title="places/place.ts" twoslash />
+
+The point is described by a nested class with the fields `type` and `coordinates`, which is the GeoJSON MongoDB expects. The `2dsphere` index is built on the whole `location` field.
+
+## Quick start [#quick-start]
+
+Let's find places no farther than five kilometers from a point. Distances in GeoJSON are measured in **meters**, and the result goes from nearest to farthest.
+
+<Snippet id="queries/geo/quick-start" twoslash />
+
+We'll go through each query separately below.
+
+## Find the nearest places [#near]
+
+Say an app shows the user the nearest sights. `$near` takes a center (`$geometry`) and, if needed, distance bounds `$maxDistance` and `$minDistance` in meters. The result is already ordered by distance from the center, so you don't need to sort it. Without `$maxDistance` every place comes back, nearest to farthest, so you usually set it together with [`.limit`](../reference/query/reading.mdx#limit).
+
+[`GeoJson.point`](../reference/query/filter-operators.mdx#geo-json) builds the center. It checks that the longitude is between −180 and 180 and the latitude between −90 and 90, and returns an object of the right shape.
+
+<Snippet id="queries/geo/near" title="places/places.service.ts" twoslash />
+
+The Louvre is the closest to the point `[2.35, 48.86]`, and the limit of 1 kept only it. But `.sort(...)` **replaces** the distance order, and with `.sort({ name: 1 })` the places come back alphabetically. So don't sort a query with `$near` if you need "nearest first".
+
+### A ring around a point [#ring-around-point]
+
+`$minDistance` cuts off places that are too close, for example "no closer than two kilometers and no farther than a hundred". `$nearSphere` takes the same bounds and also orders the result by distance, only it computes the distance on a sphere.
+
+<Snippet id="queries/geo/ring-around-point" twoslash />
+
+The Louvre is closer than two kilometers and didn't make it into the ring, and Berlin Gate is farther than a hundred. The Eiffel Tower is what's left.
+
+## Find places inside an area [#within-area]
+
+When an area is given by its border, such as a city district or a delivery zone, use `$geoWithin` with a polygon. A polygon is a closed ring of points. **The first and last points are the same**, and there are at least four points in total. An index isn't required for `$geoWithin`. It only speeds up the query.
+
+<Snippet id="queries/geo/within-area" twoslash />
+
+You can build the same polygon with [`GeoJson.polygon`](../reference/query/filter-operators.mdx#geo-json). It checks right away that the ring is closed and has at least four points. If you need to name the shape in your own function's signature, the package exports the types `GeoJsonPolygon`, `GeoJsonPoint`, and the rest.
+
+### A circle of a given radius [#circle]
+
+A circle has a special form, `$centerSphere`: a center and a radius **in radians**, not in meters. To convert meters to radians, divide them by the Earth's radius, 6,378,100 meters. A five-kilometer circle around the Louvre is `5000 / 6378100`.
+
+<Snippet id="queries/geo/circle" twoslash />
+
+You can't count places within a radius with `$near`. [`countDocuments`](../reference/query/reading.mdx#model.count-documents) with `$near` fails with the server error `ServerError: $geoNear, $near, and $nearSphere are not allowed in this context, as these operators require sorting geospatial data. (code 5626500 Location5626500)`. The server's full text, with advice to use `$geoWithin`, is in the `serverMessage` field. A circle with `$geoWithin` works for counting.
+
+## Find intersections [#intersects]
+
+`$geoIntersects` finds documents whose shape intersects a given one. For example, a point falls inside an area, or a road line crosses a district. Here the field holds points, so "intersects" means "inside". A query with a small rectangle around the city center finds one place.
+
+<Snippet id="queries/geo/intersects" twoslash />
+
+## Build a point, a line, and a polygon [#build-shapes]
+
+You can write the shapes from the examples above as ordinary GeoJSON objects. But then you watch the coordinate order and the closed ring yourself. [`GeoJson`](../reference/query/filter-operators.mdx#geo-json) takes that on. `GeoJson.point(longitude, latitude)`, `GeoJson.lineString(...positions)`, and `GeoJson.polygon(...rings)` return objects of the exact shape, which work both for `create` and for the geo operators in a filter.
+
+The helper rejects a line of one position and an unclosed ring right at the call, with a `CastError`, instead of the server rejecting them on write. The compiler requires at least two positions, and in untyped code the same requirement is checked at runtime.
+
+<Snippet id="queries/geo/build-shapes" twoslash />
+
+A polygon takes the outer ring first, and the following rings are holes inside it. The values are copied, so changing your array after the call doesn't affect the built object.
+
+If a coordinate fails the check, the helper throws a [`CastError`](../reference/errors/data-errors.mdx#cast-error) before the database is involved. The server would check the same range only when the document is written and would answer with a `ServerError` after the request was sent.
+
+<Snippet id="queries/geo/build-shapes-2" />
+
+Other violations give the same `CastError` explaining the cause: a ring shorter than four positions or not closed, a non-numeric or infinite coordinate. A plain object `{ type: "Point", coordinates: [200, 100] }` gets past Typemo, and the server rejects it: `ServerError: Could not extract geo keys at path 'location' for document with _id ObjectId('…'): Longitude/latitude is out of bounds, lng: 200 lat: 100 (code 510)`.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **what you know in advance, the center or the border**.
+
+- **The center**, such as the user's position, and you need the "nearest": use `$near` with `$maxDistance` and `.limit`.
+- **The border**, such as a district or a delivery zone: `$geoWithin`.
+- **You need to count places within a radius or get them in your own order**: `$geoWithin` with `$centerSphere`. It works in `countDocuments` and allows your own sort.
+- **You're looking for intersections of lines and areas**: `$geoIntersects`.
+
+## When not to use it [#when-not-to-use]
+
+If you need not a selection but the distance from a point to each place, to show "1.2 km", `find` won't give it to you. Use the `$geoNear` stage in an [aggregation](../reference/aggregation/stages.mdx), which adds a distance field to the rows. And if coordinates are only stored and you don't need precision within a city, you don't need a geo index at all.
+
+## Troubleshooting [#troubleshooting]
+
+**`unable to find index for $geoNear query`.** You searched with `$near` or `$nearSphere` on a field without a `2dsphere` index. The query fails with a `ServerError`, and the server's text contains `unable to find index for $geoNear query`. Without the index the database doesn't look for "nearest" at all, rather than scanning every document. Add `@Index({ location: "2dsphere" })` and call [`Model.syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes). For `$geoWithin` and `$geoIntersects` the index isn't required, and a collection without it finds the same places.
+
+**The nearest places turned up somewhere unexpected.** You wrote the coordinates as `[latitude, longitude]`, while GeoJSON requires `[longitude, latitude]`. As long as the numbers are within the allowed limits there's no error, but the point lands somewhere else entirely. A search around the swapped `[48.86, 2.35]` finds none of the Paris places. Build points in one function, not by hand in different places.
+
+**A point built outside the query doesn't compile.** In a filter the coordinates must be a pair of numbers (`[longitude, latitude]`), not any array. If you moved the point into an untyped variable, TypeScript infers `coordinates: number[]`, an array of any length. The compiler refuses, since the array could be shorter than a pair. Build the point with [`GeoJson.point`](../reference/query/filter-operators.mdx#geo-json), which returns the exact `GeoJsonPoint` type and checks the range along the way.
+
+<Snippet id="queries/geo/troubleshooting" twoslash />
+
+If the helper doesn't fit, name the point type explicitly: `const center: GeoJsonPoint = { type: "Point", coordinates: [2.35, 48.86] }`.
+
+**The coordinates are swapped.** You wrote the point as `[latitude, longitude]`. `GeoJson.point` checks the range, but it can't guess which number you meant. `GeoJson.point(48.86, 2.35)` passes the check, because both numbers are within the allowed limits. The mistake shows only in the result: a search around this point finds none of the Paris places.
+
+**A sort broke the "nearest first" order.** `$near` orders the result by distance itself, and an explicit `.sort(...)` replaces that order. Remove `.sort`, or sort the result in code after the query.
+
+**`countDocuments` with `$near`.** The server rejects a count with `$near` or `$nearSphere`, since these operators require sorting. Use `$geoWithin` with `$centerSphere`, as in the example above.
+
+## Full example [#full-example]
+
+Here it all comes together: saving a place, the nearest places, places in an area, and a count within a radius. Code that isn't part of Typemo and that you write yourself is marked `__…__`.
+
+<Snippet id="queries/geo/full-example" title="places/places.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose geo queries were written as `find({ location: { $near: … } })` with no shape check, and the compiler let any value through. In Typemo the GeoJSON shape (`$geometry`, `$maxDistance`, a polygon as an array of rings) is described by types, and a mistake in the structure shows up at compile time. Counting works as before. `$near` doesn't work in `countDocuments` here either, because that's a limit of the server itself.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Filter operators" href="../reference/query/filter-operators.mdx">
+  `$near`, `$nearSphere`, `$geoWithin`, `$geoIntersects`, and the field types they apply to.
+</Card>
+<Card title="Indexes" href="../schemas/indexes.mdx">
+  Describe `2dsphere` and other indexes in the model.
+</Card>
+<Card title="Sync indexes" href="../collections/index-sync.mdx">
+  Create the index in the database and don't forget it at deploy time.
+</Card>
+<Card title="Stages" href="../reference/aggregation/stages.mdx">
+  The `geoNear` stage, which adds the distance to a point to the rows.
+</Card>
+</Cards>

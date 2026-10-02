@@ -1,0 +1,167 @@
+---
+title: Split data by organization
+description: "The data of different organizations in one collection, where a query of one can neither see nor change the data of another"
+icon: Building2
+---
+
+Your service has many organizations as customers, and the data lives in shared collections. So every operation must work with the data of only **one** organization. Typemo calls such an organization a **tenant**. Without protection, the typical mistake looks like this: one query forgets the `orgId` condition, and a customer sees someone else's orders.
+
+You turn the rule on in the schema in two parts: the [`tenant`](../reference/policies/schema-options.mdx#tenant) option and the [`@Tenant()`](../reference/schemas/field-markers.mdx#tenant) decorator on the tenant field. From then on, the model adds the tenant condition to every query and writes the tenant into every new document on its own.
+
+If policies are new to you, start with the [overview](./overview.mdx). This page is only about splitting data.
+
+## What you need [#prerequisites]
+
+A client connected as in [Connect to the database](../connection/connect.mdx). The example is a CRM where orders belong to the organizations `acme` and `globex`.
+
+## Quick start [#quick-start]
+
+Turn on the policy in the schema and mark the tenant field with the [`@Tenant()`](../reference/schemas/field-markers.mdx#tenant) decorator and the [`TenantField`](../reference/schemas/field-markers.mdx#tenant-field) type. Open a [`PolicyContext.run`](../reference/policies/policy-context.mdx#policy-context.run) scope where the organization is already known.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/prerequisites" title="orders/order.ts" twoslash />
+
+<Snippet id="policies/tenants/quick-start" twoslash />
+
+Below we look at how this behaves in everyday tasks: describing the field, reading, writing, a tenant from an HTTP request, working across all tenants, aggregations, related data, and change streams.
+
+## Describe the tenant field [#define-tenant-field]
+
+Three things describe the tenant field at once, and each has its own role.
+
+- [`@Prop`](../reference/schemas/prop.mdx) makes it a schema field.
+- The `TenantField<T>` type tells the compiler that the library fills the field in. So `create` doesn't require it, and read results always have it.
+- The `@Tenant()` decorator says the same thing **at runtime**. TypeScript types disappear when the code runs, and without the mark the library wouldn't know which field is the tenant. It won't guess by name.
+
+The rules are short. The `tenant: true` option names the field `tenantId`, and `tenant: { field: "orgId" }` names any other one. The `@Tenant()` mark goes on exactly that field and no other. Consistency is checked twice. In typed code the compiler checks it. Here, for example, is a second mark on another field.
+
+<Snippet id="policies/tenants/define-tenant-field" twoslash />
+
+A second field with `@Tenant()` is an error, because a document has one tenant. In the same way, `@Tenant()` on a field not declared as `TenantField<T>` won't compile, and neither will a `TenantField<T>` field in a schema without the `tenant` option.
+
+At runtime, building the model checks the same rules. That's for JavaScript and for code that bypassed the types with a cast. A violation gives a [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configuration-error) when you call [`connection.model`](../reference/connection/connection.mdx#connection.model). The model isn't created, and no operation reaches the database. The texts of these errors are collected below, in [Schema build errors](#schema-errors).
+
+In the [`@venloc/typemo-decorators`](../decorators-tc39/index.mdx) package for TC39 decorators, `@Tenant()` has the same name and works the same way.
+
+## Write tenant data [#write-tenant-data]
+
+You don't need to give the tenant on insert. The model takes it from the context and writes it into the document. That's why the `create` type has no `tenantId` field, while a read document always has it.
+
+<Snippet id="policies/tenants/write-tenant-data" title="orders/orders.service.ts" twoslash />
+
+If you do put another tenant into the document, the insert refuses. The document would belong to a different organization than the operation. The error is `StrictModeError: Order.create: the document is for another tenant (tenantId: globex) than the operation's (acme) [tenant]`. The text names the method you called (`create`), not the internal insert operation.
+
+If there's no scope and one write needs a tenant, pass it in the call's options: `Orders.create({ number: "A-1" }, { policy: { tenant: "acme" } })`. `insertOne`, `insertMany`, `bulkWrite`, and `$save` take the same options. The value is cast to the type of the tenant field, so a string works for `TenantField<ObjectId>` too.
+
+## Read tenant data [#read-tenant-data]
+
+Every read (`find`, `findOne`, `countDocuments`, `distinct`, a cursor) adds the tenant condition to your filter. The collection has two orders from `acme` and one from `globex`.
+
+<Snippet id="policies/tenants/read-tenant-data" title="orders/orders.service.ts" twoslash />
+
+Your own condition on the tenant field doesn't replace the policy's condition. Both have to hold. The query `find({ tenantId: "globex" })` inside an `acme` scope returns `[]`, not the orders of `globex`. That way you can't "step out" of a tenant, either by mistake or by substitution.
+
+## Change and delete tenant data [#update-tenant-data]
+
+Updates, deletes, and find-and-modify get the same condition. So `updateMany` or `deleteMany` in an `acme` scope won't touch an order of `globex`. You can't change the tenant field itself, because moving a document to another organization is a leak.
+
+<Snippet id="policies/tenants/update-tenant-data" twoslash />
+
+## Take the tenant from an HTTP request [#tenant-from-request]
+
+The tenant is usually known to the layer that receives the request. It takes the organization from the token and opens a scope once around the whole handling. Services inside don't need the tenant as a parameter. The scope lives through the whole chain of async calls, so an `await` inside it is safe.
+
+<Snippet id="policies/tenants/tenant-from-request" title="http/handler.ts" twoslash />
+
+The scope is captured when the operation is **built**, not when it's awaited. A query built inside `run` stays a query of its tenant, even if you await it outside. And a query built outside the scope gets no tenant and throws a `StrictModeError`, even if you await it inside `run`. That way a query from a module variable won't "pick up" the tenant of someone else's request. The details are in [Pass the tenant and actor through the whole request](./policy-context.mdx).
+
+## Work across all tenants [#all-tenants]
+
+A background job or an admin panel sometimes needs every organization. That's allowed only explicitly, through `allTenants: true` in the context or in `.policy()`. "All" can't be the default: a forgotten tenant must give an error, not the whole collection.
+
+<Snippet id="policies/tenants/all-tenants" twoslash />
+
+You can't set `tenant` and `allTenants: true` together, because the context mustn't contradict itself. Inside a scope with a tenant, a nested `run({ allTenants: true })` removes the tenant, and the other way around.
+
+The tenant has to be a real value. An empty string, a string of only spaces, and `null` are rejected right when the scope opens, not on the first operation. Otherwise a bug in the code that takes the organization from the token would look like "no tenant" and quietly turn into work with documents that have no organization. The text is `PolicyContext.run: the tenant is empty (""); a tenant is a non-empty value, or allTenants: true for cross-tenant work [tenant]`.
+
+An empty tenant in a write's options, `Orders.create(doc, { policy: { tenant: "" } })`, is rejected the same way. The text names the method you called: `create.policy: the tenant is empty (""); …`.
+
+## Aggregations, related data, and change streams [#aggregation-populate-change-streams]
+
+In an aggregation, the tenant condition goes at the start of the pipeline. The [`$lookup`](../reference/aggregation/stages.mdx#lookup), [`$unionWith`](../reference/aggregation/stages.mdx#union-with), and [`$graphLookup`](../reference/aggregation/stages.mdx#graph-lookup) stages pull in documents of the same tenant only, if the class named in the stage has the policy too. Another organization's folder won't come in, even if there's a reference to it. Typemo takes the policy from the class itself, so you don't need to register a model for the pulled-in collection.
+
+The [`$out`](../reference/aggregation/stages.mdx#out) and [`$merge`](../reference/aggregation/stages.mdx#merge) stages into a collection with a tenant are forbidden, because they would write data around the policy. [`populate`](../populate/basics.mdx) queries are operations of the target model. They're restricted the same way and inherit the context of the parent query. All of this is checked by core tests on a real server.
+
+A change stream ([`watch`](../reference/change-streams/watch.mdx)) on a model with a tenant is forbidden without `allTenants: true`. A delete event has no document to filter by tenant. `watch` has no `.policy()` of its own, so `allTenants: true` is set by a scope, and the error suggests exactly that form: `PolicyContext.run({ allTenants: true }, () => Orders.watch())`. Filter the events yourself.
+
+`estimatedDocumentCount` is forbidden too, because it reads metadata and would count everyone. Use `countDocuments()`. The texts of both errors are in [Policy violations](../reference/policies/violations.mdx#tenant).
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether documents of two organizations can live in one collection**.
+
+- **Yes**: turn on `tenant`, and the split becomes a property of the model.
+- **The organizations must be isolated physically**, with separate databases and different storage requirements: give each one its own database through [`client.db(name)`](../reference/connection/typemo-client.mdx#client.db). Then you don't need the policy.
+
+You can combine the two, but one is usually enough.
+
+## When not to use it [#when-not-to-use]
+
+If you have only one organization, the policy gives you nothing but still demands a tenant on every operation. If data is split by an ordinary field the client may choose, like the owner of a note, write that condition in the filter. A tenant is exactly what the client **must not** choose.
+
+## Troubleshooting [#troubleshooting]
+
+**An operation without a tenant fails.** The service called the model outside a scope, and there's nothing to build a safe condition from. The error is `StrictModeError: Order.find: Order is scoped by tenant ("tenantId") and the operation has no tenant; run it inside PolicyContext.run({ tenant }, …) or add .policy({ tenant }) to the query (cross-tenant work: .policy({ allTenants: true })) [tenant]`. Open [`PolicyContext.run`](../reference/policies/policy-context.mdx#policy-context.run) around the handling, or pass the values in the call.
+
+The hint in the error names the form your call has. For a query it's `.policy({ tenant })`, and for a write (`create`, `insertOne`, `insertMany`, `bulkWrite`, `$save`) it's the call's options: `… or pass { policy: { tenant } } in the call's options (cross-tenant work: { policy: { allTenants: true } })`.
+
+**A query built in advance fails without a tenant.**
+
+<Snippet id="policies/tenants/troubleshooting" twoslash />
+
+The scope is captured when the query is built, not when it's awaited. That protects you from a query that would "pick up" someone else's tenant.
+
+### Schema build errors [#schema-errors]
+
+If the field and the mark don't agree, a schema with the tenant policy won't build. The compiler catches such a schema earlier, and you see these texts where there are no types or they were bypassed. `connection.model` produces them.
+
+<Snippet id="policies/tenants/schema-errors" />
+
+In order:
+
+1. The option is there, but the mark isn't.
+2. The mark is there, but the option isn't.
+3. There are two marks.
+4. The option names `orgId`, but the mark is on another field.
+5. The class has no field with the name the option gives.
+
+The fix is always the same: the option and the mark must point to the same field.
+
+**A number instead of a string in the tenant.** The tenant is cast to the field's type. For `TenantField<string>`, the number `5` gives `CastError: Cast to string failed at path "tenantId" for 5 (number): expected a string [type]`. Pass a value of the type declared for the field.
+
+## Full example [#full-example]
+
+<Snippet id="policies/tenants/full-example" title="orders/orders.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, multi-tenancy comes from a plugin or a `pre` hook on `find`. Any query the hook doesn't cover (`aggregate`, `lean`, `updateOne`) returns someone else's data. In Typemo the policy is built into the pipeline and covers every path, including aggregations and related data. And the tenant comes from the context, not from a global variable.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Pass the tenant and actor through the whole request" href="./policy-context.mdx">
+  How the `run` scope works in async code and how to nest it.
+</Card>
+<Card title="Keep an audit log" href="./audit.mdx">
+  How the tenant and the actor of every write get into the log.
+</Card>
+<Card title="Policy options in the schema" href="../reference/policies/schema-options.mdx">
+  Every setting of `tenant`, `softDelete`, and `audit`, with errors.
+</Card>
+<Card title="Watch for changes" href="../change-streams/watch.mdx">
+  How to watch a model with a tenant through `allTenants`.
+</Card>
+</Cards>

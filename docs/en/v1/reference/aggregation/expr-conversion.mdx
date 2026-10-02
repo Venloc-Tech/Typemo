@@ -1,0 +1,211 @@
+---
+title: "Expressions: type conversion"
+description: "Reference for fn.toInt, fn.toLong, fn.toDate, fn.convert, fn.typeOf, fn.hexHash, and the other operators for conversion, type checks, and sizes"
+icon: Replace
+---
+
+**Expressions** compute a new value from a document's fields inside the pipeline. The operators on this page convert a value to another BSON type, check a type, and compute hashes and sizes. They live on the `fn` object and are called in the `(f) => …` callback of stages such as [`project`](./stages.mdx#project) and [`addFields`](./stages.mdx#add-fields). What BSON types are, and why `int64` and `Decimal128` aren't the same as a plain JavaScript number, is explained on the page [MongoDB data types](../../concepts/bson-types.mdx).
+
+If you're starting out, read the guide [Calculations in aggregation](../../aggregation/expressions.mdx). This page is a reference for the operators of this group.
+
+All examples use one shop order model. Besides numbers and a date, it has a nested shipping address, which `fn.bsonSize` needs.
+
+<Snippet id="reference/aggregation/expr-conversion/intro" title="shop/order.ts" twoslash />
+
+The examples use `sort` by date, `limit(2)`, and `project`, so the first two orders remain. Alice's order for 120 is paid, with a discount of 10 and the shipping address Oslo with postal code 0150. Alice's order for 80 is also paid, with the address Oslo and no postal code. The numbers 120 and 80 are stored in the database as `int`, because that's how the driver writes a JavaScript integer. [`.plain()`](./pipeline.mdx#plain) returns the rows.
+
+The `.plain()` result differs from the types in the compiler. An operator's result type matches the data as the driver returns it (`int64` is `bigint`, `Decimal128` is `Decimal128`). `.plain()` turns `int64` and `Decimal128` into strings (for `int64` the type is `${bigint}`) that are safe to send to the client. You can see this below with `fn.toLong`.
+
+A conversion operator passes `null` and a missing field through. The result is then `null`, and the result type reflects that. If a value can't be converted (the string `"abc"` to a number), the server throws an error. To avoid it, use [`fn.convert`](#fn.convert) with `onError`.
+
+Some operators need a newer server. `fn.toUUID` requires MongoDB 8.0. `fn.toArray`, `fn.toObject`, `fn.subtype`, `fn.hash`, `fn.hexHash`, `fn.createObjectId`, `fn.serializeEJSON`, and `fn.deserializeEJSON` require 8.3, as the operator descriptions in the code say. Verified on MongoDB 9.0.0-rc0.
+
+## Transform [#transform]
+
+### fn.toString_ [#fn.to-string]
+
+`fn.toString_` turns any value into a string. The trailing underscore in the name is there because every JavaScript object already has a `toString`.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-string" twoslash />
+
+A date becomes a string in ISO format.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-string-2" twoslash />
+
+### fn.toBool [#fn.to-bool]
+
+`fn.toBool` turns any value into a `boolean`. The server's rule isn't obvious. `0` gives `false`, while any non-empty string, even `"false"`, gives `true`. For `null` the result is `null`.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-bool" twoslash />
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-bool-2" twoslash />
+
+### fn.toInt [#fn.to-int]
+
+`fn.toInt` turns a number, string, `boolean`, or date into an `int32`. In TypeScript that's `number`.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-int" twoslash />
+
+The operator can't convert a string that holds no number, and the server answers with an error.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-int-2" />
+
+### fn.toLong [#fn.to-long]
+
+`fn.toLong` returns an `int64`. In the type it's `bigint`, and in a `.plain()` result the value arrives as a string, so the client doesn't lose precision.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-long" twoslash />
+
+A string holding a number converts the same way.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-long-2" twoslash />
+
+### fn.toDouble [#fn.to-double]
+
+`fn.toDouble` returns a floating-point number. It accepts a string, a number, a `boolean`, or a date.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-double" twoslash />
+
+### fn.toDecimal [#fn.to-decimal]
+
+`fn.toDecimal` returns a `Decimal128`, a decimal number for money and other values where precision can't be lost. In a `.plain()` result it's a string.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-decimal" twoslash />
+
+### fn.toDate [#fn.to-date]
+
+`fn.toDate` turns a string, a number (milliseconds since 1970), an `ObjectId`, or a `Timestamp` into a date.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-date" twoslash />
+
+An integer literal doesn't turn into a date. The driver sends it to the server as an `int32`, and the server can't convert an `int32` to a date. That's why `fn.toDate(0)` doesn't compile, and the compiler says `Argument of type '0' is not assignable to parameter of type '0 & PathError<"fn.toDate: an int32 cannot be converted to a date (the server refuses it); use fn.toLong(n) or a double">'`. If you get around the types with a cast, the server raises the error: `ServerError: Unsupported conversion from int to date in $convert with no onError value (code 241 ConversionFailure)`. First convert the number to an `int64` with [`fn.toLong`](#fn.to-long). Then `fn.toDate(fn.toLong(0))` returns `"1970-01-01T00:00:00.000Z"`. A field of type `number` (`fn.toDate(f.total)`) and a non-integer literal (`fn.toDate(86400000.5)`) pass the compiler, because the server reads them as a `double`.
+
+### fn.toObjectId [#fn.to-object-id]
+
+`fn.toObjectId` turns a string of 24 hexadecimal characters into an `ObjectId`. In a `.plain()` result the value is a string again.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-object-id" twoslash />
+
+### fn.toUUID [#fn.to-uuid]
+
+`fn.toUUID` turns a string holding a UUID into a value of type `UUID` (binary data of subtype 4).
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-uuid" twoslash />
+
+### fn.toArray [#fn.to-array]
+
+`fn.toArray` parses a string holding a JSON array, or a binary vector, into an array.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-array" twoslash />
+
+### fn.toObject [#fn.to-object]
+
+`fn.toObject` parses a string holding a JSON object into a document.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-object" twoslash />
+
+### fn.convert [#fn.convert]
+
+`fn.convert` is the general conversion. It accepts `input`, a target type `to`, and optional `format`, `onError`, and `onNull`. The result type depends on `to`, and `onError` and `onNull` add to it if you set them.
+
+`to` is a type name (`"int"`, `"long"`, `"decimal"`, `"date"`, `"objectId"`, `"string"`, `"bool"`, `"double"`, `"binData"`, `"array"`, `"object"`), its BSON number, or an object `{ type: "binData", subtype }`. `format` is needed to convert between a string and binary data. The allowed values are `"base64"`, `"base64url"`, `"utf8"`, `"hex"`, and `"uuid"`.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-convert" twoslash />
+
+The main advantage over `fn.toInt` is `onError`, a value for the case of an error. The string `"abc"` doesn't turn into a number, but the query doesn't fail.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-convert-2" twoslash />
+
+For data you can't trust, such as imports and fields people filled in by hand, use `fn.convert` with `onError`.
+
+## Type check [#type-check]
+
+### fn.isNumber [#fn.is-number]
+
+`fn.isNumber` checks that a value is a number (`int`, `long`, `double`, or `decimal`). It never returns `null`.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-is-number" twoslash />
+
+### fn.isArray [#fn.is-array]
+
+`fn.isArray` checks that a value is an array.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-is-array" twoslash />
+
+### fn.typeOf [#fn.type-of]
+
+`fn.typeOf` returns the name of a value's BSON type. For a missing field it returns `"missing"`, and that's the only way to tell a gap from `null`. The result type is `TypeName`, that is, a type name from the BSON types table or `"missing"`. On the server the operator is called `$type`, and in `fn` it's `typeOf`.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-type-of" twoslash />
+
+### fn.subtype [#fn.subtype]
+
+`fn.subtype` returns the subtype of a binary value (`binData`). For a UUID the subtype is 4.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-subtype" twoslash />
+
+## Hashes and sizes [#hashes-and-sizes]
+
+### fn.hash [#fn.hash]
+
+`fn.hash` computes a hash of a string or binary data and returns a binary value. It accepts `{ input, algorithm }`, where `algorithm` is `"md5"`, `"sha256"`, or `"xxh64"` (the `HashAlgorithm` type). A sha256 hash takes 32 bytes.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-hash" twoslash />
+
+### fn.hexHash [#fn.hex-hash]
+
+`fn.hexHash` computes the same hash and returns it as a string of upper-case hexadecimal digits.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-hex-hash" twoslash />
+
+### fn.createObjectId [#fn.create-object-id]
+
+`fn.createObjectId` creates a new `ObjectId` for each document. It takes no arguments.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-create-object-id" twoslash />
+
+### fn.toHashedIndexKey [#fn.to-hashed-index-key]
+
+`fn.toHashedIndexKey` returns the hashed index key for a value. It's an `int64`, and it never returns `null`.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-to-hashed-index-key" twoslash />
+
+### fn.binarySize [#fn.binary-size]
+
+`fn.binarySize` returns the size of a string or binary data in bytes.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-binary-size" twoslash />
+
+### fn.bsonSize [#fn.bson-size]
+
+`fn.bsonSize` returns the size of a document in bytes as BSON. It accepts a document.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-bson-size" twoslash />
+
+## Extended JSON [#extended-json]
+
+**Extended JSON** writes BSON types as plain JSON. A date becomes an object with the key `$date`, and an `int64` number becomes `$numberLong`. That way values pass safely through text.
+
+### fn.serializeEJSON [#fn.serialize-ejson]
+
+`fn.serializeEJSON` writes a value as Extended JSON. It accepts `{ input, relaxed, onError }`. The result type is `unknown`, because the shape depends on the value. By default the output is relaxed, and a date stays a `$date` object with an ISO string.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-serialize-ejson" twoslash />
+
+With `relaxed: false` the output is strict, and a date is stored as a number of milliseconds.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-serialize-ejson-2" twoslash />
+
+### fn.deserializeEJSON [#fn.deserialize-ejson]
+
+`fn.deserializeEJSON` does the reverse. It reads Extended JSON and returns a BSON value, accepts `{ input, onError }`, and its result type is `unknown`. Pass an object with `$numberLong` through [`fn.literal`](./expr-logic.mdx#fn.literal). Otherwise the server reads `$numberLong` as an expression operator and refuses.
+
+<Snippet id="reference/aggregation/expr-conversion/fn-deserialize-ejson" twoslash />
+
+After parsing, the value's type is `long`.
+
+## When not to use it [#when-not-to-use]
+
+- **You need to convert the value as it's written to the database, not in a pipeline.** Set the field's type in the schema, and the model does the conversion.
+- **One field holds values of different types.** Check the type with `fn.typeOf` and pick a branch with [`fn.switch`](./expr-logic.mdx#fn.switch).
+- **You need arithmetic and rounding after the conversion.** See the [arithmetic operators](./expr-arithmetic.mdx).

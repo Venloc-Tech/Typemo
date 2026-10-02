@@ -1,0 +1,119 @@
+---
+title: Search by text and meaning
+description: "Search help articles with text search on any server, vector search in Atlas, and a fallback when vector search isn't available"
+icon: Search
+---
+
+Search in a help center has two parts, and they work differently. **Text search** finds articles that contain the words of the query, and it works on any MongoDB server. **Search by meaning** finds articles that are close in meaning even without shared words, like "car" and "automobile". For it, each article is turned into a vector, and the server looks for the nearest vectors. This kind of search exists only in Atlas or its local environment.
+
+Let's build a search that uses meaning when it's available and quietly stays on text when it isn't.
+
+<Callout type="warning">
+
+The vector part of this recipe **was not run**. The documentation's test server isn't Atlas, and on an ordinary server `$vectorSearch` answers with an error. What's checked: text search, the search index declaration (the code compiles), the server error without Atlas, and the fallback on it. There are no real vector search results on this page.
+
+</Callout>
+
+## What you need [#prerequisites]
+
+- A client connected as in [Connect to the database](../connection/connect.mdx), and a `help` database.
+- Your embedding model. An embedding is a vector of numbers that describes the meaning of a text. In the examples, the `__embed__` function builds it.
+- The guide [Full-text and vector search](../queries/text-and-vector-search.mdx), if you want to know how both kinds of search work.
+
+## Quick start [#quick-start]
+
+Text search is a [`$text`](../reference/query/filter-operators.mdx#text) condition plus [`.textScore`](../reference/query/search-and-explain.mdx#text-score), which adds a relevance score. It needs a text index declared with the [`@Index`](../reference/schemas/index-decorators.mdx) decorator.
+
+<Snippet id="recipes/search/quick-start" twoslash />
+
+Next we turn this into a real search, with input checks, ordering by relevance, vector search, and a fallback.
+
+## Describe the model and indexes [#define-model-and-indexes]
+
+An article has a title, a body, and a vector. The text index covers the title and the body. [`@SearchIndex`](../reference/schemas/index-decorators.mdx) defines the vector search index: the path to the vector field, the number of dimensions, and the similarity measure. The number of dimensions must match your embedding model. Here the vector has three numbers to keep it short.
+
+<Snippet id="recipes/search/define-model-and-indexes" title="articles/article.ts" twoslash />
+
+Index sync creates the indexes, not a write. [`createIndexes`](../reference/collections/model-indexes.mdx) creates ordinary indexes, and [`syncSearchIndexes`](../reference/collections/model-indexes.mdx#model.sync-search-indexes) creates search indexes. On an ordinary `mongod` the second call ends with an error. So in development without Atlas, don't call it. `createIndexes` is enough for text search.
+
+## Check the query [#check-query]
+
+The query text comes from the user. An empty string in `$text` isn't an error but an empty result. Without a check, a "nothing found" page hides the fact that the search box was empty. A query that's too long is also better cut off, since it's of no use and costs a lot.
+
+<Snippet id="recipes/search/check-query" title="articles/search.service.ts" twoslash />
+
+`$text` understands some syntax too. `-word` excludes a word, and quotes search for a phrase. You can allow that for the user. The query `"queries in" -tips` found only "Typed queries" in the test collection. If you don't need that syntax, strip quotes and minus signs from the query before searching.
+
+## Search by words and order by relevance [#text-search-relevance]
+
+`$text` doesn't order the result itself. The score sets the order. The `{ sort: true }` option of [`.textScore`](../reference/query/search-and-explain.mdx#text-score) sorts rows by descending score right on the server. Then a [`.limit`](../reference/query/reading.mdx#limit) after it keeps the best articles, not random ones. Sorting by score is covered in [Full-text and vector search](../queries/text-and-vector-search.mdx#sort-by-relevance).
+
+<Snippet id="recipes/search/text-search-relevance" title="articles/search.service.ts" twoslash />
+
+Take two articles. "Typed queries" has the text "queries in mongodb", and "Mongo tips" has the word "typed" three times. The query `typed` gives them the scores 0.75 and 1.53125 and puts "Mongo tips" first, and `searchByWords("typed", 1)` returns only that one. The numbers themselves depend on the data and the server version, so compare them only with each other.
+
+## Search by meaning [#semantic-search]
+
+Vector search is the [`vectorSearch`](../reference/aggregation/stages.mdx#vector-search) stage in an aggregation pipeline. You name the index, the vector field, the query vector, and the number of candidates. `numCandidates` is how many nearest neighbors the server looks at before it picks the `limit` best ones. More candidates means more accurate and slower.
+
+<Snippet id="recipes/search/semantic-search" title="articles/search.service.ts" twoslash />
+
+This is the only part that wasn't run on the test server. The compiler checked the code, but not the search result.
+
+## Fall back to text when meaning isn't available [#fallback-to-text]
+
+On a server without Atlas, a vector query ends with a [`ServerError`](../reference/errors/server-errors.mdx#server-error) with the code [`ServerErrorCodes.SearchNotEnabled`](../reference/errors/server-errors.mdx#server-error-codes), which is 31082, and `codeName` is `SearchNotEnabled`. The error message has the reason and the code: `Using $search and $vectorSearch aggregation stages requires additional configuration. (code 31082 SearchNotEnabled)`. The server's full text, with advice to connect to Atlas, is in the `serverMessage` field.
+
+In development the app shouldn't crash because of this. It catches exactly this error and answers with text search. Every other error is rethrown, so that a network failure doesn't look like "search by meaning isn't available".
+
+<Snippet id="recipes/search/fallback-to-text" title="articles/search.service.ts" twoslash />
+
+The fallback is checked on the test server: `search("typed")` returned the same articles as `searchByWords`.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether users search with words that appear in the text**.
+
+- **Yes**, as with product codes, names, and exact terms: text search is enough, and vector search only complicates things.
+- **The wording of queries and texts differs**, as with questions to a help center in everyday language: you need search by meaning.
+
+A combination often wins. Text catches the exact words, and meaning catches the rest. Merging two lists with their scores is a separate task, and the pipeline has stages for combining results for it, for example [`rankFusion`](../reference/aggregation/stages.mdx#rank-fusion).
+
+## When not to use it [#when-not-to-use]
+
+If there are only dozens of articles, filter them with an ordinary substring search in code. If you need fuzzy search, highlighting, and facets, you need the [`search`](../reference/aggregation/stages.mdx#search) stage from Atlas Search, not `$text`. And for exact values, vector search won't replace text search: you can't find the product code `SKU-4471` by meaning.
+
+## Troubleshooting [#troubleshooting]
+
+**`text index required for $text query`.** A `$text` query ran before the text index existed. Call `createIndexes()` on startup, or sync the indexes before the first query.
+
+**The best articles don't make it into the result.** You set [`.limit`](../reference/query/reading.mdx#limit) but didn't sort by score. Without a sort the row order is undefined, and the server cut off random ones. Sort by score on the server with `.textScore("score", { sort: true })` or `.sort({ score: -1 })`, as in `searchByWords`.
+
+**Without Atlas the app crashes on a `ServerError`.** You call vector search without a fallback, or run `syncSearchIndexes` on startup on an ordinary `mongod`. Catch the error with the code `ServerErrorCodes.SearchNotEnabled`, and don't declare `@SearchIndex` on models that work without Atlas. On them, [`connection.init()`](../reference/connection/connection.mdx#connection.init) also throws a [`SyncError`](../reference/errors/configuration-errors.mdx#sync-error) with the same server text in its cause.
+
+## Full example [#full-example]
+
+<Snippet id="recipes/search/full-example" title="articles/search.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, `$text` and `$vectorSearch` worked through `find` and `aggregate` without checking indexes or vector types, and the "no Atlas" error came as a generic `MongoServerError`. Here a vector is declared with the `Vector` type and its dimensions, and the server error comes as a `ServerError` class with a code that's easy to catch.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Full-text and vector search" href="../queries/text-and-vector-search.mdx">
+  How `$text`, the relevance score, and search in Atlas work.
+</Card>
+<Card title="Define and sync search indexes" href="../collections/search-indexes.mdx">
+  How to sync search indexes and what happens without Atlas.
+</Card>
+<Card title="Caching responses" href="./caching.mdx">
+  How to avoid running the same search on every request.
+</Card>
+<Card title="Indexes" href="../schemas/indexes.mdx">
+  Every kind of index you can describe in a schema.
+</Card>
+</Cards>

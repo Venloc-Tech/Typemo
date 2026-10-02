@@ -1,0 +1,140 @@
+---
+title: Typemo
+description: "Process-wide settings: Typemo.plugin, Typemo.use, Typemo.instrument, and the VERSION constant"
+icon: Settings
+---
+
+The `Typemo` class holds settings for the whole process: global schema plugins, global extensions, and global event subscribers. It has no database connection. You create clients yourself with [`TypemoClient`](./typemo-client.mdx), and `Typemo` only registers what all clients should see at once.
+
+Every global registration has a counterpart at the client level ([`client.use`](./typemo-client.mdx#client.use), [`client.instrument`](./typemo-client.mdx#client.instrument)) or the connection level ([`connection.plugins`](./connection.mdx#connection.plugins)). The guide [Multiple clients and extensions](../../connection/clients-and-extensions.mdx) explains when to pick which. This page is a reference.
+
+The examples use one account model and an extension with the key `label`. The compiler needs the extension key declared, so the setup of each block includes a `declare module`.
+
+<Snippet id="connection/clients-and-extensions/prerequisites" title="accounts/account.ts" twoslash />
+
+---
+
+## Typemo.plugin [#typemo.plugin]
+
+`Typemo.plugin` registers a global schema plugin. It applies to every schema compiled after the registration, for all clients, and it runs before connection and model plugins. A plugin is an object with a name and an `apply` function. The function receives the schema builder and can add fields, indexes, hooks, virtual fields, and static methods. Use it for whatever every model in the application needs.
+
+<Snippet id="reference/connection/typemo/typemo-plugin" twoslash />
+
+When any model of any client is compiled, the plugin runs once for that schema. We created two clients with the `Account` model, and the line `Account` was printed twice.
+
+<Params>
+<Param name="plugin" type="SchemaPlugin<O>" required>
+
+An object `{ name, apply(builder, options), statics? }`. The name is required and can't be empty, otherwise you get `ConfigurationError: a plugin is an object { name, apply(builder, options) }`.
+
+</Param>
+<Param name="options" type="O">
+
+The plugin settings. If the plugin declares required settings, the compiler demands the second argument.
+
+</Param>
+</Params>
+
+Returns `void`.
+
+### Register before the first model [#register-before-first-model]
+
+Register a plugin before the first model of **any** client is compiled. Schemas that are already compiled can't be changed, and Typemo won't skip them silently, since then the plugin would work for some models and not for others.
+
+<Snippet id="connection/clients-and-extensions/register-before-first-model-2" />
+
+That's why global plugins are registered at the very start of the application, before the models are created. What exactly a plugin can add is described in the reference [Plugins](../hooks/plugins.mdx) and in the guide [Reuse behavior across models](../../hooks/plugins.mdx).
+
+<FullType>
+
+<Snippet id="reference/connection/typemo/register-before-first-model" />
+
+</FullType>
+
+---
+
+## Typemo.use [#typemo.use]
+
+`Typemo.use` registers a schema extension for **every** client. An extension introduces a new key in `ext` of `@Prop` and `@Schema`, and validates every value of that key when the schema is compiled. That's how integrations keep their settings right in the model description while the core stays untouched.
+
+An extension has two parts. The first is the declaration of the key type for the compiler: `declare module "@venloc/typemo"` augments `PropExtensions` or `SchemaExtensions`. The second is the `Typemo.use` call with a name and a value check.
+
+<Snippet id="reference/connection/typemo/typemo-use" twoslash />
+
+The check receives the value as is. The compiler watches typed code, but it can't see JavaScript or values that come from configuration. That's why `value` has the type `unknown`, and the check has to throw the error itself. It becomes the `cause` of the `ConfigurationError` that the model's user sees.
+
+<Params>
+<Param name="extension" type="TypemoExtension" required>
+
+An object `{ name, validateProp?, validateSchema? }`. `validateProp` checks the value on a field, `validateSchema` checks it on the schema, and at least one is required. A key works only where the matching check exists. The name can't be empty and can't start with `$`.
+
+</Param>
+</Params>
+
+Returns `void`. Errors are thrown as `ConfigurationError`.
+
+<Snippet id="connection/clients-and-extensions/register-global-2" />
+
+That's what a repeated name looks like. It's already taken globally or registered on a client through [`client.use`](./typemo-client.mdx#client.use).
+
+### When registration closes [#registration-closes]
+
+Plugins and extensions close the same way: with the first **successful** schema compilation. The global list closes with the first model on any client. A client's or a connection's list closes with the first model of that client or connection.
+
+A failed compilation, for example because of an unknown key in `ext`, closes nothing. After such an error `Typemo.use`, `Typemo.plugin`, and `client.use` still accept registrations. Register the extension the error named and try again.
+
+Say the first successful compilation happened on client `A`. Global registrations are now closed, but client `B`, which has no models of its own, can still call `B.use(...)`. So a library that creates a client and models on import closes `Typemo.use` and `Typemo.plugin` for your application. Register global things before you import such libraries.
+
+For how extensions work, see the reference [Extensions](../extensions/extensions.mdx) and the guide [Add your own field and schema options](../../extensions/custom-options.mdx).
+
+<FullType>
+
+<Snippet id="reference/connection/typemo/registration-closes" />
+
+</FullType>
+
+---
+
+## Typemo.instrument [#typemo.instrument]
+
+`Typemo.instrument` subscribes an observer to the operations of **all** clients in the process. Integrations need it for metrics, tracing, and logging, since they have to see everything without being tied to a client. While there are no subscribers, observability costs nothing.
+
+<Snippet id="reference/connection/typemo/typemo-instrument" twoslash />
+
+The event carries the client name (`event.connection`, from the `name` option), the database, and the operation name, so one subscriber can tell the clients apart.
+
+<Params>
+<Param name="subscriber" type="InstrumentationSubscriber" required>
+
+An object with a `handle` function and optional settings (`sensitive`, `driverCommands`, `poolEvents`, `steps`, `includeTenant`, `wrap`). For details, see the reference [Events](../observability/events.mdx).
+
+</Param>
+</Params>
+
+<Returns type="Subscription">
+
+An object with an `unsubscribe()` method, which also works with `using`. To subscribe to a single client, use [`client.instrument`](./typemo-client.mdx#client.instrument).
+
+</Returns>
+
+The guide is [Operation events](../../observability/events.mdx).
+
+<FullType>
+
+<Snippet id="reference/connection/typemo/typemo-instrument-2" />
+
+</FullType>
+
+---
+
+## VERSION [#version]
+
+`VERSION` is a string with the package version. `@venloc/typemo` exports it as a separate constant, not as a member of the `Typemo` class. The value is currently `"0.0.0"`, because the package hasn't been released yet.
+
+<Snippet id="reference/connection/typemo/version" twoslash />
+
+---
+
+## When `Typemo` doesn't fit [#when-not-to-use]
+
+If only one client needs an extension, a plugin, or a subscriber, register it on that client with [`client.use`](./typemo-client.mdx#client.use), [`connection.plugins`](./connection.mdx#connection.plugins), or [`client.instrument`](./typemo-client.mdx#client.instrument). That way a library with its own client doesn't force behavior on the application, and the application doesn't force it on the library.

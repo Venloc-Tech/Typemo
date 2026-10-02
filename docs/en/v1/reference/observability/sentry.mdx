@@ -1,0 +1,214 @@
+---
+title: "@venloc/typemo-sentry"
+description: "The Sentry adapter: TypemoSentry.instrument, options, breadcrumbs, error context and tags, and the package exports"
+icon: Bug
+---
+
+`@venloc/typemo-sentry` sends Sentry what tracing doesn't have: operation **errors** with clear context, and **breadcrumbs**, the short Sentry records of what happened before an error. The package is separate. The core `@venloc/typemo` knows nothing about Sentry, and the adapter subscribes to [operation events](./events.mdx) and calls `addBreadcrumb` and `captureException` from `@sentry/core`. So it works the same with `@sentry/node` and `@sentry/bun`, and it doesn't care which SDK you initialized.
+
+The package doesn't do tracing. Spans reach Sentry from OpenTelemetry, and [`@venloc/typemo-opentelemetry`](./opentelemetry.mdx) is responsible for them. The guide [Sentry](../../observability/sentry.mdx) explains how to attach the adapter and what you'll see in Sentry. This page is a reference.
+
+The package needs `@sentry/core` version 11.1.0 or higher as a peer dependency. The application chooses the SDK, the DSN, and the other settings.
+
+```package-install
+@venloc/typemo-sentry @sentry/node
+```
+
+The examples use an account model.
+
+<Snippet id="reference/observability/sentry/intro" title="accounts/account.ts" />
+
+The documentation build doesn't compile the code blocks of this page, because it doesn't connect third-party packages. We got the results by running the adapter on a real database with a test Sentry client from `@sentry/core`. It records events and breadcrumbs instead of sending them.
+
+---
+
+## TypemoSentry.instrument [#typemo-sentry.instrument]
+
+`TypemoSentry.instrument` subscribes the adapter to the operations of a client or of all clients in the process. From then on every finished operation leaves a breadcrumb, and a failed one also sends an error to Sentry with context. From the event you see right away which model, collection, and operation failed, at which step, and whether a retry is possible.
+
+<Snippet id="reference/observability/sentry/typemo-sentry-instrument" title="monitoring.ts" />
+
+The registration itself sends nothing, it only subscribes the adapter. On the path of an operation the adapter throws no exceptions. If handling an event goes wrong, it writes `console.error("[typemo-sentry] an instrumentation subscriber failed:", error)` and the operation goes on. Two subscriptions to one error give a single event in Sentry. The same holds if the application sends that error itself after the adapter, since `@sentry/core` marks exceptions that were already sent, and the adapter relies on that.
+
+<Params>
+<Param name="target" type="InstrumentationTarget" required>
+
+A client (`TypemoClient`) or the `Typemo` class. Any object with an `instrument(subscriber)` method that returns a subscription will do. `Typemo` covers all clients of the process.
+
+</Param>
+<Param name="options" type="SentryInstrumentationOptions" default="{}">
+
+Settings in [`SentryInstrumentationOptions`](#sentry-instrumentation-options).
+
+</Param>
+</Params>
+
+<Returns type="Subscription">
+
+The core subscription with an `unsubscribe()` method. After it the adapter sends nothing new.
+
+</Returns>
+
+<FullType>
+
+<Snippet id="reference/observability/sentry/typemo-sentry-instrument-2" />
+
+</FullType>
+
+---
+
+## SentryInstrumentationOptions [#sentry-instrumentation-options]
+
+All fields are optional. Without settings the adapter both leaves breadcrumbs and sends all errors, and it masks the values in them.
+
+### captureErrors [#capture-errors]
+
+`boolean`, `true` by default. Sends **every** operation error to Sentry through `captureException`, with no filter by kind. The lack of a filter is intentional. It's easier to decide which errors are noise in Sentry (`beforeSend`, grouping rules), where you see the whole picture, and the adapter shouldn't silently skip other people's errors. With `false` only breadcrumbs remain.
+
+### breadcrumbs [#breadcrumbs]
+
+`boolean`, `true` by default. Adds a breadcrumb for the end of every operation, and for a transaction retry and rollback. With `captureErrors: false` and `breadcrumbs: false` neither a breadcrumb nor an event was left, even when a `DuplicateKeyError` occurred.
+
+### sensitive [#sensitive]
+
+`SubscriberSensitive`, `"mask"` by default. It works like the [core subscriber](./events.mdx#subscriber-sensitive). The real values of unmarked fields leave the process only with `"show"` or through your `{ mask }`. This covers the summary in a breadcrumb and the values in `CastError`, `ValidationError`, `DuplicateKeyError`, and `ServerValidationError` errors. The `sensitive` marks in the schema and hidden fields always apply. The error message in Sentry looks like this: `duplicate key on title_1: { title: "?" } (code 11000 DuplicateKey)`, while the calling code got the error with the real value.
+
+### includeTenant [#include-tenant]
+
+`boolean`, `false` by default. Puts the operation's tenant into the **error that is sent**: the tag `typemo.tenant` and the `tenant` field in `contexts.typemo`, with the value converted to a string. The tenant is absent by default, because it's your customers' data, and Sentry is an external service. The core receives the option (it turns on `OperationInfo.tenant`), and [`ErrorContextBuilder`](#error-context-builder) checks it once more. Breadcrumbs never carry the tenant. An operation outside a tenant policy has neither the tag nor the field. `Note.find().policy({ tenant: "t-1" })` with a casting error produced the tag `typemo.tenant: "t-1"` and `tenant: "t-1"` in the context.
+
+<FullType>
+
+<Snippet id="reference/observability/sentry/include-tenant" />
+
+</FullType>
+
+---
+
+## What is sent [#what-is-sent]
+
+### Breadcrumbs [#what-is-sent.breadcrumbs]
+
+A breadcrumb is created when an operation has finished, not when it started. The adapter remembers the query summary from the `operation.start` event and puts it into the record when `operation.end` or `operation.error` arrives. The message has the form `Typemo.<operation> (<Model>)`, like the span name in OpenTelemetry. The category is always `typemo`.
+
+A successful operation has the type `query` and the level `info`. A database-level operation ([`connection.aggregate`](../connection/connection.mdx#connection.aggregate)) has no model and no collection. The message will be `Typemo.aggregate (database bank)`, and `data` won't have `model` and `collection`. Here is what `find` produced.
+
+<Snippet id="reference/observability/sentry/what-is-sent-breadcrumbs" />
+
+A failed operation has the type `error` and the level `error`. `data` gains `failedStep` (`"cast"`, `"execute"`) and `errorKind` (`"duplicate-key"`, `"cast"`), and `documentCount` disappears.
+
+A transaction retry and rollback also leave a breadcrumb of the type `transaction`. The message is `Typemo.transaction retry` (level `warning`) or `Typemo.transaction abort` (level `error`). `data` holds `transactionId`, `attempt`, `connection`, `durationMS`, and `errorClass`. `errorClass` is only the name of the error class without the message, because a driver or server message may quote values.
+
+The adapter doesn't send the other events: steps, cursor batches, driver commands, the pool, and the transaction commit. For those there's [OpenTelemetry](./opentelemetry.mdx).
+
+### Errors [#errors]
+
+Every operation error goes out through `captureException(error, { contexts: { typemo }, tags })`. It's the error from the `operation.error` event, that is, a copy masked by `sensitive`. Two errors went out, a `DuplicateKeyError` and a `CastError`.
+
+`contexts.typemo` holds only metadata, without document data.
+
+<TypeTable
+  type={{
+    "model": { description: "The model name. Absent for a database-level operation.", type: "string" },
+    "collection": { description: "The collection name. Absent if the operation doesn't read a collection (the whole database, `admin`).", type: "string" },
+    "database": { description: "The database name.", type: "string" },
+    "connection": { description: "The client name.", type: "string" },
+    "operation": { description: "The operation name, for example `insertOne` or `updateOne`.", type: "string" },
+    "path": { description: "The path of the relation being populated, if the error is in a nested query.", type: "string | undefined" },
+    "failedStep": { description: "The step the operation failed at, for example `cast` or `execute`.", type: "string | undefined" },
+    "classification": { description: "The kind of error, for example `duplicate-key`, `cast`, `not-found`.", type: "string" },
+    "serverCode": { description: "The server error code, for example `11000`.", type: "number | undefined" },
+    "errorLabels": { description: "The server error labels.", type: "readonly string[]" },
+    "retryable": { description: "Whether a retry can help.", type: "boolean" },
+    "transient": { description: "Whether the error is temporary (`TransientTransactionError`).", type: "boolean" },
+    "tenant": { description: "The tenant of the operation. Only with `includeTenant: true` and only for an operation with a tenant.", type: "string" },
+  }}
+/>
+
+Tags are for filtering in the Sentry interface, so you don't have to open the event. They are `typemo.error_class` (the error class, for example `DuplicateKeyError`), `typemo.classification`, `typemo.operation`, `typemo.model` (absent for a database-level operation), and `typemo.tenant` (only with `includeTenant: true`). A repeated insert produced the tags `{ "typemo.error_class": "DuplicateKeyError", "typemo.classification": "duplicate-key", "typemo.operation": "insertOne", "typemo.model": "Account" }`.
+
+There's one more kind of event. If your `mask` function from the `sensitive` setting threw an exception, the adapter sends its error, and the error holds the path, not the value. The tags are `typemo.instrumentation.source` and `typemo.model`, and the `typemo` context has `source`, `model`, and `path`. The value became `"?"` meanwhile. It's sent with `captureErrors: true`.
+
+### What the adapter doesn't see [#adapter-limits]
+
+The adapter sees exactly what the core reports in operation events. `create`, `$save`, and `bulkSave` cast types and validate inside their own operation, so their `ValidationError` reaches Sentry too. An error in a `pre('save')` hook happens before the operation, outside it, and the adapter doesn't learn about it.
+
+---
+
+## SentrySubscriber [#sentry-subscriber]
+
+`SentrySubscriber` is the subscriber itself, which `TypemoSentry.instrument` creates. The class is exported for manual registration, for example on a client that doesn't fit `InstrumentationTarget`, or in a test. It implements [`InstrumentationSubscriber`](./events.mdx#instrumentation-subscriber), and `handle`, `sensitive`, and `includeTenant` are available as fields.
+
+<Snippet id="reference/observability/sentry/sentry-subscriber" />
+
+<Params>
+<Param name="options" type="SentryInstrumentationOptions" default="{}">
+
+The same settings as in [`TypemoSentry.instrument`](#typemo-sentry.instrument).
+
+</Param>
+</Params>
+
+The instance fields are `sensitive` and `includeTenant` with the defaults applied, and `handle`, the event handling function.
+
+---
+
+## BreadcrumbBuilder [#breadcrumb-builder]
+
+`BreadcrumbBuilder` is a static class that builds breadcrumbs. It's exported for those who write their own subscriber and want records of the same kind. All methods return a `Breadcrumb` from `@sentry/core`.
+
+<TypeTable
+  type={{
+    "BreadcrumbBuilder.message(operation, model)": { description: "The text `Typemo.<operation> (<Model>)`. The second argument can also be `database <database>`.", type: "(operation: string, model: string) => string" },
+    "BreadcrumbBuilder.targetOf(event)": { description: "What goes in the parentheses of the message: the model name, and for a database-level operation `database <database>`.", type: "(event: OperationEndEvent | OperationErrorEvent) => string" },
+    "BreadcrumbBuilder.forEnd(event, summary)": { description: "A record of a finished operation, type `query`, level `info`. `summary` is the summary from `operation.start`, if there is one.", type: "(event: OperationEndEvent, summary: OperationSummary | undefined) => Breadcrumb" },
+    "BreadcrumbBuilder.forError(event, summary)": { description: "A record of a failed operation, type `error`, level `error`, with `failedStep` and `errorKind`.", type: "(event: OperationErrorEvent, summary: OperationSummary | undefined) => Breadcrumb" },
+    "BreadcrumbBuilder.forTransaction(event)": { description: "A record of a transaction retry or rollback, holding only the error class name.", type: "(event: TransactionEvent) => Breadcrumb" },
+  }}
+/>
+
+---
+
+## ErrorContextBuilder [#error-context-builder]
+
+`ErrorContextBuilder` is a static class that builds the error context and tags. You need it for the same reason as `BreadcrumbBuilder`: your own subscriber gets the same field names.
+
+<TypeTable
+  type={{
+    "ErrorContextBuilder.context(event, includeTenant?)": { description: "The `contexts.typemo` object for an `operation.error` event. It holds only metadata, and the tenant is there only if `includeTenant` is `true`.", type: "(event: OperationErrorEvent, includeTenant?: boolean) => TypemoErrorContext" },
+    "ErrorContextBuilder.tags(event, includeTenant?)": { description: "The tags `typemo.error_class`, `typemo.classification`, `typemo.operation`, `typemo.model` (if the operation has a model), and `typemo.tenant` (if `includeTenant` is set and the operation has a tenant).", type: "(event: OperationErrorEvent, includeTenant?: boolean) => Record<string, string>" },
+    "ErrorContextBuilder.tenantOf(event, includeTenant)": { description: "The tenant as a string. `undefined` if the tenant isn't needed or the operation has none. The method checks the option once more, so a call without it won't hand out the tenant.", type: "(event: OperationErrorEvent, includeTenant: boolean) => string | undefined" },
+  }}
+/>
+
+---
+
+## TypemoErrorContext [#typemo-error-context]
+
+`TypemoErrorContext` is the type of the `contexts.typemo` context, and its fields are listed in the table of the section [Errors](#errors). `model` and `collection` are optional, a database-level operation has none, and the adapter doesn't write empty values. There's an index signature `[key: string]: unknown`, because Sentry requires an open dictionary for a context. All the listed fields are still typed exactly.
+
+<FullType>
+
+<Snippet id="reference/observability/sentry/typemo-error-context" />
+
+</FullType>
+
+---
+
+## When the adapter doesn't fit [#when-not-to-use]
+
+If you need another error tracker rather than Sentry, write your own subscriber on this model. The guide [Custom integration](../../observability/custom-integration.mdx) explains how. If you need spans and metrics, attach [`@venloc/typemo-opentelemetry`](./opentelemetry.mdx). Sentry v8 and newer reads traces from OpenTelemetry on its own.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Sentry" href="../../observability/sentry.mdx">
+  The guide: attach the adapter and investigate an error in Sentry.
+</Card>
+<Card title="Events" href="./events.mdx">
+  What the adapter receives and how values are masked.
+</Card>
+<Card title="@venloc/typemo-opentelemetry" href="./opentelemetry.mdx">
+  Tracing operations for Sentry and beyond.
+</Card>
+</Cards>

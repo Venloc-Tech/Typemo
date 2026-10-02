@@ -1,0 +1,178 @@
+---
+title: Checking the response shape
+description: "Pin down the shape of a response at compile time and check the data from the database at runtime, so an API response never changes unnoticed"
+icon: FileCheck
+---
+
+To keep the shape of a response from changing unnoticed, describe it with a **contract**, a type you write yourself. Then ask Typemo to compare it with what the query actually returns. You need this where the response shape is an agreement with other code: an API response body, a queue message, the input of another service. Add a field to the model or change the projection in a query, and the compile-time check tells you about the drift, not a client who got an extra field or lost one it needed.
+
+There are two kinds of checks, and they do different jobs.
+
+- **At compile time**: [`.expect`](../reference/query/contracts.mdx#expect) and [`Contract.check`](../reference/query/contracts.mdx#contract.check). They compare the result type with your description and cost nothing at runtime.
+- **At runtime**: [`.parse`](../reference/query/contracts.mdx#parse). It runs every row through a validation schema.
+
+You need the second kind because a type promises a shape, while the database holds whatever was written to it. And that could have been an old version of the app, a one-off script, or someone going through the driver.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the account model from `accounts/account.ts`. It has an optional note and a hidden `pin`, which show the special cases.
+
+<Snippet id="queries/contracts/prerequisites" title="accounts/account.ts" twoslash />
+
+The collection has three accounts.
+
+- Alice: `Main`, balance 100.
+- Bob: `Savings`, balance 250.
+- Carol: an old script wrote her record straight into the database with the string balance `"n/a"`.
+
+## Quick start [#quick-start]
+
+There are three methods for three situations. A contract for a row of a query result is checked at compile time with [`.expect`](../reference/query/contracts.mdx#expect) and the [`Selected`](../reference/query/contracts.mdx#selected) description, "these fields of this model in a `.plain()` result".
+
+<Snippet id="queries/contracts/quick-start" twoslash />
+
+[`.parse`](../reference/query/contracts.mdx#parse) with a schema checks the data at runtime, and [`Contract.check`](../reference/query/contracts.mdx#contract.check) checks a ready document at compile time. We'll go through all of it on real tasks below.
+
+## Pin down the response shape at compile time [#pin-response-shape]
+
+Say a handler sends the client a list of accounts with the owner and the balance. You pick two fields with [`.select`](../reference/query/reading.mdx#select), turn the result into ordinary objects with [`.plain()`](../reference/query/reading.mdx#plain), and add `.expect<Shape>()`.
+
+The shape is written as `Selected<Model, "field" | "field">`. That's the type of a `.plain()` result row with those fields. `_id` is included by default, and in a `.plain()` result it's a string. `"-_id"` among the fields removes it.
+
+<Snippet id="queries/contracts/pin-response-shape" twoslash />
+
+`.expect` compares **exactly**: the same fields, the same optionality, the same `null`s. If everything matches, the query comes back as it was, and the result type doesn't change. At runtime the method does nothing, so you can leave it in the code for good.
+
+### What the check catches [#check-catches]
+
+The check catches three kinds of drift, and all of them show up at compile time. The first is that not every field of the contract was selected.
+
+<Snippet id="queries/contracts/check-catches" twoslash />
+
+`missing` means the field is in the contract but not in the result. The opposite case is an extra selected field.
+
+<Snippet id="queries/contracts/check-catches-2" twoslash />
+
+`extra` means the field is in the result but not in the contract. An extra field here is always an error, even though ordinary TypeScript type checking would let an object with an extra field through. That's exactly what a contract is for, so a field like someone else's note doesn't slip into a response to the client unnoticed.
+
+The third kind is `mismatch`. The field is on both sides, but its type, `null`, or optionality differs.
+
+<Snippet id="queries/contracts/check-catches-3" twoslash />
+
+The message names the field with the drift. Paths of nested fields are written with dots, array elements as `[]`, and the result itself as `(root)`.
+
+## Compare a ready document or JSON [#compare-document]
+
+Only queries have `.expect`. Sometimes you already have a document, for example after `findOne` or `create`, and you send its `$toJSON()` to the client. Then compare the value with [`Contract.check`](../reference/query/contracts.mdx#contract.check). It accepts any value and returns the same value typed as the contract.
+
+The two pairs of parentheses in the call are there on purpose. The first sets the expected type, and the second takes the value, whose type TypeScript infers on its own.
+
+<Snippet id="queries/contracts/compare-document" title="accounts/accounts.api.ts" twoslash />
+
+The hidden `pin` isn't named in the contract, and the check passes, since `$toJSON()` doesn't return it. But remove `title` and `note` from the description, and the check stops you. The document returns more than the contract promises.
+
+<Snippet id="queries/contracts/compare-document-2" twoslash />
+
+## Which description to use [#choose-definition]
+
+The three description types differ in the form they show values in, the same way the forms of a query result do.
+
+- [`Selected`](../reference/query/contracts.mdx#selected) describes the result of `.plain()` and `$toPlain()`. Ids are strings, and getter virtuals are in place.
+- [`SelectedLean`](../reference/query/contracts.mdx#selected-lean) describes the result of `.lean()`. Values are as the driver returned them: `_id` is an `ObjectId`, and 64-bit numbers are `bigint`.
+- [`SelectedJson`](../reference/query/contracts.mdx#selected-json) describes what `$toJSON()` returns. Ids, dates, and 64-bit numbers are strings.
+
+Use the one that matches the form you hand the data out in. If the response goes to the client as JSON, compare with `SelectedJson`. If you work with `.lean()` inside the app, with `SelectedLean`.
+
+<Snippet id="queries/contracts/choose-definition" twoslash />
+
+If a field is filled in by `populate` or is a nested document, its shape depends on the query. You set it with the third parameter of `Selected`, an override: `Selected<Post, "title" | "author", { author: Selected<User, "name" | "-_id"> }>`. See the [Contracts](../reference/query/contracts.mdx#selected) reference.
+
+## Check data from the database at runtime [#validate-reads]
+
+A type promises a shape, while the database holds whatever was written to it. Say an old script saved Carol's balance as the string `"n/a"`. The compile-time check won't see that, since for it the balance is a number by the model's type. To catch such a record before it reaches the client, pass a schema to [`.parse`](../reference/query/contracts.mdx#parse).
+
+Any schema that follows the **Standard Schema** spec works, that is an object with a `"~standard"` field. That's how the schemas of popular validation libraries are built, and you can pass them without wrappers. Below is a hand-written schema of a few lines, so the example doesn't depend on a library. It lets a row through only if the owner is a string and the balance is a number.
+
+<Snippet id="queries/contracts/validate-reads" title="accounts/balance-row.ts" twoslash />
+
+Before the check, the result has to become ordinary objects, since `.parse` works on `.lean()` and `.plain()`. If every row is valid, you get what the schema returned. A schema can transform rows as well as check them.
+
+<Snippet id="queries/contracts/validate-reads-2" twoslash />
+
+If Carol's record gets into the result, though, the query fails with a [`ValidationError`](../reference/errors/data-errors.mdx#validation-error). There's one error for the whole query, and it collects the issues for every row. The path starts with the row's index in the result, counting from zero. Carol is third by owner, so the path starts with `2`.
+
+<Snippet id="queries/contracts/validate-reads-3" title="accounts/accounts.service.ts" twoslash />
+
+Schemas in `.parse` check the data being **read**, and the model's field schemas check the data being **written**. A read itself doesn't check rows. If the database holds a value of the wrong type, an ordinary `find` returns it as is. So put `.parse` where data crosses a trust boundary.
+
+### One document and lists [#one-and-lists]
+
+For `findOne` the result is a row or `null`. If nothing was found, `null` stays `null`, and the schema doesn't check it. A missing document isn't a shape violation.
+
+<Snippet id="queries/contracts/one-and-lists" twoslash />
+
+### Large results [#large-results]
+
+If you read a list with a cursor ([`.cursor()`](../reference/query/cursor.mdx)), rows are checked as they're read. The first invalid row ends the read with a `ValidationError` carrying the row's index in the stream, and the cursor closes. You've already processed the rows before the error. For a stream that's normal, and no data is lost.
+
+<Snippet id="queries/contracts/large-results" twoslash />
+
+## How to choose [#how-to-choose]
+
+Ask yourself **what you don't trust, the code or the data**.
+
+- **The code.** Someone on the team changes the model or the query, and the response drifts from the agreement. Use `.expect` and `Contract.check`. They're free and work at compile time.
+- **The data.** The database may hold something other than what the type promises, written by an old app, an import, or by hand. You need `.parse`.
+
+At the boundary with the outside world you often need both. `.expect` pins down that the query selects the right fields, and `.parse` checks that the values of those fields are valid.
+
+## When not to use it [#when-not-to-use]
+
+If the response doesn't leave the app and both the query and its consumer are yours, a separate contract is overkill. The compiler already knows the result type, and you can see it in your editor's tooltip.
+
+Don't put `.parse` on a hot read path if you trust the data. It parses every row, and that takes time. And `.expect` and `.parse` don't work for documents. A contract describes data, and a document is an object with methods, so compare the result of its method with `Contract.check`.
+
+## Troubleshooting [#troubleshooting]
+
+**`.expect` doesn't compile on a document.** You called `.expect` on a query without `.plain()` or `.lean()`. A contract describes data, and a document is an object with methods, so an exact comparison with it makes no sense. The compiler tells you what to do.
+
+<Snippet id="queries/contracts/troubleshooting" twoslash />
+
+**The contract drifted because of `_id`.** You described the shape as `{ owner: string; balance: number }`, and the query also returned `_id`. The result always has `_id` unless you exclude it with `.select({ owner: 1, balance: 1, _id: 0 })`. Either add it to the contract, or use `Selected<Account, "owner" | "balance">`, which already includes it, and if you exclude it, add `"-_id"`.
+
+**You selected one thing and described another: `extra` or `missing`.** The cause is always a difference between `.select` and the contract, where one changed and the other didn't. The error names the field. Keep `.select` and the contract side by side and change them together. It's easiest to build `Selected` from the same list of fields.
+
+**`.parse` before `.plain()`.** `.parse` checks data, and a document isn't data. So a call before `.lean()` or `.plain()` doesn't compile, and in untyped code it throws a `QueryError`.
+
+<Snippet id="queries/contracts/troubleshooting-2" />
+
+Add `.plain()` before `.parse(schema)`.
+
+## Full example [#full-example]
+
+Here it all comes together: a query contract at compile time, a data check at runtime, and a document comparison. Code that isn't part of Typemo and that you write yourself is marked `__…__`.
+
+<Snippet id="queries/contracts/full-example" title="accounts/accounts.api.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose you described the shape of a `lean()` result by hand with a generic, and nothing compared it with the query, so you could write any type. In Typemo the compiler checks the shape. [`.expect`](../reference/query/contracts.mdx#expect) compares the description with the result type and reports drift, and [`.parse`](../reference/query/contracts.mdx#parse) adds a runtime check with a Standard Schema schema.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Contracts" href="../reference/query/contracts.mdx">
+  Every contract method and type with exact signatures and errors.
+</Card>
+<Card title="Projections and the result type" href="./projections.mdx">
+  How `select` changes the result type and why `Selected` mirrors it.
+</Card>
+<Card title="Response masks" href="./response-masks.mdx">
+  Show the client only part of a value without removing the whole field.
+</Card>
+<Card title="Reading data" href="./reading-data.mdx">
+  A document, `.lean()`, and `.plain()`: which form to hand query data out in.
+</Card>
+</Cards>

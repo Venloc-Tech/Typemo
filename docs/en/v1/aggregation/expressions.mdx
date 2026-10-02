@@ -1,0 +1,128 @@
+---
+title: Calculations in aggregation
+description: "Refer to fields through f, compute values with the fn functions, handle missing fields, and see why raw $expr is forbidden"
+icon: Calculator
+---
+
+An **expression** is a calculation over a document's fields. Add the price and the tax, join strings, pick one of two values. Aggregation stages accept expressions wherever a new value has to be computed: in [`addFields`](../reference/aggregation/stages.mdx#add-fields), [`project`](../reference/aggregation/stages.mdx#project), [`match`](../reference/aggregation/stages.mdx#match), and [`group`](../reference/aggregation/stages.mdx#group). The MongoDB server writes expressions as strings like `"$price"` and objects with operators like `{ $add: [...] }`. In Typemo you write ordinary TypeScript. You take fields from the `f` parameter and operations from the [`fn`](../reference/aggregation/expr-arithmetic.mdx) object.
+
+This way the compiler checks your calculations. A typo in a field name, adding a number to a string, an accumulator in place of a plain value: all of these are compile errors, not an empty string or `null` in a report after an hour in production.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and a shop's product model. Stages and running an aggregation are covered in [Your first aggregation](first-aggregation.mdx). The `products` collection holds three products.
+
+- A kettle: price 40, discount 5.
+- A lamp: price 25, no discount.
+- A mug, "$5 mug": price 8, discount 1.
+
+<Snippet id="aggregation/expressions/prerequisites" title="products/product.ts" twoslash />
+
+## Quick start [#quick-start]
+
+A stage's callback gets `f`, a description of the current row's fields, and returns an object with the new values. The `fn` functions compute the values.
+
+<Snippet id="aggregation/expressions/quick-start" twoslash />
+
+Below we'll cover fields, nested and missing values, conditions, arrays, and why you write code instead of raw strings with `$`.
+
+## Refer to a field [#field-ref]
+
+`f.price` isn't the price but a **field reference**. The server reads it in each document itself. So you can't compare `f.price` with a number using `>`. There's [`fn.gt`](../reference/aggregation/expr-logic.mdx#fn.gt) for that. But the reference has a type. Your editor suggests the model's fields, and an unknown field won't compile.
+
+<Snippet id="aggregation/expressions/field-ref" twoslash />
+
+The compiler suggests the closest name, `price`. Nested documents are reachable by a chain, for example `f.address.city`. If the parent is optional or may be `null`, every field below it gets `| undefined`. The server reads a missing value as "no value", and the type says so honestly.
+
+## Compute a new field [#compute-field]
+
+To add a computed field to a row, use `addFields`. It keeps all the old fields and adds new ones, and the row type grows by your fields.
+
+<Snippet id="aggregation/expressions/compute-field" twoslash />
+
+The operators are named as in MongoDB, only without the `$`: `fn.add`, `fn.concat`, `fn.size`. Two names differ from the server's. [`fn.toString_`](../reference/aggregation/expr-conversion.mdx#fn.to-string), because in JavaScript every object already has `toString`. [`fn.typeOf`](../reference/aggregation/expr-conversion.mdx#fn.type-of) is the server's `$type`. All operators are grouped by topic in the reference: [arithmetic](../reference/aggregation/expr-arithmetic.mdx), [strings](../reference/aggregation/expr-string.mdx), [dates](../reference/aggregation/expr-date.mdx), and [arrays](../reference/aggregation/expr-array.mdx).
+
+## A missing value and `null` [#missing-and-null]
+
+The lamp has no discount, and the document has no `discount` field at all. Subtract it from the price, and the server returns `null` instead of the price, because any arithmetic with a missing value gives `null`. The type knows this. `fn.subtract(f.price, f.discount)` has the type `number | null`, and you can't assign it to a `number` field.
+
+<Snippet id="aggregation/expressions/missing-and-null" twoslash />
+
+To substitute a value for a missing one, use [`fn.ifNull`](../reference/aggregation/expr-logic.mdx#fn.if-null). The first argument is the value, the second the replacement. The result type no longer has `null`.
+
+<Snippet id="aggregation/expressions/missing-and-null-2" twoslash />
+
+That's how the server works, and Typemo hides nothing. The result won't become `0` without your decision. You decide what counts as zero.
+
+## Pick a value by a condition [#conditional-value]
+
+[`fn.cond`](../reference/aggregation/expr-logic.mdx#fn.cond) picks one of two values, [`fn.switch`](../reference/aggregation/expr-logic.mdx#fn.switch) one of several. The result type is a union of the options. In the quick start above, `tier` got the type `"premium" | "basic"`, because both branches are literals.
+
+A condition in a filter is written the same way. [`match`](../reference/aggregation/stages.mdx#match) takes either a filter object or a function that returns a boolean expression. You need the function when you compare two fields of one document or compute a value before comparing. An ordinary filter like `{ price: { $gt: 20 } }` can't do that.
+
+<Snippet id="aggregation/expressions/conditional-value" twoslash />
+
+## Work with arrays [#work-with-arrays]
+
+Functions over arrays take a callback, and the callback gets a reference to the current element. It's typed the same way as `f`, and for `tags` the element is a string.
+
+<Snippet id="aggregation/expressions/work-with-arrays" twoslash />
+
+Nested callbacks don't mix up their elements. An inner `map` inside an outer one sees its own element, and the outer one's too if needed. Typemo gives the variables unique names itself.
+
+## A string with `$` is a string [#dollar-string]
+
+In MongoDB a string that starts with `$` is a field path, and `"$price"` reads the price. Want to write the text "$5 off" into the result, and a plain aggregation reads it as a field `5 off`, which doesn't exist. Typemo won't let you make that mistake. A string in the place of a value is always a literal, and paths are written only through `f`.
+
+<Snippet id="aggregation/expressions/dollar-string" twoslash />
+
+The value goes to the server as `{ $literal: "$5 off" }`, and you get exactly what you wrote. You rarely need an explicit [`fn.literal`](../reference/aggregation/expr-logic.mdx#fn.literal), only for a value inside an object or array that mustn't be parsed.
+
+## Remove a field and get the time [#unset-and-get-time]
+
+MongoDB's system variables are collected in the [`Vars`](../reference/aggregation/expr-misc.mdx#vars) class, and the two most common ones have short calls. [`fn.now()`](../reference/aggregation/expr-misc.mdx#vars) gives the current time, one for the whole aggregation. [`fn.remove()`](../reference/aggregation/expr-misc.mdx#vars) removes the field it's assigned to.
+
+<Snippet id="aggregation/expressions/unset-and-get-time" twoslash />
+
+The `discount` field is gone from the row type, and `seenAt` is a date. That the field disappeared is recorded in the type, not in a comment, and the next stage can't reach it.
+
+## How to choose [#how-to-choose]
+
+Ask yourself whether the value is computed for each document or gathered from many.
+
+- **For each document separately**: a discounted price, a joined name, a label by a condition. That's an `fn.*` expression in `addFields`, `project`, or `match`.
+- **Many documents fold into one value**: a sum, an average, a count. That's an **accumulator**, and it lives only in `group` and similar stages, see [Grouping and reports](grouping.mdx).
+
+## When not to use it [#when-not-to-use]
+
+If you only need to select documents by a field's value, use [`find`](../reference/query/reading.mdx#model.find) with an ordinary filter. It's simpler and uses indexes. Expressions in `match` pay off when two fields of one document are compared or a value is computed on the fly. And if the documents need to change in the database, rather than you computing a value for a response, see [pipeline updates](../writes/pipeline-updates.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**Raw `$expr` in a filter.** A habit from the driver is to put an object with operators in `$expr`. Typemo rejects it right away, because such an object would bypass every type check. Write a function instead of an object.
+
+<Snippet id="aggregation/expressions/troubleshooting" twoslash />
+
+If the types were bypassed with a cast, at runtime you get `QueryError: filter: $expr is a callback (f) => fn.… (a raw $expr object is not typed)`. Write the condition as a function: `$expr: (f) => fn.gt(f.price, 20)`.
+
+**The price is compared with a string.** `fn.gt(f.price, "20")` won't compile. The server compares values of different types by a special order, and the result is almost never what you expect. The argument types of `fn.*` match the server's, so compare a number with a number.
+
+<Snippet id="aggregation/expressions/troubleshooting-2" twoslash />
+
+## Full example [#full-example]
+
+<Snippet id="aggregation/expressions/full-example" title="products/products.service.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Grouping and reports" href="./grouping.mdx">
+  Accumulators: fold many documents into one value.
+</Card>
+<Card title="Expressions: arithmetic" href="../reference/aggregation/expr-arithmetic.mdx">
+  Every arithmetic operator of `fn`, with types.
+</Card>
+<Card title="Expressions: logic and comparison" href="../reference/aggregation/expr-logic.mdx">
+  `cond`, `switch`, `ifNull`, comparisons, and logical operators.
+</Card>
+</Cards>

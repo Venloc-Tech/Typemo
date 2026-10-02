@@ -1,0 +1,85 @@
+---
+title: Sentry
+description: "Typemo operation errors in Sentry with clear context and breadcrumbs, but without user data"
+icon: Bug
+---
+
+The `@venloc/typemo-sentry` package sends operation errors to Sentry with context: the model, the collection, the step, and the kind of failure. It also leaves **breadcrumbs**, short records of what happened before the error. When you open an event in Sentry, you see right away which operation on which model failed and whether it can be retried. The adapter uses only `@sentry/core`, so it works the same with `@sentry/node` and `@sentry/bun`.
+
+You don't need tracing here. Spans reach Sentry from [OpenTelemetry](./opentelemetry.mdx). The package reference is [`@venloc/typemo-sentry`](../reference/observability/sentry.mdx).
+
+## What you need [#prerequisites]
+
+Sentry already initialized in your app, with a DSN and the rest of its settings, and a client created as in the [quick start](../getting-started/quick-start.mdx). The docs build doesn't install Sentry, so the code blocks on this page aren't compiled. The adapter was checked by running it against a real database.
+
+## Quick start [#quick-start]
+
+```package-install
+@venloc/typemo-sentry @sentry/node
+```
+
+<Snippet id="observability/sentry/quick-start" title="monitoring.ts" />
+
+To cover every client in the process, call `TypemoSentry.instrument(Typemo)`. You can unsubscribe with `subscription.unsubscribe()`.
+
+## Inspect an error in Sentry [#inspect-in-sentry]
+
+Say a `DuplicateKeyError` event arrives in Sentry. The adapter attached a `typemo` context and four tags to it. A repeated insert with the same unique `title` gave the tags `typemo.error_class: DuplicateKeyError`, `typemo.classification: duplicate-key`, `typemo.operation: insertOne`, and `typemo.model: Account`. The context got `database: "bank"`, `failedStep: "execute"`, `serverCode: 11000`, `retryable: false`, and `transient: false`. Tags are handy for filters and alert rules, and the context is for digging in.
+
+The error message in Sentry is already masked: `duplicate key on title_1: { title: "?" } (code 11000 DuplicateKey)`, even though the calling code got the real value. That way an account number or an email doesn't leak out.
+
+## See what happened before the error [#before-error]
+
+Every finished operation leaves a breadcrumb like `Typemo.find (Account)` with the `typemo` category. Its `data` holds the model, the collection, the database, the duration, the number of documents, and the shape of the query without values, for example `{ filter: { balance: { $gt: "?" } } }`.
+
+A database-level operation ([`connection.aggregate`](../reference/connection/connection.mdx#connection.aggregate)) has neither a model nor a collection. Its message is the same as the OpenTelemetry span's, `Typemo.aggregate (database bank)`, and `data` keeps the database, the duration, and the shape of the pipeline. A failed operation leaves an `error`-level record with `failedStep` and `errorKind`.
+
+A transaction retry and abort are breadcrumbs too: `Typemo.transaction retry` and `Typemo.transaction abort`. They hold only the error class name, because the driver's message can quote values.
+
+## Only breadcrumbs or only errors [#breadcrumbs-or-errors]
+
+If you already send errors yourself, turn off error sending in the adapter.
+
+<Snippet id="observability/sentry/breadcrumbs-or-errors" />
+
+Or the other way round: `breadcrumbs: false` keeps only the errors. If you turn off both, nothing reaches Sentry, and that's been checked. The adapter can't filter errors by kind and sends all of them. Cut the noise in Sentry itself, with `beforeSend`.
+
+## One error, one event [#one-error-one-event]
+
+There are no duplicates, even if the adapter is registered twice or you called `captureException` yourself for the same error. `@sentry/core` marks exceptions it has already sent.
+
+## Keep user data private [#hide-user-data]
+
+By default (`sensitive: "mask"`) the values in the summary and in `CastError`, `ValidationError`, `DuplicateKeyError`, and `ServerValidationError` are replaced with `"?"`. Real values go out only with `sensitive: "show"` or through your own `{ mask }` function, and even then not for fields marked `sensitive` in the schema. The modes are described in the [events reference](../reference/observability/events.mdx#subscriber-sensitive).
+
+By default the tenant doesn't go to Sentry, since it's your customers' data. If you need it to investigate errors, turn on `includeTenant: true`. A sent error then gets a `typemo.tenant` tag and a `tenant` field in the `typemo` context. Nothing changes for operations without a tenant, and breadcrumbs never carry the tenant.
+
+<Snippet id="observability/sentry/hide-user-data" />
+
+## How to choose [#how-to-choose]
+
+Ask yourself **where you want to see errors**. If in Sentry, use this adapter and let OpenTelemetry provide the spans. You can plug both in together. If in another tracker, write a subscriber as in [Custom integration](./custom-integration.mdx).
+
+## When not to use it [#when-not-to-use]
+
+If you already catch errors at the app's boundary and send them yourself with the context you need, the adapter duplicates that context. In that case keep only the breadcrumbs. The adapter doesn't see an error from a `pre('save')` hook thrown before the operation starts, because it happened outside the operation.
+
+## Troubleshooting [#troubleshooting]
+
+**Validation errors don't reach Sentry.** `create`, `$save`, and `bulkSave` check values inside their own operation, so `ValidationError` does reach Sentry. The only error that doesn't is one thrown in a `pre('save')` hook before the operation.
+
+**Errors arrive, but without values.** That's by design: `"?"` stands in for the values. Turn on `sensitive: "show"` deliberately, knowing the data will go to Sentry.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="@venloc/typemo-sentry" href="../reference/observability/sentry.mdx">
+  The package's options, context, tags, and exports.
+</Card>
+<Card title="OpenTelemetry" href="./opentelemetry.mdx">
+  Spans and metrics for Sentry and beyond.
+</Card>
+<Card title="Operation events" href="./events.mdx">
+  What the adapter receives from the core.
+</Card>
+</Cards>

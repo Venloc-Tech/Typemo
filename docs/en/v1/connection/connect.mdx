@@ -1,0 +1,192 @@
+---
+title: Connect to the database
+description: "Open a connection to MongoDB, get models, work with several databases, wait until the client is ready, and close it"
+icon: Plug
+---
+
+Working with data starts with a **client**. It's a [`TypemoClient`](../reference/connection/typemo-client.mdx) object that owns the connection to MongoDB. From the client you get a **connection** to a database, a [`Connection`](../reference/connection/connection.mdx), and from the connection you get models.
+
+Typemo has no global client. You create a client in one place and pass it wherever it's needed. That way your app never has an "implicit" connection that someone forgot to open or close, and in tests you can swap in another client.
+
+If you're new to MongoDB, one fact is enough for now. The server stores documents in **collections**, and collections live in **databases**. The client is the link to the server, and you pick a database by name.
+
+## What you need [#prerequisites]
+
+The account model from `accounts/account.ts` and a connection string for a local server. The `@venloc/typemo` and `mongodb` packages must be installed, and `tsconfig` set up as in [Installation and setup](../getting-started/installation.mdx).
+
+<Snippet id="connection/clients-and-extensions/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Most of the time you need one client and one database, and the client gets closed when the app stops. [`TypemoClient.connect`](../reference/connection/typemo-client.mdx#typemo-client.connect) creates a client and connects it right away. [`client.connection`](../reference/connection/typemo-client.mdx#client.connection) gives you the connection to the default database, and [`connection.model`](../reference/connection/connection.mdx#connection.model) gives you a model.
+
+<Snippet id="connection/connect/quick-start" twoslash />
+
+Below we go through each step on real tasks: picking a database, waiting until the client is ready, several databases, state, and closing.
+
+## Create the client when the app starts [#create-client-on-start]
+
+Create the client once and keep it for as long as the process runs. A client maintains a connection pool, and every new client is a new pool. That's why the client usually lives in its own file and gets exported.
+
+<Snippet id="connection/connect/create-client-on-start" title="db/client.ts" twoslash />
+
+The connection string is an ordinary MongoDB one, `mongodb://` or `mongodb+srv://`. Anything else, such as `localhost:27017` without a scheme, [`TypemoClient`](../reference/connection/typemo-client.mdx#new-typemo-client) rejects right away, before touching the network, with `ConfigurationError: TypemoClient: the first argument is a connection string (mongodb:// or mongodb+srv://)`.
+
+The second argument is the options. These are all the options of the `mongodb` driver plus a few of Typemo's own. For example, `name` sets the client's name in events and errors, and it defaults to `default`. The full list is in [Client options](../reference/connection/typemo-client.mdx#client-options).
+
+If the server is unreachable, `connect` fails with a [`ConnectionError`](../reference/errors/configuration-errors.mdx#connection-error), and you get no client. The error explains the cause. Here the connection string points to a port where nothing is listening.
+
+<Snippet id="connection/connect/create-client-on-start-2" />
+
+Before that, the driver waits for a suitable server for up to `serverSelectionTimeoutMS`, which defaults to 30 seconds. So with a wrong connection string the app doesn't stop right away.
+
+## Pick the default database [#default-database]
+
+Which database `client.connection` works with is decided in order. First the `dbName` option, then the database from the connection string. If there's neither, the database is `test`.
+
+You can combine the option and the string, but they must agree. If `dbName` names one database and the connection string another, [`new TypemoClient`](../reference/connection/typemo-client.mdx#new-typemo-client) throws a `ConfigurationError`. Otherwise part of your code would work with the wrong database, and you'd find out from missing data.
+
+<Snippet id="connection/connect/default-database" twoslash />
+
+When they disagree, the error looks like this.
+
+<Snippet id="connection/connect/default-database-2" />
+
+`test` wasn't Typemo's idea. It's the default database of the driver itself. Forget to name a database, and your app quietly starts writing to `test`. So in real projects name the database explicitly.
+
+## Get a model and work with data [#get-model-and-work]
+
+[`connection.model`](../reference/connection/connection.mdx#connection.model) returns a model. Pass it a class with `@Schema`. For the same class on the same connection you always get the same object. So call `model` wherever it fits, and don't keep the result in a global variable.
+
+<Snippet id="connection/connect/get-model-and-work" title="accounts/accounts.service.ts" twoslash />
+
+[`client.db()`](../reference/connection/typemo-client.mdx#client.db) without an argument returns the same thing as `client.connection`. The first `model` call for a class checks the schema, so a mistake in the field definitions shows up here, not on the first write. What to do with the model next is covered in [Reading data](../queries/reading-data.mdx).
+
+## Work with several databases [#multiple-databases]
+
+Sometimes data is spread across databases: an archive in one, reports in another, a database per tenant. You don't need new clients for that. [`client.db(name)`](../reference/connection/typemo-client.mdx#client.db) and [`connection.useDb(name)`](../reference/connection/connection.mdx#connection.use-db) return a connection to another database of **the same client**. The connection pool is shared, while each database has its own models and data.
+
+<Snippet id="connection/connect/multiple-databases" twoslash />
+
+The `Account` record is in the `app_archive` database, and `app` doesn't have it. Models of one class on different connections are different models with different databases. You can't close `archive` on its own, and you don't need to. The whole client gets closed.
+
+A transaction can still span several databases of one client. Both writes below commit together.
+
+<Snippet id="connection/connect/multiple-databases-2" twoslash />
+
+## Create collections and indexes [#create-collections-and-indexes]
+
+Typemo doesn't create anything in the database by itself, neither collections nor indexes. A collection appears on the first write, but the schema's indexes (`unique`, `index`) don't exist until then, and neither does the uniqueness guarantee. So call [`connection.init`](../reference/connection/connection.mdx#connection.init) at startup. It creates whatever the database doesn't have yet, and it doesn't delete or change anything.
+
+<Snippet id="connection/connect/create-collections-and-indexes" twoslash />
+
+The report shows that the database now matches the models (`inSync: true`), and `created` lists what this particular call created. On a second run `created` is empty, since there's nothing left to create.
+
+If an index in the database is declared differently from the schema, `init` runs the remaining steps and fails with a [`SyncError`](../reference/errors/configuration-errors.mdx#sync-error). The error has `failures` with the list of failures per collection, and the full report is in its `report` field. This can't be skipped silently, because after `init` the app assumes uniqueness is guaranteed.
+
+A different method brings the database exactly in line with the schema, [`connection.syncAll`](../reference/connection/connection.mdx#connection.sync-all). See [Sync indexes](../collections/index-sync.mdx).
+
+## Wait until the client is ready [#wait-ready]
+
+Usually `await TypemoClient.connect(...)` is all you need. But sometimes the client is created before it's connected. A module exports the client, and the startup code calls `connect`. For that there's [`new TypemoClient`](../reference/connection/typemo-client.mdx#new-typemo-client) and a separate [`client.connect`](../reference/connection/typemo-client.mdx#client.connect).
+
+<Snippet id="connection/connect/wait-ready" title="db/client.ts" twoslash />
+
+Until `start` is called, model operations don't fail and don't get lost. Each one waits for the connection on its own and continues as soon as the client is ready. There's no retry queue. The very same call continues.
+
+An operation won't wait forever. The limit is its own `timeoutMS`, or if it has none, the client's [`readyTimeoutMS`](../reference/connection/typemo-client.mdx#client-options), which defaults to 10 seconds. When the limit runs out you get a [`TimeoutError`](../reference/errors/server-errors.mdx#timeout-error), and its text shows that someone forgot to call `connect`.
+
+<Snippet id="connection/connect/wait-ready-2" />
+
+If you need to wait for the connection explicitly, for example before starting an HTTP server, call [`client.ready`](../reference/connection/typemo-client.mdx#client.ready) with the time limit you want. Zero means "wait with no limit".
+
+<Snippet id="connection/connect/wait-ready-3" twoslash />
+
+If `connect` fails, everyone who's waiting gets the same error. The client goes back to the `idle` state, and you can call `connect` again. With an unreachable connection string that gives two identical errors in a row.
+
+## Close the client [#close-client]
+
+[`client.close`](../reference/connection/typemo-client.mdx#client.close) closes the connection pool and ends the sessions. Call it when the app stops and at the end of scripts, or the open client keeps the process from exiting. A closed client can't be opened again. Operations on it fail right away with a `ConnectionError`, and a second `close` does nothing.
+
+<Snippet id="connection/connect/close-client" />
+
+Operations that were still waiting for the connection when it closed also get a `ConnectionError` with `failure: "closed"`, only their text is `TypemoClient "main" was closed`.
+
+To avoid forgetting to close the client in a script, declare it with `await using`. Then [`client[Symbol.asyncDispose]`](../reference/connection/typemo-client.mdx#client.async-dispose) closes it for you at the end of the block, even if an error was thrown inside.
+
+<Snippet id="connection/connect/close-client-2" title="scripts/count-accounts.ts" twoslash />
+
+## Watch the connection state [#connection-state]
+
+A client has a state: `idle`, `connecting`, `connected`, `unavailable`, or `closed`. It comes in handy for readiness checks ("is the server reachable?") and for logs. [`client.onStateChange`](../reference/connection/typemo-client.mdx#client.on-state-change) calls your function on every change, and the current value is always in [`client.state`](../reference/connection/typemo-client.mdx#client.state).
+
+<Snippet id="connection/connect/connection-state" title="db/monitor.ts" twoslash />
+
+The function receives only changes. It doesn't get the initial `idle`, so read that from `client.state`.
+
+If the connection to the server is lost, the client moves to `unavailable`. It was connected, but there's no data-bearing server right now. The driver reconnects by itself, and operations wait no longer than `timeoutMS`. All the transitions are described in the [`ConnectionState`](../reference/connection/connection-state.mdx) reference.
+
+## Replica set [#replica-set]
+
+Transactions and writes to models with an audit log work only on a replica set (several MongoDB servers holding copies of the same data) or a sharded cluster. A standalone `mongod` doesn't support them. For development a single-node replica set is enough.
+
+You can check this right after connecting with [`client.supportsTransactions`](../reference/connection/typemo-client.mdx#client.supports-transactions). It's `true` for a replica set, `false` for a standalone server, and `undefined` while the client hasn't connected yet.
+
+<Snippet id="connection/connect/replica-set" title="db/health.ts" twoslash />
+
+How to use transactions is covered in [Transactions](../transactions/transactions.mdx).
+
+## How to choose how to create the client [#how-to-choose]
+
+Ask yourself **whether you need the client before the app is ready to connect**.
+
+- **No**: use [`TypemoClient.connect`](../reference/connection/typemo-client.mdx#typemo-client.connect). The client is connected right away, and a connection error stops startup where you can see it.
+- **The client has to be exported from a module before startup**: create it with [`new TypemoClient`](../reference/connection/typemo-client.mdx#new-typemo-client) and connect it in the startup code.
+- **A short script**: declare the client with `await using`, and you won't forget to close it.
+
+## When not to use it [#when-not-to-use]
+
+For operations Typemo doesn't wrap, such as admin commands or GridFS, the connection stays the same. You work through [`client.unsafeDriver`](../reference/connection/typemo-client.mdx#client.unsafe-driver), as described in [Driver access](./driver-access.mdx). And don't create a separate client for every database on the same server. That's what [`client.db`](../reference/connection/typemo-client.mdx#client.db) is for.
+
+## Troubleshooting [#troubleshooting]
+
+**The app doesn't exit after the last operation.** The script did everything, but the process hangs until you interrupt it. The same script with `close` exits with code 0. The process is held by the open connection pool. Close the client at the end of the script, or declare it with `await using`.
+
+<Snippet id="connection/connect/troubleshooting" twoslash />
+
+**The error `is not connected after … ms`.** An operation waited for the connection and gave up. The client was created with `new TypemoClient`, and `connect` was never called or was called after the limit. The error text itself tells you the fix: call [`client.connect`](../reference/connection/typemo-client.mdx#client.connect) at startup, or create the client with `TypemoClient.connect`.
+
+**The data ended up in the `test` database.** The write went through, but the database you wanted is empty. Most likely the database isn't set in `dbName` or in the connection string, and the client works with `test`. Name the database explicitly: `mongodb://localhost:27017/app` or `dbName: "app"`.
+
+**A client is created for every request.** Every client opens its own connection pool and connects to the server from scratch. A client per request spends time connecting and holds extra connections. Create the client once at startup and pass it along.
+
+## Full example [#full-example]
+
+Here it all comes together: the client, preparing the database, working with a model, and closing. Code that isn't part of Typemo and that you write yourself is marked `__…__`.
+
+<Snippet id="connection/connect/full-example" title="main.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose `mongoose.connect(uri)` creates a **global** connection, and models bind to it on their own. Typemo has no global connection. You hold a [`TypemoClient`](../reference/connection/typemo-client.mdx) and get models from it.
+
+Instead of `mongoose.createConnection` and `connection.useDb` there's [`client.db`](../reference/connection/typemo-client.mdx#client.db) and [`connection.useDb`](../reference/connection/connection.mdx#connection.use-db), and `useDb` doesn't open new connections. You close the whole client, not one database. There's no queue that buffers commands until the connection is up. An operation waits for the connection on its own for no longer than `readyTimeoutMS`, and then gets a `TimeoutError`.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Multiple clients and extensions" href="./clients-and-extensions.mdx">
+  Register extensions and subscribers for one client or for all of them at once.
+</Card>
+<Card title="Driver access" href="./driver-access.mdx">
+  When you need the `MongoClient` itself and what you lose by working with it directly.
+</Card>
+<Card title="Transactions" href="../transactions/transactions.mdx">
+  Run several operations as one, with automatic retries.
+</Card>
+<Card title="TypemoClient" href="../reference/connection/typemo-client.mdx">
+  Every client method and option with exact types and errors.
+</Card>
+</Cards>

@@ -1,0 +1,123 @@
+---
+title: Empty filters in writes
+description: "Why write methods don't accept an empty filter, why the literal doesn't compile, and how to change or delete everything on purpose"
+icon: ShieldAlert
+---
+
+Pass an empty filter `{}` to [`updateMany`](../reference/writes/writes.mdx#update-many), [`deleteMany`](../reference/writes/writes.mdx#delete-many), or any other method that changes or deletes documents, and Typemo won't run the write. A `{}` literal won't compile, and an empty object that turns up at runtime causes an error.
+
+In MongoDB an empty filter matches **every** document. Such an update would change the whole collection, and such a delete would empty it. Filters are often built from data: request parameters, settings, optional form fields. One typo or one missing parameter, and not a few records would suffer, but all of them.
+
+If you really need to change or delete everything, say so explicitly with [`Filters.all()`](../reference/policies/violations.mdx#filters.all). Then the intent is visible both in the code and in the command log.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the account model from [Create documents](./create.mdx). The collection holds three accounts: `Main` and `Second` belong to `alice`, `Other` to `bob`.
+
+<Snippet id="writes/bulk/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+An empty filter is rejected, and an explicit "everything" goes through.
+
+<Snippet id="writes/empty-filters/quick-start" twoslash />
+
+Below we'll cover which methods reject an empty filter, what the compiler checks, how `Filters.all` works, and where empty filters come from in practice.
+
+## What happens with an empty filter [#empty-filter-behavior]
+
+Typemo checks the filter **before** it goes to the database. The error is a [`StrictModeError`](../reference/errors/data-errors.mdx#strict-mode-error) with the reason `empty-filter`, and the text names the method you called.
+
+<Snippet id="writes/empty-filters/empty-filter-behavior" />
+
+The text depends on how many documents the method affects. For `updateMany` and `deleteMany` it's `would affect every document`. For `updateOne`, `deleteOne`, `replaceOne`, and `findOneAnd*` it's `would change or remove an arbitrary document`. Only one document would be affected, but the database doesn't promise which one. The compiler answers a `{}` literal with the same words. The point is the same: the filter has to say what you mean.
+
+Typemo checks exactly the filter you wrote. Conditions the core adds on its own, such as the tenant or soft delete, don't rescue an empty filter. Otherwise "delete everything" would quietly turn into "delete everything within the tenant" without the author noticing.
+
+Every method that changes or deletes documents rejects an empty filter.
+
+- [`updateMany`](../reference/writes/writes.mdx#update-many) and [`deleteMany`](../reference/writes/writes.mdx#delete-many) affect many documents.
+- [`updateOne`](../reference/writes/writes.mdx#update-one), [`deleteOne`](../reference/writes/writes.mdx#delete-one), [`replaceOne`](../reference/writes/writes.mdx#replace-one), [`findOneAndUpdate`](../reference/writes/writes.mdx#find-one-and-update), [`findOneAndReplace`](../reference/writes/writes.mdx#find-one-and-replace), and [`findOneAndDelete`](../reference/writes/writes.mdx#find-one-and-delete) affect one, but **pick it** by the filter. An empty filter would pick a random document, not the one you meant.
+
+The same rule applies to operations inside [`bulkWrite`](../reference/writes/writes.mdx#bulk-write): `updateOne`, `updateMany`, `replaceOne`, `deleteOne`, and `deleteMany`. A read, [`find`](../reference/query/reading.mdx#model.find), does accept `{}`, since it doesn't damage anything.
+
+## Change or delete everything on purpose [#update-or-delete-all]
+
+A data migration, cleaning a test collection, a mass update of every document. In such cases, pass `Filters.all()` instead of an empty object.
+
+<Snippet id="writes/empty-filters/update-or-delete-all" title="accounts/maintenance.ts" twoslash />
+
+`Filters.all()` is a real filter, `{ _id: { $exists: true } }`. It matches every stored document, because every document has an `_id`. The server runs it like any other condition, so the command log shows that you meant it, and nothing special happens in the write plan. You don't need to give the model type, because `Filters.all()` fits any write method of any model. The full description of the filter and its limits is in [Policy violations](../reference/policies/violations.mdx#filters.all).
+
+The compiler won't accept an empty literal in its place.
+
+<Snippet id="writes/empty-filters/update-or-delete-all-2" twoslash />
+
+The compiler complains about a `"filter error"` property with the text `an empty filter would affect every document; pass a filter, or Filters.all() to mean every document on purpose`. As at runtime, the text depends on the method. For `updateMany` and `deleteMany` it's `would affect every document`, and for `updateOne`, `deleteOne`, `replaceOne`, `findOneAndUpdate`, `findOneAndReplace`, and `findOneAndDelete` it's `would change or remove an arbitrary document`. All these methods have the check, and it's the [`WriteFilterCheck`](../reference/writes/writes.mdx#write-filter-check) type.
+
+But the compiler catches only an empty literal. A filter declared as `Filter<Account>`, or an object built from conditions, compiles, and the runtime check catches it instead. So the runtime check is the main protection, and the compiler only helps.
+
+## Where an empty filter comes from [#empty-filter-sources]
+
+People rarely write an empty filter by hand. It shows up on its own when a filter is built from data. For example, from an object whose fields are added conditionally.
+
+<Snippet id="writes/empty-filters/empty-filter-sources" title="accounts/accounts.service.ts" twoslash />
+
+Call `clearNotes({})`, and the filter stays empty, so `updateMany` refuses. This is what the rule is for. Without it, a search with no conditions would wipe the notes of every account.
+
+The second common source is `undefined`. Typemo rejects the filter `{ owner }`, where `owner` turned out to be `undefined`, too, but with a different error. `undefined` in a filter isn't "no condition" but an invalid value.
+
+<Snippet id="writes/empty-filters/empty-filter-sources-2" />
+
+## How to choose [#how-to-choose]
+
+Ask yourself whether you know which documents you're affecting.
+
+- **I know**: describe them with a filter, even a broad one, such as `{ balance: { $gte: 0 } }`.
+- **I'm affecting everything on purpose**: write `Filters.all()`, and it will be visible in review.
+- **The filter comes from outside and may be empty**: don't turn emptiness into "everything" yourself. Check the condition before the call and return an error to the client.
+
+## When not to use it [#when-not-to-use]
+
+If you need to affect one document, use [`updateOne`](../reference/writes/writes.mdx#update-one) or [`deleteOne`](../reference/writes/writes.mdx#delete-one). They need a condition too, because the filter has to pick that one document, for example by `_id`.
+
+## Troubleshooting [#troubleshooting]
+
+**The filter came out empty.** A call with optional conditions gives `StrictModeError … [empty-filter]`. None of the conditions arrived. Check before the call that there's a condition, and if you really need everything, call `Filters.all()` explicitly.
+
+**An empty literal doesn't compile.** The compiler reports `TS2345`, and for `updateOne` and `updateMany` it's `TS2769` "No overload matches this call", with text about `"filter error"`. You wrote `{}` where a filter is needed. Write a condition, such as `{ owner: "alice" }`, or `Filters.all()` if you need every document.
+
+**An empty filter in `bulkWrite`.** For example, the operation `{ deleteMany: { filter: {} } }` in [`bulkWrite`](../reference/writes/writes.mdx#bulk-write). The rule is the same as for a single method.
+
+<Snippet id="reference/policies/violations/empty-filter" />
+
+Write `{ deleteMany: { filter: Filters.all() } }`.
+
+## Full example [#full-example]
+
+Everything in one file: a safe cleanup by search and an explicit cleanup of everything.
+
+<Snippet id="writes/empty-filters/full-example" title="accounts/maintenance.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose the `requireFilter` option, which forbids an empty filter, was off by default, and one mistake in a built filter emptied the collection. In Typemo the ban is always on and can't be turned off, and "everything" is written explicitly with `Filters.all`.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Update documents" href="./update.mdx">
+  Apply updates to one or many documents.
+</Card>
+<Card title="Delete documents" href="./delete.mdx">
+  Every way to delete, soft delete included.
+</Card>
+<Card title="Policy violations" href="../reference/policies/violations.mdx">
+  Every reason for a `StrictModeError`, `empty-filter` included, with the texts.
+</Card>
+<Card title="Writing" href="../reference/writes/writes.mdx#update-many">
+  What `updateMany` and `deleteMany` accept.
+</Card>
+</Cards>

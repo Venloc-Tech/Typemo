@@ -1,0 +1,108 @@
+---
+title: Define and sync search indexes
+description: "Declare an Atlas Search or Vector Search index in the schema, compare it with the server, apply it, and know what happens without Atlas Search"
+icon: SearchCode
+---
+
+Regular MongoDB indexes speed up exact queries and sorting. Full-text search with ranking and vector search, that is search by meaning, run on different indexes: **search indexes**. These are Atlas Search and Atlas Vector Search indexes. They're stored separately from regular ones and work only where Atlas Search is turned on, in MongoDB Atlas or in a local Atlas CLI deployment. The server itself confirms this in the text of its error, shown below.
+
+Typemo lets you describe these indexes in the schema and sync them the same way as regular ones. This page is about describing and creating an index. How to search with it is covered in [Search in aggregation](../aggregation/search.mdx).
+
+**Important.** These docs were checked on a plain `mongod` without Atlas Search. So only what happens **without** Atlas Search is verified, that is which errors you get. Successful creation, update, and deletion of search indexes is described from the code and wasn't checked on a server. The page says so wherever that's the case.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and an article model with text.
+
+## Quick start [#quick-start]
+
+Declare the index with the [`@SearchIndex`](../reference/schemas/index-decorators.mdx#search-index) decorator and sync it. For one model there's [`syncSearchIndexes`](../reference/collections/model-indexes.mdx#model.sync-search-indexes), and for all of them the shared [`connection.syncAll`](../reference/connection/connection.mdx#connection.sync-all).
+
+<Snippet id="collections/search-indexes/quick-start" title="articles/article.ts" twoslash />
+
+On a server with Atlas Search, `plan.toCreate` will contain `"articles_text"`, and `syncSearchIndexes` creates the index. This result is described from the code and wasn't verified. We'll go through the tasks in more detail below.
+
+## Describe a search index [#define-search-index]
+
+Say a collection needs full-text search. The [`@SearchIndex`](../reference/schemas/index-decorators.mdx#search-index) decorator takes the index name, the type, and the definition. The definition is the same object Atlas expects. Typemo doesn't parse it and passes it on as is.
+
+<Snippet id="collections/search-indexes/define-search-index" title="articles/article.ts" twoslash />
+
+The default type is `"search"`, full-text. For vector search, set `type: "vectorSearch"`. The decorator only writes the description into the schema, and the index appears on the server when you run a sync. One class can have several such indexes with different names.
+
+The declared indexes are visible in the schema description, with no trip to the server. [`model.schema.describe().searchIndexes`](../reference/schemas/schema-info.mdx) returns their names, types, and definitions in declaration order, for example `[{ name: "articles_text", definition: { mappings: { dynamic: true } } }]`.
+
+## See the drift [#view-diff]
+
+You changed an index definition and want to know what will change. [`diffSearchIndexes`](../reference/collections/model-indexes.mdx#model.diff-search-indexes) compares the schema's indexes with the server's **by name**.
+
+- One missing on the server goes into `toCreate`.
+- One with a different type or definition goes into `toUpdate`.
+- Server indexes that aren't in the schema go into `toDrop`.
+
+<Snippet id="collections/search-indexes/view-diff" twoslash />
+
+The result in the comment is described from the code. On the test server the method throws an error, covered below.
+
+## Apply the changes [#apply-changes]
+
+The plan looks right. [`syncSearchIndexes`](../reference/collections/model-indexes.mdx#model.sync-search-indexes) drops the extra search indexes, updates the ones that differ, and creates the missing ones. It doesn't stop at the first failure. It collects them all and at the end throws one [`IndexSyncError`](../reference/errors/configuration-errors.mdx#index-sync-error). With `dryRun: true` the method only shows the plan.
+
+<Snippet id="collections/search-indexes/apply-changes" title="scripts/sync-search.ts" twoslash />
+
+This result is also described from the code. The steps run in order: drops first, then updates, then creates.
+
+A direct call to `syncSearchIndexes` ignores the `autoIndex` schema option. But for a model with `autoIndex: false`, `init` and `syncAll` skip the search indexes along with the regular ones.
+
+## What happens without Atlas Search [#without-atlas-search]
+
+Say the app runs on a plain `mongod`, for example in development. The server answers a request for the list of search indexes with an error, and Typemo **doesn't pass it off as "no indexes"**. Otherwise a server without search would look like "everything is in sync".
+
+On a plain `mongod`, both [`diffSearchIndexes`](../reference/collections/model-indexes.mdx#model.diff-search-indexes) and [`syncSearchIndexes`](../reference/collections/model-indexes.mdx#model.sync-search-indexes), even with `dryRun: true`, throw a [`ServerError`](../reference/errors/server-errors.mdx#server-error) with code `31082` (`SearchNotEnabled`).
+
+<Snippet id="collections/search-indexes/without-atlas-search" twoslash />
+
+`message` holds the cause and the code. The server's full text, with a hint to connect to Atlas and a link to the MongoDB docs, is in `serverMessage`.
+
+<Snippet id="collections/search-indexes/without-atlas-search-2" />
+
+The same happens during a full sync. [`connection.syncAll`](../reference/connection/connection.mdx#connection.sync-all) and [`connection.init`](../reference/connection/connection.mdx#connection.init) run the other steps, such as creating the collection itself and the regular indexes, and at the end throw a [`SyncError`](../reference/errors/configuration-errors.mdx#sync-error). That `ServerError` sits in `error.errors` and in the `errors` of the collection's entry in `error.report`. This behavior was verified on a server.
+
+If you need to develop without Atlas Search, don't declare `@SearchIndex` on models that run on a plain `mongod`. Or develop against a local Atlas CLI deployment.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether every server your app runs on has Atlas Search**.
+
+- **Yes**: declare the indexes in the schema and sync them along with everything else through [`connection.syncAll`](../reference/connection/connection.mdx#connection.sync-all).
+- **Only in production, while developers use a plain `mongod`**: keep the search models separate and sync them in a separate deploy step with [`syncSearchIndexes`](../reference/collections/model-indexes.mdx#model.sync-search-indexes).
+
+## When not to use it [#when-not-to-use]
+
+For simple word search, a regular `text` index in [`@Index`](../reference/schemas/index-decorators.mdx#index) is enough. It works on any server and syncs along with the other indexes, as covered in [Sync indexes](./index-sync.mdx). Atlas search indexes are for the `$search` and `$vectorSearch` stages.
+
+## Troubleshooting [#troubleshooting]
+
+**`SearchNotEnabled` at startup.** On a plain `mongod` you get a `ServerError` with code `31082`, because the server doesn't support search indexes. Connect to Atlas or to a local Atlas CLI deployment. Or don't declare `@SearchIndex` for that environment.
+
+**`init` failed because of a search index.** Even one search index failure makes [`connection.init`](../reference/connection/connection.mdx#connection.init) and [`connection.syncAll`](../reference/connection/connection.mdx#connection.sync-all) throw a [`SyncError`](../reference/errors/configuration-errors.mdx#sync-error), although everything else has already been created. The cause is in `error.errors`, and the full report in `error.report`. If search isn't available everywhere, don't declare `@SearchIndex` in models that run without it.
+
+## Full example [#full-example]
+
+Here's a model with a search index and a deploy step that syncs it and stops on a failure. The example compiles, but on a plain `mongod` it fails with error `31082`, as described above.
+
+<Snippet id="collections/search-indexes/full-example" title="scripts/deploy-search.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Search in aggregation" href="../aggregation/search.mdx">
+  How to search with the index you created: `$search`, `$vectorSearch`, and other stages.
+</Card>
+<Card title="Sync indexes" href="./index-sync.mdx">
+  Regular indexes: creating them, the plan, applying it, and handling failures.
+</Card>
+<Card title="Model indexes" href="../reference/collections/model-indexes.mdx">
+  `diffSearchIndexes`, `syncSearchIndexes`, and the types of their results.
+</Card>
+</Cards>

@@ -1,0 +1,141 @@
+---
+title: Unknown fields
+description: "UnknownFieldsError, unknownFieldsOf, isUnknownFieldsError, and UnknownFields: schema-less fields in the database and how Typemo protects them"
+icon: FileWarning
+---
+
+This page is about **unknown fields**: keys in stored subdocuments that your class schema doesn't have. They show up when another schema version, older or newer, or another program wrote the data. Typemo never loses such data silently. [`unknownFieldsOf`](#unknown-fields-of) shows it, [`UnknownFieldsError`](#unknown-fields-error) refuses a save that would erase it, and [`SaveOptions.dropUnknownFields`](./document-api.mdx#save-options) allows the loss on purpose.
+
+If you're new here, read the [Handle fields that aren't in the schema](../../documents/unknown-fields.mdx) guide first. It explains where such data comes from and what to do with it. This page is the reference.
+
+The examples use the order from the [Document API](./document-api.mdx). An older schema version wrote extra keys into its database record: `oldPrice` on the first line and `legacyZip` on the address. An extra key at the document root (`rootExtra`) stays untouched. A save changes fields by path and doesn't rewrite the root, so such keys don't appear in the list.
+
+<Snippet id="reference/documents/unknown-fields/intro" title="models/order.ts" twoslash />
+
+---
+
+## unknownFieldsOf [#unknown-fields-of]
+
+`unknownFieldsOf` returns the list of subdocuments that hold keys the schema doesn't know. Call it when you want to learn about such data ahead of time: to show a warning, record a metric, or decide whether to migrate a document before a save fails.
+
+Typemo remembers the keys **when it reads the document**, with no extra query. That's why the function returns instantly, and why the result is empty for a document from [`Model.new`](./model-document-methods.mdx#model.new). Paths use **class field names** from the document root, such as `lines.0`, `address`, or `notes.home`. The function accepts a whole document, a subdocument, or a collection. For a subdocument the path is still counted from the root.
+
+<Snippet id="reference/documents/unknown-fields/unknown-fields-of" twoslash />
+
+<Returns type="readonly UnknownFields[]">
+
+The list of subdocuments with unknown keys, or an empty list if there are none. Keys appear in storage order.
+
+</Returns>
+
+<Params>
+<Param name="value" type="object" required>
+
+A model document, a subdocument, or a typed collection.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/unknown-fields/unknown-fields-of-2" />
+
+</FullType>
+
+### What doesn't appear in the list [#not-listed]
+
+Unknown keys at the **root** of a document aren't listed. A save changes the root only by schema fields and leaves everything else alone, so there is nothing to lose there. `lean()` and `.plain()` return rows without hydration, so they don't hide keys. In a `lean()` result the keys are visible, while in a document and in `$toObject()` they aren't.
+
+---
+
+## UnknownFieldsError [#unknown-fields-error]
+
+`UnknownFieldsError` is the error for a save that would **rewrite** a subdocument together with its unknown fields and erase them from the database. By default Typemo refuses. Data from another schema version isn't yours, and silent loss is the worst thing you can do to it. Nothing is sent to the database.
+
+The error is possible when a save writes a subdocument again and the subdocument stays in the document, or can stay after the write. That happens in these cases.
+
+- `reverse`, `sort`, `splice`, `clear`, or `replace` on an array of subdocuments.
+- Replacing a subdocument through [`$set`](./document-api.mdx#set) or `lines.set(index, …)`.
+- `clear()` on a Map of subdocuments.
+- `set` on a Map key that already exists.
+
+Editing individual fields inside a subdocument (`order.address.city = …`) doesn't touch unknown fields. The same goes for `push`, `unshift`, `addToSet`, `pull`, `pop`, and `shift` when they are the only changes in the save. But editing a field inside an element together with a `push` in the same save writes the whole array, and then the error is possible.
+
+A separate remove operator doesn't count as a loss. `pull`, `pop`, and `shift` on an array and `delete(key)` on a Map remove an element on purpose and raise no error. `splice`, `clear`, and `replace`, though, write the whole array. The unknown fields of its elements are at risk, and the save is refused.
+
+<Snippet id="reference/documents/unknown-fields/unknown-fields-error" twoslash />
+
+<Params title="Fields">
+<Param name="fields" type="readonly UnknownFields[]">
+
+All subdocuments the save would rewrite without their unknown fields. The list is frozen.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/unknown-fields/unknown-fields-error-2" />
+
+</FullType>
+
+The error text names the paths and keys and points to a way out.
+
+<Snippet id="documents/unknown-fields/why-save-failed-2" />
+
+### What to do [#what-to-do]
+
+There are three ways out. You can **migrate the data** by removing the extra keys or moving them. You can **extend the schema**: if the key is actually needed, add the field to the class and it becomes known. Or you can **accept the loss** by passing `{ dropUnknownFields: true }` to [`$save`](./document-api.mdx#save) or [`Model.bulkSave`](../writes/writes.mdx#bulk-save). After such a save the unknown fields disappear from the database and from document instances, and `unknownFieldsOf` stops showing them.
+
+<Snippet id="reference/documents/unknown-fields/what-to-do" twoslash />
+
+In the example the address is still in the list. This save didn't rewrite it, so its keys are still in the database.
+
+### Preview: `$getChanges` [#get-changes]
+
+[`$getChanges`](./document-api.mdx#get-changes) doesn't throw `UnknownFieldsError`. It puts the same refusal under the `$problems` key: the subdocument path and the text of the error `$save` would throw. The rest of the update comes back as usual. Before saving, you can see both what will be written and what will be refused.
+
+<Snippet id="reference/documents/unknown-fields/get-changes" />
+
+### Errors [#errors]
+
+`UnknownFieldsError` itself throws no other errors. It's the result of the check before the write. `bulkSave` applies the same rule to every document in the list.
+
+---
+
+## isUnknownFieldsError [#is-unknown-fields-error]
+
+`isUnknownFieldsError` is a type guard. It returns `true` if the value is an [`UnknownFieldsError`](#unknown-fields-error) and narrows the type to it. It's handy in a `catch` block, where the error has type `unknown`. The check `error instanceof UnknownFieldsError` gives the same result.
+
+<Returns type="error is UnknownFieldsError">
+
+`true` for `UnknownFieldsError`, `false` for any other value.
+
+</Returns>
+
+<Params>
+<Param name="error" type="unknown" required>
+
+The value to check.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/unknown-fields/is-unknown-fields-error" />
+
+</FullType>
+
+---
+
+## UnknownFields [#unknown-fields]
+
+`UnknownFields` describes one subdocument with unknown keys. The result of [`unknownFieldsOf`](#unknown-fields-of) and the `fields` property of [`UnknownFieldsError`](#unknown-fields-error) are made of these items.
+
+<TypeTable
+  type={{
+    path: { description: "The path of the subdocument inside the root document, in class field names, for example `lines.0`, `address`, `notes.home`.", type: "string" },
+    keys: { description: "Stored keys that the schema lacks, in storage order.", type: "readonly string[]" },
+  }}
+/>

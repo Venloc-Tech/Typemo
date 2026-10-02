@@ -1,0 +1,83 @@
+---
+title: Custom integration
+description: "How to build an adapter for your own monitoring system on operation events: metrics, a log, or your own tracker"
+icon: Plug
+---
+
+The ready-made [OpenTelemetry](./opentelemetry.mdx) and [Sentry](./sentry.mdx) packages aren't always enough. Metrics in Prometheus, a log in a file, an in-house tracker: you write an adapter for your own system on the same [operation events](./events.mdx). It's a class that registers a subscriber through `instrument`, keeps its own state, and cleans it up on unsubscribe. The core needs nothing else from an adapter, and it knows nothing about your system or anyone else's.
+
+## What you need [#prerequisites]
+
+An understanding of how subscribers and events work, from the [Operation events](./events.mdx) guide. The account model in the examples comes from there too.
+
+## Quick start [#quick-start]
+
+A minimal adapter takes a target, a client or `Typemo`, and returns a subscription. You remove it by calling `unsubscribe()` or by leaving a `using` scope. The adapter below counts operations and errors per model and operation, and the average time comes from the sum.
+
+<Snippet id="observability/custom-integration/quick-start" title="monitoring/operation-stats.ts" twoslash />
+
+The key is built from the model and the operation. A database-level operation (`connection.aggregate`) has no model, so `event.model` is `null` and the key uses the database instead. Here's how the adapter is plugged in and what it counted on a real database after one insert and three `find` calls, one of them with `.orFail()` on an empty result.
+
+<Snippet id="observability/custom-integration/quick-start-2" twoslash />
+
+Below we'll cover what to keep in mind once the adapter outgrows a counter.
+
+## Choose events [#choose-events]
+
+An adapter rarely needs every event. The less it asks for, the less work the core does. Steps are built only if at least one subscriber wants them, and driver commands and pool events are turned on with the `driverCommands` and `poolEvents` flags. Tell the core what you need and handle only that.
+
+<Snippet id="observability/custom-integration/choose-events" twoslash />
+
+`steps: false` means this subscriber doesn't receive steps. If someone else asked for them, the core builds the steps but doesn't deliver them to this subscriber. With `steps: false` only `operation.start` and `operation.end` arrived.
+
+## Keep operation state between events [#operation-state]
+
+A span or a measurement opens on `operation.start` and closes on `operation.end` or `operation.error`. The key is `operationId`. It's unique within the process, and the nested queries that load related data carry the outer operation's number in `parentId`.
+
+<Snippet id="observability/custom-integration/operation-state" title="monitoring/open-operations.ts" twoslash />
+
+`operation.start` arrives first of all, before type casting, validation, and `pre` hooks. So an operation that never reached the driver can still have an error event, for example when it fails on type casting. Close the state in both branches. On unsubscribe, close whatever is still open too. The OpenTelemetry adapter, for example, ends all unfinished spans on `unsubscribe()`.
+
+## Make your context active with `wrap` [#wrap]
+
+A tracing system needs to know that a hook, a nested query, or a driver command belongs to this operation. For that, the subscriber sets `wrap`. The core runs the operation inside it, and you put your context in place for that time.
+
+<Snippet id="observability/custom-integration/wrap" twoslash />
+
+Here's the contract. Call `run` exactly once and return what it returns, or wait for it. `run` decides the result of the operation, whatever `wrap` returns. If `wrap` throws before `run` or never calls it, that goes to `console.error` as a subscriber error, and the operation still runs. Several `wrap` functions nest inside each other in registration order. For a cursor, `wrap` covers only the opening. More in the [`InstrumentationSubscriber`](../reference/observability/events.mdx#instrumentation-subscriber) reference.
+
+## Don't change the core's policies [#keep-core-policies]
+
+An adapter can't change an operation or get around masking. The event reaches it already in the form its `sensitive`, `includeTenant`, and the schema marks allow. If you need the real values, you explicitly choose `sensitive: "show"`, and that's your decision to let the data out. Even so, that choice doesn't override `sensitive` marks and hidden fields.
+
+If your adapter lacks data or an extension point, don't work around the core. Report what's missing. The core gets a general mechanism, an event, an option, or a hook, not a special case for one product.
+
+## How to choose [#how-to-choose]
+
+Ask yourself whether you **need to observe or to change**. Observing, that is counting, logging, or sending, is a subscriber's job. Changing an operation (a condition, values, a rejection) is a [hook](../hooks/operation-hooks.mdx)'s job. If you need both, register both. They don't get in each other's way.
+
+## When not to use it [#when-not-to-use]
+
+You don't need to write your own adapters for tracing and Sentry, because there are [`@venloc/typemo-opentelemetry`](../reference/observability/opentelemetry.mdx) and [`@venloc/typemo-sentry`](../reference/observability/sentry.mdx). And if a query log is enough during development, the dozen lines of the subscriber from the [quick start of the events guide](./events.mdx#quick-start) will do.
+
+## Troubleshooting [#troubleshooting]
+
+**The adapter keeps eating memory.** The map of open operations isn't cleaned up if you skip `operation.error`. Memory grows in an app where errors happen. Close the state in both branches, as in the example above.
+
+**`handle` slows operations down.** `handle` runs on the operation's path, and a network call inside it slows down every query. Collect the data in memory and send it in batches on a timer.
+
+**`"?"` arrives instead of the real values.** By default `summary` holds only `"?"`, and that's by design. Choose `sensitive: "show"` deliberately or pass your own function through `{ mask }`.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Events" href="../reference/observability/events.mdx">
+  Every event field and every subscriber setting.
+</Card>
+<Card title="OpenTelemetry" href="./opentelemetry.mdx">
+  An example of a full adapter with spans, pool metrics, and masking.
+</Card>
+<Card title="Hook into an operation" href="../hooks/operation-hooks.mdx">
+  When you need to change an operation rather than observe it.
+</Card>
+</Cards>

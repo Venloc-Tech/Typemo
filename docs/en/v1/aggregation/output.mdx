@@ -1,0 +1,107 @@
+---
+title: Save the result
+description: "Write an aggregation result to a collection with out and merge, keep it updated, and see when a materialized view is the better choice"
+icon: Save
+---
+
+There's no reason to recompute a heavy report every time it's shown. You compute it once an hour or once a day, save it to a separate collection, and read it from there with an ordinary [`find`](../reference/query/reading.mdx#model.find). Two final pipeline stages do this without your app's involvement. [`out`](../reference/aggregation/stages.mdx#out) **replaces** the collection with the result entirely. [`merge`](../reference/aggregation/stages.mdx#merge) **merges** the rows into an existing collection: it inserts new ones and updates matching ones by a rule.
+
+After `out` or `merge` the pipeline is finished. You can't add another stage, and the aggregation returns an empty array, not rows. If your app needs the result rows too, run a second query against the resulting collection.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and running an aggregation from [Your first aggregation](first-aggregation.mdx). Orders with the fields `customer`, `status`, `total`, and `placedAt` are already in the `orders` collection. Three orders are paid: 120 in January, 80 and 50 in February.
+
+The result is stored in the `MonthlyRevenue` model, where `_id` is the month, a string. So the model extends not [`Entity`](../reference/schemas/base-classes.mdx#entity) but [`EntityWithId`](../reference/schemas/base-classes.mdx#entity-with-id) with a string `_id`. The group key becomes the `_id` of the result row, and the target of `out` or `merge` must have an `_id` of the same type. For more on such models, see [Use your own _id type](../schemas/custom-ids.mdx#write-aggregation-result).
+
+<Snippet id="aggregation/output/prerequisites" title="orders/models.ts" twoslash />
+
+## Quick start [#quick-start]
+
+End the pipeline with an `out` stage and a result class. The rows must fit its fields, and the compiler checks that.
+
+<Snippet id="aggregation/output/quick-start" twoslash />
+
+To update the collection instead of replacing it, use `merge`. We'll cover both ways below.
+
+## Replace a collection with the result [#replace-collection]
+
+With `out`, the previous content of the target collection disappears entirely, and only the rows of this run remain. So `out` fits a report that's recomputed from all the data every time.
+
+You can pass a class to `out`, and then the rows are checked against its fields. You can pass the name of a collection in the same database, or an object `{ db, coll }` for another database, where `db` is required, otherwise the server rejects the request. A collection name gives nothing to check against, so in that case the row type isn't checked.
+
+<Snippet id="aggregation/output/replace-collection" twoslash />
+
+The write runs once per query object. A second `await` of the same query throws `QueryError: aggregate: this operation was already executed; build a new one, or run it again deliberately with exec({ force: true }) (a write runs once per builder)`. This is how Typemo guards against an accidental double recompute. To recompute on purpose, create a new query or call [`.exec({ force: true })`](../reference/aggregation/pipeline.mdx#exec).
+
+## Merge rows into an existing collection [#merge-into-collection]
+
+If rows need to be added or updated while everything else stays, use `merge`.
+
+- `on` names the fields by which a result row is matched to a target row. By default it's `_id`.
+- `whenMatched` decides what to do with a matching row: `"replace"` replaces it, `"keepExisting"` keeps the old one, `"merge"` merges the fields, and `"fail"` gives an error. You can also pass a pipeline.
+- `whenNotMatched` decides the fate of a new row.
+
+<Snippet id="aggregation/output/merge-into-collection" twoslash />
+
+The result here is shown after two more unpaid orders appeared in `orders`: 25 in February and 10 in April. February was updated from 130 to 155, April was inserted, and January didn't change. `merge` doesn't delete rows that have no fresh data. If a month disappeared from the source data, its row in the result stays.
+
+The `on` fields must be under a **unique index** on the target, otherwise the server can't find the matching row unambiguously. For `_id` such an index already exists.
+
+## Update a row by your own rule [#custom-row-update]
+
+You can pass a function to `whenMatched` that builds an update pipeline over the existing row. The new row is available as `v.new`, so you can, for example, add the fresh total to the previous one.
+
+<Snippet id="aggregation/output/custom-row-update" twoslash />
+
+<Callout type="warning" title="A full recompute with addition doubles the totals">
+
+**Don't run this pipeline again over the same orders.** `merge` doesn't know which orders are already included in the saved row. On every run, `group` recomputes the total over all paid orders, and `fn.add` adds it to the previous one. A second run over the same data gave January 240 instead of 120 and February 285 instead of 155, and a third would triple the totals. There's no error. That's how the server works, and Typemo can't tell a new addition from a repeated one.
+
+If the pipeline recomputes **all** orders, use `whenMatched: "replace"`. The row is replaced with the fresh total, and a repeated run gives the same number. Addition fits only when `match` selects only new orders, for example those with a `placedAt` later than the last update.
+
+</Callout>
+
+## How to choose [#how-to-choose]
+
+Ask yourself whether the result is recomputed as a whole.
+
+- **Yes, and the collection can be replaced**: use `out`.
+- **The result is updated in parts, or other processes read the collection**: use `merge`, with `"replace"` for a recompute and with a pipeline for adding.
+- **The result needs regular updates, and you want to describe the "source to result" pair once**: use a [materialized view](../collections/materialized-views.mdx). It adds the `merge` itself and checks the index.
+
+## When not to use it [#when-not-to-use]
+
+If you need the result only for the duration of a request, don't save it. Read the aggregation's rows. And if the result must always be fresh rather than recomputed on a schedule, look at a [view](../collections/views.mdx), which is computed on every read.
+
+## Troubleshooting [#troubleshooting]
+
+**A second `await` doesn't run the write.** The write runs once per query object. A repeated `await`, for example on a retry, throws a `QueryError` with the text from the section above. Create the query again.
+
+**The result doubled after `merge` with addition.** The pipeline recomputed all orders, and `whenMatched` added them to the previous totals, as described above. In that example, addition gave January 240 instead of 120, and February 285 instead of 155. For a recompute, use `"replace"`.
+
+**The compiler says the rows don't fit the target.** The grouping produced `{ _id, total }` rows, but the result class has a required `revenue` field. The compiler rejects `out` right at the call site and names the field to check.
+
+<Snippet id="aggregation/output/troubleshooting" twoslash />
+
+The message reads `PathError<"the pipeline rows do not match the target model: check the field \"revenue\"">`. The compiler answers `merge({ into: MonthlyRevenue })` the same way. Rename the field in `group`, or bring the result class in line with the rows you write.
+
+**`out` wiped a collection.** `out` replaces the target collection entirely, even if you named the wrong one. A model class as the target protects better than a string name: the collection name comes from the schema, and the rows are checked against its fields.
+
+## Full example [#full-example]
+
+<Snippet id="aggregation/output/full-example" title="reports/monthly.job.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Save an aggregation result and keep it up to date" href="../collections/materialized-views.mdx">
+  A "source to result" pair with a ready-made update and an index check.
+</Card>
+<Card title="Read a predefined selection through a view" href="../collections/views.mdx">
+  A result that's computed on every read.
+</Card>
+<Card title="Stages" href="../reference/aggregation/stages.mdx#merge">
+  Every parameter of `out` and `merge`.
+</Card>
+</Cards>

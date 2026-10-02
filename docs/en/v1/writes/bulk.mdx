@@ -1,0 +1,192 @@
+---
+title: Bulk writes
+description: "Send many different write operations in one request, handle partial errors, and save a batch of documents at once"
+icon: Layers
+---
+
+When there are many writes, calling a method in a loop is wasteful, because every call is a separate round trip to the server. [`bulkWrite`](../reference/writes/writes.mdx#bulk-write) gathers inserts, updates, replacements, and deletes into **one request**. [`bulkSave`](../reference/writes/writes.mdx#bulk-save) does the same for documents you loaded and changed in memory. The price is a new concern. Some operations may succeed while others fail, and you have to sort out the result.
+
+If the operations are all of one kind, you don't need a batch. [`insertMany`](../reference/writes/writes.mdx#insert-many), [`updateMany`](../reference/writes/writes.mdx#update-many), or [`deleteMany`](../reference/writes/writes.mdx#delete-many) is simpler. `bulkWrite` is for when the operations differ and their order matters: syncing with an external source, a batch of events, "insert this, change that, delete the third thing".
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the account model from [Create documents](./create.mdx). The collection holds the account `Main` owned by `alice`.
+
+<Snippet id="writes/bulk/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+`bulkWrite` takes a list of operations, `bulkSave` a list of documents.
+
+<Snippet id="writes/bulk/quick-start" twoslash />
+
+Below we'll cover mixed operations, the order of execution, errors, and saving documents.
+
+## Mix different operations [#mixed-operations]
+
+An external system sent a batch of changes. Something appeared, something changed, something went away. Each operation in the batch is an object with **one** name key: `insertOne`, `updateOne`, `updateMany`, `replaceOne`, `deleteOne`, or `deleteMany`. The operation's data sits inside the key.
+
+<Snippet id="writes/bulk/mixed-operations" title="accounts/accounts.service.ts" twoslash />
+
+The operations ran in order, and a [`BulkWriteResult`](../reference/writes/writes.mdx#bulk-write-result) came back. 1 document inserted, 3 matched and 3 modified (`Main`, then `B1` twice), 1 document inserted through `upsert`, and 1 deleted. The ids of inserted documents are in `insertedIds`, and those inserted through `upsert` are in `upsertedIds`. The key in both is the **operation's index** in the input list. Here `upsertedIds` has the key `4`, because the `upsert` is the fifth operation.
+
+Each operation goes through the same checks as the standalone method. The filter, the update, and the values are checked before sending, and the input array doesn't change. Typemo copies the operations before sending, so you can reuse the same list.
+
+The update in `updateOne` and `updateMany` is an object of operators (`{ $set: … }`) or a pipeline function, as in the standalone [`updateOne`](../reference/writes/writes.mdx#update-one) and [`updateMany`](../reference/writes/writes.mdx#update-many). That way you can compute the new value from the document's own fields. An array of stages isn't accepted, neither by the types nor at runtime. The pipeline is built with a builder function.
+
+<Snippet id="writes/bulk/mixed-operations-2" twoslash />
+
+## Order of execution and stopping [#order-and-stop]
+
+By default a batch is **ordered**. Operations run one by one, and the first error stops everything. What ran before it stays written, because a batch isn't a transaction.
+
+<Snippet id="writes/bulk/order-and-stop" twoslash />
+
+`B2` is written, the database refused `B1`, and `B3` never ran. If order doesn't matter and you want to do everything that can be done, pass `ordered: false`. Then errors accumulate, and the other operations run.
+
+<Snippet id="writes/bulk/order-and-stop-2" twoslash />
+
+If you need all or nothing, run the batch in a transaction, see [Transactions](../transactions/transactions.mdx).
+
+## Handle batch errors [#bulk-errors]
+
+Any failure arrives as one [`BulkWriteError`](../reference/errors/server-errors.mdx#bulk-write-error). It holds three things.
+
+- `writeErrors`: the list of failures.
+- `result`: what's already written.
+- `ordered`: the batch mode.
+
+Each failure in `writeErrors` names the operation's index, the server code, and the parsed error. Typemo's validation errors have the server code `undefined`.
+
+<Snippet id="writes/bulk/bulk-errors" title="accounts/accounts.service.ts" twoslash />
+
+To load a list, this code picks unordered mode, so one bad row doesn't hold up the rest. The function returns which rows weren't written and why. `DuplicateKeyError` means a duplicate, and `ValidationError` means the row failed the check. Typemo's errors and server errors sit in one list, because the calling code doesn't care who refused. The row isn't written, and that's it.
+
+That's how unordered mode behaves. In ordered mode, an invalid value stops the batch before it's sent. You get the error itself, a `ValidationError` or a `CastError`, not a `BulkWriteError`, and nothing is written. A policy violation, such as an empty filter, stops the batch in both modes.
+
+<Snippet id="writes/bulk/bulk-errors-2" />
+
+`first at index` is the failure with the lowest index in the input list, the first element of `writeErrors`. It doesn't matter who found it first, Typemo before sending or the server. In this text a server refusal is short, without the key value, and the full text is in the error's `serverMessage`.
+
+## Save many documents [#save-many]
+
+You loaded a hundred accounts, changed some of them in memory, added a few new ones, and want to write it all. A loop with [`$save`](../reference/documents/document-api.mdx#save) would make a hundred round trips to the server. [`bulkSave`](../reference/writes/writes.mdx#bulk-save) writes everything in one request. Each document goes through the same preparation as with `$save`: hooks, validators (async ones included), and the version.
+
+<Snippet id="writes/bulk/save-many" twoslash />
+
+The new document `fresh` is inserted, and the changed `existing` is updated. Unchanged documents are skipped. If the list has only those, or it's empty, no request is sent, and the result is `undefined`.
+
+<Snippet id="writes/bulk/save-many-2" twoslash />
+
+A document that fails the check stops the whole write before sending. Not a single document of the list is written.
+
+## Operation hooks inside bulkWrite [#bulk-write-hooks]
+
+A model has hooks, and they have to fire even when writes go in a batch. Each operation of a batch runs the hooks of its standalone counterpart.
+
+- `insertOne` runs the `document.validate` and `document.save` [document hooks](../hooks/document-hooks.mdx), like [`create`](./create.mdx). A change made by `@Pre` reaches the database.
+- `updateOne`, `updateMany`, `replaceOne`, `deleteOne`, and `deleteMany` run the `query.updateOne`, `query.updateMany`, and other [operation hooks](../hooks/operation-hooks.mdx).
+- The `model.bulkWrite` hooks run around the batch itself.
+
+<Snippet id="writes/bulk/bulk-write-hooks" title="accounts/account.ts" twoslash />
+
+A hook of one operation learns which operation it was called for from `this.bulkIndex`. That's the operation's number in the list, and for a normal call it's `undefined`. Let's run a batch of four operations.
+
+<Snippet id="writes/bulk/bulk-write-hooks-2" twoslash />
+
+A fixed rule sets the order here. Before sending, the `@Pre` document hooks of the inserts run, then the `@Pre` operation hooks in list order, then the `@Pre` hooks of `model.bulkWrite`, and only then the request goes out. After the request the `@Post` hook of `model.bulkWrite` runs first, followed by the `@Post` hooks of the operations and inserts in list order.
+
+The `markNote` hook changed the update of operation zero through [`modify`](../reference/hooks/operation-context.mdx#modify), and `Main` got `bulk #0` in `note`. For the `updateOne` with `upsert`, the server returned the id of the inserted document, so the second hook saw the `upsert`. An `upsert` doesn't run document hooks, since there's no document until the server answers.
+
+The `@Post` hook of an operation gets a [`BulkOperationResult`](../reference/hooks/operation-context.mdx#bulk-operation-result), not the usual result. A batch is one request, and for each operation the server reports only the id of a document inserted through `upsert`. How many documents each operation matched, modified, or deleted is unknown. So `matchedCount`, `modifiedCount`, and `deletedCount` are `null` here, not zero, since zero would mean "nothing found". The totals of the whole batch go to the `model.bulkWrite` hook, which is `matched 1` in the example.
+
+A hook can't skip a single operation of the batch, and `this.skip(...)` is forbidden in it. You can't substitute the result of one operation inside a batch. You can skip only the whole batch, from a `@Pre("model.bulkWrite")` hook.
+
+<Snippet id="reference/hooks/operation-context/skip-errors-2" />
+
+The batch treats an exception from the `@Pre` hook of one operation as a schema validation error of that operation. An **ordered** batch stops before sending. Nothing is written, and you get the hook's exception itself.
+
+In an **unordered** batch, the operation isn't sent and lands in `writeErrors` under its index. `error` holds a `TypemoError` with the original exception in `cause`, and `code` is `undefined`. The other operations are written, and the `@PostError` hooks run for the failed operation.
+
+<Snippet id="writes/bulk/bulk-write-hooks-3" />
+
+### If the batch fails [#bulk-failed]
+
+When the server refuses one of the operations, the hooks end like this. Operations the server managed to apply get `@Post`, and all the others get `@PostError`. In an **ordered** batch, everything before the first failure is applied, and the failed operation and everything after it aren't. The insert of `Main` violates uniqueness, so the `deleteOne` after it didn't run.
+
+<Snippet id="writes/bulk/bulk-failed" twoslash />
+
+`O1` is written, and its hook ended with `@Post`. The insert of `Main` failed and got `@PostError`. The delete didn't run, and it gets `@PostError` too, since the operation wasn't applied. In an **unordered** batch, only the operations with a write error get `@PostError`. All the others, even those after the failed one, end with `@Post`.
+
+<Snippet id="writes/bulk/bulk-failed-2" twoslash />
+
+In both cases `error.result.insertedIds` has only the inserts that were written, and the failed one's id isn't there. A document's `@PostError` hook gets the error of the whole batch, a `BulkWriteError`, so look for the failure's index in `writeErrors`.
+
+If a Typemo check rejected the batch (an invalid value in an ordered batch, or an empty filter), nothing goes to the database. All the hooks then end with `@PostError` carrying that check's error.
+
+## Invalid operations and limits [#invalid-operations]
+
+Typemo rejects a malformed operation before sending and names its index.
+
+<Snippet id="writes/bulk/invalid-operations" />
+
+An empty filter in `updateOne`, `updateMany`, `replaceOne`, `deleteOne`, and `deleteMany` is rejected the same way as in the standalone method, see [Empty filters in writes](./empty-filters.mdx). A replacement with `_id` is rejected, as in [`replaceOne`](../reference/writes/writes.mdx#replace-one). And `updateOne` with `upsert: true` checks that the inserted document gets every required field. An empty list is allowed: no request goes out, and the result is all zeros.
+
+One limit is worth knowing in advance. `bulkWrite` **doesn't accept** `$inc` or `$mul` on a field with `min` or `max`. To tell a triggered bound guard from a missing document, you need to know how many documents each operation matched, and a batch doesn't report that.
+
+<Snippet id="reference/writes/writes/inc-with-bounds" />
+
+For such fields, call [`updateOne`](../reference/writes/writes.mdx#update-one) or [`updateMany`](../reference/writes/writes.mdx#update-many).
+
+## How to choose [#how-to-choose]
+
+Ask yourself where the data came from.
+
+- **Operations you describe yourself**, insert, update, and delete mixed together: use [`bulkWrite`](../reference/writes/writes.mdx#bulk-write).
+- **Documents you loaded and changed as objects**: use [`bulkSave`](../reference/writes/writes.mdx#bulk-save). It decides on its own what to insert and what to update, and sends only what changed.
+
+Then decide whether order matters. If an operation depends on the previous one, keep ordered mode. If the operations are independent, `ordered: false` gets more done.
+
+## When not to use it [#when-not-to-use]
+
+For operations of one kind, use [`insertMany`](../reference/writes/writes.mdx#insert-many), [`updateMany`](../reference/writes/writes.mdx#update-many), or [`deleteMany`](../reference/writes/writes.mdx#delete-many). They're simpler and checked more precisely. If you need all or nothing, a batch isn't enough, you need a [transaction](../transactions/transactions.mdx). And for one document you don't need a batch at all.
+
+## Troubleshooting [#troubleshooting]
+
+**Part of the batch is written after an error.** You got a `BulkWriteError`, but some of the operations are visible in the collection. A batch doesn't roll back. In ordered mode everything before the error is written, in unordered mode everything except the failed operations. Look at `error.result` and `error.writeErrors` to see what was written, and if you need to, run the batch in a transaction.
+
+**Two operations in one object.** For example, `{ insertOne: { … }, deleteOne: { … } }`. An operation is one key, and Typemo tells you so by index: `bulkWrite[0]: one of insertOne, updateOne, updateMany, replaceOne, deleteOne, deleteMany (got insertOne, deleteOne)`. Split them into two objects in the list.
+
+**`$inc` with a bound in a batch.** For example, `{ updateOne: { filter: {…}, update: { $inc: { balance: -1 } } } }` for a field with `min`. The error is described above. Call `updateOne` outside the batch.
+
+## Full example [#full-example]
+
+Everything in one file: apply a batch of operations, load rows with error handling, and save changed documents.
+
+<Snippet id="writes/bulk/full-example" title="accounts/accounts.service.ts" twoslash />
+
+<Callout type="migration">
+
+Mongoose replaced the documents, filters, and updates inside your array of operations with cast values, and `bulkWrite([])` skipped some of the hooks. In Typemo the input doesn't change, because the operations are copied and checked. An empty list goes through the same pipeline as any other, the `model.bulkWrite` hooks run, and the result is all zeros. Each operation of the batch runs the hooks of its standalone counterpart. The server code is kept in `writeErrors`, and the index always points to the position in the input list.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Create documents" href="./create.mdx">
+  One insert or a list with checks, default values, and duplicates.
+</Card>
+<Card title="Hook into an operation" href="../hooks/operation-hooks.mdx">
+  The `query.*` hooks that each operation of a batch runs.
+</Card>
+<Card title="Transactions" href="../transactions/transactions.mdx">
+  Make a batch all or nothing.
+</Card>
+<Card title="Writing" href="../reference/writes/writes.mdx#bulk-write">
+  Operation shapes, options, and the result of `bulkWrite` and `bulkSave`.
+</Card>
+<Card title="Server errors" href="../reference/errors/server-errors.mdx#bulk-write-error">
+  The fields of `BulkWriteError` and other write errors.
+</Card>
+</Cards>

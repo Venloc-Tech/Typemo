@@ -1,0 +1,202 @@
+---
+title: Update operators
+description: "Change fields, numbers, and arrays with $set, $inc, $push, and the other operators, and edit single array elements"
+icon: Wrench
+---
+
+To change a document without replacing it whole, describe the update with **operators**. These are keys that start with `$` and tell the database what to do with a field. [`$set`](../reference/writes/update-operators.mdx#set) writes a value, [`$inc`](../reference/writes/update-operators.mdx#inc) adds to a number, and [`$push`](../reference/writes/update-operators.mdx#push) appends an element to an array. The database applies the operator in place and atomically. Two concurrent `$inc` calls both land, while "read, add, write" would lose one of them.
+
+Typemo checks an update twice. The compiler knows which operator applies to which field, and at runtime the values are cast to the schema types and run through the validators. This page shows the operators on tasks. The full list with types and errors is in the [reference](../reference/writes/update-operators.mdx).
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and an account model that grows as the page goes on. Every example starts with the same document: `title: "Main"`, `owner: "alice"`, `balance: 10`, `tags: ["a", "b"]`, `nickname: "al"`, `scores: [5, 3]`, `lines: [{ sku: "x", qty: 1 }, { sku: "y", qty: 5 }]`, `counters: { logins: 1 }`. The `// →` comment shows what's in the database after the update.
+
+<Snippet id="writes/update-operators/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Here are the three most common operators in one update: write a field, add to a number, append an element. You can combine operators in one object as long as they change **different** fields.
+
+<Snippet id="writes/update-operators/quick-start" twoslash />
+
+Below, the operators are grouped by task: fields, numbers, arrays, dates, and single array elements.
+
+## Write and remove fields [#set-and-unset]
+
+You need to change the owner or drop an optional field. [`$set`](../reference/writes/update-operators.mdx#set) writes values, and [`$unset`](../reference/writes/update-operators.mdx#unset) removes fields. A path can go deeper with a dot and point to an entry of a `Map`.
+
+<Snippet id="writes/update-operators/set-and-unset" twoslash />
+
+You can remove only optional fields (`?:`). Without a required field the document would break the schema, and if such an update does get to run, Typemo stops it with `ValidationError: Validation failed: "title": the field is required; $unset would remove it [required]`.
+
+`$set` doesn't accept `undefined` at all: `QueryError: update: undefined at "$set.note" (use $exists: false / $unset; undefined is never a value)`. The driver would write `null` instead, and that's not the same thing. `$unset` removes a field, and "no value" is `null` in a field declared `nullable`.
+
+Put a prepared object of changes into `$set` whole. The `UpdateInput<Account>` type is accepted there without a cast. It holds the model's fields minus `_id` and immutable fields, all of them optional.
+
+### Rename a field [#rename-field]
+
+[`$rename`](../reference/writes/update-operators.mdx#rename) moves a value under another name. Both fields, the old and the new one, must be optional and of the same type.
+
+<Snippet id="reference/writes/update-operators/rename" twoslash />
+
+## Change numbers [#change-numbers]
+
+Top up or debit a balance, increase a counter. [`$inc`](../reference/writes/update-operators.mdx#inc) adds a number, and a negative one subtracts. [`$mul`](../reference/writes/update-operators.mdx#mul) multiplies.
+
+<Snippet id="writes/update-operators/change-numbers" twoslash />
+
+An `int64` (`bigint`) field takes the operand as a `bigint` or as a decimal string. The string helps when the number came from JSON and doesn't fit in a regular number.
+
+<Snippet id="writes/update-operators/change-numbers-2" twoslash />
+
+### Keep the largest or smallest value [#keep-max-or-min]
+
+[`$min`](../reference/writes/update-operators.mdx#min) writes the value only if it's **less** than the current one, and [`$max`](../reference/writes/update-operators.mdx#max) only if it's **greater**. That's how you keep a "best result" without reading anything first.
+
+<Snippet id="writes/update-operators/keep-max-or-min" twoslash />
+
+### The min and max bounds [#min-max-bounds]
+
+Suppose `balance` has `min: 0`. A value from `$set` can be checked before sending, but the result of `$inc` can't, because it depends on what's in the database. So Typemo makes such an update **conditional**. It adds a check of the result to the filter, and the server runs it against the stored value. A result past the bound is never written, even with concurrent updates.
+
+<Snippet id="writes/update-operators/min-max-bounds" twoslash />
+
+<Snippet id="reference/writes/update-operators/min-max-bounds" />
+
+The error holds the value from the database and the result, so the log shows why the write was rejected. If no document matches the filter, there's no error, only the usual `matchedCount: 0`. For `updateMany`, the documents that would go past the bound are found before the write, and then nothing is written.
+
+The protection has three limits.
+
+- With `upsert` such an update is rejected. If the condition fails, the server would insert a new document.
+- In [`bulkWrite`](../reference/writes/writes.mdx#bulk-write) it's rejected too, since the batch result doesn't say how many documents each operation found.
+- A path through an array (`$`, `$[]`, `$[id]`, or an index) isn't protected, so Typemo won't let `$inc` through there either.
+
+## Change arrays [#change-arrays]
+
+Tags, scores, order lines. Arrays have five operators, and each does one job.
+
+[`$push`](../reference/writes/update-operators.mdx#push) appends an element at the end, and [`$addToSet`](../reference/writes/update-operators.mdx#add-to-set) adds it only if it isn't there yet.
+
+<Snippet id="writes/update-operators/change-arrays" twoslash />
+
+[`$pull`](../reference/writes/update-operators.mdx#pull) removes every element that matches a condition, [`$pullAll`](../reference/writes/update-operators.mdx#pull-all) removes every element from a list of values, and [`$pop`](../reference/writes/update-operators.mdx#pop) removes the first or the last one.
+
+<Snippet id="writes/update-operators/change-arrays-2" twoslash />
+
+### Insert, sort, trim [#insert-sort-trim]
+
+Instead of an element, `$push` takes an object with `$each` and modifiers. [`$position`](../reference/writes/update-operators.mdx#position) inserts at a given index, [`$sort`](../reference/writes/update-operators.mdx#sort) sorts after adding, and [`$slice`](../reference/writes/update-operators.mdx#slice) trims. That's how you keep a short list such as "top three results".
+
+<Snippet id="reference/writes/update-operators/sort" twoslash />
+
+The array `[5, 3]` got `9` and `1` starting at index 1, was then sorted in descending order to `[9, 5, 3, 1]`, and trimmed to three elements. The order is always the same: insert, sort, trim.
+
+If the `Timestamped` base class keeps the timestamps, any write moves `updatedAt`, even when the array itself didn't change. So an `$addToSet` of a value already in the array still gives `modifiedCount: 1`, because the timestamp was updated. That's intended, and the counter isn't lying.
+
+## Write the current time [#current-date]
+
+[`$currentDate`](../reference/writes/update-operators.mdx#current-date) writes the **server's** time. Use it when time should come from one source, not from the clocks of different apps.
+
+<Snippet id="reference/writes/update-operators/current-date" twoslash />
+
+## arrayFilters and positional paths [#array-filters]
+
+Sometimes you need to change only some elements of the `lines` array, not all of it. The server won't run a path "through an array" that doesn't say which element. There are four ways to say it.
+
+An index changes the element at a known position, and `$[]` changes **all** elements.
+
+<Snippet id="writes/update-operators/array-filters" twoslash />
+
+To change the elements that match a condition, name them `$[name]` and describe the condition in [`arrayFilters`](../reference/writes/writes.mdx#array-filters). The element's name works as a prefix in the condition, so `l.sku` is the `sku` field of element `l`.
+
+<Snippet id="writes/update-operators/array-filters-2" twoslash />
+
+The compiler checks the condition against the element type, so for `lines.$[l].qty` you have `l.sku` and `l.qty`. There's a flip side, and Typemo catches it before sending. Every `$[name]` needs its own filter, and every filter has to be used somewhere.
+
+<Snippet id="writes/update-operators/array-filters-3" />
+
+A `$` without brackets takes the first element that the **filter** found in this array. So the filter needs a condition on that array. Without one, the server can't tell which element you mean and rejects the update as soon as it finds a document. Typemo notices this earlier, before sending.
+
+<Snippet id="reference/writes/update-operators/positional-paths-2" />
+
+The condition can be on the array itself or on a path below it (`lines.sku`), including inside `$and`, `$or`, and `$nor`. `$[]` and `$[name]` don't need a condition in the filter.
+
+<Snippet id="writes/update-operators/array-filters-4" twoslash />
+
+## Change a Map [#change-map]
+
+An entry of a `Map` is a path with a key, for example `"counters.visits"`. You write, change, and remove a key with the same operators.
+
+<Snippet id="writes/update-operators/change-map" twoslash />
+
+## How to choose [#how-to-choose]
+
+Ask yourself whether the new value is known in advance or depends on the old one.
+
+- **Known**: [`$set`](../reference/writes/update-operators.mdx#set).
+- **Depends on the old number**: [`$inc`](../reference/writes/update-operators.mdx#inc) or [`$mul`](../reference/writes/update-operators.mdx#mul), which are atomic.
+- **Depends on other fields of the same document**: operators aren't enough, you need a [pipeline](./pipeline-updates.mdx).
+
+For an array the question is different: do you need duplicates and order? If yes, use [`$push`](../reference/writes/update-operators.mdx#push). If not, use [`$addToSet`](../reference/writes/update-operators.mdx#add-to-set).
+
+## When not to use it [#when-not-to-use]
+
+If most of the fields change, it's simpler to replace the document whole, see [Replace a document](./replace.mdx). And if you're working with a loaded document, `doc.field = value` and [`$save`](../reference/documents/document-api.mdx#save) send the right operators for you, see [Change and save a document](../documents/change-and-save.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**One path under two operators.** You can't do this.
+
+<Snippet id="writes/update-operators/troubleshooting" twoslash />
+
+The server rejects an update where two operators change one path, with code 40. Typemo notices it earlier.
+
+<Snippet id="reference/writes/update-operators/path-conflict" />
+
+Keep one action per path. If you need both to add and to write, that's two separate updates.
+
+**An operator that doesn't fit the field.** For example, `$inc` on a string. The compiler won't let it through.
+
+<Snippet id="writes/update-operators/troubleshooting-2" twoslash />
+
+If the types are bypassed because the data came from outside, Typemo stops this at runtime, the same way it stops a `$push` to something that isn't an array.
+
+<Snippet id="writes/update-operators/troubleshooting-3" />
+
+Use the operator that fits the field's type. Numbers are added to numbers, and elements are added to arrays.
+
+**An array element without a required field.** For example, `$push: { lines: { sku: "s" } }`. The element is checked whole, and an order line requires `qty`.
+
+<Snippet id="writes/update-operators/troubleshooting-4" />
+
+The path `lines.+0.qty` means the first of the elements being added. Add `{ sku: "s", qty: 1 }`.
+
+## Full example [#full-example]
+
+Everything in one file: a top-up that protects the bound, a list of best scores, and an edit of one order line.
+
+<Snippet id="writes/update-operators/full-example" title="accounts/accounts.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, validators on update were turned on with the `runValidators` option, and `$inc`, `$min`, and `$max` weren't checked at all. Here checks are always on, and `$inc` and `$mul` protect the `min` and `max` bounds on the server side. An empty update and one path under two operators are errors, not a silent no-op.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Update operators" href="../reference/writes/update-operators.mdx">
+  Every operator and modifier, their types, and the exact error texts.
+</Card>
+<Card title="Pipeline updates" href="./pipeline-updates.mdx">
+  When a value is computed from other fields of the document.
+</Card>
+<Card title="Update documents" href="./update.mdx">
+  Apply an update to one or many documents and get the result.
+</Card>
+<Card title="Arrays and Maps in a document" href="../documents/typed-collections.mdx">
+  How changes to an array in a document turn into operators.
+</Card>
+</Cards>

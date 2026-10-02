@@ -1,0 +1,141 @@
+---
+title: Reuse behavior across models
+description: "A schema plugin that attaches to a model, a database, or the whole app, adds model methods, and turns on policies"
+icon: Puzzle
+---
+
+A **plugin** is an object with a name and an `apply` function. When a schema compiles, `apply` adds fields, indexes, hooks, virtuals, model methods, and policies to it. Use a plugin when many models need the same behavior: a shared logging hook, soft delete, a set of indexes, or shared methods. You write it once and attach it instead of copying the code into every class.
+
+If you need one hook on one model, you don't need a plugin. A class method with [`@Pre`](../reference/hooks/pre-post.mdx#pre) is enough. And if you only want to store your own settings on a field, see [Add your own field and schema options](../extensions/custom-options.mdx).
+
+## What you need [#prerequisites]
+
+An account model and the client from [Connect to the database](../connection/connect.mdx). `Accounts` is the account model you get from the client after the plugins are attached.
+
+## Quick start [#quick-start]
+
+A plugin is an object `{ name, apply }`. The [`@Plugin`](../reference/hooks/plugins.mdx#plugin) decorator attaches it to a model, `connection.plugins.use` to a database, and [`Typemo.plugin`](../reference/connection/typemo.mdx#typemo.plugin) to the whole app.
+
+<Snippet id="hooks/plugins/quick-start" title="plugins/read-log.ts" twoslash />
+
+Now `find()` on this model prints `read list Account`. Below we cover what a plugin can add and how to choose the level to attach it at.
+
+## Write a plugin [#write-plugin]
+
+The `apply` function gets a [`PluginBuilder`](../reference/hooks/plugins.mdx#plugin-builder), a narrow interface through which the plugin changes the schema. It's called once for every schema. The builder knows which model it compiles (`builder.target`) and which fields it already has (`builder.fieldKeys`).
+
+A plugin can add a field, an index, a hook, a virtual, a static method, and a policy. Plugin hooks go on the same [events](../reference/hooks/pre-post.mdx#hook-events) as class hooks and run after them. Their function is declared as `function (this: unknown)`. The builder doesn't know which `this` belongs to which event, so cast it yourself when you need it.
+
+<Snippet id="hooks/plugins/write-plugin" twoslash />
+
+Attached to a model with the fields `_id` and `title`, this plugin prints `Account [ "_id", "title" ]`.
+
+## Attach to a model, a database, or the app [#apply-plugin]
+
+There are three levels, and they differ in which models get the plugin. They're applied in order: global plugins first, then database plugins, then model plugins.
+
+To attach a plugin to one model, put the `@Plugin` decorator on the class. Several plugins are applied from top to bottom.
+
+<Snippet id="hooks/plugins/apply-plugin" twoslash />
+
+To attach a plugin to every model of one database, use the database's registry. For every model of the app, use `Typemo.plugin`. Make both calls **before the first model**.
+
+<Snippet id="hooks/plugins/apply-plugin-2" twoslash />
+
+If the same plugin is attached at two levels with the same options, it's applied once, where it first appears. Say a database plugin `conn` and a plugin `both` attached at both the database and the model level give the order `conn`, `both`. If the options differ, or two different plugins share a name, you get a `ConfigurationError`. The error texts are under "Troubleshooting".
+
+## A plugin with options [#plugin-with-options]
+
+Options are passed as the second argument and arrive in `apply`. Their type is the first parameter of `SchemaPlugin<O>`. If the options are required, the compiler demands them when you attach the plugin.
+
+<Snippet id="hooks/plugins/plugin-with-options" twoslash />
+
+A plugin of the same kind with a `seenAt` field (`addField("seenAt", () => Date)`) stores the value you pass in the document. But the model type doesn't know about this field. The plugin adds it when the schema compiles, and the TypeScript compiler sees only the declared class. You can write and read such a field with a type cast. If you need the field in the types, declare it in the class itself.
+
+## Add methods to a model [#add-model-methods]
+
+A plugin can add static methods, and every model it's attached to gets them. You declare the methods in the plugin's `statics` object, and `this` in them is the model. [`Model.statics`](../reference/hooks/plugins.mdx#model.statics) gives you typed access to them. It returns the same model, now with the types of the plugin's methods.
+
+<Snippet id="hooks/plugins/add-model-methods" twoslash />
+
+After inserting an account `w`, the call `byTitle("w")` returns `1`. The method is bound to the model, so its type has no `this` parameter.
+
+A model the plugin isn't attached to is checked at runtime. The type doesn't promise a method that isn't there.
+
+<Snippet id="hooks/plugins/add-model-methods-2" />
+
+If a method name matches a member of the model, like `find` or `create`, it can't silently shadow it. When the model is created, you get a `ConfigurationError` with the text `the plugin static "find" would shadow a member of the model`.
+
+## Turn on a policy [#enable-policy]
+
+A plugin can turn on a policy (`tenant`, `softDelete`, or `audit`) with the same options as [`@Schema`](../reference/schemas/schema.mdx). That way a soft delete plugin attaches to every model with a `deletedAt` field in one line.
+
+<Snippet id="hooks/plugins/enable-policy" twoslash />
+
+After `deleteOne({ title: "w" })`, `countDocuments()` returns 0, but the document stays in the collection. If `@Schema` already turns the policy on with different options and the plugin turns it on another way, you get a `ConfigurationError` like `declared by @Schema and enabled by plugin "other"`. The policy itself is covered in [Delete with a way to restore](../policies/soft-delete.mdx).
+
+## How to choose [#how-to-choose]
+
+Ask yourself **how many models should get it**.
+
+- **One model**: a class method, or `@Plugin` on that class.
+- **Every model of one database**: the database's registry.
+- **Every model of the app**, including those created by libraries: `Typemo.plugin`.
+
+The wider the level, the stricter the order. Global and database plugins are closed by the first successfully compiled schema. `@Plugin` is tied to the class, and the startup order doesn't matter to it.
+
+## When not to use it [#when-not-to-use]
+
+Don't turn one hook on one model into a plugin. A plugin can't change operations directly. It only has hooks, and they go through every policy. To watch the operations of every model, use [operation events](../observability/events.mdx). A subscriber is global and breaks nothing. And if you need your own field options and checks for them, write an [extension](../extensions/custom-options.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**The plugin is registered too late.**
+
+<Snippet id="connection/clients-and-extensions/register-before-first-model-2" />
+
+A registry closes with the first **successfully** compiled schema. Otherwise the plugin wouldn't reach every model. A database registry is closed by the first model of that database, and the global registry (`Typemo.plugin`) by the first model on any client of the app. A schema that fails to compile doesn't close the registries, and after such an error you can still register a plugin.
+
+Move the registration to the very start of the app, before any model is created. For a database the text is the same, but with the words `the connection plugins`. Extensions close by the same rule. See [Multiple clients and extensions](../connection/clients-and-extensions.mdx#register-before-first-model).
+
+**One plugin with different options.**
+
+<Snippet id="hooks/plugins/troubleshooting" />
+
+The same plugin at two levels with different options is ambiguous. Keep one attachment, or make the options the same.
+
+**Two plugins with the same name.**
+
+<Snippet id="hooks/plugins/troubleshooting-2" />
+
+A plugin's name must be unique. Rename one of them.
+
+**A plugin without a name.**
+
+<Snippet id="hooks/plugins/troubleshooting-3" />
+
+## Full example [#full-example]
+
+A plugin that adds methods and a hook, and a model that uses it.
+
+<Snippet id="hooks/plugins/full-example" title="plugins/tools.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, global plugins are applied at `model()`, so a plugin registered after some models were created silently doesn't apply to them. In Typemo that's a [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configuration-error). Static methods are added there as `schema.statics.x = …`, without types. Here they're typed through the plugin's `statics` and `model.statics(plugin)`, and a name that matches a model method is an error, not silent shadowing.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Plugins" href="../reference/hooks/plugins.mdx">
+  `SchemaPlugin`, `PluginBuilder`, the registries, and `Model.statics` with exact signatures.
+</Card>
+<Card title="Multiple clients and extensions" href="../connection/clients-and-extensions.mdx">
+  Where to register plugins and extensions when the app has several clients.
+</Card>
+<Card title="Add your own field and schema options" href="../extensions/custom-options.mdx">
+  How to store and check your own field settings without changing the schema.
+</Card>
+</Cards>

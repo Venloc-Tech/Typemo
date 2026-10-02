@@ -1,0 +1,307 @@
+---
+title: Reading data
+description: "Read data and choose the form to send it to the client in: a document, a .lean() result, or a .plain() result"
+icon: BookOpen
+---
+
+Typemo hands back the data it reads in one of three forms. A **document** can be changed and saved. A **`.lean()` result** is the data exactly as the driver returned it. A **`.plain()` result** is ordinary objects ready for a response to the client. You pick the form with one call at the end of the query.
+
+Why the difference? MongoDB stores data in the BSON format, and BSON has types that JSON doesn't: the `ObjectId` id, 64-bit integers, exact `Decimal128` decimals. They're handy inside the app, but you can't send them to a client as they are. If you're new to MongoDB, look at [MongoDB data types](../concepts/bson-types.mdx) first, where this is covered in detail.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx). The examples are written as plain service functions, without a web framework, and the same code gets called from a handler in any framework. App boundaries like a 404 response are stood in for by your own classes `__NotFound__` and `__BadRequest__`.
+
+The collections hold a customer, Alice, and her two accounts.
+
+- `Main`: balance `9007199254741093`, tags `salary` and `vip`, a `tier` label with the value `gold`.
+- `Savings`: balance `500`, no tags.
+
+The results in the `// →` comments come from this data, with ids shortened to `"…"`.
+
+## Quick start [#quick-start]
+
+Let's start with a bank account model that has two fields.
+
+<Snippet id="queries/reading-data/quick-start" title="models/account.ts" twoslash />
+
+[`Entity`](../reference/schemas/base-classes.mdx#entity) gives the model an `_id` field of type `ObjectId`. That's the id MongoDB assigns to every document. `BigInt` means the balance is stored in the database as a 64-bit integer, and in code it's a `bigint`.
+
+Here are three ways to read the same account. Hover over the variable names to see their types.
+
+<Snippet id="queries/reading-data/quick-start-2" twoslash />
+
+In `forClient` the `_id` and `balance` fields are strings, and in `raw` they're an `ObjectId` and a `bigint`. The types come from the model and from the call at the end of the query, so the compiler always knows which form of data you're working with.
+
+[`.orFail()`](../reference/query/reading.mdx#or-fail) throws an error if nothing was found. Without it, [`findOne`](../reference/query/reading.mdx#model.find-one) can return `null`, and TypeScript makes you handle that case.
+
+We'll go through each form on real tasks below.
+
+## Change a record [#update-record]
+
+If the query doesn't end with [`.plain()`](../reference/query/reading.mdx#plain) or [`.lean()`](../reference/query/reading.mdx#lean), you get a document. It looks like an instance of your `Account` class, but it can do more. It remembers which fields you changed and can save itself to the database.
+
+<Snippet id="queries/reading-data/update-record" twoslash />
+
+[`$save()`](../reference/documents/document-api.mdx#save) doesn't overwrite the whole document in the database. Typemo sends only the changed fields, here `{ $set: { title: "Main account" } }`. If another query changed the `balance` of the same account at the same time, its change won't get lost.
+
+Document methods start with `$`: [`$set()`](../reference/documents/document-api.mdx#set), [`$isModified()`](../reference/documents/document-api.mdx#is-modified), [`$toPlain()`](../reference/documents/document-api.mdx#to-plain). That makes them easy to tell apart from your model's fields.
+
+Arrays and `Map`s inside a document track changes too. Let's give the account some tags.
+
+<Snippet id="queries/reading-data/update-record-2" title="models/account.ts" twoslash />
+
+<Snippet id="queries/reading-data/update-record-3" twoslash />
+
+How arrays turn into MongoDB operations is covered in [Arrays and Maps in a document](../documents/typed-collections.mdx).
+
+A document costs more than the other two forms. For every row Typemo builds an object and its collections and remembers the original values. If you aren't going to change anything, that work is wasted.
+
+## Send data to the client [#send-to-client]
+
+A client asks for an account through the API. You can't send a document, since it has methods and internal state. A `.lean()` result won't do either. `JSON.stringify` can't serialize a `bigint` and throws, and an `ObjectId` means nothing to the client.
+
+That's what [`.plain()`](../reference/query/reading.mdx#plain) is for. It reads the data from the database and turns every value into its ordinary JavaScript form.
+
+<Snippet id="queries/reading-data/send-to-client" twoslash />
+
+`_id` became a string. That's the hex form of the `ObjectId`, which the client can display, put in a URL, and send back.
+
+`balance` became a string too, and that matters. An ordinary JavaScript `number` holds integers exactly only up to 2⁵³. The balance `9007199254741093` is above that limit. Send it as a number, and the client would get `9007199254741092` without any error. That's why 64-bit numbers in a `.plain()` result are always decimal strings.
+
+No document gets created along the way, so `.plain()` is almost as fast as `.lean()`. How each MongoDB type looks in a `.plain()` result is shown in the [Value forms](../reference/values/value-forms.mdx) reference.
+
+### A list of accounts [#account-list]
+
+The most common case is a list for a page of the app. It lives in a service function that the request handler calls.
+
+<Snippet id="queries/reading-data/account-list" title="accounts/accounts.service.ts" twoslash />
+
+[`.select({ title: 1, balance: 1 })`](../reference/query/reading.mdx#select) asks the database to return only these fields. The compiler knows that. The result items have no `tags` field, and you can't reach for it. MongoDB always returns `_id` unless you exclude it explicitly with `_id: 0`. Picking fields is covered in [Projections and the result type](./projections.mdx), and sorting and limiting a list in [Sorting and paging](./sorting-and-pages.mdx).
+
+Notice that `listAccounts` isn't declared `async` and returns the query, not the result. The query builder behaves like a `Promise` itself. The calling code writes `await listAccounts()`, and you can declare the return type as `Promise<…>` with no wrappers. The query goes to the database only on `await`.
+
+### One account by an id from the URL [#account-by-id]
+
+A client requests `GET /accounts/6abcfa30531a3d0a555e2f5b`. The id arrives as a string, and [`findById`](../reference/query/reading.mdx#model.find-by-id) accepts it as is. You don't need to convert the string to an `ObjectId` yourself.
+
+<Snippet id="queries/reading-data/account-by-id" title="accounts/accounts.service.ts" twoslash />
+
+There are two errors here, and both are about the client's input, not a server failure. If there's no account with that id, `.orFail()` throws a [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#document-not-found-error), and the function turns it into "not found".
+
+<Snippet id="queries/reading-data/account-by-id-2" />
+
+If the string doesn't look like an id, the query doesn't even reach the database. Typemo checks the format itself and throws a [`CastError`](../reference/errors/data-errors.mdx#cast-error).
+
+<Snippet id="queries/reading-data/account-by-id-3" />
+
+You don't need to parse the string yourself before the call. A `CastError` is already the signal that the id is wrong, and the function above answers it with a 400 error.
+
+<Callout type="tip">
+
+To avoid repeating `try/catch` in every function, turn `DocumentNotFoundError` and `CastError` into responses once, at the place where your app turns errors into responses.
+
+</Callout>
+
+### Return a record after changing it [#return-updated]
+
+A client renames an account and expects the updated record in the response. There are two ways to do it, and both return the same `.plain()` result.
+
+The first way is to change the record with one database query, using [`findByIdAndUpdate`](../reference/writes/writes.mdx#find-by-id-and-update).
+
+<Snippet id="queries/reading-data/return-updated" title="accounts/accounts.service.ts" twoslash />
+
+`returnDocument: "after"` asks for the record after the change. Without this option you get the state before the change.
+
+The second way is to read the document, change it, and get an ordinary object with [`$toPlain()`](../reference/documents/document-api.mdx#to-plain).
+
+<Snippet id="queries/reading-data/return-updated-2" title="accounts/accounts.service.ts" twoslash />
+
+`$toPlain()` on a document gives the same thing as `.plain()` on a query, only it takes the data from the document already loaded, not from the database. You need the second way when there's logic before saving: checks, calculations, [hooks](../hooks/document-hooks.mdx). If there's no logic, the first way is simpler and costs one trip to the database instead of two.
+
+### Accept values back from the client [#accept-client-values]
+
+The client got `balance` as a string and may send it back. In [`create`](../reference/writes/writes.mdx#create), in updates, and in filters you don't need to turn the string into a `bigint`. Typemo accepts a string holding an integer wherever it expects a 64-bit number. You can pass an id as a string too.
+
+<Snippet id="queries/reading-data/accept-client-values" twoslash />
+
+After `Bonus` is created, the collection has three accounts with a balance of at least 500: `Main`, `Savings`, and `Bonus`.
+
+The same works in the operators that do arithmetic: [`$inc`](../reference/writes/update-operators.mdx#inc), `$mul`, `$min`, and `$max`. So a top-up amount that arrived as a string can be passed as is.
+
+<Snippet id="queries/reading-data/accept-client-values-2" title="accounts/accounts.service.ts" twoslash />
+
+The string must be written strictly, for example `"500"`, `"-42"`, or `"9223372036854775807"`. Anything that could be read two ways Typemo rejects with a `CastError` instead of rounding.
+
+<Snippet id="queries/reading-data/accept-client-values-3" />
+
+`"1e3"`, `"+1"`, `"01"`, `" 1"`, `"0x10"`, an empty string, and numbers beyond 64 bits are rejected the same way. Otherwise an amount the client mistyped would quietly turn into a different one.
+
+### Keep secret fields out [#hide-secrets]
+
+Let's add a bank customer model with a password hash.
+
+<Snippet id="queries/reading-data/hide-secrets" title="models/customer.ts" twoslash />
+
+The [`hidden`](../reference/schemas/prop.mdx#hidden) option together with the `Hidden<string>` type makes the field **hidden**. Such a field isn't read from the database until you ask for it explicitly, and it doesn't get into a `.plain()` result even if it was read.
+
+At sign-in you need the hash to check the password. Ask for it with `select`, putting `+` in front of the field name.
+
+<Snippet id="queries/reading-data/hide-secrets-2" title="auth/auth.service.ts" twoslash />
+
+The hash was read and checked, but it didn't get into the response. And that isn't only checked at runtime. The type of the `$toPlain()` result has no `passwordHash` field, so reaching for it won't compile.
+
+<Snippet id="queries/reading-data/hide-secrets-3" twoslash />
+
+You can't send the hash to the client by accident. If you do need a hidden field in `$toPlain()`, for example in an internal service, ask for it explicitly.
+
+<Snippet id="queries/reading-data/hide-secrets-4" twoslash />
+
+A query has the same option: `.plain({ hidden: true })`. Hidden fields and value masking are covered in detail in [Hidden and sensitive fields](../schemas/hidden-and-sensitive.mdx).
+
+### Send related data [#send-related]
+
+An account belongs to a customer. Let's add a reference to the owner in `Account`.
+
+<Snippet id="queries/reading-data/send-related" title="models/account.ts" twoslash />
+
+In the database `owner` holds the customer's `ObjectId`. To return the customer itself instead, add [`populate`](../reference/populate/populate.mdx). Typemo runs a second query against the `customers` collection and puts the document it finds in place of the reference.
+
+<Snippet id="queries/reading-data/send-related-2" title="accounts/accounts.service.ts" twoslash />
+
+The populated customer is also turned into an ordinary object by its own model. Its `passwordHash` wouldn't get into the response even if you selected it, because the hidden field rule applies at any depth. See [Show related data](../populate/basics.mdx).
+
+### Export many rows [#export-rows]
+
+If there are thousands of rows, for example for an export to another system, don't load them into memory all at once. A **cursor** hands out rows one at a time as they're read from the database. [`.cursor()`](../reference/query/reading.mdx#cursor) returns one.
+
+<Snippet id="queries/reading-data/export-rows" title="export/export-accounts.ts" twoslash />
+
+Each row is already the same as in a `.plain()` result. Other ways to process large result sets are in [Large results](./large-results.mdx).
+
+## Compute something inside the app [#compute-in-app]
+
+A `.plain()` result is awkward for calculations. You can't add the strings `"9007199254741093"` and `"500"` as numbers. Here you need [`.lean()`](../reference/query/reading.mdx#lean). It returns the data exactly as the database sent it, with no conversion.
+
+Let's count how much money a customer has across all accounts. `Bonus` from the previous section joined `Main` and `Savings`, so there are three accounts.
+
+<Snippet id="queries/reading-data/compute-in-app" title="accounts/accounts.service.ts" twoslash />
+
+`row.balance` is a `bigint` here, and the sum is exact even if it's above 2⁵³. Notice that the owner goes into the filter as a string. Typemo builds the `ObjectId` from the string itself.
+
+In a `.lean()` result ids stay `ObjectId` objects. Compare them with the `equals` method, because `===` compares objects by reference, not by value.
+
+<Snippet id="queries/reading-data/compute-in-app-2" twoslash />
+
+`.lean()` has one quirk with `Map` fields. Let's give the account some key-value labels.
+
+<Snippet id="queries/reading-data/compute-in-app-3" title="models/account.ts" twoslash />
+
+MongoDB stores a `Map` as an ordinary object, and the driver returns it that way. The type of the `.lean()` result accounts for this.
+
+<Snippet id="queries/reading-data/compute-in-app-4" twoslash />
+
+In a document and in a `.plain()` result, `labels` is a `Map`. Typemo knows your model and restores it.
+
+## Find a list and treat an empty result as an error [#empty-list-as-error]
+
+Usually an empty list is a normal answer. The customer has no accounts yet. But sometimes missing data is a failure, for example when a lookup table didn't load. Then add `.orFail()` to `find` too. An empty list turns into a `DocumentNotFoundError`, and a non-empty one comes back as usual.
+
+<Snippet id="queries/reading-data/empty-list-as-error" twoslash />
+
+MongoDB itself would return an empty array here. You turn the error on yourself, when an empty result isn't acceptable. This doesn't work with a cursor. [`.cursor()`](../reference/query/reading.mdx#cursor) can't know in advance that there will be no documents, and on an empty result it ends without a single row.
+
+## How to choose [#how-to-choose]
+
+Ask yourself what will happen to the data after you read it.
+
+- **You'll change and save it**: use a document. Only a document tracks changes and has [`$save()`](../reference/documents/document-api.mdx#save).
+- **The data leaves the app**, into an HTTP response, a message queue, a cache, or a log: use [`.plain()`](../reference/query/reading.mdx#plain). It turns BSON types into strings, keeps large numbers exact, and doesn't let hidden fields out.
+- **The data is for a calculation inside the app**, to add, compare, or pass into another query: use [`.lean()`](../reference/query/reading.mdx#lean). It's the fastest and keeps the exact types.
+
+Sometimes you've read a document, changed it, and now need to return it to the client. You don't need to read from the database again. Call [`$toPlain()`](../reference/documents/document-api.mdx#to-plain) on the document.
+
+## When not to use it [#when-not-to-use]
+
+You don't need a document if you're only reading. For lists, reports, and API responses it does extra work, so use [`.plain()`](../reference/query/reading.mdx#plain) or [`.lean()`](../reference/query/reading.mdx#lean).
+
+You don't need `.plain()` if the data stays inside the app. Strings instead of numbers only get in the way of calculations, and [`.lean()`](../reference/query/reading.mdx#lean) fits here.
+
+You don't need `.lean()` if the data goes to the client. You'd have to convert `bigint` and `ObjectId` yourself, and that's easy to get wrong. For a response use [`.plain()`](../reference/query/reading.mdx#plain).
+
+If you only need to know whether a document exists, or to count documents, you don't need to read them. That's what [`exists`](../reference/query/reading.mdx#model.exists) and [`countDocuments`](../reference/query/reading.mdx#model.count-documents) are for.
+
+## Troubleshooting [#troubleshooting]
+
+**`JSON.stringify` fails on a `bigint`.** You read accounts with `.lean()` and send them to the client.
+
+<Snippet id="queries/reading-data/troubleshooting" twoslash />
+
+In a `.lean()` result 64-bit numbers stay `bigint`, and `JSON.stringify` can't handle them. For a response to the client use `.plain()`, and the balance becomes a string.
+
+**The labels turned into `{}`.**
+
+<Snippet id="queries/reading-data/troubleshooting-2" twoslash />
+
+A `.plain()` result is JavaScript data, not JSON. A `Map` in it stays a `Map`, and `JSON.stringify` silently turns any `Map` into an empty object. If the model has a `Map` and you serialize the result yourself, serialize the document. `JSON.stringify(document)` calls [`$toJSON()`](../reference/documents/document-api.mdx#to-json), and the `Map` becomes an object.
+
+<Snippet id="queries/reading-data/troubleshooting-3" twoslash />
+
+If you don't need the document, turn the `Map` into an object yourself: `Object.fromEntries(account.labels)`.
+
+**`.mask()` doesn't compile.**
+
+<Snippet id="queries/reading-data/troubleshooting-4" twoslash />
+
+The error text itself explains why: `mask() masks rows: call .lean() or .plain() first — a hydrated document with masked values could be saved`. [Masks](./response-masks.mdx) hide part of a value in the response, for example keeping only the last four digits of a card number. A document with masked values could be saved by accident, and the mask would land in the database instead of the real data. That's why [`.mask()`](../reference/query/masks.mdx#mask) works only with `.plain()` and `.lean()`.
+
+**A `.plain()` result has no `$save`.**
+
+<Snippet id="queries/reading-data/troubleshooting-5" twoslash />
+
+The `.plain()` and `.lean()` results are data, not a document. To change a record, read it without `.plain()`, or use [`updateOne`](../reference/writes/writes.mdx#update-one) and [`findByIdAndUpdate`](../reference/writes/writes.mdx#find-by-id-and-update).
+
+**The balance came back as a number, not a string.** The `Imported` account came into the collection from an old system, and the import wrote the balance as an ordinary number instead of a 64-bit integer. The model reads the document as is. In `.plain()` the balance arrives as the number `500`, although the type promises a string, and client code that expects a string breaks without any error on the server.
+
+By default Typemo doesn't compare documents it reads with the schema, since everything the model wrote was checked on write. To find such a document, turn on strict reads with [`.validateReads()`](../reference/query/options.mdx#validate-reads).
+
+<Snippet id="queries/reading-data/troubleshooting-6" twoslash />
+
+Fix the data with a migration. And to catch such documents right away, turn the check on for the whole client with the [`validateReads: "development"`](../reference/connection/typemo-client.mdx#validate-reads) option. Then every read is compared with the schema in development and tests, and in production the check costs nothing.
+
+## Full example [#full-example]
+
+An account service with every scenario from this page. Code that isn't part of Typemo and that you write yourself is marked `__…__`.
+
+<Snippet id="queries/reading-data/full-example" title="accounts/accounts.service.ts" twoslash />
+
+<Callout type="migration">
+
+[`.lean()`](../reference/query/reading.mdx#lean) works the same as in Mongoose, but its type accounts for `select` and `populate`, and fields you didn't select aren't in the type. Mongoose has no `.plain()`. There you usually read a document and call `toJSON()` for a response. In Typemo `toObject()` and `toJSON()` are called [`$toObject()`](../reference/documents/document-api.mdx#to-object) and [`$toJSON()`](../reference/documents/document-api.mdx#to-json).
+
+A hidden field is removed from the `.plain()` result and from JSON even if it was loaded explicitly, and it disappears from the type. `findById`, filters, and updates all accept a string in place of an `ObjectId`, so there's nothing to convert by hand.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Reading" href="../reference/query/reading.mdx">
+  Every read method and query builder method: arguments, results, errors.
+</Card>
+<Card title="Filters" href="./filters.mdx">
+  Write a search condition: comparisons, sets of values, arrays, a filter from user input.
+</Card>
+<Card title="Projections and the result type" href="./projections.mdx">
+  `select`, excluding fields, and the `Selected` type for describing the shape of a response.
+</Card>
+<Card title="Response masks" href="./response-masks.mdx">
+  Show the client only part of a value.
+</Card>
+<Card title="Value forms" href="../reference/values/value-forms.mdx">
+  How each MongoDB type looks in each form, including `Decimal128`, `Date`, `Binary`, and vectors.
+</Card>
+<Card title="Hidden and sensitive fields" href="../schemas/hidden-and-sensitive.mdx">
+  `hidden` and `sensitive` in detail.
+</Card>
+</Cards>

@@ -1,0 +1,149 @@
+---
+title: Show related data
+description: "Put the related documents in place of stored identifiers, and see what happens to the type and how many queries reach the database"
+icon: Link
+---
+
+To show a post with its author's name instead of an opaque identifier, call [`.populate`](../reference/populate/populate.mdx#populate). It reads the related documents and puts them in place of the identifiers. In MongoDB documents are stored separately and point to each other by `_id`, and the server doesn't join them when it reads. Without populate you'd have to collect the identifiers, run a second query, and put the results in their places. Typemo does this in one call and, more importantly, changes the result type. The compiler knows that `author` now holds a user, not an identifier, or `null` if the user was deleted.
+
+If references between documents are new to you, one idea is enough. A field declared as `Ref<User>` stores the `_id` of a user document, and `.populate("author")` puts the user itself in its place. References are described in the schema, as covered in [Reference other models](../schemas/references.mdx).
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the blog models: a user, a tag, a post, and a comment. The model grows as the page goes on, and the [`.populate`](../reference/populate/populate.mdx) reference shows it in full. The database holds this data.
+
+- Two users: Alice and Bob.
+- Two tags: `db` and `ts`.
+- Three posts. Alice wrote "Hello" and "Second", and Bob wrote "Bob's". "Hello" has the tags `db` and `ts`, "Second" has the tag `ts`, and "Bob's" has no tags.
+
+Identifiers in the results are shortened to `"…"`. Let's start with two models, where a post stores its author's identifier.
+
+<Snippet id="populate/basics/prerequisites" title="blog/models.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Here are the three most common calls. Each takes the path of a reference field, and the result is the same post, but `author` holds a user instead of an identifier. The examples need `?.` because of `null`: if the author was deleted, the field becomes `null`, as described below.
+
+<Snippet id="populate/basics/quick-start" twoslash />
+
+Below we'll go through each case on real tasks: a list of posts with authors, field selection, one-to-many relations, the result type, and the number of queries.
+
+## Show the author in a list of posts [#show-author]
+
+The blog's home page needs a list of posts with author names. A post stores only `author`, an identifier, and without populate there's nowhere to get the name from.
+
+<Snippet id="populate/basics/show-author" title="blog/posts.service.ts" twoslash />
+
+Typemo read three posts, collected the author identifiers from them (Bob and Alice, once each), read those users in one query, and put them into the posts. The number of queries doesn't depend on the number of posts. There are two of them for three posts and for a thousand.
+
+Look at the type. After `.populate("author")` the `author` field is no longer a `Ref<User>` but a user object or `null`, so you reach the name through `?.`. The author could have been deleted after the post was written. See [What you get and its type](#result-and-type) for details.
+
+Remove `.populate`, and the type shows the difference. Without it, `post.author` is an identifier, and `post.author.name` won't compile.
+
+<Snippet id="populate/basics/show-author-2" twoslash />
+
+The compiler answers `Property 'name' does not exist on type 'string'`, because in a `.plain()` result the identifier is a string. That's how a forgotten `.populate` gets caught before the code even runs.
+
+## Select only the fields you need from the related document [#populate-select]
+
+You need only the author's name. You shouldn't show the email, and there's no reason to fetch it. The [`select`](../reference/populate/populate.mdx#select) option works like an ordinary projection, but for the related documents.
+
+<Snippet id="populate/basics/populate-select" twoslash />
+
+`_id` stays unless you exclude it explicitly, because projection works the same way everywhere in Typemo. The field's type narrows along with the selection, and the compiler won't let you reach `post.author?.email`, since that field isn't in the result. Selecting fields also cuts the amount of data the database sends to your app, which is noticeable with large related documents. See [Load related data faster](./performance.mdx) for details.
+
+## Several relations in one call [#multiple-populate]
+
+A post page needs the author and the tags. Pass a list, and you can mix paths and objects with options in it.
+
+<Snippet id="populate/basics/multiple-populate" twoslash />
+
+Each path is a separate query to its own model, so three paths make three extra queries. You can also chain paths with `.populate("author").populate("tags")`, and the result is the same. But a repeated call for the same path doesn't add to the previous one, it replaces it. The last one wins.
+
+## A reverse relation through a virtual field [#virtual-populate]
+
+You need the post's comments. But the post doesn't store their identifiers. It's the other way around: each comment stores a reference to the post. A **virtual field** describes such a reverse relation. It writes nothing to the database, and on populate it finds the comments by their `post` field. Let's describe it in the post model.
+
+<Snippet id="populate/basics/virtual-populate" title="blog/models.ts" twoslash />
+
+`localField` is the post's field whose value we look for (`_id`), and `foreignField` is the comment's field where it should be (`post`). For more on virtual fields, see [Add computed fields and reverse references](../schemas/virtuals.mdx). You load a virtual field the same way as a reference.
+
+<Snippet id="populate/basics/virtual-populate-2" twoslash />
+
+For a post without comments the virtual field is an empty array, not a missing value. After populate the virtual field is always there. If you need only the number of comments, declare a virtual field with a counter (`count: true`). Then [`populate`](../reference/populate/populate.mdx#populate) asks the database to count the documents instead of loading them. The other kinds of relations, nested ones, ones through Maps, and polymorphic ones, are covered in [Relations inside nested data](./complex-relations.mdx).
+
+## What you get and its type [#result-and-type]
+
+A reference that didn't find its document behaves according to the field's shape. A single reference becomes `null`, while an array element drops out, and the rest keep their order. This happens if the document was deleted or hidden by soft delete.
+
+That's why the type of a single reference after populate always allows `null`: `HydratedDoc<User> | null` on a document, and `{ … } | null` in `.lean()` and `.plain()` results. The schema can't rule this out. `required: true` on `@Prop` requires the identifier to be in the post, but it doesn't promise that a user with that identifier exists.
+
+<Snippet id="populate/basics/result-and-type" twoslash />
+
+The [`match`](../reference/populate/populate.mdx#match) option kept only `ts` among the tags, and "Hello" lost its reference to `db`. What ends up in the field depends on the kind of result. On a document it's a document of the target model with all its methods, and such an array is read-only. In [`.lean()`](../reference/query/reading.mdx#lean) and [`.plain()`](../reference/query/reading.mdx#plain) results you get plain objects. You can see the difference in `_id`. In `.lean()` it's an `ObjectId`, in `.plain()` a string.
+
+<Snippet id="populate/basics/result-and-type-2" twoslash />
+
+How to deal with the changed type when a document goes into your function is covered in [Make sure a reference is populated](./type-checks.mdx). And you need to be careful when changing and saving populated documents, as covered in [Populate a document you already have](./document-populate.mdx).
+
+## How many queries go to the database [#query-count]
+
+One path is one extra query to the target model, however many documents you read. The subqueries show up in [operation events](../observability/events.mdx). Each has `populatePath` filled in, with the main query as its parent. Here are the events for `Posts.find().populate(["author", "tags", "comments"])`.
+
+<Snippet id="populate/basics/query-count" />
+
+Queries to different models run in parallel, and inside a transaction one after another. They can't start before the main query. Only after the posts are read is it known which identifiers to look for. If the main query found nothing, there are no extra queries at all.
+
+## How to choose [#how-to-choose]
+
+Ask yourself what you'll do with the related data.
+
+- **Show it together with the main data, and it lives in other collections**: use populate.
+- **You need one related document, and you already have the main one**: a plain [`findById`](../reference/query/reading.mdx#model.find-by-id) is shorter and clearer.
+- **Compute over related data** (a sum, an average, a grouping) **or filter the main documents by related fields**: you need an aggregation with a [`$lookup`](../reference/aggregation/stages.mdx#lookup) stage. Populate loads documents after the main query, and the main query can't filter by them.
+
+## When populate isn't needed [#when-not-to-use]
+
+If the related data isn't shown to the user and is only needed for a check like "does the author exist", there's no reason to load it. [`exists`](../reference/query/reading.mdx#model.exists) is enough. If you need the reference only as an identifier, for example for a `/users/<id>` URL, populate is unnecessary too. And if you need to find posts by an author's field, say all posts by authors from Moscow, populate won't help. It runs after the main documents are read.
+
+## Troubleshooting [#troubleshooting]
+
+**An identifier instead of the author.** `.populate` was called on the wrong field or not at all. In a `.plain()` result there's a string, in `.lean()` and on a document an `ObjectId`. The type gives you a hint: `post.author.name` won't compile, with the error `Property 'name' does not exist on type 'string'`. Call `.populate("author")`.
+
+**The path isn't a reference.** For example, populate on an ordinary field.
+
+<Snippet id="populate/basics/troubleshooting" twoslash />
+
+The compiler answers `TS2345: Argument of type '"title"' is not assignable to parameter of type 'PopulateObject | "Invalid populate path \"title\": \"title\" is not a reference"'`. If the path came from data, at runtime you get `QueryError: populate "title": "title" is neither a reference nor an embedded document`. Populate works only with fields marked `ref` and with virtual fields. Name a reference field, such as `author` or `tags`.
+
+**The author is `null`.** The reference points to a document that doesn't exist or is hidden by soft delete. Populate doesn't throw but sets `null`, and the type allows it, so `post.author.name` won't compile (`TS18047: 'post.author' is possibly 'null'`). If such a reference is normal, check it with `?.` or [`isPresent`](../reference/populate/populate-types.mdx#is-present). If it means broken data, ask for [`required: true`](../reference/populate/populate.mdx#required). Then a missing document throws a `DocumentNotFoundError`, and `null` drops out of the result type.
+
+## Full example [#full-example]
+
+<Snippet id="populate/basics/full-example" title="blog/posts.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Typemo, `limit` and `skip` in `populate` apply to each source document separately and exactly: `limit: 2` means "at most two documents per post". A repeated `.populate` call for the same path replaces the previous one, and an unknown path or an unknown option is an error, not a silent skip.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Relations inside nested data" href="./complex-relations.mdx">
+  Nested relations, arrays and Maps of references, different models by `refPath`, and virtual fields.
+</Card>
+<Card title="Populate a document you already have" href="./document-populate.mdx">
+  `$populate`, `$depopulate`, and `$populated` for a document that's already loaded.
+</Card>
+<Card title="Make sure a reference is populated" href="./type-checks.mdx">
+  Make sure a relation is loaded and narrow the type without casts.
+</Card>
+<Card title="Load related data faster" href="./performance.mdx">
+  Field selection, a per-document limit, and the cases where `$lookup` is better.
+</Card>
+<Card title=".populate" href="../reference/populate/populate.mdx">
+  Every call form, every option, and every error.
+</Card>
+</Cards>

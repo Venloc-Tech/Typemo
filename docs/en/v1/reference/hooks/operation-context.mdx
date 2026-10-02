@@ -1,0 +1,328 @@
+---
+title: Operation context
+description: "OperationHookContext, the skip and modify methods, OperationChanges, and also OperationName, OperationInfo, and DocumentChanges"
+icon: Cog
+---
+
+The **operation context** is the object that arrives in `this` of a hook on a query, model, or aggregation event. It's a view of the operation Typemo is running right now. A hook reads from it what will go to the database (the filter, the update, the documents) and decides what to do next: nothing, change it, or skip it entirely. This page describes that object and three neighboring types: the operation name, the operation description for observers, and the description of document changes.
+
+If you're writing an operation hook for the first time, start with the guide [Hook into an operation](../../hooks/operation-hooks.mdx). This page is a reference. The hook decorators and the list of events are described on the page [`@Pre`, `@Post`, and `@PostError`](./pre-post.mdx).
+
+All the examples use one account model.
+
+<Snippet id="reference/hooks/operation-context/intro" title="accounts/account.ts" twoslash />
+
+The collection holds three accounts. `alice` owns `a` and `b`, and `bob` owns `c`.
+
+---
+
+## OperationHookContext [#operation-hook-context]
+
+`OperationHookContext<T, E>` is the type of `this` for all events except `document.*`. `T` is your model and `E` is the event. A `@Pre("query.find")` hook declares `this: OperationHookContext<Account, "query.find">`, and the compiler knows which changes and which result are valid for `find` specifically. If a hook serves a list of events, you can omit the second parameter, and then any of them is valid.
+
+The values in the context are in the **base form**, as the operation will go to the driver. They're cast by the schema and extended by policies (the deleted-documents condition, the tenant). So in `this.filter` you see what will really be sent to the database, not what the calling code wrote. The values are read-only. To change the operation, use [`.modify`](#modify).
+
+<Snippet id="reference/hooks/operation-context/operation-hook-context" twoslash />
+
+`updateOne({ title: "a" }, { $inc: { balance: 5 } })` printed `query.updateOne updateOne Account` and both objects, as in the comment.
+
+<TypeTable
+  type={{
+    "event": { description: "The event that's running now, for example `query.updateMany`.", type: "E" },
+    "operation": { description: "The operation name: `find`, `updateMany`, `insertMany`, `aggregate`.", type: "string" },
+    "model": { description: "The model name, that is, the class name.", type: "string" },
+    "operationId": { description: "A number unique in the process for the operation. The same value is in the observability events (`operationId`), and a hook uses it to find the events of its operation.", type: "number" },
+    "filter": { description: "The filter that will go to the database. `undefined` if the operation has no filter, for example `insertMany`. For `find()` without conditions it's `{}`.", type: "Readonly<Record<string, unknown>> | undefined" },
+    "update": { description: "The update document or the update pipeline. `undefined` if it isn't an update.", type: "Readonly<Record<string, unknown>> | readonly Readonly<Record<string, unknown>>[] | undefined" },
+    "replacement": { description: "The replacement document of `replaceOne` and `findOneAndReplace`, otherwise `undefined`.", type: "Readonly<Record<string, unknown>> | undefined" },
+    "documents": { description: "The documents to insert for `insertMany`, otherwise `undefined`.", type: "readonly Readonly<Record<string, unknown>>[] | undefined" },
+    "operations": { description: "The operations of `bulkWrite`, otherwise `undefined`.", type: "readonly Readonly<Record<string, unknown>>[] | undefined" },
+    "pipeline": { description: "The pipeline stages of `aggregate`, otherwise `undefined`. Change stages through `modify({ stages })`.", type: "readonly Readonly<Record<string, unknown>>[] | undefined" },
+    "session": { description: "The driver session the operation runs in, explicit or from the surrounding transaction. `undefined` if there is no session.", type: "ClientSession | undefined" },
+    "inTransaction": { description: "Whether the operation runs inside a transaction.", type: "boolean" },
+    "policy": { description: "The policy values of the operation: tenant, actor, soft delete mode. Without policies it's an empty object.", type: "Readonly<PolicyValues>" },
+    "locals": { description: "A map for values shared by the `pre`, `post`, and `postError` hooks of **this** operation. A new one is created for each operation.", type: "Map<string, unknown>" },
+    "bulkIndex": { description: "The number of the operation in the `bulkWrite` list, if the hook runs for a single operation of a batch (`updateOne`, `updateMany`, `replaceOne`, `deleteOne`, `deleteMany` inside `Model.bulkWrite`). `undefined` in an ordinary call. See [the section on `bulkIndex`](#bulk-index).", type: "number | undefined" },
+  }}
+/>
+
+What each field means is easiest to see in an example. A model with one hook on several events recorded everything it saw.
+
+<Snippet id="reference/hooks/operation-context/operation-hook-context-2" />
+
+A field that doesn't apply to the operation is `undefined`. `find` has no `update`, and `updateOne` has no `documents`. That's why a hook on a list of events checks a field before reading it.
+
+<FullType>
+
+<Snippet id="reference/hooks/operation-context/operation-hook-context-3" />
+
+</FullType>
+
+### locals: values shared between the hooks of one operation [#locals]
+
+`locals` is an ordinary `Map` that lives for exactly one operation. A `pre` hook puts a value into it, and the `post` and `postError` hooks of the same operation read it. That's how you measure time or pass on a decision made before the operation. `locals.set("startedAt", 1)` in `pre` was read in `post` of the same operation. The next operation gets a new, empty `Map`.
+
+### bulkIndex: a hook for one operation of a batch [#bulk-index]
+
+Each operation of [`bulkWrite`](../writes/writes.mdx#bulk-write) triggers the same `query.*` hooks as its standalone counterpart. A batch `updateOne` triggers the `query.updateOne` hooks, and a batch `deleteMany` triggers the `query.deleteMany` hooks. So that a hook can tell which operation it runs for, the context has `bulkIndex`, the position of the operation in the input list. In a hook of an ordinary call `bulkIndex` is `undefined`, so one method serves both cases.
+
+<Snippet id="reference/hooks/operation-context/bulk-index" twoslash />
+
+In a `bulkWrite` of six operations the `query.updateOne` hook was called for operations 0 and 1 and printed their numbers and filters in the base form. `event`, `operation`, and `filter` in such a hook are the same as in a standalone call, that is `query.updateOne`, `updateOne`, and the filter of the operation. It has no `documents`, `operations`, or `pipeline`, and they're `undefined`. A batch operation doesn't own documents, and only the `model.bulkWrite` hooks see the list of operations. `session`, `inTransaction`, and `policy` are shared by the whole batch.
+
+[`.modify`](#modify) in such a hook changes **this one operation** the same way it does in a standalone call. `modify({ update: { $set: { note: "hook@0" } } })` in the `query.updateOne` hook added `note` to the update of the batch's operation 0. After the change the batch is rebuilt and goes through all policies, so a condition with a nonexistent field throws the same `StrictModeError`. [`.skip`](#skip) is forbidden for a single batch operation, and the section on `.skip` has the details.
+
+What happens to an exception from the `@Pre` of a single batch operation depends on the batch mode. In an unordered batch (`ordered: false`) it doesn't stop the batch. The operation isn't sent and lands in `BulkWriteError.writeErrors` under its `bulkIndex`, with a `TypemoError` in `error` that holds the original exception in `cause`, and `code` is `undefined`. The other operations are written, and the `@PostError` hooks run for the operation itself. In an ordered batch, the batch stops before sending, and the hook's exception arrives as is.
+
+We rejected operation 1 out of three upserts. In unordered mode operations 0 and 2 were written, and `writeErrors` kept one element with index 1. In ordered mode nothing was written.
+
+### Fields don't change in place [#no-in-place-change]
+
+You can't change the values in the context directly. Arrays of stages and updates are handed out as frozen copies, and reading `this.pipeline` again returns the same object until the stages are replaced. To change the operation, call [`.modify`](#modify).
+
+Inside the hook that called `modify`, the fields still show the old operation, because Typemo rebuilds it after the hook returns. A hook added `$inc` through `modify` and read `this.update` right away, and it held only `{ $set: { archived: true } }`.
+
+### When the context doesn't fit [#operation-hook-context.when-not-to-use]
+
+If you only need to watch operations, use [operation events](../observability/events.mdx). A subscriber gets the same fields and can't break anything. If you need a document rather than an operation, use the `document.*` hooks, where `this` is the document itself.
+
+---
+
+## .skip <Badge>pre only</Badge> [#skip]
+
+`.skip(result)` cancels the operation. No query goes to the database, and the calling code gets `result` as if the server had returned it. It's useful for a cache, for a dry run when a write has to be checked without consequences, and for tests that substitute the database response.
+
+<Snippet id="reference/hooks/operation-context/skip" twoslash />
+
+With `dryRun = true`, `deleteMany({ owner: "bob" })` returned `{ acknowledged: true, deletedCount: 0 }`, and `countDocuments()` after it showed the same three accounts.
+
+<Params>
+<Param name="result" type="SkipResult<E, T>" required>
+
+The operation result in the names used in code. For `find` it's an array of `.lean()` data, for a count a number, for a write an `UpdateResult` or `DeleteResult`, and for `findOne` a `Lean<T> | null`. The exact shape per event is described in [`SkipResult`](./pre-post.mdx#skip-result). `undefined` isn't accepted.
+
+</Param>
+</Params>
+
+Returns `void`. After `skip` the other `pre` hooks of this operation don't run, while the `post` hooks do run and receive what `skip` returned.
+
+The skipped result goes on through all steps like a real one. The documents of `find` become model documents or stay `.lean()` data, as the calling code asked, `.orFail()` fires on `null`, and populate works. So you can't slip in something the server wouldn't return. The schema casts the document, and an invalid one gives the same error as a read from the database.
+
+<Snippet id="reference/hooks/operation-context/skip-2" />
+
+A skipped write writes nothing and doesn't reach the change log.
+
+### Errors [#skip.errors]
+
+`.skip` works only in `pre`. From `post` it throws `QueryError`.
+
+<Snippet id="reference/hooks/operation-context/skip-errors" />
+
+A call without a result, or with `undefined`, throws `QueryError: Account.find: skip(result) needs a result`. A result of the wrong shape, for example a string instead of a number for a count, gives a `QueryError` with a text like `Account.countDocuments: skip(result): the count must be a non-negative integer`. An event without a result, that is `document.*`, can't be skipped, and it has no `skip` method.
+
+If you call `modify` before `skip` in the same hook, the operation is still skipped. The result is returned, and the change is dropped. The reverse order, `modify` after `skip`, is an error: `QueryError: Account.find: modify() after skip() — the operation is not sent`.
+
+In a hook of a single [`bulkWrite`](../writes/writes.mdx#bulk-write) operation `.skip` is forbidden too, because the result of one batch operation can't be replaced.
+
+<Snippet id="reference/hooks/operation-context/skip-errors-2" />
+
+You can skip the whole batch from a `@Pre("model.bulkWrite")` hook. It gets `skip(result)` with a [`BulkWriteResult`](../writes/writes.mdx#bulk-write-result). `skip` with an all-zero result in such a hook returned it to the caller, and the insert from the batch never reached the database.
+
+### When `.skip` doesn't fit [#skip.when-not-to-use]
+
+To forbid an operation, throw an error from the hook. `skip` returns a successful result to the caller, who won't know the operation never happened. To change an operation rather than cancel it, use [`.modify`](#modify).
+
+---
+
+## .modify <Badge>pre only</Badge> [#modify]
+
+`.modify(change)` changes the operation Typemo is about to run. It adds a condition to the filter, appends operators to the update, replaces the field selection or the sort, and adds stages to an aggregation. With it a rule applies to all reads and writes of the model, even if the calling code knows nothing about it. For example, exclude archived records or bump a revision counter on every update.
+
+<Snippet id="reference/hooks/operation-context/modify" twoslash />
+
+`updateMany({ owner: "alice" }, { $set: { title: "x" } })` touched two accounts, and both got `balance` equal to 1.
+
+<Params>
+<Param name="change" type="OperationChange<T, E>" required>
+
+An object of changes. The valid keys depend on the event. The compiler rejects the others, and at runtime they give a `QueryError`. The keys and their meaning are described in [`OperationChanges`](#operation-changes).
+
+</Param>
+</Params>
+
+Returns `void`. Changes add up. Several `modify` calls in one hook and in different hooks apply in turn, and the next hook sees the result of the previous ones.
+
+**A changed operation goes through all policies again.** After the hook Typemo rebuilds the operation as if the calling code had built it. It normalizes, resolves paths, casts types, applies policies (strictness, the sanitizer, the tenant, soft delete, hidden fields), fills in defaults, and validates. A hook can't bypass a policy. A condition with a nonexistent field gives the same `StrictModeError` as in an ordinary query. `modify({ where: { nope: 1 } })` in `find` led to that error.
+
+<Snippet id="hooks/operation-hooks/filter-all-reads-2" />
+
+A hook that changed nothing, including `modify({})`, costs nothing. No copy is made, and the steps don't run again.
+
+### How changes merge with the query [#merge-with-query]
+
+`where` is combined with the caller's filter through AND. The caller's conditions stay, and a hook can only narrow the selection. `update` adds operators to the caller's update, and if such an operator is already there, the hook's paths are appended to it. `select` and `sort` replace the projection and the sort entirely. `stages` are appended to the end of the pipeline.
+
+A hook can't silently overwrite a value the update already writes. A path that the same operator writes is an error. `updateOne({ owner: "bob" }, { $set: { title: "user" } })` with a `modify({ update: { $set: { title: "hook" } } })` hook threw that error.
+
+<Snippet id="hooks/operation-hooks/extend-update-2" />
+
+`update` doesn't work with a pipeline update (an array of stages). You get a `QueryError` with the text "`update` merges operators into an update of operators, not an update pipeline".
+
+### Errors [#modify.errors]
+
+`.modify` works only in `pre`. From `post` it throws `QueryError`.
+
+<Snippet id="hooks/operation-hooks/troubleshooting" />
+
+A key outside the list throws `QueryError: Account.find: modify(): unknown change "nope" (where, update, select, sort, stages)`. A key that doesn't apply to the operation throws `QueryError: Account.find: modify(): "update" does not apply to find`. The compiler catches both errors in advance.
+
+<Snippet id="reference/hooks/operation-context/modify-errors" twoslash />
+
+### When `.modify` doesn't fit [#modify.when-not-to-use]
+
+To cancel the whole operation, use [`.skip`](#skip). To forbid it, throw an error. If a condition has to apply to every read of a model by its meaning, like soft delete or the tenant, there are [policies](../policies/schema-options.mdx) for that. They're built into the core and don't depend on hooks.
+
+---
+
+## OperationChanges [#operation-changes]
+
+`OperationChanges<T>` describes all the changes a hook can make to an operation. The keys are named as in code, like the model methods. `OperationChange<T, E>` keeps only the keys that fit event `E`, and `ChangeKeys<E>` gives the list of those keys.
+
+<TypeTable
+  type={{
+    "where": { description: "A condition combined with the operation's filter through AND. Typed like the `find` filter.", type: "Filter<T>" },
+    "update": { description: "Update operators added to the operation's update. A path the update already writes with the same operator gives a `QueryError`.", type: "Update<T>" },
+    "select": { description: "Replaces the field selection. `+field` includes a hidden field, as in `select`.", type: "Projection<T>" },
+    "sort": { description: "Replaces the sort.", type: "Sort<T>" },
+    "stages": { description: "Stages appended to the end of the aggregation. They go through all steps like builder stages: values are cast, hidden fields are removed, and the policies of the joined models apply.", type: "readonly PipelineStage[]" },
+  }}
+/>
+
+This type shows which keys are valid for which events.
+
+<Snippet id="reference/hooks/operation-context/operation-changes" twoslash />
+
+For `query.find`, `query.findOne`, `query.findOneAndReplace`, and `query.findOneAndDelete` they are `where`, `select`, `sort`. For `query.findOneAndUpdate`, `update` is added to them. For `query.updateOne` and `query.updateMany` they are `where` and `update`. For `query.countDocuments`, `query.distinct`, `query.replaceOne`, `query.deleteOne`, and `query.deleteMany` only `where`. For `aggregate` only `stages`. For `query.estimatedDocumentCount`, `model.insertMany`, and `model.bulkWrite` there is nothing to change, and `ChangeKeys` gives `never`.
+
+<FullType>
+
+<Snippet id="reference/hooks/operation-context/operation-changes-2" />
+
+</FullType>
+
+---
+
+## BulkOperationResult [#bulk-operation-result]
+
+`BulkOperationResult` is the result that the `@Post` of a `query.updateOne`, `query.updateMany`, `query.replaceOne`, `query.deleteOne`, or `query.deleteMany` hook receives when the hook runs for a single operation inside [`bulkWrite`](../writes/writes.mdx#bulk-write). With it a hook can say what happened to its operation without making up numbers the server didn't report.
+
+`bulkWrite` goes to the server as one request, and the response is the totals for the whole batch. For a single operation the server names only the id of a document inserted through `upsert`. How many documents the operation matched, changed, or deleted is unknown. So such counters in `BulkOperationResult` are `null`, not zero. Zero would mean "nothing was found", and that's untrue. The batch totals arrive in the `model.bulkWrite` hook as a [`BulkWriteResult`](../writes/writes.mdx#bulk-write-result).
+
+<Snippet id="reference/hooks/operation-context/bulk-operation-result" twoslash />
+
+In a batch of two `updateOne` operations the second one, with `upsert: true`, inserted a document. The first call of the hook printed `upsertedCount: 0` and `upsertedId: null`, and the second printed `upsertedCount: 1` and a real id. For `deleteOne` and `deleteMany` inside a batch the result is shorter: `{ acknowledged: true, deletedCount: null }`. The object is frozen.
+
+<TypeTable
+  type={{
+    "acknowledged": { description: "Whether the server acknowledged the batch write.", type: "boolean" },
+    "matchedCount": { description: "Only for updates and replaces. Unknown for a single batch operation, always `null`.", type: "null" },
+    "modifiedCount": { description: "Only for updates and replaces. Unknown, always `null`.", type: "null" },
+    "upsertedCount": { description: "Only for updates and replaces. `1` if this operation inserted a document through `upsert`, otherwise `0`. It's the only counter the server reports for a single operation.", type: "number" },
+    "upsertedId": { description: "Only for updates and replaces. The `_id` of the inserted document, otherwise `null`.", type: "Id | null" },
+    "deletedCount": { description: "Only for deletes. Unknown, always `null`.", type: "null" },
+  }}
+/>
+
+The type is a union of two forms. Updates and replaces have `matchedCount`, `modifiedCount`, `upsertedCount`, and `upsertedId`, while deletes have only `deletedCount`. The `@Post` type is chosen by the event. For `query.updateOne` it's `UpdateResult | BulkOperationResult`, where the first form comes from an ordinary call and the second from a batch. For `query.deleteMany` it's `DeleteResult | BulkOperationResult` with the delete form. If a hook needs only the fields shared by both forms (`upsertedId`, `acknowledged`), declare the argument with a narrow type, as in the example.
+
+<FullType>
+
+<Snippet id="reference/hooks/operation-context/bulk-operation-result-2" />
+
+</FullType>
+
+### Which hooks receive this shape [#hooks-with-this-shape]
+
+Only the `@Post` hooks of the five `query.*` events for operations inside `bulkWrite`. For an ordinary call `Accounts.updateOne(...)` the same hook receives an [`UpdateResult`](../writes/writes.mdx#update-result) with real counters. `@PostError` hooks have no result, and they get the error. The call order and the difference between an ordered and an unordered batch are described in the guide [Operation hooks inside bulkWrite](../../writes/bulk.mdx#bulk-write-hooks).
+
+### When it doesn't fit [#bulk-operation-result.when-not-to-use]
+
+Read the batch totals (how much was inserted, matched, and deleted overall) from the [`BulkWriteResult`](../writes/writes.mdx#bulk-write-result) in the `model.bulkWrite` hook or in the result of the call itself. To find out how many documents a particular operation touched, run it as a separate [`updateMany`](../writes/writes.mdx#update-many) or [`deleteMany`](../writes/writes.mdx#delete-many) call.
+
+---
+
+## DocumentChanges [#document-changes]
+
+`DocumentChanges` is what `$save` would send to the database for this document. These are operators, paths, and values in the names used in code. The document method `$getChanges()` returns it, and in a `document.save` hook it shows what will go to the database.
+
+<Snippet id="reference/hooks/operation-context/document-changes" twoslash />
+
+In the hook `this` has the type `HydratedDoc<Account>`, so the document methods with `$` are available without a type cast. `balance = 5` on a loaded document and `$save()` printed `false { $set: { balance: 5 } }`. For a new document `$set` gets all the fields, including `_id` and the defaults: `true { $set: { _id: "…", title: "  Main  ", balance: 0 } }`. For change tracking, see the guide [Change and save a document](../../documents/change-and-save.mdx), and the method itself is described in the [Document API](../documents/document-api.mdx#get-changes).
+
+<FullType>
+
+<Snippet id="reference/hooks/operation-context/document-changes-2" />
+
+</FullType>
+
+---
+
+## OperationName [#operation-name]
+
+`OperationName` is the operation name, the value in the `operation` field of the hook context and of the observability event. It's a union of strings that name the action without a scope: `find`, `findOne`, `findOneAndUpdate`, `findOneAndReplace`, `findOneAndDelete`, `updateOne`, `updateMany`, `replaceOne`, `deleteOne`, `deleteMany`, `countDocuments`, `estimatedDocumentCount`, `distinct`, `insertOne`, `insertMany`, `bulkWrite`, `aggregate`, and `watch`.
+
+The operation name doesn't match the hook event. The event has a scope (`query.find`), and the name is for the observer. In the hook context `operation` is strictly `string`, while in observability events it's `OperationName`. The operations `insertOne` and `watch` have no hook event, so no hooks run for them.
+
+<FullType>
+
+<Snippet id="reference/hooks/operation-context/operation-name" />
+
+</FullType>
+
+---
+
+## OperationInfo [#operation-info]
+
+`OperationInfo` is the part shared by all operation events in observability. It's the same data about the operation that a hook sees in the context, plus a description of the environment (the database, the client, the server). `OperationStartEvent`, `OperationEndEvent`, and `OperationErrorEvent` inherit from it, so a subscriber and a hook read an operation the same way. For more on events, see the reference [Events](../observability/events.mdx).
+
+<TypeTable
+  type={{
+    "operationId": { description: "The process-unique operation number. It matches the `operationId` of the hook context.", type: "number" },
+    "parentId": { description: "The number of the outer operation, if this is a nested populate query.", type: "number | undefined" },
+    "operation": { description: "The operation name.", type: "OperationName" },
+    "mode": { description: "How the operation runs: `run`, `cursor`, or `explain`.", type: "ExecutionMode" },
+    "model": { description: "The model class name. `null` for a database-level operation (`connection.aggregate`, `client.aggregate`), because it has no model.", type: "string | null" },
+    "collection": { description: "The collection name. `null` for an aggregation of the whole database or of `admin`, and `\"system.sessions\"` for `Pipeline.sessions()`.", type: "string | null" },
+    "database": { description: "The database name. `\"admin\"` for `Pipeline.admin()`, and `\"config\"` for `Pipeline.sessions()`.", type: "string" },
+    "connection": { description: "The client name (the `name` option, `\"default\"` by default).", type: "string" },
+    "inTransaction": { description: "Whether the operation runs inside a transaction.", type: "boolean" },
+    "transactionId": { description: "The number of the transaction the operation runs in.", type: "number | undefined" },
+    "serverAddress": { description: "The first host of the connection string.", type: "string | undefined" },
+    "serverPort": { description: "The port of the first host of the connection string.", type: "number | undefined" },
+    "populatePath": { description: "The populate path for a nested query, otherwise `undefined`.", type: "string | undefined" },
+    "schema": { description: "A read-only description of the model schema, a reference, not a copy. Don't serialize the whole event. `null` for a database-level operation.", type: "SchemaInfo | null" },
+    "tenant": { description: "The tenant. Present only for subscribers with `includeTenant: true`, because the tenant is data.", type: "unknown" },
+  }}
+/>
+
+The hook context and `OperationInfo` are different types. The context shows an operation that hasn't been sent yet and can change it, while `OperationInfo` describes an event and can't change anything. They share `operationId`, `model`, and `inTransaction`.
+
+<FullType>
+
+<Snippet id="reference/hooks/operation-context/operation-info" />
+
+</FullType>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Hook into an operation" href="../../hooks/operation-hooks.mdx">
+  How to use `skip` and `modify` in real tasks: a cache, a dry run, a shared condition.
+</Card>
+<Card title="@Pre, @Post, and @PostError" href="./pre-post.mdx">
+  The hook decorators and all events with the result of each.
+</Card>
+<Card title="Events" href="../observability/events.mdx">
+  How to watch operations without changing anything.
+</Card>
+</Cards>

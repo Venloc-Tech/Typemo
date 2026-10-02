@@ -1,0 +1,120 @@
+---
+title: Set default values
+description: "Fill in a field's value, constant or computed, when it isn't passed, and see when that happens on create, on upsert, and when reading old documents"
+icon: WandSparkles
+---
+
+A **default value** is one Typemo writes into a field for you when you don't pass it: the `user` role for a new member, a sign-up date, an initial set of tags. You set it with the [`default`](../reference/schemas/prop.mdx#default) option, and you no longer repeat the same value in every [`create`](../reference/writes/writes.mdx#create).
+
+A field with this option is declared with a special type, [`Defaulted<T>`](../reference/schemas/field-markers.mdx#defaulted). That's how the types learn that you can leave the field out on create and that it's always there after a read. Arrays don't need this type, since an array field is optional on create anyway.
+
+The main thing is to understand **when** the value is filled in. On create and on upsert, yes. On a normal update and on a read through `.lean()` and `.plain()`, no. Below you'll see all of this in examples.
+
+## What you need [#prerequisites]
+
+A model described as in [Define a model](./define-model.mdx), and the difference between a missing field and `null` from [Required fields, null, and missing values](./required-and-null.mdx). The examples build a community member model.
+
+## Quick start [#quick-start]
+
+`default` takes a value or a function with no arguments. A field with it is declared as `Defaulted<T>`.
+
+<Snippet id="schemas/defaults/quick-start" title="community/member.ts" twoslash />
+
+`role` wasn't passed, and it got the value `user`. You can of course pass it too, and `create({ name: "Bob", role: "admin" })` saves `admin`. Below we'll look at different kinds of values and the situations where they're filled in.
+
+## Fill in a constant value [#constant-value]
+
+Write numbers, strings, `null`, and other simple values directly. A field with a default value is still an ordinary field and is stored in the database like any other.
+
+<Snippet id="schemas/defaults/constant-value" twoslash />
+
+`default: null` is allowed only together with `nullable: true`. A default value must be one the field accepts, otherwise the document would break its own schema right after it's created.
+
+## Compute the value for each document [#computed-per-document]
+
+If every document has its own value, pass a function. Typemo calls it again on every create, so `() => new Date()` gives the creation date of that particular document, not the date the module loaded.
+
+<Snippet id="schemas/defaults/computed-per-document" twoslash />
+
+An array, like any value, is computed for each document separately. Change the first member's tags, and the second member isn't affected. Typemo copies even an array literal (`default: ["new"]`) for each document, so no shared mutable object appears between them. The type of an array field stays a plain `string[]`. `Defaulted<string[]>` is allowed but not needed, because even without `default` the array gets `[]` (more in [Store lists of values and subdocuments](./arrays.mdx)).
+
+## When the value is filled in [#when-default-applies]
+
+The value is filled in when a document is created.
+
+- With `create`, [`insertMany`](../reference/writes/writes.mdx#insert-many), and [`Model.new`](../reference/documents/model-document-methods.mdx#model.new).
+- On upsert, that is, when an update didn't find the document and created it.
+
+On upsert Typemo adds the missing default values only to the insert, and an existing document isn't overwritten.
+
+<Snippet id="schemas/defaults/when-default-applies" twoslash />
+
+The update inserted a document with `score: 5` and added `role: "user"` on its own. A normal update of an existing document, though, doesn't fill in default values. If the field wasn't in the document, it won't be there afterwards either. That makes sense: `updateOne` changes what you asked for and doesn't "complete" the document.
+
+## Read an old document [#read-old-document]
+
+Documents in the database may predate your `default`. They were written before the field existed, or by a different program altogether. A model document gets the default value on read, so `member.role` is never `undefined`. But `.lean()` and `.plain()` return what's in the database as is. They don't create a document and don't fill anything in.
+
+<Snippet id="schemas/defaults/read-old-document" twoslash />
+
+There's a flip side. Load such a document, change another field, and save it, and the filled-in values end up in the changes and get written to the database. In [`$getChanges()`](../reference/documents/document-api.mdx#get-changes) after `score = 4` there were both `score` and `role: "user"`, and for a model with a `tags` array with `default`, `tags` as well. An array without a key behaves the same way. The document reads it as empty, and `$save` writes it. Old documents that you don't load as model documents stay without the field.
+
+So if you added `default` to a collection that already has data and you send `.plain()` to clients, old documents arrive without that field, even though the result type promises it's there. If that matters, fill in the field in the database once and don't rely on the read to fill it.
+
+## Don't pass `undefined` or `null` explicitly [#no-explicit-undefined]
+
+A default value is filled in only when the field is **absent** from the data. An explicit `undefined` doesn't count as absent. As everywhere in Typemo, it's a `CastError`. An explicit `null` on a field without `nullable` is an error too, not a request to fill in the default value.
+
+<Snippet id="schemas/defaults/no-explicit-undefined" twoslash />
+
+Zero, an empty string, and `false` are ordinary values and are saved as they are. The default value is filled in only when the field is missing, not for "falsy" values.
+
+## How to choose [#how-to-choose]
+
+Ask yourself: **can the document exist without this field?**
+
+- **No, and the value is known in advance** (a role, a status, a counter): `default` together with `Defaulted<T>`.
+- **The value must come from the user, and a filled-in one would be a lie** (an address, a name): [`required`](./required-and-null.mdx).
+- **The value is computed from other fields and shouldn't be stored**: that's not `default` but a getter ([Add computed fields and reverse references](./virtuals.mdx)).
+
+## When not to use it [#when-not-to-use]
+
+`default` doesn't replace `required`. It fills in a value but doesn't forbid passing another valid one explicitly. Don't build creation and update timestamps with `default: () => new Date()`. There are the [`Timestamped`](../reference/schemas/base-classes.mdx#timestamped) base classes for them, see [Timestamps and versions](./timestamps-and-versions.mdx). And `_id` gets its value from [`Entity`](../reference/schemas/base-classes.mdx#entity) on its own.
+
+## Troubleshooting [#troubleshooting]
+
+**The default value doesn't fit the field.** The model doesn't build. `default: "x"` on a numeric field throws a `ConfigurationError` when you get the model, not on the first write.
+
+<Snippet id="schemas/defaults/troubleshooting" twoslash />
+
+Fix the value. It must be of the type the field accepts and pass its checks.
+
+**`default` without `Defaulted<T>` or the other way around.** The compiler watches the pair and reports `@Prop "score": "default" is set, declare the field as Defaulted<T>` or `the field is Defaulted<T>, but "default" is missing`. It's `Defaulted<T>` that says the field is optional on create. Without the pair, the types would promise one thing and the schema would do another. Add the missing half.
+
+**An initializer in the class body instead of `default`.** `score: number = 0` in the class body doesn't set the schema's default value. Typemo rejects it when building the model: `Member: field(s) "score" get a value from an initializer or the constructor; use the "default" option — service fields are filled by Typemo`. Move the value into the `default` option.
+
+## Full example [#full-example]
+
+One file with a member that uses every kind of value, so you can see what got saved. Code that isn't part of Typemo is marked `__…__`.
+
+<Snippet id="schemas/defaults/full-example" title="community/members.service.ts" twoslash />
+
+<Callout type="migration">
+
+The `default` option is familiar from Mongoose, but Typemo adds the `Defaulted<T>` type to it. It tells the compiler that the field can be left out on create, and the compiler checks the `default` and `Defaulted<T>` pair both ways. Like Mongoose, Typemo creates an array without a value as empty on its own, so you don't need `default: () => []`.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Validate field values" href="./validation.mdx">
+  How to check a field's value: bounds, length, shape, and your own checks.
+</Card>
+<Card title="Immutable fields" href="./immutable.mdx">
+  Values that are set once and never change.
+</Card>
+<Card title="@Prop" href="../reference/schemas/prop.mdx#default">
+  The `default` option and the rules it's checked by when the model is built.
+</Card>
+</Cards>

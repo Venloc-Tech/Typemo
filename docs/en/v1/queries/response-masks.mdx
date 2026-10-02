@@ -1,0 +1,149 @@
+---
+title: Response masks
+description: "Show the client only part of a value (an email, a phone number, a card number) in queries, aggregations, and document serialization"
+icon: EyeOff
+---
+
+Sometimes you need to show a field's value, but not all of it. Then mask it. [`.mask`](../reference/query/masks.mdx#mask) turns `alice@gmail.com` into `a***@gmail.com` and a card number into `************4242`. A support agent needs to know which card it's about, but has no reason to see the full number. A mask affects what the calling code receives, while the data in the database and in the app's memory stays real.
+
+If the client doesn't need a field at all, better not to read it. That's what [`.select`](../reference/query/reading.mdx#select) and [`hidden`](../reference/schemas/prop.mdx#hidden) are for. A mask is for when you need to "show part of it".
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the shop customer model from `customers/customer.ts`.
+
+<Snippet id="queries/response-masks/prerequisites" title="customers/customer.ts" twoslash />
+
+The collection has two customers.
+
+- Alice: email `alice@gmail.com`, phone `+79161234567`, age 30. She has two cards, `4242 4242 4242 4242` with the holder `Alice A` and `5555 5555 5555 4444` with no holder, and a note `vip` with the value `yes`.
+- Bob: email `bob@example.org`, phone `null`, age 17, no cards.
+
+## Quick start [#quick-start]
+
+There are two common cases. The first is a mask on a query. You pass a "path → mask" object, where the mask is a ready-made one from the [`Mask`](../reference/query/masks.mdx#mask-presets) set or the string `"mask"`.
+
+<Snippet id="queries/response-masks/quick-start" twoslash />
+
+The second is a mask on a document you've already loaded, through the `mask` parameter of its serialization.
+
+<Snippet id="queries/response-masks/quick-start-2" twoslash />
+
+We'll go through each variant on real tasks below.
+
+## Show a support agent part of the data [#support-view]
+
+Say a support page shows a customer's email, phone, and age, but not in full. A mask is applied as the **last step**, after the read, populating related documents, and turning them into ordinary objects. That's why you call it after [`.plain()`](../reference/query/reading.mdx#plain) or [`.lean()`](../reference/query/reading.mdx#lean).
+
+<Snippet id="queries/response-masks/support-view" title="customers/support.service.ts" twoslash />
+
+`Mask.bucket([18, 35, 60])` turns an age into a range label. 30 falls into `"18–35"`, and 17 into `"<18"`.
+
+Bob's phone was `null` and became `"?"`. For `null` and `undefined` in a masked field the mask isn't called, and such values are always replaced with `"?"`. So a mask doesn't let you tell "no value" from "value hidden". In return, a mask function doesn't need to check for `null`.
+
+The result type changed too, and the compiler knows it.
+
+<Snippet id="queries/response-masks/support-view-2" twoslash />
+
+A field with `"mask"` got the type `"?"`, and a field with a ready-made mask got `SensitiveJson`, that is any JSON value, since a mask may return a string or an object. The compiler checks the paths too. A typo in a field name won't compile, and a mask for a number won't fit a string field.
+
+## Mask nested values [#mask-nested]
+
+A path through an array goes over every element, so `cards.number` masks the number of each card. Dictionary values are masked with `$*`. The key stays, and only the value is masked.
+
+<Snippet id="queries/response-masks/mask-nested" twoslash />
+
+The second card has no holder, and the result doesn't have one either. A missing field stays missing, and a mask doesn't make one up.
+
+## A custom mask [#custom-mask]
+
+If the ready-made masks aren't enough, pass a function. It receives the real value and returns what the calling code will see. The function is called only for values that exist.
+
+<Snippet id="queries/response-masks/custom-mask" twoslash />
+
+If the function throws, the query fails with `QueryError: mask: the mask of "email" (model Customer) threw`. Silently handing out the real value instead of the mask would be a leak, so the error is always loud.
+
+## Mask a document [#mask-document]
+
+A loaded document has three ways to turn into data: [`$toPlain`](../reference/documents/document-api.mdx#to-plain), [`$toObject`](../reference/documents/document-api.mdx#to-object), and [`$toJSON`](../reference/documents/document-api.mdx#to-json). Their `mask` option takes the same "path → mask" object and works on a copy. The document itself and its next save don't change. The paths name the fields of the form the document is serialized into.
+
+<Snippet id="queries/response-masks/mask-document" twoslash />
+
+The document stayed untouched, and `alice.email` is still the real email. That way you can send the client a masked copy and keep working with the real data.
+
+## Mask an aggregation result [#mask-aggregation]
+
+An aggregation also returns data that leaves the app. It has its own [`.mask`](../reference/aggregation/pipeline.mdx) with the same rules, and you call it after `.plain()` or `.lean()` too.
+
+<Snippet id="queries/response-masks/mask-aggregation" twoslash />
+
+## Read large results [#read-large-results]
+
+A query with a mask has [`.cursor()`](../reference/query/cursor.mdx). The mask is applied to each row as it's read, and memory doesn't grow with the result.
+
+<Snippet id="queries/response-masks/read-large-results" twoslash />
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether the client needs to see this field in any form at all**.
+
+- **No**: don't read it. Excluding it with `.select` or `hidden` in the model is more reliable than any mask, because the value never leaves the database.
+- **In a recognizable but incomplete form**, like the last digits of a card, the email domain, or an age range: use `.mask` in the query.
+- **The field must be masked everywhere**, including logs, events, and error texts: set `sensitive` in the model. The masks are the same `Mask.*`, only they apply all the time, not in one query. See [Hidden and sensitive fields](../schemas/hidden-and-sensitive.mdx).
+
+## When not to use it [#when-not-to-use]
+
+A mask doesn't protect anything on its own. It hides the value only in the result it's applied to. If a field must not leave the database, use `.select` or `hidden`.
+
+If data goes out with different access levels, handle that at the level of queries and models, not with masks in every handler. One forgotten mask, and the value goes out whole. The path check of `.mask` catches typos, but not forgotten calls.
+
+## Troubleshooting [#troubleshooting]
+
+**`.mask` doesn't compile on a document.** You called `.mask` on a query without `.plain()` or `.lean()`. A document with masked values could be saved by accident, and the mask would land in the database instead of the data. That's why Typemo forbids it, and a mask works only on ordinary objects. In untyped code the call throws a `QueryError` with the same text the compiler shows.
+
+<Snippet id="queries/response-masks/troubleshooting" twoslash />
+
+**The compiler rejects a path.** A path that isn't in the result row won't compile, so a mask won't let a typo in a field name through.
+
+<Snippet id="queries/response-masks/troubleshooting-2" twoslash />
+
+If the mask object is built from data the compiler can't see, Typemo checks the path itself. A path that doesn't exist would mask nothing, and the value would go out real. So `.mask` throws a `StrictModeError` right at the call, before the query reaches the database.
+
+<Snippet id="queries/response-masks/troubleshooting-3" />
+
+But the check doesn't replace caution. Don't make a mask your only protection.
+
+**A ready-made mask doesn't fit the field type.** A mask is typed by the value it accepts. `Mask.email()` accepts a string, so it won't compile for a numeric field.
+
+<Snippet id="queries/response-masks/troubleshooting-4" twoslash />
+
+**The mask showed `"?"` instead of a value.** A ready-made mask doesn't throw because of the data. It replaces a value of the wrong kind, such as an email without `@` or a number that's too short, with `"?"`. Losing a detail is better than revealing the value. If you see `"?"` where you expected a partial value, check the value itself in the database.
+
+## Full example [#full-example]
+
+Here it all comes together: a support query with masks, nested values, and a document mask. Code that isn't part of Typemo and that you write yourself is marked `__…__`.
+
+<Snippet id="queries/response-masks/full-example" title="customers/support.service.ts" twoslash />
+
+<Callout type="migration">
+
+Mongoose has no response masks. Values were hidden in schema getters or by hand before sending. In Typemo it's a separate step of the query. [`.mask`](../reference/query/masks.mdx#mask) is applied to a copy after the read, the document doesn't change, the result type accounts for the masks, and the compiler checks the path and the mask type.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Masks" href="../reference/query/masks.mdx">
+  Every ready-made `Mask.*` with examples and rules, exact types, and errors.
+</Card>
+<Card title="Hidden and sensitive fields" href="../schemas/hidden-and-sensitive.mdx">
+  Mask a field everywhere rather than in one query, and when it's better to hide it entirely.
+</Card>
+<Card title="Checking the response shape" href="./contracts.mdx">
+  Pin down the shape of a response with a contract so it doesn't change unnoticed.
+</Card>
+<Card title="Send a document to the client" href="../documents/serialization.mdx">
+  `$toPlain`, `$toObject`, and `$toJSON`: the form a document leaves the app in.
+</Card>
+</Cards>

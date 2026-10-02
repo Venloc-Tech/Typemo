@@ -1,0 +1,140 @@
+---
+title: Arrays and Maps in a document
+description: "Change a document's arrays, subdocument arrays, and Maps so that precise operations reach the database instead of a rewrite of the field"
+icon: List
+---
+
+To change an array or a `Map` in a loaded document, call a collection method (`push`, `pull`, `set`, or `delete`) and save the document. Typemo turns the call into a precise MongoDB operation, like `$push`, `$pullAll`, or `$set` of one key, and doesn't rewrite the whole field. Writing by index and to `length` is closed off by the types, because a write like that doesn't say what you meant.
+
+Why does this matter? Say two clients change an order's tags at the same time, and you send the whole array. Whoever saves last wins, and the other one's edit is lost. The `$push` and `$pull` operations say **what** to change, not **what the field looks like now**, so they don't get in each other's way.
+
+Typemo calls such arrays typed collections.
+
+- [`StrictArray`](../reference/documents/typed-collections.mdx#strict-array): for arrays of values.
+- [`SubdocumentArray`](../reference/documents/typed-collections.mdx#subdocument-array): for arrays of nested objects.
+- [`TypedMap`](../reference/documents/typed-collections.mdx#typed-map): for `Map`.
+
+## What you need [#prerequisites]
+
+The order from [Change and save a document](./change-and-save.mdx), with `tags`, `lines`, and a `fees` `Map`. You read the collections like ordinary ones. `for…of`, `map`, `filter`, spread, and `JSON.stringify` work, and `map` and `filter` return ordinary arrays.
+
+## Quick start [#quick-start]
+
+<Snippet id="documents/typed-collections/quick-start" twoslash />
+
+Below we go through each case: which operation goes to the database, what you can't do, and what to do instead.
+
+## Add and remove elements [#add-and-remove-elements]
+
+`push` adds to the end, `unshift` to the start, `addToSet` only what isn't there yet, and `pull` removes by value. Each method casts the values to the element type right away, so a type error shows up on the call line, not on save. The methods return the same things as on an ordinary array. `push` returns the new length, and `pull` and `addToSet` return the removed or added elements.
+
+<Snippet id="documents/typed-collections/add-and-remove-elements" twoslash />
+
+Each call gives its own operator. But if different operations piled up on **the same array** within one save, Typemo doesn't try to fit them into one update. Two operators on one path can't be combined reliably, so it writes the whole array. That's what happens if you call `push` and `pull` in a row before saving, and after a second `pop` too.
+
+<Snippet id="documents/typed-collections/add-and-remove-elements-2" twoslash />
+
+Writing the whole array is less precise. If another client edited the same array between your read and your save, their edit gets overwritten. So where concurrent changes are possible, save after each kind of operation. Or check with [`$getChanges`](../reference/documents/document-api.mdx#get-changes) which operation will go out.
+
+## Replace an element [#replace-element]
+
+To replace an existing element, call `set(index, value)`. The index has to exist. You can't add an element at an index that doesn't exist.
+
+<Snippet id="documents/typed-collections/replace-element" twoslash />
+
+A `$set` by index is tied to a position. If another client managed to remove the first element, index `1` now points to a different one. That's why, for documents with a version, such a `$set` is guarded by a `__v` check. See [Don't lose concurrent changes](./versions.mdx). If the position doesn't matter to you, removing by value with `pull` is safer.
+
+## Change a subdocument in an array [#change-subdocument]
+
+The elements of an array of classes are subdocuments, and you change their fields by ordinary assignment. Typemo writes the path with the index computed at save time.
+
+<Snippet id="documents/typed-collections/change-subdocument" twoslash />
+
+To add an element, pass a plain object to [`push`](../reference/documents/typed-collections.mdx#strict-array.push), and the `_id` is created on its own. [`lines.create`](../reference/documents/typed-collections.mdx#subdocument-array.create) creates a ready subdocument that isn't attached to the array yet.
+
+## Find and remove a subdocument by id [#find-and-remove-subdocument]
+
+Subdocuments have an `_id`, so you can find and remove them by id instead of by position. [`lines.id(id)`](../reference/documents/typed-collections.mdx#subdocument-array.id) returns the element or `undefined`. [`lines.pull(id)`](../reference/documents/typed-collections.mdx#subdocument-array.pull) removes it with a `$pull` by `_id`, and positions play no part. You can pass the id as a string, too. That helps when it comes from the request URL, since you don't have to wrap it in `ObjectId`.
+
+<Snippet id="documents/typed-collections/find-and-remove-subdocument" twoslash />
+
+## Work with a Map [#work-with-map]
+
+You change a `Map` with the `set`, `delete`, and `clear` methods. The key is checked on the call. It must be a non-empty string without a dot that doesn't start with `$` and isn't `__proto__`. Otherwise the key would be read as a path or an operator.
+
+<Snippet id="documents/typed-collections/work-with-map" twoslash />
+
+## Get a plain copy [#plain-copy]
+
+To pass the contents on without a tie to the document, use the collection's [`$toObject`](../reference/documents/typed-collections.mdx#strict-array), spread, or `map`. The result is an ordinary array, and changing it doesn't affect the document.
+
+<Snippet id="documents/typed-collections/plain-copy" twoslash />
+
+## An empty array by default [#empty-array-default]
+
+An array field without `required` and without `default` always exists. In a new document (`create`, `Model.new`) and in a document read from the database without that key, it's an empty array, not `undefined`. So `order.tags.push("a")` works on any order, and the next `$save` writes a key the database didn't have.
+
+New subdocuments and documents inserted through an upsert get an empty array too. `lean()`, though, returns the document as it's stored, that is, without the key. An array with `required: true` has no default, and without a value `create` refuses.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **what should survive of other clients' changes**.
+
+- **Other clients' changes to the array must survive**: use the methods with precise operations. Those are `push`, `addToSet`, `pull`, `pop`, and writing a field inside a subdocument.
+- **You deliberately overwrite the whole array**, for example on import or when syncing with an external source: use [`replace`](../reference/documents/typed-collections.mdx#strict-array.replace) or `sort`. They honestly write the whole array.
+
+`push` and `addToSet` differ in one thing: `addToSet` doesn't add what's already there.
+
+## When not to use it [#when-not-to-use]
+
+If you need to change an array in many documents at once, or in a document you'd rather not load, use the update operators [`$push`, `$pull`, and `$addToSet`](../reference/writes/update-operators.mdx) in [`updateOne`](../reference/writes/writes.mdx#update-one) and [`updateMany`](../reference/writes/writes.mdx#update-many). Collections are for when the document is already loaded and changes in code.
+
+## Troubleshooting [#troubleshooting]
+
+**Writing by index doesn't compile.** `order.tags[0] = "x"` and `order.tags.length = 0` don't pass the type check.
+
+<Snippet id="documents/typed-collections/troubleshooting" twoslash />
+
+To replace an element, use [`tags.set(0, "express")`](../reference/documents/typed-collections.mdx#strict-array.set), and instead of `length = 0`, use [`tags.clear()`](../reference/documents/typed-collections.mdx#strict-array.clear).
+
+**The save refuses to write "around the methods".** If a write to an array or a `Map` went around the methods (through a cast to `any`, `Array.prototype.push.call`, or `Map.prototype.set.call`), `$save` throws a [`DirectWriteError`](../reference/errors/data-errors.mdx#direct-write-error) and suggests the right method. [`$getChanges`](../reference/documents/document-api.mdx#get-changes) doesn't throw in this case. It shows the same text under the `$problems` key.
+
+<Snippet id="documents/typed-collections/troubleshooting-2" />
+
+Typemo doesn't try to guess what you meant, because a guess could overwrite someone else's data. Replace the write with a collection method.
+
+**The array is loaded partially.** If you read part of an array, say with `select({ tags: { $slice: 2 } })`, you don't see every element. Say the order has the tags `a`, `b`, and `c`. A change that would overwrite what you didn't see gives a [`PartialArrayError`](../reference/errors/data-errors.mdx#partial-array-error).
+
+<Snippet id="documents/typed-collections/troubleshooting-3" twoslash />
+
+<Snippet id="documents/typed-collections/troubleshooting-4" />
+
+`push`, `unshift`, `addToSet`, and `pull` are allowed, because they don't depend on positions. `splice`, `sort`, `reverse`, `replace`, `clear`, `set` by index, `pop`, and `shift` are forbidden. Here too `$getChanges` doesn't throw but records the reason under the `$problems` key. Read the document without the array projection.
+
+## Full example [#full-example]
+
+Functions of an order service: add a line, remove a line by an id from the request URL, and set a fee.
+
+<Snippet id="documents/typed-collections/full-example" title="orders/orders.service.ts" twoslash />
+
+## Coming from Mongoose [#from-mongoose]
+
+<Callout type="migration">
+
+In Mongoose you could change an array by index and by assignment, but then you had to call `markModified`. In Typemo writing by index and to `length` is closed off, changes go through methods, and `DocumentArray` is called `SubdocumentArray`. Typemo throws element type errors right away, on the method call, instead of collecting them in `invalidate`.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Typed collections" href="../reference/documents/typed-collections.mdx">
+  Every method, the operator each one gives, and the full error texts.
+</Card>
+<Card title="Work with nested objects" href="./subdocuments.mdx">
+  The parent, the path, `_id`, and the methods of a subdocument.
+</Card>
+<Card title="Don't lose concurrent changes" href="./versions.mdx">
+  How Typemo protects array changes by index from other clients' edits.
+</Card>
+</Cards>

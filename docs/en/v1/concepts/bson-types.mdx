@@ -1,0 +1,104 @@
+---
+title: MongoDB data types
+description: "How ObjectId, int64, Decimal128, Binary, UUID, Date, Timestamp, and vectors differ from JSON, and what each one looks like in Typemo code"
+icon: Braces
+---
+
+MongoDB doesn't store documents as JSON. It stores them as **BSON**, a binary format that looks like JSON but has more value types. So some values in the database have no counterpart in JavaScript or in JSON: the `ObjectId` identifier, a 64-bit integer, an exact decimal number, binary data. Typemo turns them into clear TypeScript types and shows you plainly where a value stays itself and where it becomes a string. That way your data doesn't change behind your back.
+
+Below we'll look at where these types come from and why they need different result forms. Read this page once, before the guides [Choose a field type](../schemas/field-types.mdx) and [Reading data](../queries/reading-data.mdx). After that, the docs link back here at every new `ObjectId` or `bigint`. The full "type and form" table is in the [Value forms](../reference/values/value-forms.mdx) reference.
+
+## What BSON is [#bson]
+
+**BSON** (binary JSON) is the format the MongoDB server stores documents in and uses to exchange data with the driver. Like JSON, it has objects, arrays, strings, numbers, and booleans. But BSON also has separate types for a date, an identifier, binary data, integers of different widths, and an exact decimal number. The official `mongodb` driver turns them into JavaScript objects and back, and it takes their classes from the `bson` package.
+
+The difference between types matters both to you and to the database. If a field holds an `ObjectId` and the filter has a string of the same 24 characters, the document won't be found. To the server those are two different values. Sorting and comparison also look at the type of a value, not at how it looks as text.
+
+## Why they don't fit into JSON [#not-json-safe]
+
+JSON knows only strings, numbers, booleans, `null`, arrays, and objects. A number in it is a JavaScript number, that is, a double. Let's see what happens to the other types if you pass them straight to `JSON.stringify`. That's what a request handler would do if it sent a freshly read row to the client.
+
+<Snippet id="concepts/bson-types/not-json-safe" twoslash />
+
+Each value has its own problem, and none of them is fit for the client without rework. `ObjectId` became a string, so the client sends back a string, not an identifier. `Decimal128` turned into an object with a service key, binary data into a base64 string, and `Long` into the two halves of a number.
+
+The most dangerous case is a number beyond the precision of a double. As a JavaScript number, `9007199254740993` quietly becomes `9007199254740992`, with no error at all. The only thing `JSON.stringify` fails on is a `bigint`, with the error `TypeError: JSON.stringify cannot serialize BigInt.`. That's why you can't hand a `.lean()` result with an int64 straight to the client.
+
+This is why Typemo doesn't force one picture of a value onto every case. The same stored value is available in several **forms**.
+
+- As in the driver, for calculations inside the application.
+- As in `.plain()`, ordinary JavaScript data where the MongoDB types have become strings.
+- As JSON.
+
+You pick the form by what happens to the data after the read. [Reading data](../queries/reading-data.mdx#send-to-client) walks through that choice with real tasks.
+
+## ObjectId [#object-id]
+
+`ObjectId` is a 12-byte identifier. The server and the driver create it for the `_id` field if you didn't set one yourself. It starts with the creation time in seconds, so sorting by `_id` roughly follows the order of creation. In the database it's a type of its own, not a string, and as text it's written as 24 hexadecimal characters.
+
+In a document, in a `.lean()` result, and in `$toObject()` it's an `ObjectId` instance. In `.plain()` and in JSON it's a string. Every write method, every filter, and [`findById`](../reference/query/reading.mdx#model.find-by-id) accept the string back, so you don't need to wrap a string from the client in an `ObjectId` by hand. Keep in mind that two `ObjectId` instances with the same value are different objects, and `===` between them gives `false`. Compare them with `id.equals(other)`.
+
+## Integers int32, int64, and double [#int32-int64-double]
+
+BSON has three numeric types: a 32-bit integer, a 64-bit integer, and a double. JavaScript has one number type, so the driver has to choose. A number from a `Number` field goes into the database as an int32 if it's an integer that fits, and as a double if not. `Types.Int32` requires exactly an int32 and won't let through a fraction or a number out of range. `Types.Double` always stores a double.
+
+A 64-bit integer is a different story. Only `bigint` can hold it exactly in JavaScript. You declare the field with the `BigInt` type (`Types.Long` doesn't work as a field type), and in every form where the value stays a value, it's a `bigint`. Precision is the whole reason this type exists. Integers above 2⁵³ lose their low digits as JavaScript numbers, so an amount in cents or an event counter that crosses that line belongs in an `int64`.
+
+In `.plain()` and JSON an int64 becomes a **decimal string**, `"9007199254740993"`. It keeps every digit and passes through `JSON.stringify` without trouble. The write methods accept it back, including `$inc`, `$mul`, `$min`, and `$max`. An int64 field accepts a plain number only if it's a safe integer. Otherwise you get an error with a hint: `Cast to Long failed at path "total" for 1152921504606847000 (number): beyond Number.MAX_SAFE_INTEGER the number is already imprecise; pass a bigint (5n) or a decimal integer string ("5") [precision]`.
+
+## Decimal128 [#decimal128]
+
+`Decimal128` is a decimal number with up to 34 digits of precision. A JavaScript number is binary, and `0.1 + 0.2` gives `0.30000000000000004`. That's unacceptable for money, where the amount in the database must be exactly `19.99`. `Decimal128` stores the decimal notation as is and does arithmetic by decimal rules.
+
+In a document and in a `.lean()` result it's a `Decimal128` instance. In `.plain()` and JSON it's a string like `"19.99"`. Create the value from a string, `Types.Decimal128.fromString("19.99")`, not from a JavaScript number. A number would lose precision before it ever reached `Decimal128`. The write methods also accept the string `"19.99"` itself, and `create({ weight: "19.99" })` stored the exact value.
+
+## Dates and Timestamp [#dates-and-timestamp]
+
+A BSON `Date` is milliseconds since January 1, 1970 UTC. Its JavaScript counterpart is the native `Date`, so in `.lean()` and `.plain()` it stays a `Date`, and in JSON it becomes the ISO string `"2026-01-02T03:04:05.000Z"`. The value has no time zone. A time zone appears only when you display it.
+
+`Timestamp` isn't a date, whatever the name suggests. It's an internal MongoDB type for replication, a pair of seconds and an ordinal within that second. In `.plain()` and JSON it becomes an object `{ t, i }`. For points in time in your own data, use `Date`. Declare a `Timestamp` field only when you read someone else's data that already has one.
+
+## Binary, UUID, and vectors [#binary-uuid-vectors]
+
+`Binary` is bytes with a **subtype** that says what's inside.
+
+- Subtype 0: arbitrary data.
+- Subtype 4: a UUID.
+- Subtype 9: a vector.
+- Values from 128 up: for your own needs.
+
+In a document it's a `Binary` instance, in `.plain()` a copy as a `Uint8Array`, and in JSON a base64 string.
+
+A `UUID` is a 16-byte identifier stored as a `Binary` of subtype 4. Typemo gives it to you as the `UUID` class with its methods and accepts a string like `0f8fad5b-d9cb-469f-a165-70867728950e`. In `.plain()` and JSON it's that same string.
+
+A **vector** is an array of numbers of one type (`int8`, `float32`, or packed bits) in a `Binary` of subtype 9. MongoDB uses it for vector search. In a document it stays a `Binary`, and in `.plain()` and JSON it turns into an ordinary array of numbers, because the client needs numbers, not bytes. To see how to declare such fields, check [`Spec.binary`](../reference/schemas/types-and-spec.mdx#spec.binary) and [`Spec.vector`](../reference/schemas/types-and-spec.mdx#spec.vector) in the reference.
+
+## What it looks like in Typemo code [#in-typemo-code]
+
+You declare a field with the class that matches its type in the database: `BigInt` for an int64, `Types.Decimal128` for an exact number, `Types.UUID`, `Date`. Say a sensor records readings with an exact weight, a large counter, and a device identifier.
+
+<Snippet id="concepts/bson-types/in-typemo-code" title="sensors/reading.ts" twoslash />
+
+The form depends on how you read, not on the schema. `.lean()` gives you the driver's values, and `.plain()` gives you data you can send straight to the client. You can see the difference in your editor's hints without running anything.
+
+<Snippet id="concepts/bson-types/in-typemo-code-2" twoslash />
+
+`doc.total` stayed `bigint | undefined`. The field is optional, and the document keeps the value as is. In the `.plain()` result the same field is already `` `${bigint}` `` (the [`Int64String`](../reference/values/form-types.mdx#int64-string) type), a string of decimal digits that the write methods accept back without casting. The device identifier there is a `string`. Here's what it looks like for one document.
+
+<Snippet id="concepts/bson-types/in-typemo-code-3" twoslash />
+
+Look at `total` in the response. It's a string, and its last digit is `3`, so the `bigint` reached the client intact. A plain number would have lost that digit.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Value forms" href="../reference/values/value-forms.mdx">
+  The full table: how each type looks in a document, in `.lean()`, `$toObject()`, `.plain()`, and JSON.
+</Card>
+<Card title="Types and Spec" href="../reference/schemas/types-and-spec.mdx">
+  `Types` and `Spec`: how to declare a field of each type and what happens with a wrong value.
+</Card>
+<Card title="Reading data" href="../queries/reading-data.mdx">
+  How to choose between a document, `.lean()`, and `.plain()` for a real task.
+</Card>
+</Cards>

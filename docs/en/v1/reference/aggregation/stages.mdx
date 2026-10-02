@@ -1,0 +1,454 @@
+---
+title: Stages
+description: "Reference for every stage of the pipeline builder: what each accepts, what the rows look like after it, and where it runs"
+icon: Layers
+---
+
+This page covers every stage of the pipeline builder. They're methods of the object you get in [`Model.aggregate((p) => …)`](./pipeline.mdx#model.aggregate) or from [`Pipeline.from`](./pipeline.mdx#pipeline.from). A **stage** is one step of a **pipeline**. It takes the rows of the previous step and hands on new ones. The method name matches the MongoDB stage name without the `$`, so `match` is `$match`.
+
+If you're starting out, read the guide [Your first aggregation](../../aggregation/first-aggregation.mdx) first. This page is a reference.
+
+The main difference between Typemo and the bare driver is that after every stage the compiler recomputes the **row type**. After `group`, a row is no longer an order but a group with the fields you named. The next stage sees only real fields, and a typo in a field name stops the compiler. You write the values inside stages (`fn.sum(f.total)`) with an `(f) => …` callback. In it `f` is a proxy of the fields and `fn` is the operator catalog. For more, see the guide [Calculations in aggregation](../../aggregation/expressions.mdx).
+
+All examples use a shop model: customers and orders with item lines.
+
+<Snippet id="reference/aggregation/stages/intro" title="models/order.ts" twoslash />
+
+The customers are Alice (Oslo), Bob (Paris), and Carol (Oslo, invited by Alice). There are four orders.
+
+- Alice, `paid`, 120, January 5, items `pen`×2 and `book`.
+- Bob, `open`, 40, January 20, `pen`×4.
+- Alice, `paid`, 60, February 3, `ink`×3, note `gift`.
+- Bob, `paid`, 30, February 14, no items.
+
+The results in the `// →` comments come from this data. The `_id` fields are left out of them when they don't matter.
+
+The stages that read internal server data (`collStats`, `currentOp`, and others) and the Atlas stages (`search`, `vectorSearch`) are described at the end. They run only first in a pipeline, and not in every mode.
+
+If the model has [hidden fields](../../schemas/hidden-and-sensitive.mdx#hidden-in-aggregation), [`Model.aggregate`](./pipeline.mdx#model.aggregate) removes them with an `$unset` stage at the start of the pipeline. If the first stage must stay first (`search`, `searchMeta`, `vectorSearch`, `geoNear`, `collStats`, `indexStats`, and others), `$unset` goes right after it, as the server requires.
+
+The database and server stages (`documents`, `currentOp`, `listLocalSessions`, `listSessions`, and others) are built in [`Pipeline.database`](./pipeline.mdx#pipeline.database), [`Pipeline.admin`](./pipeline.mdx#pipeline.admin), and [`Pipeline.sessions`](./pipeline.mdx#pipeline.sessions). [`client.aggregate`](../connection/typemo-client.mdx#client.aggregate) runs them.
+
+## match [#match]
+
+`match` keeps only the rows that satisfy a condition. It's the most common stage. The earlier it sits, the fewer rows the server drags through the pipeline and the better it uses indexes.
+
+You write the condition as a [`find`](../query/reading.mdx#model.find) filter or as a callback with a boolean expression. In the second case Typemo sends it as `$expr`.
+
+<Snippet id="reference/aggregation/stages/match" twoslash />
+
+A raw object with `$expr` is forbidden. Write a condition that compares two fields of a row with a callback.
+
+<Snippet id="reference/aggregation/stages/match-2" twoslash />
+
+The stage returns a builder with the same rows. It works in any mode except a pipeline update. The third form accepts a ready entity filter (`const filter: Filter<Order>`) while the rows still have their stored shape.
+
+## sort [#sort]
+
+`sort` orders the rows. The keys are paths of the current row, and the directions are `1`/`-1` or the words `"ascending"`/`"descending"`. You can replace a key with the text search score `{ $meta: "textScore" }`.
+
+<Snippet id="reference/aggregation/stages/sort" twoslash />
+
+An empty object gives the error `ConfigurationError: $sort needs at least one key`. The rows after `sort` stay the same.
+
+## limit [#limit]
+
+`limit` passes the first `n` rows and drops the rest. `n` is an integer of at least 1. In MongoDB, zero means "no limit", and a typo would turn "nothing" into "everything", so Typemo refuses it.
+
+<Snippet id="reference/aggregation/stages/limit" twoslash />
+
+<Snippet id="reference/aggregation/stages/limit-2" />
+
+## skip [#skip]
+
+`skip` skips the first `n` rows. `n` is an integer of at least 0. Together with `limit` it gives pages, but at large offsets the server still reads what it skipped. For long lists, [keyset pagination](../query/keyset.mdx) is better.
+
+<Snippet id="reference/aggregation/stages/skip" twoslash />
+
+<Snippet id="reference/aggregation/stages/skip-2" />
+
+## sample [#sample]
+
+`sample` returns `size` random rows. It's handy for checks on a sample and for examples. If there are fewer rows than `size`, all of them come back.
+
+<Snippet id="reference/aggregation/stages/sample" twoslash />
+
+`size` is an integer of at least 1, otherwise you get a `ConfigurationError`.
+
+## count [#count]
+
+`count` replaces all rows with one of the form `{ [field]: number }`. If no rows came in, none come out, not a `0`. To count by group, use [`group`](#group) with `fn.count()`.
+
+<Snippet id="reference/aggregation/stages/count" twoslash />
+
+The field name can't be empty, start with `$`, or contain a dot.
+
+<Snippet id="reference/aggregation/stages/count-2" />
+
+## redact [#redact]
+
+`redact` decides by a condition what to do with a document: keep it whole, drop it, or go deeper into nested documents. The condition is a callback that returns `Vars.KEEP`, `Vars.PRUNE`, or `Vars.DESCEND`, usually through `fn.cond`. You need the stage for security inside a document, when a user must not see some of the nested blocks.
+
+<Snippet id="reference/aggregation/stages/redact" twoslash />
+
+## addFields [#add-fields]
+
+`addFields` adds fields or replaces existing ones and keeps the rest. The values are expressions over the row's fields. A key with a dot writes into a nested document, and `fn.remove()` removes a field.
+
+<Snippet id="reference/aggregation/stages/add-fields" twoslash />
+
+The row type after the stage is the previous one plus the new fields. A typo in a field name inside an expression stops the compiler.
+
+## set [#set]
+
+`set` is a second name for [`addFields`](#add-fields) and does the same thing. In a pipeline update ([`Pipeline.update`](./pipeline.mdx#pipeline.update)) you usually write `set`, and in reports `addFields`.
+
+<Snippet id="reference/aggregation/stages/set" twoslash />
+
+## project [#project]
+
+`project` keeps only the named fields or computes new ones. The value `1` or `true` keeps a field, `0` or `false` removes it, and an expression computes it. You can't mix "keep" and "remove", except for `_id`. The compiler stops such a projection, and the server would reject it.
+
+<Snippet id="reference/aggregation/stages/project" twoslash />
+
+The second form takes an object of paths without a callback: `p.project({ status: 1, total: 1 })`. An empty projection gives `ConfigurationError: $project needs at least one field`.
+
+In a [pipeline update](./pipeline.mdx#pipeline.update), `project` rewrites the whole document. On a model with immutable fields (`immutable`, and `createdAt` on `Timestamped`), Typemo lets it through only if an inclusive projection names every immutable field, or an exclusive one doesn't touch them. Otherwise the update stops before sending, and the error text names the lost fields. For more, see the guide [Pipeline updates](../../writes/pipeline-updates.mdx#replace-with-stage).
+
+## unset [#unset]
+
+`unset` removes fields by path. Pass one path as a string or several as an array. It's a `project` with zeros, except you don't need to list the other fields.
+
+<Snippet id="reference/aggregation/stages/unset" twoslash />
+
+The compiler rejects a path that isn't in the row.
+
+## replaceRoot [#replace-root]
+
+`replaceRoot` makes another document the root of the row, either a nested one or one built from expressions. You use it to lift a nested document to the top level. The new root must be a document. On `null` or a missing field the stage fails, so `null` isn't in the type.
+
+<Snippet id="reference/aggregation/stages/replace-root" twoslash />
+
+## replaceWith [#replace-with]
+
+`replaceWith` is a short form of [`replaceRoot`](#replace-root). It takes the new root itself, without the `newRoot` wrapper.
+
+In a [pipeline update](./pipeline.mdx#pipeline.update), this stage, like `replaceRoot` and `project`, replaces the whole document. On a model with immutable fields, the new root must carry over every such field as is (`createdAt: f.createdAt`, or the whole root through `fn.mergeObjects(f, …)`). Otherwise Typemo throws a `StrictModeError` with the reason `immutable` before sending. You write the new root's keys with the model's field names, and if a field has a `dbName`, Typemo translates them to database names. The guide is [Pipeline updates](../../writes/pipeline-updates.mdx#replace-with-stage).
+
+<Snippet id="reference/aggregation/stages/replace-with" twoslash />
+
+## unwind [#unwind]
+
+`unwind` unwinds an array. Each element gets its own row, and the other fields are copied. That's how you count per item instead of per order. You write the path as a string with `$`, and the compiler accepts only array paths.
+
+<Snippet id="reference/aggregation/stages/unwind" twoslash />
+
+The second form takes an object with three keys. `path` is the path, `includeArrayIndex` is the name of the field for the element's index (an int64), and `preserveNullAndEmptyArrays` keeps rows with an empty or missing array.
+
+<Snippet id="reference/aggregation/stages/unwind-2" twoslash />
+
+Bob's row without items survived, but it has no `items` field and its index is `null`. Without `preserveNullAndEmptyArrays` it would be gone. In the other rows `pos` is an int64, and in a `.plain()` result it's a number.
+
+## group [#group]
+
+`group` collects rows into groups by the `_id` key and computes **accumulators** for each group: operators like `fn.sum`, `fn.avg`, and `fn.count`. It's the main stage of reports, for example revenue by status or the number of orders per customer.
+
+<Snippet id="reference/aggregation/stages/group" twoslash />
+
+`_id` is an expression, `null` (one group for all rows), or a compound object. Every other field must be an accumulator. The compiler rejects an ordinary expression, because the server would reject it too. All the accumulators are listed in the reference [Accumulators](./accumulators.mdx).
+
+The reverse is also true. Operators that work only as accumulators (`fn.push`, `fn.addToSet`, `fn.count`, `fn.top`, and others) are allowed only in `group`, `bucket`, `bucketAuto` (in their `output`), and `setWindowFields`. In `project` or `addFields` they don't compile. Operators with two roles (`fn.sum`, `fn.avg`, `fn.min`, `fn.max`) stay ordinary expressions over an array inside a document there. The section [on accumulators](./accumulators.mdx#how-accumulators-work) explains how this works.
+
+If an ordinary expression ends up in `group`, the compiler names the field and the reason right in the error text.
+
+<Snippet id="reference/aggregation/stages/group-2" twoslash />
+
+The error text is `Property 'error' is missing in type '{ readonly _id: …; readonly doubled: Expr<number>; }' but required in type 'PathError<"$group field \"doubled\" needs an accumulator (fn.sum, fn.avg, fn.push, fn.first, fn.count, ...)">'`. Look at the name in `PathError`. It holds the field (`doubled`), the stage (`$group`), and what you need to write. `bucket` and `bucketAuto` give the same text for their `output`, only with their own stage name. A forgotten `_id` is rejected separately: `Property '_id' is missing in type …`.
+
+<Snippet id="reference/aggregation/stages/group-3" twoslash />
+
+## bucket [#bucket]
+
+`bucket` sorts rows into intervals with set boundaries. The group's `_id` is the interval's lower bound, and rows outside the boundaries go into the `default` group. You need the stage for histograms, for example orders under 50 and from 50 to 100.
+
+<Snippet id="reference/aggregation/stages/bucket" twoslash />
+
+The boundaries are an array of at least two values in ascending order, of the same type as `groupBy`. A row with a value outside the boundaries gives a server error without `default`.
+
+## bucketAuto [#bucket-auto]
+
+`bucketAuto` picks the boundaries itself so the intervals hold roughly equal numbers of rows. You name only the number of intervals. The group's `_id` is an object `{ min, max }`.
+
+<Snippet id="reference/aggregation/stages/bucket-auto" twoslash />
+
+The optional `granularity` rounds the boundaries to a series of preferred numbers, for example `"R5"`. `buckets` is an integer of at least 1, otherwise you get a `ConfigurationError`.
+
+## sortByCount [#sort-by-count]
+
+`sortByCount` groups by an expression and sorts the groups by descending row count, so the most frequent value comes first. It's a short form of `group` + `count` + `sort`.
+
+<Snippet id="reference/aggregation/stages/sort-by-count" twoslash />
+
+## setWindowFields [#set-window-fields]
+
+`setWindowFields` computes a new field over a **window** of neighboring rows and doesn't collapse rows into groups. That's how you get a running sum, a place in a ranking, or the difference from the previous row. `partitionBy` splits rows into independent parts, `sortBy` sets the order, and `output` describes the fields through `withWindow`.
+
+<Snippet id="reference/aggregation/stages/set-window-fields" twoslash />
+
+Functions that need an order (`fn.rank()`, `fn.shift`, bounded windows) require `sortBy`, and without it they don't compile. The ranks and `fn.linearFill` (`fn.rank`, `fn.denseRank`, `fn.documentNumber`, `fn.linearFill`) require a `sortBy` of exactly one field. With two, the compiler stops the call and names the result field and the rule. The window operators are described in the reference [Window operators](./window-operators.mdx). The guide is [Window functions](../../aggregation/windows.mdx).
+
+## densify [#densify]
+
+`densify` fills gaps in a series of numbers or dates and adds rows with the missing values of a field. You need it for charts where a month with no orders must show as zero instead of disappearing.
+
+<Snippet id="reference/aggregation/stages/densify" twoslash />
+
+The added rows contain only this field and the `partitionByFields` fields, so the other fields become optional in the type. For dates `range` sets `step` and `unit`, and for numbers only `step`.
+
+## fill [#fill]
+
+`fill` fills empty (`null` or missing) values of a field. You can fill with a constant expression or with a method: `"locf"` (the last known value) or `"linear"` (linear interpolation). A method requires `sortBy`.
+
+<Snippet id="reference/aggregation/stages/fill" twoslash />
+
+## lookup [#lookup]
+
+`lookup` pulls the documents of another collection into each row. The result is an array in the `as` field, even if one document is found or none. It's the analog of a join in relational databases.
+
+The first form works by field equality. It compares this row's `localField` with the pulled-in collection's `foreignField`. The type of the pulled-in documents comes from `from`.
+
+<Snippet id="reference/aggregation/stages/lookup" twoslash />
+
+The pulled-in documents go through the policies of the class in `from`, as in an ordinary read through its model. Soft-deleted documents aren't pulled in, `Hidden` fields are removed, and from a tenant collection only the operation's tenant documents are pulled in. Without a tenant, Typemo throws a `StrictModeError` with the `tenant` rule before it contacts the server. You don't need to create a model of this class on the connection, because Typemo compiles the schema itself.
+
+The second form uses a **sub-pipeline**. The pulled-in documents go through their own stages. Variables (`let`) pass the row's values in, and the pipeline callback receives them as its second argument.
+
+<Snippet id="reference/aggregation/stages/lookup-2" twoslash />
+
+The third form works without `from`. The sub-pipeline creates the documents itself with the [`documents`](#documents) stage. It must have at least one stage, otherwise you get a `ConfigurationError`. The variable name must be valid, or you get an error too. An `as` key with a dot writes into a field of a nested document. For more, see the guide [Joins](../../aggregation/joins.mdx).
+
+## graphLookup [#graph-lookup]
+
+`graphLookup` walks links inside one collection recursively. That's how you follow a chain of invitations, a comment tree, or an employee's subordinates. `startWith` is where to start, and `connectFromField` and `connectToField` are how to move to the next document.
+
+<Snippet id="reference/aggregation/stages/graph-lookup" twoslash />
+
+The found documents go through the policies of the class in `from` the same way as in [`lookup`](#lookup): soft delete, tenant, and `Hidden` fields. With `depthField`, each found document gets its depth (an int64). `maxDepth` limits the depth and takes an integer of at least 0. `restrictSearchWithMatch` is a filter on the found documents.
+
+## unionWith [#union-with]
+
+`unionWith` appends the rows of another collection to the rows. The row type after it is the union `T | Joined`, because rows come in two kinds. You need the stage for one list built from two sources.
+
+<Snippet id="reference/aggregation/stages/union-with" twoslash />
+
+There are three forms. The first takes only a collection (`unionWith(Customer)`). The second takes a collection with a sub-pipeline (`{ coll, pipeline }`). The third takes a pipeline without a collection that creates the documents itself, as in the example above. The appended rows go through the policies of the class named as the collection the same way as in [`lookup`](#lookup): soft delete, tenant, and `Hidden` fields. You don't need to create a model of this class.
+
+## facet [#facet]
+
+`facet` runs several pipelines over the same rows and returns **one** row where each branch has its own array. The stage gives you several reports in one pass over the data, for example a list and totals by status.
+
+<Snippet id="reference/aggregation/stages/facet" twoslash />
+
+A branch can't use `facet`, `out`, `merge`, or first-place stages. A branch without stages gives a `ConfigurationError`, and so does an empty set of branches. The guide is [Several reports in one query](../../aggregation/facets.mdx).
+
+## geoNear [#geo-near]
+
+`geoNear` searches for documents near a point and adds the distance. It's always the first stage of a pipeline or of a `lookup` sub-pipeline, and it can't go in `facet`. It needs a `2dsphere` geospatial index on the field.
+
+<Snippet id="reference/aggregation/stages/geo-near" twoslash />
+
+The stage accepts `near` (a point), `distanceField` (where to write the distance), `key`, `query` (a filter), `spherical`, `maxDistance`, `minDistance`, `distanceMultiplier`, and `includeLocs`. Rows get the `distanceField` field (a number), and with `includeLocs` the found location. The example shows only the stages. The `Customer` model has no geo field, so the query didn't run on the server.
+
+## documents [#documents]
+
+`documents` creates rows from literal documents, without a collection. It suits test data and substituting values, because the documents can contain expressions. It's the first stage of a database pipeline (`Pipeline.database`, `Pipeline.admin`) or of a sub-pipeline.
+
+<Snippet id="reference/aggregation/stages/documents" twoslash />
+
+The stage accepts a non-empty tuple of documents. [`client.aggregate`](../connection/typemo-client.mdx#client.aggregate) or [`connection.aggregate`](../connection/connection.mdx#connection.aggregate) runs the plan. For more, see [`Pipeline.database`](./pipeline.mdx#pipeline.database) and the guide [Database-level queries](../../aggregation/database-level.mdx).
+
+## search [#search]
+
+`search` is Atlas Search full-text search. The stage works only in Atlas (or in a local Atlas CLI installation) and only first in a pipeline. The types check the specification: `index`, the operator (`text`, `phrase`, `compound`, …), `highlight`, `count`, and `sort`.
+
+<Snippet id="reference/aggregation/stages/search" twoslash />
+
+On ordinary MongoDB the server answers with the error `ServerError: Using $search and $vectorSearch aggregation stages requires additional configuration. (code 31082 SearchNotEnabled)`. The full server text, with the advice to connect to Atlas or to a local Atlas CLI deployment, is in the `serverMessage` field. The stage was verified only at the level of building the pipeline. The guide is [Search in aggregation](../../aggregation/search.mdx).
+
+## searchMeta [#search-meta]
+
+`searchMeta` returns not documents but search metadata: the total number of matches and facets. It works like [`search`](#search), that is, only in Atlas and first in a pipeline. It accepts a search operator or a `facet` object.
+
+<Snippet id="reference/aggregation/stages/search-meta" twoslash />
+
+The rows after it are metadata (`SearchMetaRow`), not orders. Only building the stage was verified.
+
+## vectorSearch [#vector-search]
+
+`vectorSearch` finds the documents closest in meaning among vectors (Atlas Vector Search). It's the first stage of a pipeline, and it needs a vector index.
+
+<Snippet id="reference/aggregation/stages/vector-search" twoslash />
+
+The stage accepts `index`, `path`, `queryVector` (an array of numbers or a `Binary`), `limit`, and also `numCandidates`, `exact`, and `filter`. Only building the stage was verified. On ordinary MongoDB you get the same error as for `search`.
+
+## rankFusion [#rank-fusion]
+
+`rankFusion` combines the results of several pipelines into one ranking by the reciprocal rank method. It helps when you search two ways (text and vector) and need one list. It requires MongoDB 8.1+ and goes first in a collection pipeline.
+
+<Snippet id="reference/aggregation/stages/rank-fusion" twoslash />
+
+Besides `input.pipelines`, the stage accepts `combination.weights` (weights by branch name) and `scoreDetails`. A branch without stages gives a `ConfigurationError`.
+
+## scoreFusion [#score-fusion]
+
+`scoreFusion` combines branches that already have a score, with normalization (`"none"`, `"sigmoid"`, `"minMaxScaler"`). It requires MongoDB 8.2+ and goes first in a collection pipeline.
+
+<Snippet id="reference/aggregation/stages/score-fusion" twoslash />
+
+## score [#score]
+
+`score` writes a score into the document, the value of an expression that `fn.meta("score")` or [`scoreFusion`](#score-fusion) reads later. It requires MongoDB 8.2+.
+
+<Snippet id="reference/aggregation/stages/score" twoslash />
+
+The stage accepts `score` (a callback with a numeric expression), `normalization`, and `weight`.
+
+## collStats [#coll-stats]
+
+`collStats` returns collection statistics instead of documents. It's a first stage. You list the sections you want: `count`, `storageStats`, `latencyStats`, and `queryExecStats`. The compiler rejects an unknown key.
+
+<Snippet id="reference/aggregation/stages/coll-stats" twoslash />
+
+The row also has `ns`, `host`, and `localTime`. The statistics counters (`count`) have the type `StatNumber`, that is, `number | bigint`. The server writes a counter as an int32 while it's small and as an int64 once it has grown, so on a large collection the same counter arrives as a `bigint`. Compare through `Number(stats.count)` or check `typeof`.
+
+## indexStats [#index-stats]
+
+`indexStats` returns one row per index of the collection: the name, the keys, and how many times the index was used. It's a first stage. It has no arguments.
+
+<Snippet id="reference/aggregation/stages/index-stats" twoslash />
+
+The other fields of the row are `key`, `host`, `accesses`, and `spec`.
+
+## planCacheStats [#plan-cache-stats]
+
+`planCacheStats` shows the query plans the server has remembered for the collection. It's a first stage. It accepts an optional `allHosts`.
+
+<Snippet id="reference/aggregation/stages/plan-cache-stats" twoslash />
+
+A fresh collection has no entries. The server remembers a plan when several indexes fit a query and it has to pick the best one. After such a query (over two indexed fields at once), a plan row appears. How many rows come back depends on which queries have already run.
+
+## listSearchIndexes [#list-search-indexes]
+
+`listSearchIndexes` lists the collection's Atlas Search indexes. It's a first stage, and it accepts an optional `id` or `name`. It works only in Atlas, and on ordinary MongoDB it answers `ServerError: Using Atlas Search Database Commands and the $listSearchIndexes aggregation stage requires additional configuration. (code 31082 SearchNotEnabled)`.
+
+<Snippet id="reference/aggregation/stages/list-search-indexes" twoslash />
+
+## listSessions [#list-sessions]
+
+`listSessions` reads sessions from `config.system.sessions`. It's a first stage, and it accepts `users`, `allUsers`, or nothing. The server accepts it only over that collection, so the stage exists only on the [`Pipeline.sessions`](./pipeline.mdx#pipeline.sessions) pipeline. `Pipeline.from`, `Model.aggregate`, `Pipeline.database`, and `Pipeline.admin` don't have it, and the compiler stops the call.
+
+<Snippet id="reference/aggregation/stages/list-sessions" twoslash />
+
+The server writes sessions to `config.system.sessions` about once every five minutes, so on a freshly started server the result is empty. [`listLocalSessions`](#list-local-sessions) shows the sessions this node knows right now. A row is a `SessionRow`. It holds `_id` (the session `id` and the user's `uid`), `lastUse`, and, if the session is authenticated, `user`.
+
+## currentOp [#current-op]
+
+`currentOp` shows what the server is running right now: queries, cursors, and idle connections. It works only in a [`Pipeline.admin`](./pipeline.mdx#pipeline.admin) pipeline and goes first.
+
+<Snippet id="reference/aggregation/stages/current-op" twoslash />
+
+The stage accepts the optional `allUsers`, `idleConnections`, `idleCursors`, `idleSessions`, `localOps`, and `backtrace`.
+
+## listLocalSessions [#list-local-sessions]
+
+`listLocalSessions` lists the sessions known to this server. It's the first stage of a database pipeline, [`Pipeline.database`](./pipeline.mdx#pipeline.database) or [`Pipeline.admin`](./pipeline.mdx#pipeline.admin).
+
+<Snippet id="reference/aggregation/stages/list-local-sessions" twoslash />
+
+The number of sessions depends on the server, but the query's own session is among them. The stage accepts `users` or `allUsers`.
+
+## queryStats [#query-stats]
+
+`queryStats` returns statistics on the queries the server has seen. It works only in `Pipeline.admin` and goes first. The optional `transformIdentifiers` (`{ algorithm: "hmac-sha-256", hmacKey }`) replaces field names in the result with hashes.
+
+<Snippet id="reference/aggregation/stages/query-stats" twoslash />
+
+An empty result means the server hasn't collected statistics yet.
+
+## listSampledQueries [#list-sampled-queries]
+
+`listSampledQueries` reads the sample of queries collected for sharding analysis. It works only in `Pipeline.admin`, goes first, and accepts an optional `namespace`.
+
+<Snippet id="reference/aggregation/stages/list-sampled-queries" twoslash />
+
+With and without `namespace`, the stage returned an empty list on the test server.
+
+## listClusterCatalog [#list-cluster-catalog]
+
+`listClusterCatalog` shows the cluster catalog: databases and collections. It requires MongoDB 8.1+ and goes first in a database pipeline. It accepts the optional `shards` and `balancingConfiguration`.
+
+<Snippet id="reference/aggregation/stages/list-cluster-catalog" twoslash />
+
+## shardedDataDistribution [#sharded-data-distribution]
+
+`shardedDataDistribution` shows how data is spread across shards. It works only in `Pipeline.admin`, goes first, and suits only the router of a sharded cluster. It has no arguments.
+
+<Snippet id="reference/aggregation/stages/sharded-data-distribution" twoslash />
+
+An ordinary server answers with a [`ServerError`](../errors/server-errors.mdx#server-error) with the text `The $shardedDataDistribution stage can only be run on router (code 6789101 Location6789101)`. The stage makes sense only on the router of a sharded cluster.
+
+## querySettings [#query-settings]
+
+`querySettings` shows the server's saved query settings. It requires MongoDB 8.0+, works only in `Pipeline.admin`, and goes first. It accepts an optional `showDebugQueryShape`.
+
+<Snippet id="reference/aggregation/stages/query-settings" twoslash />
+
+## changeStream [#change-stream]
+
+`changeStream` opens a change stream as an aggregation stage, and the rows are driver events. It's the first stage of a collection, database, or `admin` pipeline. You usually open a change stream through [`Model.watch`](../change-streams/watch.mdx). You need the stage when the change stream is part of a larger pipeline.
+
+<Snippet id="reference/aggregation/stages/change-stream" twoslash />
+
+The stage accepts `fullDocument`, `fullDocumentBeforeChange`, `resumeAfter`, `startAfter`, `startAtOperationTime`, `showExpandedEvents`, and `allChangesForCluster`. Only building the stage was verified.
+
+## changeStreamSplitLargeEvent [#change-stream-split-large-event]
+
+`changeStreamSplitLargeEvent` splits an event larger than 16 MB into parts so the change stream doesn't break. It's the **last** stage of a change stream pipeline. The builder is sealed after it, and you can't add a stage.
+
+<Snippet id="reference/aggregation/stages/change-stream-split-large-event" twoslash />
+
+The stage has no arguments. Rows get `splitEvent` fields for reassembling the parts. The tests built the stage and sent it to the server, but an event of that size wasn't reproduced.
+
+## out [#out]
+
+`out` writes the pipeline result into a collection and completely replaces its contents. It's the last stage. You can't add stages after it, and the result of `await` is an empty array, because there are no rows. An aggregation with `out` counts as a write, and a second `await` of the same query gives an error, see [`.exec`](./pipeline.mdx#exec).
+
+If the target is an entity, the compiler checks the rows against its fields. If a field is missing or has the wrong type, you get an error at the call site, not corrupted data in the collection. The message names the target and the field, for example `PathError<"the pipeline rows do not match the target model: check the field \"revenue\"">`. When the group key becomes the result's `_id`, the target must have an `_id` of the same type. Describe it with [`EntityWithId`](../schemas/base-classes.mdx#entity-with-id). An ordinary class with `_id!: string` is accepted too, but its `_id` type isn't checked in `findById` or in references, and `_id` stays mutable.
+
+<Snippet id="reference/aggregation/stages/out" twoslash />
+
+You can name the target with a string (`out("paid_orders")`, a collection in the same database) or with an object `{ db, coll }`. Both fields are required. Typemo rejects an object without `db` or without `coll` immediately, at build time, with a `ConfigurationError` `$out: a target object needs both "db" and "coll" as non-empty strings (got coll); to write into an entity, pass the class` (the object's keys are in the parentheses), not with a server text. In the object you can set `timeseries` (`timeField`, `metaField`, `granularity`). The name strings aren't checked.
+
+Typemo rejects a write into a tenant collection named by an entity or a model on the connection with a `StrictModeError` (the `tenant` rule) if the operation has no `allTenants: true`. Such a write would mix tenants. The guide is [Save the result](../../aggregation/output.mdx).
+
+## merge [#merge]
+
+`merge` writes the result into a collection and doesn't erase it. Matching documents are updated, and new ones are added. It's the last stage, and you need it to accumulate reports gradually.
+
+<Snippet id="reference/aggregation/stages/merge" twoslash />
+
+`into` is an entity or `{ db, coll }`. You can leave out `db`, and then the aggregation's own database is used. An object without `coll` gives a `ConfigurationError` `$merge: a target object needs "coll" (and "db" when given) as non-empty strings (got db); to write into an entity, pass the class`.
+
+`on` is the matching field or fields, and they need a unique index. `whenMatched` is `"replace"`, `"keepExisting"`, `"merge"`, `"fail"`, or an update pipeline where the new row is available as `v.new`. `whenNotMatched` is `"insert"`, `"discard"`, or `"fail"`. The `let` variables are available in the `whenMatched` pipeline.
+
+The compiler rejects rows that don't fit the `into` class the same way as for `out`, with the error `PathError<"the pipeline rows do not match the target model: check the field …">`. A write into a tenant collection is rejected the same way as for [`out`](#out).
+
+<Callout type="warning" title="A full recompute with addition doubles the totals">
+
+The example above runs the pipeline twice on the same data, and the totals **doubled**. `paid` became 420 instead of 210, and `open` became 80 instead of 40. `whenMatched` with `fn.add` adds the new row to the one already written, and the pipeline recomputes all the orders every time. There's no error, because that's how the server works. `merge` doesn't know the row has already been counted, and Typemo can't see that. Addition fits only when `match` selects just the new documents. For a full recompute, use `whenMatched: "replace"`, and a repeated run gives the same total.
+
+</Callout>
+
+## When not to use it [#when-not-to-use]
+
+Simple selections and counts are easier with model methods: [`find`](../query/reading.mdx#model.find), [`countDocuments`](../query/reading.mdx#model.count-documents), and [`distinct`](../query/reading.mdx#model.distinct). For a result you want stored permanently, see [`TypedView.define`](../collections/typed-view.mdx#typed-view.define) and [materialized views](../collections/materialized.mdx).

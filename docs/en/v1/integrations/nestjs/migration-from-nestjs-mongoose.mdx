@@ -1,0 +1,144 @@
+---
+title: Migrating from @nestjs/mongoose
+description: "What in @venloc/typemo-nestjs matches MongooseModule, @InjectModel, and the @nestjs/mongoose pipes, and how to move an app over step by step"
+icon: ArrowRightLeft
+---
+
+`@venloc/typemo-nestjs` is laid out the same way as `@nestjs/mongoose`: `forRoot` at the root, `forFeature` in modules, `@InjectModel` in services. What differs is what stands behind those names. A model is registered by class, not by a string, the schema is the entity class itself, and the model type is inferred. The package takes care of database errors and request body checks. Below are the mapping table and the order of the move.
+
+If you're also moving the models themselves from Mongoose to Typemo, read [Step-by-step migration](../../migration/step-by-step.mdx) first. This page covers only the Nest layer.
+
+## What you need [#prerequisites]
+
+A NestJS 12 app with `@nestjs/mongoose`, and entities already described as Typemo classes (`@Schema` and `@Prop` from `@venloc/typemo`).
+
+## Quick start [#quick-start]
+
+The root module, a feature module, and a service before and after the move.
+
+<Compare labels={["@nestjs/mongoose", "@venloc/typemo-nestjs"]}>
+
+<Snippet id="integrations/nestjs/migration-from-nestjs-mongoose/quick-start" />
+
+<Snippet id="integrations/nestjs/migration-from-nestjs-mongoose/quick-start-2" />
+
+</Compare>
+
+Below are the full mapping and the steps.
+
+## API mapping [#api-mapping]
+
+| `@nestjs/mongoose` | `@venloc/typemo-nestjs` | What changed |
+|---|---|---|
+| `MongooseModule.forRoot(uri, options)` | [`TypemoModule.forRoot(uri, options)`](../../reference/integrations/nestjs.mdx#typemo-module.for-root) | Typemo client options, plus `sync` for collections and indexes |
+| `MongooseModule.forRootAsync({ useFactory, useClass, useExisting, inject, imports })` | [`TypemoModule.forRootAsync(...)`](../../reference/integrations/nestjs.mdx#typemo-module.for-root-async) | the options class method is `createTypemoOptions`, with `uri` in the result |
+| `connectionName` | `name` | next to the factory, and a compile error in its result |
+| `retryAttempts`, `retryDelay` | the same | the total number of attempts, and errors a retry can't fix aren't retried |
+| `lazyConnection` | the same | `onClientCreate` is called with it too |
+| `connectionFactory(connection, name)` | [`clientFactory(client)`](../../reference/integrations/nestjs.mdx#client-factory) | |
+| `connectionErrorFactory(error)` | [`clientErrorFactory(error)`](../../reference/integrations/nestjs.mdx#client-error-factory) | |
+| `onConnectionCreate(connection)` | [`onClientCreate(client)`](../../reference/integrations/nestjs.mdx#on-client-create) | once per client, before the first model |
+| `MongooseModule.forFeature([{ name, schema, collection }], connectionName)` | [`TypemoModule.forFeature([Entity], { client, db })`](../../reference/integrations/nestjs.mdx#typemo-module.for-feature) | by class, the collection is set on the entity, `db` is another database of the client |
+| `discriminators: [{ name, schema, value }]` | a `@Discriminator` child in the same list | |
+| `MongooseModule.forFeatureAsync` | none | plugins go through `@Plugin` or `onClientCreate` |
+| `@InjectModel(Cat.name, connectionName)` | [`@InjectModel(Cat, { client, db })`](../../reference/integrations/nestjs.mdx#inject-model) | |
+| `@InjectConnection(name)` | [`@InjectConnection({ client, db })`](../../reference/integrations/nestjs.mdx#inject-connection) and [`@InjectClient(name)`](../../reference/integrations/nestjs.mdx#inject-client) | the database connection and the client are different objects |
+| `getModelToken(Cat.name)` | [`getModelToken(Cat)`](../../reference/integrations/nestjs.mdx#get-model-token) | a symbol, not a string |
+| `getConnectionToken(name)` | [`getConnectionToken({ client, db })`](../../reference/integrations/nestjs.mdx#get-connection-token), [`getClientToken(name)`](../../reference/integrations/nestjs.mdx#get-client-token) | |
+| `ParseObjectIdPipe`, `IsObjectIdPipe` | [`ParseIdPipe.for(Entity)`](../../reference/integrations/nestjs.mdx#parse-id-pipe) | any `_id` type |
+| `@Schema`, `@Prop`, `SchemaFactory`, `raw` | `@Schema`, `@Prop` from `@venloc/typemo` | the schema is the class itself |
+| `Model<CatDocument>` | `Model<Cat>` | the type is inferred from the class |
+| `connection.startSession()` + `session` in every operation | [`@Transactional()`](../../reference/integrations/nestjs.mdx#transactional) | the session is implicit |
+| — | [`TypemoExceptionFilter`](../../reference/integrations/nestjs.mdx#typemo-exception-filter), [`ValidateBodyPipe`](../../reference/integrations/nestjs.mdx#validate-body-pipe), [`PolicyInterceptor`](../../reference/integrations/nestjs.mdx#policy-interceptor) | new |
+
+## Move over step by step [#step-by-step]
+
+<Steps>
+<Step>
+
+### Install the package [#install]
+
+```package-install
+@venloc/typemo @venloc/typemo-nestjs mongodb
+```
+
+Keep `@nestjs/mongoose` and `mongoose` for now. You move the modules one at a time.
+
+</Step>
+<Step>
+
+### Add TypemoModule.forRoot next to MongooseModule.forRoot [#add-for-root]
+
+Both modules coexist in one app, and their tokens don't overlap. Typemo uses `TypemoClient:default` and symbol model tokens, and Mongoose uses the strings `DatabaseConnection` and `CatModel`. While the move is in progress, the app holds two connection pools to the same database.
+
+</Step>
+<Step>
+
+### Move a module [#migrate-module]
+
+In the feature module, replace `MongooseModule.forFeature` with `TypemoModule.forFeature([Cat])`, `@InjectModel(Cat.name)` with `@InjectModel(Cat)` from `@venloc/typemo-nestjs`, and the `Model<CatDocument>` type with `Model<Cat>` from `@venloc/typemo`. The compiler shows every place where the service used the Mongoose API: `.exec()`, callbacks, `lean<T>()` with a hand-written type.
+
+</Step>
+<Step>
+
+### Turn on the filter and pipes [#enable-filter-and-pipes]
+
+`app.useGlobalFilters(new TypemoExceptionFilter())` turns errors from Typemo models into responses. `ValidateBodyPipe.for(Entity)` replaces the DTOs that repeated the entity's fields, and `ParseIdPipe.for(Entity)` replaces `ParseObjectIdPipe`.
+
+</Step>
+<Step>
+
+### Remove Mongoose [#remove-mongoose]
+
+Once the last module is moved, remove `MongooseModule.forRoot` and the `@nestjs/mongoose` and `mongoose` packages.
+
+</Step>
+</Steps>
+
+## Differences your app will notice [#visible-differences]
+
+**Models by class.** In `@nestjs/mongoose` a typo in `@InjectModel("Cat")` shows up only at startup. And a model already created on the connection under that name is silently reused, even with a different schema. Here you pass the class to the decorator. There can be no typo, and two classes with the same name are two models.
+
+**`name` in the factory result.** In `@nestjs/mongoose`, `connectionName` inside `useFactory` compiled, then at startup the driver rejected the unknown option, and the module went into retries. Here it's a compile error, and if you bypass the types, one clear error with no retries.
+
+**`lazyConnection`.** With it, `@nestjs/mongoose` doesn't call `onConnectionCreate` and doesn't report a failed connection. Here `onClientCreate` is always called, and a failure is written to the log.
+
+**Retries.** In `@nestjs/mongoose` every attempt creates a new connection, and `onConnectionCreate` is called for each. Here there's one client, so `onClientCreate` is called once and extensions are registered once. A wrong password isn't retried.
+
+**An unknown field in the body.** Mongoose in strict mode silently drops it, and a request without a required field fails with a 500. In Typemo an unknown field is an error. Without the pipe, the filter responds 400 with the field name, and with `ValidateBodyPipe`, 422 with all the errors at once.
+
+**Database errors.** `@nestjs/mongoose` has no filter, and a duplicate key reaches the client as a 500. `TypemoExceptionFilter` responds 409 with the field names.
+
+**Collections and indexes.** Mongoose creates them when it compiles a model (`autoCreate`, `autoIndex`). Typemo doesn't write to the database until you ask it to, with `sync: "init"` or a deployment step.
+
+## When not to use it [#when-not-to-use]
+
+If the app stays on Mongoose, you don't need this package. It works only with Typemo models. And you can't move the Nest layer before the models, because `@InjectModel` from this package injects a Typemo model.
+
+## Troubleshooting [#troubleshooting]
+
+**The model token isn't found after replacing the import.** `@InjectModel` is imported from `@venloc/typemo-nestjs`, but the module still imports `MongooseModule.forFeature`. Replace `forFeature` too, because the two packages have different tokens.
+
+**The options class doesn't fit useClass.** The options class method is called `createTypemoOptions`, not `createMongooseOptions`, and it returns `uri` inside the object.
+
+## Full example [#full-example]
+
+The cats module after the move: the model, the service, and a controller with pipes.
+
+<Snippet id="integrations/nestjs/migration-from-nestjs-mongoose/full-example" title="cats/cats.module.ts" twoslash />
+
+This is the cats app from the tests of `@nestjs/mongoose` itself, rewritten for Typemo. Its tests ("should return created document", "should populate array of kittens") passed. There's one difference. A body with an unknown field gives a 500 there and a 400 with the field name here.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Connect Typemo to NestJS" href="./setup.mdx">
+  The module, models, and injection from the very beginning.
+</Card>
+<Card title="Step-by-step migration" href="../../migration/step-by-step.mdx">
+  How to move the models themselves from Mongoose to Typemo.
+</Card>
+<Card title="@venloc/typemo-nestjs" href="../../reference/integrations/nestjs.mdx">
+  Every option, decorator, and class.
+</Card>
+</Cards>

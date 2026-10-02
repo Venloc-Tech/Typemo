@@ -1,0 +1,124 @@
+---
+title: Read a predefined selection through a view
+description: "Describe a MongoDB view as a class, create it in the database, read typed rows, and update the definition after you change the pipeline"
+icon: Eye
+---
+
+A **view** is a predefined selection. MongoDB stores it as a pipeline over another collection and recomputes it on every read. For example, "only open accounts", "orders without personal data", or "a summary per customer". The app reads a view like a regular collection, and the selection conditions live in one place, the database, instead of being repeated in every query.
+
+In Typemo a view is described by `TypedView`. You define it with a class, and reads get the same types as a model.
+
+If you haven't worked with aggregation yet, start with [Your first aggregation](../aggregation/first-aggregation.mdx). A view's pipeline is assembled with the same builder.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and some accounts. The `accounts` collection has three documents.
+
+- Main: owner alice, balance 120, open.
+- Old: alice, 0, closed.
+- Savings: bob, 500, open.
+
+<Snippet id="collections/views/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Describe the class of a view row, define the view with [`TypedView.define`](../reference/collections/typed-view.mdx#typed-view.define), create it in the database with [`ensure`](../reference/collections/typed-view.mdx#typed-view.ensure), and read.
+
+<Snippet id="collections/views/quick-start" twoslash />
+
+We'll go through each step on real tasks below.
+
+## Describe a view [#define-view]
+
+You need a selection that the app reads in several places. The view class is written like an ordinary entity. Its `collection` is the name of the view, and its fields are what a row holds. The compiler checks the pipeline against the class, and if the pipeline doesn't produce some field of the class, the compiler points that out.
+
+<Snippet id="collections/views/define-view" title="accounts/open-account.ts" twoslash />
+
+`define` doesn't create anything in the database. It only remembers the definition. If `project` in the pipeline leaves out `owner` or `balance`, the compiler rejects the definition and tells you which fields of the class are missing from the result. The pipeline has limits: no `$out` or `$merge`, and the source must not use `dbName`. See the [`TypedView.define`](../reference/collections/typed-view.mdx#typed-view.define) reference.
+
+## Create the view in the database [#create-view]
+
+The definition exists, but the database doesn't have the view yet. There are two ways to create it. [`connection.init`](../reference/connection/connection.mdx#connection.init) and [`connection.syncAll`](../reference/connection/connection.mdx#connection.sync-all) create all defined views along with the collections. For a single view, call [`ensure`](../reference/collections/typed-view.mdx#typed-view.ensure).
+
+<Snippet id="collections/views/create-view" twoslash />
+
+Calling it again is safe. The second `ensure` saw that the view already matches the definition and did nothing. Syncing doesn't create a regular collection or indexes for a view class. [`connection.syncAll`](../reference/connection/connection.mdx#connection.sync-all) handles it as a view.
+
+Until the view is created, reading from it throws a [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configuration-error). The server would answer such a read with an empty result, as if there were no rows, and nobody would notice the forgotten create. So the first operation on a view checks that it exists.
+
+<Snippet id="collections/views/create-view-2" />
+
+Typemo remembers a view it has found and doesn't check it again. The details and limits of this rule are in the [`TypedView`](../reference/collections/typed-view.mdx#missing-view) reference.
+
+## Read rows [#read-rows]
+
+The app needs an owner's open accounts. `TypedView` has [`find`](../reference/collections/typed-view.mdx#typed-view.find), [`findOne`](../reference/collections/typed-view.mdx#typed-view.find-one), [`countDocuments`](../reference/collections/typed-view.mdx#typed-view.count-documents), [`distinct`](../reference/collections/typed-view.mdx#typed-view.distinct), and [`aggregate`](../reference/collections/typed-view.mdx#typed-view.aggregate). Filters are checked against the fields of the view class.
+
+<Snippet id="collections/views/read-rows" title="accounts/accounts.service.ts" twoslash />
+
+Rows come back as plain objects with the fields of the class, like a `.lean()` result, not as documents you can change and save. That's by design. You can't write to a view, so it has no `create`, `save`, or similar methods, and calling them won't compile. The closed account `Old` isn't in the result, because the server already applied the `closed: false` condition.
+
+## Keep secret fields out [#hide-secrets]
+
+Say an account has a hidden field like `pin`, and the view must not return it. Typemo itself puts a stage that removes the source's hidden fields ([`hidden`](../reference/schemas/prop.mdx#hidden)) at the start of the stored pipeline. View rows don't contain that field, even if your pipeline knows nothing about it.
+
+You can see it in the definition. For a source with a `pin` field, the first stage is `{ $unset: ["pin"] }`. See the [`TypedView.define`](../reference/collections/typed-view.mdx#stored-pipeline) reference.
+
+## Update the definition [#update-definition]
+
+You changed the pipeline, but the database still has the old definition. By default [`ensure`](../reference/collections/typed-view.mdx#typed-view.ensure) refuses to change an existing view and throws a [`CollectionOptionsError`](../reference/errors/configuration-errors.mdx#collection-options-error). A view in use shouldn't change by accident.
+
+<Snippet id="collections/views/update-definition" />
+
+To see the difference, call `ensure({ dryRun: true })`. The report has `result: "updated"` and a difference with `option: "pipeline"`. To apply it, call `ensure({ update: true })`, and with [`connection.syncAll`](../reference/connection/connection.mdx#connection.sync-all) the `update: true` option does the same. Both calls were verified on a server.
+
+A view's collation rule can't be changed this way. You'll have to drop the view with [`drop`](../reference/collections/typed-view.mdx#typed-view.drop) and create it again.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether the result must always be fresh and how often it's read**.
+
+- **The result reflects the current state, and it's read moderately**: use a view. It stores nothing and never goes stale.
+- **The selection is heavy, it's read often, and a small delay is fine**: save the result as a [materialized view](./materialized-views.mdx). Reads are fast, and you refresh the result yourself.
+
+## When not to use it [#when-not-to-use]
+
+If you need the selection in one place, an ordinary [`find`](../reference/query/reading.mdx#model.find) with a filter is enough. A view is one more object in the database to keep an eye on. If you need to change data through the selection, a view won't do, since it's read-only. And for a one-off report, use an [aggregation](../aggregation/first-aggregation.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**A `ConfigurationError` because the view doesn't exist.** The text contains `the view "open_accounts" does not exist`. The view is defined but wasn't created on the server. Call [`ensure`](../reference/collections/typed-view.mdx#typed-view.ensure) at startup, or [`connection.init`](../reference/connection/connection.mdx#connection.init).
+
+**The view is empty.** A read returned `[]`, even though the source has data. First check the `match` condition in the pipeline. Maybe it lets nothing through. It also happens that the view was created and read, and then someone dropped it behind Typemo's back. The server then answers with an empty result, and there's no second existence check, so call [`ensure`](../reference/collections/typed-view.mdx#typed-view.ensure) and create it again.
+
+**The compiler rejects the pipeline.** The definition doesn't compile, and the error names the fields. The pipeline doesn't produce every field of the class, or the types don't match. Add the missing fields to `project` or remove them from the class.
+
+**`already defined on this connection`.** The connection already has a view with that name but a different definition: `ConfigurationError: view "open_accounts" is already defined on this connection with another definition`. Define each view once, in its own file, and import it from there. Defining it again with the same pipeline isn't an error.
+
+**A collection sits under the view's name.** [`ensure`](../reference/collections/typed-view.mdx#typed-view.ensure) refuses to work (`exists as a collection, not a view: drop it or rename the view`), [`drop`](../reference/collections/typed-view.mdx#typed-view.drop) won't drop it (`is a collection, not a view: drop() only drops views`), and a read throws a `ConfigurationError` (`"open_accounts" is a collection, not the view; drop it or rename the view, then create the view`). Rename the view or drop the collection by hand.
+
+## Full example [#full-example]
+
+Here's a view and a service that reads it. At startup the view is created along with everything else.
+
+<Snippet id="collections/views/full-example" title="accounts/open-accounts.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose you create a view with `createCollection` and `viewOn` and `pipeline`, and the model on top of it stays an ordinary one, with write methods the server will reject. In Typemo a [`TypedView`](../reference/collections/typed-view.mdx) has only read methods, and the compiler checks the pipeline against the row class. A definition that differs from the database is an error, not a silent skip.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Save an aggregation result and keep it up to date" href="./materialized-views.mdx">
+  Save the result of an aggregation to a collection and refresh it on command.
+</Card>
+<Card title="Create collections with options" href="./create.mdx">
+  Collection options and the order of creation at startup.
+</Card>
+<Card title="TypedView" href="../reference/collections/typed-view.mdx">
+  Every view method, its types, and its errors.
+</Card>
+</Cards>

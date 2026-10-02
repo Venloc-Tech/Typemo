@@ -1,0 +1,89 @@
+---
+title: Test your app
+description: "Set up a test database, create data with factories, and check that a query uses an index"
+icon: FlaskConical
+---
+
+Tests of a Typemo app run against a real MongoDB. Casting errors, unique indexes, transactions, and query plans can't be reproduced with a fake. To keep these tests short, the package ships two things: **factories** for test data and **index checks**. An index check fails the test when a query stops using an index.
+
+All of it lives in a separate entry point, `@venloc/typemo/testing`. You start the test server yourself.
+
+## What you need [#prerequisites]
+
+The account model below and the `bun:test` runner. With another runner the code stays the same. The test database is a separate one, not your production database, and the app reads its connection string from configuration. If your tests need transactions or change streams, the database must be a replica set (several MongoDB servers holding copies of the same data, though one server is enough for transactions).
+
+<Snippet id="reference/observability/sentry/intro" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Describe a factory once, and a test creates its data in one line.
+
+<Snippet id="testing/testing-apps/quick-start" twoslash />
+
+We'll cover preparing the database, factories, and index checks below.
+
+## Prepare a clean database for a test [#clean-test-database]
+
+Every test should see only its own data. The most reliable way is a separate database per test suite, with the collections cleared between tests.
+
+An empty filter in [`deleteMany`](../reference/writes/writes.mdx#delete-many) is forbidden. In production code one typo would delete the whole collection. In a test, though, "delete everything" is exactly what you want, so say it explicitly with [`Filters.all()`](../reference/policies/violations.mdx#filters.all). You can also drop and recreate the whole database through the driver, as described in [Driver access](../connection/driver-access.mdx).
+
+<Snippet id="testing/testing-apps/clean-test-database" title="accounts/accounts.test.ts" />
+
+Don't skip `syncIndexes`. It creates the indexes from the schema, and without them your uniqueness and plan tests prove nothing. Close the client in `afterAll`, or the runner won't exit.
+
+## Create data with factories [#factories]
+
+Say a test needs three accounts, and only one field matters. A factory takes its defaults from a function of the sequence number (1, 2, …), so a unique `title` never clashes. In the test you override only what you need.
+
+<Snippet id="testing/testing-apps/factories" twoslash />
+
+`build` only assembles the data, and `create` also saves it. The factory has one shared counter, so the second call gets number 2. If the numbers shouldn't depend on the order the tests run in, call `accountFactory.reset()` between tests.
+
+The compiler checks the factory. Rename `balance` in the model, and the factory stops compiling, instead of a test failing later in some unexpected place. See the reference for [`defineFactory`](../reference/testing/testing.mdx#define-factory) and [`Factory`](../reference/testing/testing.mdx#factory).
+
+## Check that a query uses an index [#check-index-used]
+
+Sometimes a field gets renamed or a filter changes, and a query quietly starts reading the whole collection. [`expectIndexScan`](../reference/testing/testing.mdx#expect-index-scan) runs `explain` and throws [`IndexUsageError`](../reference/testing/testing.mdx#index-usage-error) if no index is used.
+
+<Snippet id="testing/testing-apps/check-index-used" title="accounts/accounts.test.ts" />
+
+For a field without an index the same test fails with `the query is not served by an index: it scans the whole collection (COLLSCAN). plan: COLLSCAN; examined 3 documents, returned 3`.
+
+If a field has no index on purpose, pin that down with [`expectCollScan`](../reference/testing/testing.mdx#expect-coll-scan). The test then breaks when someone adds an index or the query changes. [`explainIndexUsage`](../reference/testing/testing.mdx#explain-index-usage) gives you the raw plan report. How to read a plan and choose an index is covered in [Query performance](../queries/performance.mdx#test-index).
+
+## How to choose [#how-to-choose]
+
+Ask yourself **what should break the test**.
+
+- **Wrong data in the response**: ordinary assertions on the result are enough.
+- **The query must stay fast**: add `expectIndexScan` with `maxDocsExamined`.
+- **A specific index matters**: set `index`.
+
+## When not to use it [#when-not-to-use]
+
+Don't put `expectIndexScan` on every query. A small collection in a test can get any plan, so the check belongs only where speed is part of what your app promises. And don't call these checks from production code, since each one runs an extra `explain`.
+
+## Troubleshooting [#troubleshooting]
+
+**A uniqueness test passes even though there's no index.** `syncIndexes` creates the indexes. They don't appear on their own when you connect. Call it in `beforeAll`, or the duplicate goes in without an error.
+
+**A factory fails with `count must be a non-negative integer`.** `buildMany` and `createMany` accept only a non-negative integer and got something else: `TypemoError: defineFactory: count must be a non-negative integer, got -1`. Pass the number of documents, not a length that can go negative.
+
+**`covered: true` fails for a query that uses an index.** `expectIndexScan(query, { covered: true })` fails with `it is not covered by the index (it fetches documents)` if the server read even one document. `findById` and `find` by a unique field read the whole document, even when the index has already found it.
+
+A query becomes covered when `select` asks only for fields of the index and leaves out `_id`. For example, `Accounts.find({ title: { $gte: "A" } }).select({ title: 1, _id: 0 })` gives `covered: true` and `docsExamined: 0`. See the reference for [`explainIndexUsage`](../reference/testing/testing.mdx#explain-index-usage).
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="@venloc/typemo/testing" href="../reference/testing/testing.mdx">
+  Every function, type, and error text.
+</Card>
+<Card title="Type tests for your models" href="./type-tests.mdx">
+  Check that the types of a model and its responses are what you meant.
+</Card>
+<Card title="Query performance" href="../queries/performance.mdx">
+  The query plan, indexes, and `explain`.
+</Card>
+</Cards>

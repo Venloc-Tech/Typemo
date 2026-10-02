@@ -1,0 +1,149 @@
+---
+title: Database-level queries
+description: "Run an aggregation without a collection: literal documents, server operations, and sessions through connection.aggregate and client.aggregate"
+icon: Database
+---
+
+An ordinary aggregation reads the documents of one collection and runs through a model. But some stages have no collection.
+
+- [`documents`](../reference/aggregation/stages.mdx#documents) emits documents you write right in the pipeline.
+- [`currentOp`](../reference/aggregation/stages.mdx#current-op) lists the operations the server is running now.
+- [`listLocalSessions`](../reference/aggregation/stages.mdx#list-local-sessions) shows open sessions.
+
+Such aggregations are called **database-level queries**. They have no model, but they have a database, or the whole server, that they address. Typemo runs them with the [`connection.aggregate`](../reference/connection/connection.mdx#connection.aggregate) and [`client.aggregate`](../reference/connection/typemo-client.mdx#client.aggregate) methods. They can do what `Model.aggregate` does: a cursor, the server's plan, transactions, `timeoutMS`, Typemo errors. Only hooks are missing, because hooks are attached to models.
+
+If you haven't built pipelines yet, start with [Your first aggregation](./first-aggregation.mdx). This page assumes you already know what a stage and a plan are.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and an account model with soft delete. The `accounts` collection holds two accounts, `ann@example.com` and `bob@example.com`, and the second one is deleted.
+
+<Snippet id="aggregation/database-level/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+A database-level query has two parts. [`Pipeline.database`](../reference/aggregation/pipeline.mdx#pipeline.database), [`Pipeline.admin`](../reference/aggregation/pipeline.mdx#pipeline.admin), or [`Pipeline.sessions`](../reference/aggregation/pipeline.mdx#pipeline.sessions) builds the plan, and a call of `client.aggregate(plan)` runs it.
+
+<Snippet id="aggregation/database-level/quick-start" twoslash />
+
+Below we'll cover where each plan runs, which tasks it's for, and how a database-level query differs from a model query.
+
+## Choose where a plan runs [#choose-plan-target]
+
+The plan itself decides where it runs, not the method you run it with.
+
+- [`Pipeline.database()`](../reference/aggregation/pipeline.mdx#pipeline.database) works in the connection's database. [`connection.aggregate`](../reference/connection/connection.mdx#connection.aggregate) takes that connection's database, and [`client.aggregate`](../reference/connection/typemo-client.mdx#client.aggregate) takes the client's default database.
+- [`Pipeline.admin()`](../reference/aggregation/pipeline.mdx#pipeline.admin) always runs in the `admin` database, since only there does the server allow system stages such as `currentOp`.
+- [`Pipeline.sessions()`](../reference/aggregation/pipeline.mdx#pipeline.sessions) always reads the `config.system.sessions` collection. Only there does the server accept the [`listSessions`](../reference/aggregation/stages.mdx#list-sessions) stage.
+
+Whichever connection you take, `admin` and `config.system.sessions` stay the same.
+
+That's what decides the method. `client.aggregate` is shorter when there's one connection and the default database suits you. You need `connection.aggregate` when you work with several databases of one client and `Pipeline.database()` has to run in a specific one.
+
+<Snippet id="aggregation/database-level/choose-plan-target" twoslash />
+
+One plan ran in two databases, `shop` and `archive`. With literal documents you don't see a difference. But stages that read the database, such as `listClusterCatalog`, show the content of exactly the database where they ran.
+
+## Check a list of values against a collection [#validate-against-collection]
+
+Say you're importing a list of emails and want to know which of them already belong to accounts. The list came from a user, and it isn't in the database. The [`documents`](../reference/aggregation/stages.mdx#documents) stage turns the array into pipeline rows, [`lookup`](../reference/aggregation/stages.mdx#lookup) pulls the accounts into them, and [`client.aggregate`](../reference/connection/typemo-client.mdx#client.aggregate) runs the plan.
+
+<Snippet id="aggregation/database-level/validate-against-collection" twoslash />
+
+Notice Bob. He's in the list, and his document is in the collection, but it's soft-deleted, so he has zero pulled-in accounts. Typemo takes the policies of the pulled-in collection from the `Account` class named in `from`, and they work as in an ordinary read. Soft delete, the tenant field, and hidden fields apply even if the pipeline started without a collection. You don't need to register the `Account` model on the connection for this.
+
+For a tenant collection, Typemo rejects a plan without a tenant before it reaches the server, as it does for a model query. Hooks, however, aren't called, because a database-level query has no model for them to hang on.
+
+## See what's running on the server [#current-operations]
+
+When the server is slow, the first thing you check is what it's busy with: which queries are running and for how long. The [`currentOp`](../reference/aggregation/stages.mdx#current-op) stage answers that. It works only in the `admin` database, so [`Pipeline.admin()`](../reference/aggregation/pipeline.mdx#pipeline.admin) builds its plan.
+
+<Snippet id="aggregation/database-level/current-operations" title="ops/current-ops.ts" twoslash />
+
+A `currentOp` row describes one operation: `type`, `active`, `op` (the kind of operation), `ns` (the collection), and other fields. The set of the remaining fields differs between operations, so their type is `unknown`. The `allUsers`, `idleConnections`, `idleCursors`, `idleSessions`, `localOps`, and `backtrace` parameters turn on the corresponding details.
+
+## See sessions [#sessions]
+
+A **session** is a context in which the server tracks a client's operations, transactions included. Two different stages show the list of sessions, and they run in different places. [`listLocalSessions`](../reference/aggregation/stages.mdx#list-local-sessions) shows the sessions the server holds in memory right now, and it works in [`Pipeline.database()`](../reference/aggregation/pipeline.mdx#pipeline.database) or [`Pipeline.admin()`](../reference/aggregation/pipeline.mdx#pipeline.admin). [`listSessions`](../reference/aggregation/stages.mdx#list-sessions) reads what the server wrote to `config.system.sessions`, and it has its own [`Pipeline.sessions()`](../reference/aggregation/pipeline.mdx#pipeline.sessions).
+
+<Snippet id="aggregation/database-level/sessions" twoslash />
+
+The second result is empty, and that's not an error. The server writes sessions to `config.system.sessions` about every five minutes, and on a freshly started server it's still empty there. `listLocalSessions` shows the live sessions, including the session of the query itself.
+
+The row of both stages is a `SessionRow`. It holds `_id` with the session identifier (`id`) and the user identifier (`uid`), the last-use time `lastUse`, and `user` if the session is authenticated.
+
+## Read the result the same way as for a model [#read-like-model]
+
+[`client.aggregate`](../reference/connection/typemo-client.mdx#client.aggregate) returns the same query as [`Model.aggregate`](../reference/aggregation/pipeline.mdx#model.aggregate), so everything you know about an aggregation query works here too. [`.plain()`](../reference/aggregation/pipeline.mdx#plain) turns identifiers and `bigint` into strings for a client response, [`.cursor()`](../reference/aggregation/pipeline.mdx#cursor) hands out rows one at a time, and [`.explain()`](../reference/aggregation/pipeline.mdx#explain) shows the server's plan.
+
+<Snippet id="aggregation/database-level/read-like-model" twoslash />
+
+Run parameters go in the second argument or in a chain. `client.aggregate(plan, { timeoutMS: 5_000 })` and `client.aggregate(plan).timeoutMS(5_000)` do the same thing. `session`, `timeoutMS`, and `policy` are accepted. A negative or non-integer time gives `QueryError: timeoutMS must be a non-negative integer, got -5 (number)`, and an unknown policy key gives `QueryError: options.policy: unknown policy value "nope" (known: tenant, allTenants, actor, includeDeleted, onlyDeleted, hardDelete)`.
+
+Inside [`transaction`](../reference/connection/typemo-client.mdx#client.transaction) the query joins the transaction on its own, like a model query. The transaction's read settings apply in full, so a `readConcern` of its own is forbidden inside it.
+
+<Snippet id="aggregation/database-level/read-like-model-2" />
+
+The error names the method you called, `client.aggregate` or `connection.aggregate`, so you see right away which place in your code caused it. Server errors arrive as a [`ServerError`](../reference/errors/server-errors.mdx#server-error) with the original driver error in `cause`. For example, `currentOp` in an ordinary database, bypassing the types, gives `ServerError: $currentOp must be run against the 'admin' database with {aggregate: 1} (code 73 InvalidNamespace)`.
+
+## What event subscribers see [#subscriber-view]
+
+A database-level query goes through the same operation pipeline, and subscribers of [`client.instrument`](../reference/connection/typemo-client.mdx#client.instrument) get its events. There's one difference: there's no model. So `model`, `collection`, and `schema` in the event are `null`, and `database` names the database where the query ran. For a `Pipeline.sessions()` plan, the collection is `"system.sessions"` and the database is `"config"`.
+
+<Snippet id="aggregation/database-level/subscriber-view" twoslash />
+
+If a subscriber groups operations by model, have it account for `null`. Such events don't belong to any model. The event fields are described in the [`OperationInfo`](../reference/observability/events.mdx#operation-info) reference.
+
+## How to choose [#how-to-choose]
+
+Ask yourself whose documents you're reading.
+
+- **A model's documents**: use [`Model.aggregate`](../reference/aggregation/pipeline.mdx#model.aggregate). It applies the model's policies and removes hidden fields with the first stage.
+- **There are no model documents** (a list of values from a user, the server's state, sessions): use [`client.aggregate`](../reference/connection/typemo-client.mdx#client.aggregate) or [`connection.aggregate`](../reference/connection/connection.mdx#connection.aggregate).
+
+Choose between the last two by database. `client.aggregate` works with the client's default database, `connection.aggregate` with its connection's database.
+
+## When not to use it [#when-not-to-use]
+
+If you need not an aggregation but a server command that Typemo doesn't have, use [`client.unsafeDriver()`](../reference/connection/typemo-client.mdx#client.unsafe-driver). It gives you the real `MongoClient`. Keep in mind that Typemo's policies don't apply to such calls, and there are no operation events. For model data you don't need a database-level query, because the [system stages](./system.mdx) show a collection's statistics and indexes through the model itself.
+
+## Troubleshooting [#troubleshooting]
+
+**A collection plan passed to `client.aggregate`.** A plan from [`Pipeline.from(Order)`](../reference/aggregation/pipeline.mdx#pipeline.from) reads the model's collection, and the model has to run it so that its policies apply. [`client.aggregate`](../reference/connection/typemo-client.mdx#client.aggregate) rejects such a plan right away, before it reaches the database.
+
+<Snippet id="aggregation/database-level/troubleshooting" />
+
+Run it with [`Orders.aggregate(plan)`](../reference/aggregation/pipeline.mdx#model.aggregate).
+
+**A database plan passed to a model.** The reverse case. [`Model.aggregate`](../reference/aggregation/pipeline.mdx#model.aggregate) accepts only a plan for its own collection, and it rejects a [`Pipeline.database()`](../reference/aggregation/pipeline.mdx#pipeline.database) or [`Pipeline.sessions()`](../reference/aggregation/pipeline.mdx#pipeline.sessions) plan.
+
+<Snippet id="aggregation/database-level/troubleshooting-2" />
+
+The text names the right method.
+
+**A stage in the wrong plan.** Each system stage has its own place, and the compiler enforces it. [`currentOp`](../reference/aggregation/stages.mdx#current-op) exists only on [`Pipeline.admin()`](../reference/aggregation/pipeline.mdx#pipeline.admin). In a plan for a user database the server would reject it, so the method isn't there.
+
+<Snippet id="aggregation/database-level/troubleshooting-3" twoslash />
+
+Likewise, `listSessions` exists only on `Pipeline.sessions()`, which has no `out` or `merge` at all, because a sessions plan only reads.
+
+## Full example [#full-example]
+
+<Snippet id="aggregation/database-level/full-example" title="ops/monitoring.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="System aggregations" href="./system.mdx">
+  Collection and index statistics, query plans, and other system stages.
+</Card>
+<Card title="Pipeline and Model.aggregate" href="../reference/aggregation/pipeline.mdx#pipeline.database">
+  All three entry points, `AggregatePlan`, and `AggregateExecutionPlan`.
+</Card>
+<Card title="Connection" href="../reference/connection/connection.mdx#connection.aggregate">
+  The parameters, errors, and message texts of the connection method.
+</Card>
+<Card title="Operation events" href="../observability/events.mdx">
+  Subscribe to operations and see what `model: null` means.
+</Card>
+</Cards>

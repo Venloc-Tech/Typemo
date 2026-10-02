@@ -1,0 +1,122 @@
+---
+title: Delete documents
+description: "Delete one or many documents, get the deleted document back, and see how all of it works with soft delete"
+icon: Trash2
+---
+
+[`deleteOne`](../reference/writes/writes.mdx#delete-one) deletes a document. It takes the first document that matches the filter, deletes it, and returns a counter. For several documents there's [`deleteMany`](../reference/writes/writes.mdx#delete-many), and if you still need the deleted document, there's [`findOneAndDelete`](../reference/writes/writes.mdx#find-one-and-delete) and [`findByIdAndDelete`](../reference/writes/writes.mdx#find-by-id-and-delete).
+
+A delete can't be undone, so it has more safeguards than other writes. Every delete method requires a non-empty filter, and a model with soft delete doesn't physically erase the document.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the account model from [Create documents](./create.mdx). The collection holds three accounts: `Main` and `Second` belong to `alice`, `Other` to `bob`. Every example starts with this data.
+
+<Snippet id="writes/delete/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Delete one document, delete many, and delete with the document returned.
+
+<Snippet id="writes/delete/quick-start" twoslash />
+
+Below we'll cover each way and soft delete.
+
+## Delete one document [#delete-one]
+
+A user closed an account. Call `deleteOne` with a filter that picks this account.
+
+<Snippet id="writes/delete/delete-one" title="accounts/accounts.service.ts" twoslash />
+
+The method returned a [`DeleteResult`](../reference/writes/writes.mdx#delete-result), where `deletedCount` is how many documents were deleted. If nothing matched, the method **doesn't throw** and returns `deletedCount: 0`. "Nothing to delete" is a normal outcome. If it's a failure for you, add [`.orFail()`](../reference/writes/writes.mdx#or-fail).
+
+<Snippet id="writes/delete/delete-one-2" twoslash />
+
+<Snippet id="reference/writes/writes/nothing-deleted" />
+
+The filter of `deleteOne` is required and can't be empty. With an empty filter, "the first matching document" is any document in the collection, not the one you meant. A `{}` literal won't compile, and an empty object built at runtime gives a `StrictModeError` with the reason `empty-filter`. If you really need to delete any document at all, pass [`Filters.all()`](../reference/policies/violations.mdx#filters.all).
+
+## Delete many documents [#delete-many]
+
+An owner is gone, and all their accounts have to go too. `deleteMany` deletes every document that matches the filter.
+
+<Snippet id="writes/delete/delete-many" twoslash />
+
+The filter of `deleteMany` is required and non-empty too. In MongoDB an empty filter matches every document, and filters are often built from data. One typo, and the collection is empty. So Typemo refuses.
+
+<Snippet id="reference/policies/violations/empty-filter" />
+
+How to delete everything on purpose is covered in [Empty filters in writes](./empty-filters.mdx). If the filter is built from an optional parameter, remember that `undefined` in a filter is an error too, `QueryError: filter: undefined at "owner" (use $exists: false / $unset; undefined is never a value)`. That way it can't turn into "delete anything".
+
+## Delete a document and get it back [#delete-and-return]
+
+Sometimes you need to keep a copy before deleting, show the client "record deleted", or take a job from a queue and delete it at once. [`findOneAndDelete`](../reference/writes/writes.mdx#find-one-and-delete) deletes a document and returns it as it was. The delete and the read run in one command, and nobody can slip in between them.
+
+<Snippet id="reference/writes/writes/find-one-and-delete" twoslash />
+
+You get a query builder, as from [`find`](../reference/query/reading.mdx#model.find), and you can add [`.plain`](../reference/query/reading.mdx#plain), [`.select`](../reference/query/reading.mdx#select), and [`.orFail`](../reference/query/reading.mdx#or-fail) to it. If nothing is found, you get `null`.
+
+The filter of `findOneAndDelete` is required and non-empty. The method picks a document to delete, and an empty filter would pick a random one. When you know the `_id`, there's [`findByIdAndDelete`](../reference/writes/writes.mdx#find-by-id-and-delete). It accepts an `ObjectId` or its string of 24 hex characters, and returns `null` for a document that doesn't exist.
+
+<Snippet id="writes/delete/delete-and-return" title="accounts/accounts.service.ts" twoslash />
+
+## Soft delete [#soft-delete]
+
+Deleted accounts have to be kept for audit, but not shown. For that a model has **soft delete**. The document isn't erased. It gets a timestamp, and every query stops seeing it. You turn it on in the schema, and `deleteOne` and `deleteMany` work as before.
+
+<Snippet id="writes/delete/soft-delete" twoslash />
+
+Of the two notes, `first` and `second`, the first is marked as deleted. A normal query sees one, and with `.policy({ includeDeleted: true })` it sees both. To erase a document physically, add `.policy({ hardDelete: true })`.
+
+<Snippet id="writes/delete/soft-delete-2" twoslash />
+
+The second note is physically deleted, and the first one is still marked. How to turn on soft delete, restore documents, and purge old ones is covered in [Delete with a way to restore](../policies/soft-delete.mdx).
+
+## How to choose [#how-to-choose]
+
+Ask yourself whether you need the data after the delete.
+
+- **The calling code needs it** to show it or archive it. Use [`findOneAndDelete`](../reference/writes/writes.mdx#find-one-and-delete), which returns the data and deletes it in one command.
+- **You need it for audit and restore**: turn on soft delete in the schema instead of adding your own "deleted" field.
+- **Nobody needs it**: [`deleteOne`](../reference/writes/writes.mdx#delete-one) or [`deleteMany`](../reference/writes/writes.mdx#delete-many).
+
+After that, the number of documents decides. One means `deleteOne`, many means `deleteMany`.
+
+## When not to use it [#when-not-to-use]
+
+If the document only has to disappear from queries and maybe come back later, a physical delete doesn't fit. Use soft delete. If the document is already loaded as an object, it has its own [`$deleteOne`](../reference/documents/document-api.mdx#delete-one). And if the delete has to go through together with other writes, all or nothing, run them in a transaction, see [Transactions](../transactions/transactions.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**An empty filter in `deleteMany`.** You can't do this.
+
+<Snippet id="writes/delete/troubleshooting" twoslash />
+
+A type with an optional field compiles, but at runtime Typemo stops the write with `StrictModeError: deleteMany with an empty filter would affect every document; … [empty-filter]`. A `{}` literal would be stopped by the compiler already. Pass a real condition, and if you need to delete everything, say so [explicitly](./empty-filters.mdx) with `Filters.all()`.
+
+**`deleteOne` silently deleted nothing.** The code keeps running, and the document is still there. If nothing matches, `deleteOne` returns `deletedCount: 0`, not an error. Check `deletedCount` or add `.orFail()`.
+
+**A filter from an optional parameter.** For example, `Accounts.deleteMany({ owner })`, where `owner` may turn out to be `undefined`. Typemo rejects such a filter with `QueryError: filter: undefined at "owner" …`. Check the parameter before the call, and don't pass such a filter if there's no condition.
+
+## Full example [#full-example]
+
+Everything in one file: close an account and check the result, remove all of an owner's accounts, and return the deleted account to the calling code.
+
+<Snippet id="writes/delete/full-example" title="accounts/accounts.service.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Empty filters in writes" href="./empty-filters.mdx">
+  Why delete methods don't accept `{}` and how to delete everything on purpose.
+</Card>
+<Card title="Delete with a way to restore" href="../policies/soft-delete.mdx">
+  Turn on soft delete, restore documents, and purge old ones.
+</Card>
+<Card title="Bulk writes" href="./bulk.mdx">
+  Deletes together with inserts and updates in one request.
+</Card>
+<Card title="Writing" href="../reference/writes/writes.mdx#delete-one">
+  Every delete method, its results, and errors.
+</Card>
+</Cards>

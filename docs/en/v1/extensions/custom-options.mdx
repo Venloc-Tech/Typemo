@@ -1,0 +1,123 @@
+---
+title: Add your own field and schema options
+description: "Add your own key to the ext of fields and schemas, check its values when the schema compiles, and read them from the schema description"
+icon: SlidersHorizontal
+---
+
+`@Prop` and `@Schema` have an `ext` option, a place for settings the Typemo core doesn't have. Libraries and your own code put field or model metadata there. For example, a caption for the UI, export rules, or search flags.
+
+An extension adds your own key to `ext`. You declare the type of the key, register a check for its value, and then read the values from the schema description. An extension only stores and checks metadata. It doesn't change operations and doesn't bypass policies.
+
+If you need to change how queries behave, an extension won't help. See [Hook into an operation](../hooks/operation-hooks.mdx). Where extensions get registered in general is covered in [Multiple clients and extensions](../connection/clients-and-extensions.mdx).
+
+## What you need [#prerequisites]
+
+A client connected as in [Connect to the database](../connection/connect.mdx). Here `client` is a `TypemoClient`. Every example uses one extension, `label`, a field caption for the UI.
+
+## Quick start [#quick-start]
+
+An extension takes three steps. Declare the type of the key, register a check, and use the key in `ext`.
+
+<Snippet id="extensions/custom-options/quick-start" title="extensions/label.ts" twoslash />
+
+We'll go through each step, schema keys, and reading the values below.
+
+## Declare the type of the key [#declare-key-type]
+
+This step is for the compiler. It needs to know that `ext` has a `label` key and what its value looks like. The core declares two empty interfaces: `PropExtensions` for fields and `SchemaExtensions` for schemas. You add your key to them with a module declaration, and TypeScript merges such declarations into one interface.
+
+<Snippet id="extensions/custom-options/declare-key-type" twoslash />
+
+The `V` parameter of `PropExtensions` is the type of the field's value. Through it the option gets typed by the field's value, so `format` on a numeric field receives a number. The parameter must be named exactly `V` in every declaration, because TypeScript requires it. The compiler rejects a key with the wrong value type, as well as a key that doesn't exist at all.
+
+<Snippet id="extensions/custom-options/declare-key-type-2" twoslash />
+
+## Register a check [#register-check]
+
+A type protects only TypeScript code. The compiler doesn't see values from JavaScript or from configuration. So an extension registers a check function. It receives the value as `unknown` and throws if the value is wrong. To register it, use [`Typemo.use`](../reference/connection/typemo.mdx#typemo.use) for all clients or [`client.use`](../reference/connection/typemo-client.mdx#client.use) for one.
+
+<Snippet id="extensions/custom-options/register-check" twoslash />
+
+The key is allowed only where there's a check. `validateProp` allows it on fields and `validateSchema` on schemas, and you need at least one of them. As its second argument the check gets a description of the place, such as the kind of field or its path. For a field that's [`ExtensionFieldInfo`](../reference/extensions/extensions.mdx#extension-field-info), for a schema [`ExtensionSchemaInfo`](../reference/extensions/extensions.mdx#extension-schema-info). Typemo adds the field's address to the error message itself.
+
+The check runs when the schema compiles, that is on the first [`connection.model`](../reference/connection/connection.mdx#connection.model), not on the first write. Its error becomes the `cause` of a `ConfigurationError`, and the message names the field. Here's what you get for `ext: { label: { text: "" } }` on the field `Bad.a` with the check above.
+
+<Snippet id="extensions/custom-options/register-check-2" />
+
+## Use the key on a field and a schema [#use-key]
+
+You pass the extension's value in the `ext` option of `@Prop` and `@Schema`. On fields the key works everywhere, including fields of nested objects, arrays, subdocuments, and Maps.
+
+<Snippet id="extensions/custom-options/use-key" twoslash />
+
+Look at `value` in `format`. It's a number, because the compiler took the type from the field. `title` has its own caption, and the schema has its own name. The values are copied and frozen, so neither the check nor the readers can change them. Your object in `@Prop` stays untouched.
+
+## Read the values [#read-values]
+
+The values live in the schema description, [`SchemaInfo`](../reference/schemas/schema-info.mdx). For the schema it's `model.schema.ext`, for a field `model.schema.extOf(path)`. The same `SchemaInfo` arrives in the `schema` field of every operation event. So an event subscriber can read its extension's options from the model of the operation.
+
+<Snippet id="extensions/custom-options/read-values" twoslash />
+
+The field with the extension returned its value, a field without options returned an empty object, and a path that doesn't exist returned `undefined`. The type of the values is `Readonly<Record<string, unknown>>`, because in `extOf` the compiler doesn't know the type of the key. Narrow it yourself. The check you registered guarantees the shape.
+
+## An extension for one client or for all [#per-client-or-global]
+
+All clients see `Typemo.use`, and only the models of that client see `client.use`. A model that uses the key on a client without the extension won't compile. The error text is the same for both ways of registering.
+
+<Snippet id="extensions/custom-options/per-client-or-global" />
+
+Make both calls before the client's first model. The two levels are compared in detail in [Multiple clients and extensions](../connection/clients-and-extensions.mdx#register-before-first-model), along with the rules for when the registry closes.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **who should see this extension**.
+
+- **Your models live on one client**: use `client.use`, and the extension won't leak into someone else's code.
+- **Models are created on several clients, or libraries need the key**: `Typemo.use`.
+- **You need to change behavior, not store a setting**: an extension won't do. Use [hooks](../hooks/operation-hooks.mdx) or a [plugin](../hooks/plugins.mdx).
+
+## When not to use it [#when-not-to-use]
+
+If the setting already exists among the `@Prop` options, such as `required`, `hidden`, or `enum`, you don't need an extension. And if the value has to change queries or documents, an extension won't help either. It has no access to operations or policies. It's only metadata. Change operations in hooks with `modify`, and those changes go through every policy.
+
+## Troubleshooting [#troubleshooting]
+
+**The type is declared, but the extension isn't registered.** `declare module` tells only the compiler about the key. Without `Typemo.use` or `client.use`, TypeScript accepts the model, but creating it fails with `ext "label" is not a registered extension`. You need both parts.
+
+**The extension was registered after the first model.**
+
+<Snippet id="connection/clients-and-extensions/register-before-first-model" />
+
+The client's first **successfully** compiled schema closes registration. An extension that showed up later couldn't check schemas that are already built. A failed compilation doesn't close the registry, so after a "not a registered extension" error it's enough to register the named extension and call `model` again.
+
+But don't build logic on that. Register extensions before the first `connection.model`. The global `Typemo.use` registry closes on the first successful schema on any client.
+
+**The key is on a schema, but there's no `validateSchema`.**
+
+<Snippet id="extensions/custom-options/troubleshooting" />
+
+The key is allowed only where the extension has a check. If you need it on `@Schema`, add `validateSchema`.
+
+## Full example [#full-example]
+
+The full example has its own page. [An extension from start to finish](./example.mdx) takes `label` from the declaration all the way to a table in the UI.
+
+<Callout type="migration">
+
+Mongoose has no separate notion of a schema extension. In Typemo an `ext` key is declared by a type, checked when the schema compiles, and unreachable from operations. So an extension can't bypass strictness, the tenant, or soft delete.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="An extension from start to finish" href="./example.mdx">
+  The whole `label` extension: the type, the check, using it, and reading it in the UI.
+</Card>
+<Card title="Extensions" href="../reference/extensions/extensions.mdx">
+  `TypemoExtension`, `PropExtensions`, `SchemaExtensions`, and every error text.
+</Card>
+<Card title="Multiple clients and extensions" href="../connection/clients-and-extensions.mdx">
+  Where to register extensions and why the order matters.
+</Card>
+</Cards>

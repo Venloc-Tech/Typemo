@@ -1,0 +1,161 @@
+---
+title: Query performance
+description: "Find out whether a query uses an index, track down a slow query in the server log, limit its run time, and check the index in a test"
+icon: Gauge
+---
+
+To understand why a query is slow, ask the database itself how it runs it. [`.explain`](../reference/query/search-and-explain.mdx#explain) returns the **query plan**: which index the database chose and how many documents it had to read. Most often the answer is the same. The query reads the whole collection because there's no suitable index.
+
+Around `explain` there are three more tools.
+
+- [`.hint`](../reference/query/options.mdx#hint) pins an index.
+- [`.comment`](../reference/query/options.mdx#comment) tags a query for the server log.
+- [`.timeoutMS`](../reference/query/options.mdx#timeout-ms) limits the run time.
+
+If you're new to MongoDB indexes, remember one thing. An index is a sorted copy of some fields that lets the database find documents without scanning the whole collection. Without an index on the filter field the database checks every document in turn, and the query slows down as the collection grows.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the article model from `articles/article.ts` with an index on the view count. The index was created by an [index sync](../collections/index-sync.mdx). Until you run one, the index doesn't exist in the database, however many times it's described in the model. The collection has three articles.
+
+- "Typed queries": 5 views.
+- "Mongo tips": 50.
+- "Cooking": 500, with the text "pasta".
+
+<Snippet id="queries/performance/prerequisites" title="articles/article.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Ask for the query plan and look at the stages. `IXSCAN` means "by index", and `COLLSCAN` means "the whole collection". The [`explainIndexUsage`](../reference/testing/testing.mdx#explain-index-usage) function from the `@venloc/typemo/testing` package boils the database's answer down to a short report.
+
+<Snippet id="queries/performance/quick-start" twoslash />
+
+The query on `views` uses the index, and the query on `body` reads all three articles to return one. We'll go through each step in more detail below.
+
+## Look at the query plan [#explain]
+
+Say the list of popular articles opens slowly. Call [`.explain`](../reference/query/search-and-explain.mdx#explain) on the same query. It returns no documents, but shows how the database intends to run the query. The answer is a server document, and its shape depends on the version. So Typemo doesn't parse it, and you read the fields without type hints.
+
+<Snippet id="queries/performance/explain" twoslash />
+
+A plan reads from the inside out. The inner `IXSCAN` stage finds the matching keys in the `views_1` index, and the outer `FETCH` reads the documents themselves by those keys. `winningPlan` is the plan that won. The database picked it from several candidates.
+
+## See how much work the database did [#work-done]
+
+Without running the query, a plan only tells you the intent. To see how much work the database actually did, pass `"executionStats"`. The query runs, and you get counters. The main thing is to compare `nReturned`, how many documents came back, with `totalDocsExamined`, how many the database read. For a good query they're close.
+
+<Snippet id="queries/performance/work-done" twoslash />
+
+In the second query the database examined all three articles and returned one. On three documents you won't notice, but on a million the same condition reads a million documents to return one. The warning sign is `totalDocsExamined` much larger than `nReturned`, with `COLLSCAN` in the plan. The fix is an index on the filter field, with [`@Index`](../reference/schemas/index-decorators.mdx) or the field's `index` option, followed by a sync.
+
+The third level, `"allPlansExecution"`, adds statistics for the plans the database tried and rejected. It helps when the database picks a different index from the one you expected.
+
+### A short report instead of a server document [#short-report]
+
+[`explainIndexUsage`](../reference/testing/testing.mdx#explain-index-usage) runs `explain("executionStats")` and returns a parsed report. It has the plan stages, the indexes used, a flag for a full collection scan, and the counters. The function lives in the separate `@venloc/typemo/testing` entry point and is meant for tests, but it works as well in a console or a debug script.
+
+<Snippet id="queries/performance/short-report" twoslash />
+
+### A query that reads only the index [#covered-query]
+
+The cheapest query reads no documents at all, because everything it needs is already in the index. That happens when the response has only indexed fields. Select exactly those and exclude `_id`, which isn't in the `views_1` index.
+
+<Snippet id="queries/performance/covered-query" twoslash />
+
+`covered` is `true` only when the plan has no `FETCH` and the database read no documents, that is `docsExamined` is zero. The absence of `FETCH` alone isn't enough. A query by `_id` goes through `EXPRESS_IXSCAN` without a `FETCH` stage but still reads the document, so its `covered` is `false`.
+
+## A sort that doesn't use the index [#in-memory-sort]
+
+An index on `views` helps a sort by `views` too, because its keys are already in order. But if you sort by another field, the database has to gather the matching documents in memory and sort them itself. In the plan this shows up as a `SORT` stage on top of the others.
+
+<Snippet id="queries/performance/in-memory-sort" twoslash />
+
+On large results an in-memory sort runs into the database's memory limit. So it's better to build an index for the "filter plus sort" pair from the start. How to set a sort is covered in [Sorting and paging](./sorting-and-pages.mdx).
+
+## Make the database use an index [#force-index]
+
+Usually the database picks an index itself and does it well. But sometimes the plan shows a poor choice, and you can't rebuild the indexes. Then name the index explicitly with [`.hint`](../reference/query/options.mdx#hint), by name (`"views_1"`) or by keys (`{ views: 1 }`).
+
+<Snippet id="queries/performance/force-index" twoslash />
+
+The hint stays in the code even when the data changes and another index becomes better. So keep it as a last resort. If there's no index with that name, the database refuses to run the query, and you get a [`ServerError`](../reference/errors/server-errors.mdx#server-error) with the text `hint provided does not correspond to an existing index (code 2 BadValue)`.
+
+## Find a query in the server log [#find-in-server-log]
+
+A slow query is visible in the database log or the profiler, but it's unclear which code produced it. [`.comment`](../reference/query/options.mdx#comment) attaches a text tag to the query. The result doesn't change, and the tag shows up in the log and in `system.profile`. Put the place in the code there, not data, since the tag ends up in the server logs.
+
+<Snippet id="queries/performance/find-in-server-log" title="articles/articles.service.ts" twoslash />
+
+## Limit the query time [#query-timeout]
+
+One heavy query shouldn't hold up the whole app. [`.timeoutMS`](../reference/query/options.mdx#timeout-ms) limits the time of the whole operation on the client side. If it doesn't fit, the driver aborts the query and throws a [`TimeoutError`](../reference/errors/server-errors.mdx#timeout-error). `0` means "no limit", and a negative number gives a `QueryError`.
+
+<Snippet id="queries/performance/query-timeout" twoslash />
+
+One millisecond is chosen on purpose, so the query can't make it. The text after the colon depends on where the time ran out. If it was during server selection, it says `Timed out during server selection`, while the error class and the start of the text stay the same. In your app, set a limit that a normal query meets with room to spare.
+
+## Check the index in a test [#test-index]
+
+An index is easy to lose. Rename a field or reorder the keys in a filter, and the query quietly starts reading the whole collection. [`expectIndexScan`](../reference/testing/testing.mdx#expect-index-scan) from `@venloc/typemo/testing` turns that into a failing test. It runs `explain` and throws an `IndexUsageError` if the query reads the whole collection or doesn't use the expected index.
+
+You can set the index name, a limit on the number of examined documents, and `covered: true` if the query must be read entirely from the index. The opposite check, [`expectCollScan`](../reference/testing/testing.mdx#expect-coll-scan), is for when there's no index on purpose.
+
+<Snippet id="queries/performance/test-index" title="articles/articles.index.test.ts" twoslash />
+
+Testing your app is covered in more detail in [Test your app](../testing/testing-apps.mdx).
+
+## How to choose [#how-to-choose]
+
+Ask yourself **what exactly you don't know**.
+
+- **Why the query is slow**: look at the plan, [`.explain`](../reference/query/search-and-explain.mdx#explain) with `"executionStats"`.
+- **Which code produced a slow query in the log**: add [`.comment`](../reference/query/options.mdx#comment).
+- **The plan is bad, and you can't change the index**: pin the right index with [`.hint`](../reference/query/options.mdx#hint).
+- **The query may hang**: limit it with [`.timeoutMS`](../reference/query/options.mdx#timeout-ms).
+
+And to keep the index from getting lost in future changes, add a check to a test.
+
+## When not to use it [#when-not-to-use]
+
+If the collection is small, a few hundred documents, `COLLSCAN` is no problem. The database reads it faster than you'd notice, and an index would only slow down writes. Judge a plan on data similar to the real thing, because on an empty test collection plans can differ.
+
+And remember that `.explain` tells you how the database runs the query, not why it's slow **in your app**. There's also the network and building the result. For that, use [observability events](../observability/events.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**The plan shows `COLLSCAN` even though the index is declared in the model.** The index is described in `@Index` or on the field, but the plan reads the whole collection. Usually there's one cause. Typemo doesn't create indexes in the database itself, an [index sync](../collections/index-sync.mdx) does. On a freshly created collection the query on `views` reads the whole collection, and after [`Model.syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes) it uses `views_1`. Run the sync at deploy time.
+
+**`.hint` with a typo in the index name.** The compiler doesn't check the index name, because it can't see the schema's indexes. A typo leads to a `ServerError` with the text `hint provided does not correspond to an existing index (code 2 BadValue)`. The default name is built from the keys, so the `{ views: 1 }` index is called `views_1`. Check the name against the query plan or `listIndexes`.
+
+**`.explain` on a query that isn't a `find`.** `.explain` exists on [`find`](../reference/query/reading.mdx#model.find), [`findOne`](../reference/query/reading.mdx#model.find-one), and [`findById`](../reference/query/reading.mdx#model.find-by-id). On find-and-modify queries the method doesn't compile. An aggregation has its own `explain` on the aggregation itself, [`Pipeline`](../reference/aggregation/pipeline.mdx).
+
+**`timeoutMS` was set for the whole handler instead of the query.** The option limits **one operation**, not the whole handler. If a handler has several queries, each one needs its own `timeoutMS`, and the handler code sets the overall deadline.
+
+## Full example [#full-example]
+
+Here it all comes together: a query with a tag and a time limit, reading the plan, and an index check. Code that isn't part of Typemo and that you write yourself is marked `__…__`.
+
+<Snippet id="queries/performance/full-example" title="articles/articles.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose a query also has `explain`, `hint`, `comment`, and `maxTimeMS`. But the time limit there was the server-side `maxTimeMS`, and nobody parsed the `explain` result. In Typemo the time limit is the client-side [`.timeoutMS`](../reference/query/options.mdx#timeout-ms) for the whole operation, and reading the plan and checking the index in a test live in `@venloc/typemo/testing`.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Search and the query plan" href="../reference/query/search-and-explain.mdx">
+  The `.explain` verbosity levels and `ExplainResult`.
+</Card>
+<Card title="Query options" href="../reference/query/options.mdx">
+  `.hint`, `.comment`, `.timeoutMS`, and other query options with exact errors.
+</Card>
+<Card title="Sync indexes" href="../collections/index-sync.mdx">
+  Create the model's indexes in the database and check that they're in place.
+</Card>
+<Card title="Test your app" href="../testing/testing-apps.mdx">
+  A test database, factories, and index checks in tests.
+</Card>
+</Cards>

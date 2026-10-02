@@ -1,0 +1,294 @@
+---
+title: Configuration and connection errors
+description: "ConfigurationError, ConnectionError, DriverError, IndexSyncError, SyncError, CollectionOptionsError, AuditError, and InternalError"
+icon: PlugZap
+---
+
+The errors in this group aren't about data but about the state of the environment. A setting is wrong, there is no connection to the server, the driver refused on its own side, the indexes and collections in the database drifted from the schema, or an audit write failed. They usually appear at application startup or on the first access to the database. A person fixes them more often than a retry does.
+
+If you're new here, read the [Error handling](../../errors/handling.mdx) guide first. The class tree is described in [Error hierarchy](./hierarchy.mdx).
+
+The examples use an account model with a unique title. Both index errors and setting errors show up on it.
+
+<Snippet id="errors/handling/prerequisites" title="accounts/account.ts" twoslash />
+
+Errors of the neighboring groups are described on other pages: [data errors](./data-errors.mdx), [query errors](./query-errors.mdx), and [server errors](./server-errors.mdx).
+
+---
+
+## ConfigurationError [#configuration-error]
+
+`ConfigurationError` is thrown when a setting error is found, and it happens **before** any data is touched. That's the case with incompatible client options, with an impossible field description (a vector of zero dimensions, a union with no variants), with a schema that can't be built, and with a call that makes no sense in the current state, such as a transaction inside a transaction. Bad data doesn't cause this error. [`CastError`](./data-errors.mdx#cast-error) or [`ValidationError`](./data-errors.mdx#validation-error) catches it.
+
+Almost always the code is at fault, and you need to fix the code or the configuration, not repeat the call. So Typemo throws it as early as possible, and the text names both the problem and the cure. In the example the schema asks for optimistic concurrency but doesn't add a version field.
+
+<Snippet id="reference/errors/configuration-errors/configuration-error" twoslash />
+
+The model compiles on the first call of [`connection.model`](../connection/connection.mdx#connection.model), so a schema error shows up there, not when the class is declared.
+
+### Where it occurs [#where-used]
+
+Here are the texts by situation.
+
+<Snippet id="reference/errors/configuration-errors/where-used" />
+
+The first text arrives on a nested transaction. The second arrives when a model of another client is called inside one client's transaction. It can't join the transaction, and Typemo doesn't stay silent but asks you to state explicitly that the operation runs outside the transaction. The third is one of the client option checks, all described in the [`TypemoClient`](../connection/typemo-client.mdx#new-typemo-client) reference.
+
+The fourth is `client.transaction` on a standalone `mongod`. Transactions need a replica set (several MongoDB servers holding copies of the same data, though one server is enough for transactions) or a sharded cluster, and the call refuses before the function runs (see [transactions](../../transactions/transactions.mdx#troubleshooting)). The fifth is an unknown key in `@Schema`. An option that isn't in the list stops the schema build, and the [`@Schema`](../schemas/schema.mdx) page has the details.
+
+A model also rejects, at build time, a schema with a tenant field that isn't marked `@Tenant()`: `Order: the tenant field "tenantId" must be marked @Tenant() (declare it @Prop(...) @Tenant() tenantId!: TenantField<T>)`. The other tenant schema build errors are collected in the [Split data by organization](../../policies/tenants.mdx#schema-errors) guide.
+
+Failures of [`connection.init`](../connection/connection.mdx#connection.init) and `syncAll` don't belong here. They arrive as [`SyncError`](#sync-error).
+
+<Params title="Error fields">
+<Param name="message" type="string">
+
+What is wrong with the setting. The class has no fields of its own. The whole reason is in the text, and the root cause, if there is one, is in `cause`.
+
+</Param>
+</Params>
+
+### When not to use it [#configuration-error.when-not-to-use]
+
+Don't catch `ConfigurationError` around every operation, because it isn't about user input. Catch it at application startup and stop the launch with a clear message.
+
+---
+
+## ConnectionError [#connection-error]
+
+`ConnectionError` is thrown when the client couldn't reach the server or is already closed. The `failure` field names the reason, and `cause` holds the driver error. There are four reasons, and each needs its own action. A closed client is created again. An unavailable server and the network are waited out and retried. A credentials refusal can't be fixed by a retry.
+
+<Snippet id="reference/errors/configuration-errors/connection-error" twoslash />
+
+<TypeTable
+  type={{
+    closed: { description: "The client is closed (after `close()`). Create a new client." },
+    "server-selection": { description: "No server suitable for the operation was found (`MongoServerSelectionError`)." },
+    network: { description: "A network failure (`MongoNetworkError`)." },
+    authentication: { description: "The server rejected the credentials (code 18)." },
+  }}
+/>
+
+The text for an unavailable server is `no server available: connect ECONNREFUSED 127.0.0.1:1`, obtained on a closed port. The details and a way to reproduce it are in the [`TypemoClient.connect`](../connection/typemo-client.mdx#typemo-client.connect) section. The reason is determined by the class of the driver error. `MongoServerSelectionError` gives `server-selection`, `MongoNetworkError` and `MongoNetworkTimeoutError` give `network`, and a stopped client gives `closed`. The reasons `network` and `authentication` weren't reproduced in practice.
+
+### Fields [#connection-error.fields]
+
+<Params title="Error fields">
+<Param name="failure" type="ConnectionFailure">
+
+The reason: `closed`, `server-selection`, `network`, or `authentication`.
+
+</Param>
+<Param name="errorLabels" type="readonly string[]">
+
+The labels the driver sent. The array is frozen.
+
+</Param>
+</Params>
+
+The database is unavailable on your side, not the user's, so it's worth answering the client with a 503 from your application. If the client didn't manage to connect by the time of the operation, you get not this error but a [`TimeoutError`](./server-errors.mdx#timeout-error) of the `connection` kind.
+
+### When not to use it [#connection-error.when-not-to-use]
+
+Don't create the client again on every `server-selection` error. The driver reconnects by itself, and operations wait for the server up to `serverSelectionTimeoutMS`. You need to recreate the client only after `closed`.
+
+---
+
+## DriverError [#driver-error]
+
+`DriverError` is thrown when the driver refused **on the client side**, without reaching the server. You used its API incorrectly, and it noticed. That happens with an already closed session, with a transaction in a wrong state, and with a bad argument that reached the driver. The driver error is kept in `cause`, and its class is named by the `driverError` field.
+
+In the example a query runs in a session that was already closed.
+
+<Snippet id="reference/errors/configuration-errors/driver-error" twoslash />
+
+<Params title="Error fields">
+<Param name="driverError" type="string">
+
+The class name of the driver error (`MongoExpiredSessionError`, `MongoTransactionError`).
+
+</Param>
+<Param name="errorLabels" type="readonly string[]">
+
+The labels of the driver error. The array is frozen.
+
+</Param>
+</Params>
+
+Any driver error without a server code that doesn't fit `ConnectionError` and `TimeoutError` arrives as `DriverError`. The calling code is at fault, so there is no need to repeat the operation.
+
+### When not to use it [#driver-error.when-not-to-use]
+
+If you need a server error with a code, look at [`ServerError`](./server-errors.mdx#server-error). It occurs when the server refused, while `DriverError` occurs when the driver itself refused before sending.
+
+---
+
+## IndexSyncError [#index-sync-error]
+
+`IndexSyncError` is thrown when `syncIndexes` or `createIndexes` couldn't apply all the indexes. Typemo collects **all** the failures and doesn't stop at the first, as Mongoose does. You see the full list of problems in one run. The indexes that were applied stay applied.
+
+Most often the cause is data that already violates the uniqueness of the new index. In the example the collection has two accounts with the same title, and the schema requires a unique title.
+
+<Snippet id="reference/errors/configuration-errors/index-sync-error" twoslash />
+
+The message starts with `Account: 1 index operation(s) failed: create title_1: duplicate key on title_1: { title: "Main" } (code 11000 DuplicateKey)` and lists all the failures separated by `;`. The model is named once, at the start. If the text of a nested error itself starts with the model name (`Account: index "title_1" exists on the server with other keys or options; …` for `init`), that start is omitted in the general message, while the text in `failures[i].error.message` stays whole. The texts of nested errors are short. The server's full text with index build identifiers is in the nested error's `serverMessage`.
+
+### Fields [#index-sync-error.fields]
+
+<Params title="Error fields">
+<Param name="model" type="string">
+
+The model whose indexes were being synced.
+
+</Param>
+<Param name="failures" type="readonly IndexFailure[]">
+
+Every failed index operation. An item has `name` (the index name), `action` (`create`, `drop`, `modify`, and for search indexes `createSearch`, `updateSearch`, `dropSearch`), and `error` (the operation's error, a `DuplicateKeyError` in the example). The array is frozen.
+
+</Param>
+</Params>
+
+The model methods `syncIndexes` and `createIndexes` throw `IndexSyncError`. [`connection.init`](../connection/connection.mdx#connection.init) and `syncAll` don't pass it through as is. They collect the failures of all models into a [`SyncError`](#sync-error), where `IndexSyncError` lies in the `errors` of its collection's failure.
+
+### When not to use it [#index-sync-error.when-not-to-use]
+
+If you only want to see what diverged and apply nothing, use `diffIndexes`. It compares indexes and creates nothing.
+
+---
+
+## SyncError [#sync-error]
+
+`SyncError` is thrown by [`connection.init`](../connection/connection.mdx#connection.init) and `syncAll` when the database couldn't be brought in line with the models. A collection wasn't created, an index wasn't applied, or a collection or view already exists with other options. One failure doesn't stop the others. Before throwing the error, Typemo performs every step for every model. So the error has the full summary: what failed for each collection and view, all the original errors in a row, and the whole report. Running it at startup gives one `catch` with the whole list of problems, not a chain of "fixed one thing, the next one failed".
+
+The error is thrown with `dryRun: true` too, if a failure is already found during the check. A trial run doesn't hide a problem that the real run would discover anyway. In the example the database already has an ordinary collection `logs`, while the schema declares a capped one (`capped`). MongoDB doesn't change this option in place.
+
+<Snippet id="reference/errors/configuration-errors/sync-error" twoslash />
+
+The message starts with the method and the database name. Then comes the number of failures, and for each collection (`collection "…"`) or view (`view "…"`) their texts. The collection name is given once. If a nested error itself starts with it (`CollectionOptionsError`), the repeat is removed. The texts of index errors are nested whole, so the message can be long. To compare by meaning, use the fields.
+
+### Fields [#sync-error.fields]
+
+<Params title="Error fields">
+<Param name="operation" type='"connection.init" | "syncAll"'>
+
+The method that failed.
+
+</Param>
+<Param name="failures" type="readonly SyncFailure[]">
+
+Failures by collection and view, only those where there was a failure. The array is frozen. A `SyncFailure` item has `kind` (`"collection"` for a model's collection, `"view"` for a view), `name` (the name of the collection or view), `model` (the name of the collection's root class, `undefined` for a view), and `errors` (all failures of this collection in step order, among them [`IndexSyncError`](#index-sync-error), [`CollectionOptionsError`](#collection-options-error), and [`ServerError`](./server-errors.mdx#server-error)).
+
+</Param>
+<Param name="errors" type="readonly TypemoError[]">
+
+All the original errors in a row, in report order. The same list is in the `AggregateError` in the `cause` field. The array is frozen.
+
+</Param>
+<Param name="report" type="SyncReport">
+
+The whole report of the call, with `failed: true`. It has what was found and what was done, for a trial run too.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/errors/configuration-errors/sync-error-fields" />
+
+</FullType>
+
+[`ErrorClassifier`](./hierarchy.mdx#error-classifier) assigns `SyncError` the `index-sync` kind, as it does [`IndexSyncError`](#index-sync-error). Model-level errors (`syncIndexes`, `createIndexes`) still throw `IndexSyncError` without a wrapper. The [Sync indexes](../../collections/index-sync.mdx) guide shows syncing as an application startup task.
+
+### When not to use it [#sync-error.when-not-to-use]
+
+Don't swallow `SyncError` at startup. An application that works with a database that doesn't match the schema gets errors later, in unexpected places. If you only want to see what diverged, use `syncAll({ dryRun: true })`. It changes nothing, but on a found failure it also throws `SyncError`, and the report is in `error.report`.
+
+---
+
+## CollectionOptionsError [#collection-options-error]
+
+`CollectionOptionsError` is thrown when a collection (or view) already exists but with other options than in the schema, or of another kind. For example, a view where an ordinary collection is needed, or an ordinary collection where a time series is declared. In this situation Mongoose reported nothing. `createCollection` silently skipped the existing collection, and the changed option never reached the database. Typemo reports the divergence.
+
+In the example the schema declares a capped collection (`capped`), while the database already has an ordinary `logs`.
+
+<Snippet id="reference/errors/configuration-errors/collection-options-error" twoslash />
+
+<Params title="Error fields">
+<Param name="collection" type="string">
+
+The name of the collection or view.
+
+</Param>
+<Param name="differences" type="readonly CollectionDifference[]">
+
+The options that differ. An item has `option` (the option name: `validator`, `capped`, `timeseries.granularity`, `pipeline`), `mutable` (`true` if `collMod` can change it, meaning `ensureCollection({ update: true })` will do), `wanted` (what the schema declares), and `actual` (what is on the server, `undefined` if not set). The array is frozen.
+
+</Param>
+</Params>
+
+The `capped` option can't be changed in place (`mutable: false`), and the collection has to be recreated. Options that `collMod` can change are applied through `ensureCollection({ update: true })`. The text is the same for `createCollection`, `ensureCollection`, `connection.init`, and `syncAll`. If the differences include something MongoDB can't change, that comes first (`exists with options MongoDB cannot change (capped): drop the collection and create it again`). If everything can be changed, the text points to `ensureCollection({ update: true })` (`exists with other options (validator); run ensureCollection({ update: true }) to change them with collMod`).
+
+### When not to use it [#collection-options-error.when-not-to-use]
+
+To bring the options of an existing collection in line with the schema, use `ensureCollection`. It compares and applies what can be changed. `createCollection` is only for creating, and it reports if the collection already exists with other options.
+
+---
+
+## AuditError [#audit-error]
+
+`AuditError` is thrown when an audit write failed, and **this fails the operation itself**. A write to a model with the `audit` policy doesn't stay without an audit trail. The write and the trail go in one transaction, so on a failure they roll back together. If the write is called outside a transaction, Typemo starts a transaction of its own for it. A model with audit needs a replica set (or a sharded cluster), and on a standalone `mongod` such a write throws [`ConfigurationError`](#configuration-error).
+
+In the example the audit collection was created in advance with a validator that rejects every write. It requires a field the log rows don't have.
+
+<Snippet id="reference/errors/configuration-errors/audit-error" twoslash />
+
+After the error the payment counter in the collection didn't grow. The write rolled back together with the audit.
+
+<Params title="Error fields">
+<Param name="model" type="string">
+
+The model with audit.
+
+</Param>
+<Param name="operation" type="string">
+
+The method you called that was audited: `create`, `updateMany`, or `save`. As with [`PostHookError`](./hierarchy.mdx#post-hook-error), it's the name of your call, not of an internal operation.
+
+</Param>
+<Param name="applied" type="false">
+
+Always `false`. The write rolls back together with the log row, and it isn't in the database. The error constructor has no argument that could change this.
+
+</Param>
+<Param name="operationError" type="unknown">
+
+The operation's own error, if it failed too and the log was written after its failure. If the write itself succeeded, the field is `undefined`, as in the example above.
+
+</Param>
+</Params>
+
+The reason the audit write failed is in `cause`. The [Keep an audit log](../../policies/audit.mdx) guide has more on audit.
+
+### When not to use it [#audit-error.when-not-to-use]
+
+Don't catch `AuditError` to skip the audit and write anyway. Typemo deliberately doesn't allow that. If you don't need a trail for all writes, don't turn on `audit` for the whole model.
+
+---
+
+## InternalError [#internal-error]
+
+`InternalError` is thrown when an internal invariant of the library itself is broken. For example, a foreign object turned up where a document should be, or a single-row query asked for a cursor. Your data is never the cause, so such an error is a reason to report a bug in Typemo, not to look for a mistake in your code. The message always starts with `Internal error: `.
+
+The class is part of the hierarchy, so `instanceof TypemoError` still separates library failures from foreign ones. You can't reproduce the error on purpose. It isn't a usage scenario but a failure, and we couldn't get it.
+
+<Params title="Error fields">
+<Param name="message" type="string">
+
+Which invariant is broken. The class has no fields of its own. The root cause, if there is one, is in `cause`.
+
+</Param>
+</Params>
+
+### When not to use it [#internal-error.when-not-to-use]
+
+Don't handle this error in a special way in the application. Let it reach the general handler of unexpected errors as a 500, and send the text and the trace to the library developers.

@@ -1,0 +1,587 @@
+---
+title: Update operators
+description: "Every update operator and modifier: which fields it applies to, what it accepts, what it does, and which errors it throws"
+icon: Wrench
+---
+
+This page describes every operator accepted by [`updateOne`](./writes.mdx#update-one), [`updateMany`](./writes.mdx#update-many), [`findOneAndUpdate`](./writes.mdx#find-one-and-update), and [`findByIdAndUpdate`](./writes.mdx#find-by-id-and-update), along with the `$each`, `$position`, `$slice`, and `$sort` modifiers of `$push`. For each one it says which fields it applies to, what value it accepts, and what it does to the document.
+
+If you're just starting out, read the [Update operators](../../writes/update-operators.mdx) guide first. This page is a reference.
+
+An **update operator** is a key that starts with `$` and tells the database what to do with a field. `$inc` adds a number, `$push` appends an element to an array. The update itself is an object whose first-level keys are operators and whose values are "path and operand" objects. The database changes the document in place and atomically. Two parallel `$inc` calls add up to both increments, while a "read, add, write" chain would lose one of them.
+
+Typemo checks an update twice. The compiler knows the model's fields and which operators apply to which fields. At runtime, Typemo casts values to the schema types and runs the field validators. An update is rejected as a whole in three cases.
+
+- It's empty (`{}` or an operator without paths).
+- Two operators change one path (the server answers with error 40).
+- A value is `undefined`. It can't be a value, and `$unset` exists for removing a field.
+
+All examples use the same account model and the same source document.
+
+<Snippet id="reference/writes/update-operators/intro" title="accounts/account.ts" twoslash />
+
+The source document each example starts from is `title: "Main"`, `owner: "alice"`, `balance: 10`, `tags: ["a", "b"]`, `nickname: "al"`, `points: 10n`, `flags: 1`, `scores: [5, 3]`, `lines: [{ sku: "x", qty: 1 }, { sku: "y", qty: 5 }]`, `counters: { logins: 1 }`. The result in the `// →` comment is what sits in the database after the update.
+
+Operands share one rule. `ObjectId` and `UUID` accept a string, and `int64` (`bigint`) accepts a decimal string, including in `$inc`, `$mul`, `$min`, and `$max`. A number in place of the string `"5"` isn't accepted in `$inc` for a numeric field.
+
+---
+
+## $set [#set]
+
+`$set` writes values into fields. It's the most common operator: change the owner, write a note, update a nested field. The path can be nested with a dot (`"lines.0.qty"`) and can point at a `Map` entry (`"counters.logins"`).
+
+<Snippet id="reference/writes/update-operators/set" twoslash />
+
+<Params>
+<Param name="paths" type="{ [path]: value }">
+
+Write paths and new values. A value is cast to the field type and goes through its validators (`min`, `enum`, custom ones). An embedded document is checked as a whole, including `required` inside it. `null` is accepted only for fields declared `nullable`. You can't change the `_id` path.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/set-2" />
+
+</FullType>
+
+### Errors [#set.errors]
+
+An unknown path, a value of the wrong type, and a validator violation stop before sending.
+
+<Snippet id="reference/writes/update-operators/set-errors" />
+
+The update parser itself rejects an `undefined` value. It's easy to get one from an optional parameter, and the driver would write `null` instead.
+
+<Snippet id="reference/writes/update-operators/set-errors-2" />
+
+A path through an array with no index and no positional operator is rejected, because the server doesn't run it.
+
+<Snippet id="reference/writes/update-operators/set-errors-3" />
+
+### When not to use it [#set.when-not-to-use]
+
+To add a number rather than write it, use [`$inc`](#inc). To remove a field, use [`$unset`](#unset). To replace a whole document, use [`replaceOne`](./writes.mdx#replace-one). The guide is [Update operators](../../writes/update-operators.mdx).
+
+---
+
+## $setOnInsert [#set-on-insert]
+
+`$setOnInsert` writes values **only when `upsert` inserted a new document**. If the document already existed, the operator does nothing. Use it for initial values that must not overwrite existing data: creation dates, a starting balance, fields with `Immutable`.
+
+This is the only place where a field with `Immutable` can be written. Such a field is written when the document is created and doesn't change after that.
+
+<Snippet id="reference/writes/update-operators/set-on-insert" twoslash />
+
+<Params>
+<Param name="paths" type="{ [path]: value }">
+
+The same paths and values as [`$set`](#set), plus fields with `Immutable`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/set-on-insert-2" />
+
+</FullType>
+
+### Errors [#set-on-insert.errors]
+
+Any other operator rejects a write to a field with `Immutable`.
+
+<Snippet id="reference/writes/update-operators/set-on-insert-errors" />
+
+### When not to use it [#set-on-insert.when-not-to-use]
+
+Without `upsert` the operator is useless. Write values that must always be written with [`$set`](#set). For `upsert`, see the [`upsert` option](./writes.mdx#upsert).
+
+---
+
+## $unset [#unset]
+
+`$unset` removes fields from a document. Use it when a value should disappear rather than become empty: remove a note, clear a nickname. The value of the operand doesn't matter, and `""`, `1`, and `true` all work.
+
+You can remove only **optional** fields (`?:`). Without a required field, the document would break the schema.
+
+<Snippet id="reference/writes/update-operators/unset" twoslash />
+
+<Params>
+<Param name="paths" type={'{ [path]: "" | 1 | true }'}>
+
+Paths of optional fields. The compiler accepts neither the path of a required field nor the path of an array element.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/unset-2" />
+
+</FullType>
+
+### Errors [#unset.errors]
+
+If a required field is removed anyway (the types were bypassed), Typemo stops the update.
+
+<Snippet id="reference/writes/update-operators/unset-errors" />
+
+### When not to use it [#unset.when-not-to-use]
+
+To write `null`, use [`$set`](#set) on a field with `nullable`. To remove an element from an array, use [`$pull`](#pull) or [`$pop`](#pop).
+
+---
+
+## $inc [#inc]
+
+`$inc` adds a number to a numeric field, and a negative number subtracts. Use it for counters and balances. The operation is atomic, so simultaneous increments aren't lost.
+
+<Snippet id="reference/writes/update-operators/inc" twoslash />
+
+<Params>
+<Param name="paths" type="{ [path]: number | bigint | Int64String | Decimal128 }">
+
+Paths of numeric fields and numbers of **the same kind** as the field. For `number` it's a number, for `bigint` (int64) it's a `bigint` or its decimal string, and for `Decimal128` it's a `Decimal128`. A string in place of a number for a numeric field gives a `CastError`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/inc-2" />
+
+</FullType>
+
+### The `min` and `max` bounds [#min-max-bounds]
+
+If a field has `min` or `max`, the result of `$inc` depends on the value in the database, and you can't check it in advance. So Typemo makes the update **conditional**. It adds a condition to the filter, and the server checks it against the stored value. A result outside the range is never written, and you get a `ValidationError`. Its text holds the stored value and the result.
+
+<Snippet id="reference/writes/update-operators/min-max-bounds" />
+
+If there's no document at all, there's no error, just the usual result: `matchedCount: 0`. There are limits. Such an update is rejected with `upsert`, because the server would insert a new document. The same goes for `bulkWrite`. A path through an array (`$`, `$[]`, `$[id]`, an index) isn't protected. In `updateMany`, documents outside the range are found before the write, and then nothing is written.
+
+### Errors [#inc.errors]
+
+<Snippet id="reference/writes/update-operators/inc-errors" />
+
+### When not to use it [#inc.when-not-to-use]
+
+To multiply, use [`$mul`](#mul). To write a value, use [`$set`](#set). To raise a value to a threshold, use [`$max`](#max).
+
+---
+
+## $mul [#mul]
+
+`$mul` multiplies a numeric field by a number. The field and operand types are the same as in [`$inc`](#inc).
+
+<Snippet id="reference/writes/update-operators/mul" twoslash />
+
+<Params>
+<Param name="paths" type="{ [path]: number | bigint | Int64String | Decimal128 }">
+
+Paths of numeric fields and multipliers of the same kind. The `min` and `max` protection works the same way as in [`$inc`](#inc).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/mul-2" />
+
+</FullType>
+
+### When not to use it [#mul.when-not-to-use]
+
+To add, use [`$inc`](#inc).
+
+---
+
+## $min [#min]
+
+`$min` lowers a field to a value if the value is **less** than the current one. Use it for "the smallest seen so far": the earliest date, the minimum price.
+
+<Snippet id="reference/writes/update-operators/min" twoslash />
+
+<Params>
+<Param name="paths" type="{ [path]: value }">
+
+Paths of orderable fields (numbers, strings, dates) and a value of the same type. The value itself is checked, and the result is either it or the stored one.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/min-2" />
+
+</FullType>
+
+### When not to use it [#min.when-not-to-use]
+
+To raise a field to a value, use [`$max`](#max). To write unconditionally, use [`$set`](#set).
+
+---
+
+## $max [#max]
+
+`$max` raises a field to a value if the value is **greater** than the current one. It mirrors [`$min`](#min).
+
+<Snippet id="reference/writes/update-operators/max" twoslash />
+
+<Params>
+<Param name="paths" type="{ [path]: value }">
+
+Paths of orderable fields and a value of the same type.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/max-2" />
+
+</FullType>
+
+### When not to use it [#max.when-not-to-use]
+
+To lower, use [`$min`](#min).
+
+---
+
+## $currentDate [#current-date]
+
+`$currentDate` writes the current **server** time. Use it when all writes must get their time from one source rather than from the clocks of different applications.
+
+<Snippet id="reference/writes/update-operators/current-date" twoslash />
+
+<Params>
+<Param name="paths" type={'{ [path]: true | { $type: "date" } | { $type: "timestamp" } }'}>
+
+Paths of `Date` fields (`true` or `{ $type: "date" }`) and `Timestamp` fields (`{ $type: "timestamp" }`).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/current-date-2" />
+
+</FullType>
+
+### When not to use it [#current-date.when-not-to-use]
+
+If you need the time from the application's clock, write it with [`$set`](#set). For `createdAt` and `updatedAt` there's the `Timestamped` base class, which maintains them itself. `updatedAt` moves on any write, even if no fields changed. For example, an `$addToSet` of a value that's already in the array gives `modifiedCount: 1` on such a model.
+
+---
+
+## $rename [#rename]
+
+`$rename` renames a field inside a document. The value moves under the new name, and the old field disappears. Use the operator for data migrations.
+
+The source and the target must be **optional** fields of **the same type**. Positional paths aren't allowed.
+
+<Snippet id="reference/writes/update-operators/rename" twoslash />
+
+<Params>
+<Param name="paths" type="{ [oldPath]: newPath }">
+
+The source path and the target path, as a string.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/rename-2" />
+
+</FullType>
+
+### Errors [#rename.errors]
+
+The target must be a path.
+
+<Snippet id="reference/writes/update-operators/rename-errors" />
+
+### When not to use it [#rename.when-not-to-use]
+
+To rename a field in **all** documents after a schema change, use [`updateMany`](./writes.mdx#update-many) with `Filters.all<Account>()`. The field's own name in the schema is set in `@Prop`, not in an update.
+
+---
+
+## $push [#push]
+
+`$push` adds an element to the **end of an array**. To add several elements at once, insert at a position, sort, or trim the array, replace the element with an object with `$each` and modifiers: [`$each`](#each), [`$position`](#position), [`$slice`](#slice), [`$sort`](#sort).
+
+The operator applies only to array fields. It doesn't drop duplicates. For unique elements, use [`$addToSet`](#add-to-set).
+
+<Snippet id="reference/writes/update-operators/push" twoslash />
+
+<Params>
+<Param name="paths" type="{ [path]: element | { $each, $position?, $slice?, $sort? } }">
+
+The array path and an element. The element is cast to the array's element type and goes through its validators. For arrays of subdocuments the element is an object, checked as a whole.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/push-2" />
+
+</FullType>
+
+### Errors [#push.errors]
+
+<Snippet id="reference/writes/update-operators/push-errors" />
+
+The last error is about a subdocument element without the required field `qty`. `+0` means the first of the added elements.
+
+### When not to use it [#push.when-not-to-use]
+
+For unique elements, use [`$addToSet`](#add-to-set). To replace the whole array, use [`$set`](#set).
+
+---
+
+## $each [#each]
+
+`$each` is a modifier of `$push` and `$addToSet`. It turns the operand into a **list** of elements to add. Use it to add several elements at once or to use the other modifiers. In `$addToSet` only `$each` is allowed, without the others.
+
+<Snippet id="reference/writes/update-operators/each" twoslash />
+
+<Params>
+<Param name="$each" type="readonly E[]" required>
+
+A list of elements. Each one is cast and checked as a separate element.
+
+</Param>
+</Params>
+
+---
+
+## $position [#position]
+
+`$position` is a modifier of `$push`. It's the index where the `$each` elements are inserted. Without it they go to the end.
+
+<Snippet id="reference/writes/update-operators/position" twoslash />
+
+<Params>
+<Param name="$position" type="number">
+
+The insertion index. Works only together with `$each`.
+
+</Param>
+</Params>
+
+---
+
+## $slice [#slice]
+
+`$slice` is a modifier of `$push`. It trims the array **after** the add. A positive number keeps the first N elements, a negative one keeps the last N. It's handy for bounded lists like "the last 10 events".
+
+<Snippet id="reference/writes/update-operators/slice" twoslash />
+
+<Params>
+<Param name="$slice" type="number">
+
+How many elements to keep. A positive number counts from the start, a negative one from the end, and `0` empties the array.
+
+</Param>
+</Params>
+
+---
+
+## $sort [#sort]
+
+`$sort` is a modifier of `$push` that sorts the array after the add. For an array of numbers or strings the value is `1` (ascending) or `-1` (descending). For an array of subdocuments it's an object with element fields, for example `{ qty: 1 }`.
+
+If `$sort` and `$slice` are used together, the sort comes first and the trim second. That's how you keep "the top three".
+
+<Snippet id="reference/writes/update-operators/sort" twoslash />
+
+<Params>
+<Param name="$sort" type="1 | -1 | { [field]: 1 | -1 }">
+
+The sort direction of the elements or of the subdocument fields.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/sort-2" />
+
+</FullType>
+
+---
+
+## $addToSet [#add-to-set]
+
+`$addToSet` adds an element to an array **only if it isn't there yet**. Use it for sets: tags, roles, followers. For several elements, use `$each`.
+
+<Snippet id="reference/writes/update-operators/add-to-set" twoslash />
+
+<Params>
+<Param name="paths" type="{ [path]: element | { $each: element[] } }">
+
+The array path and an element, or `$each` with a list.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/add-to-set-2" />
+
+</FullType>
+
+### When not to use it [#add-to-set.when-not-to-use]
+
+If duplicates are fine or the order matters, use [`$push`](#push).
+
+---
+
+## $pull [#pull]
+
+`$pull` removes **all elements that match a condition** from an array. For an array of numbers or strings the condition is a value or an operator (`{ $lt: 4 }`, `{ $in: [...] }`). For an array of subdocuments it's a filter on the element's fields. A whole element is compared with `$in`, `$nin`, `$eq`, or `$ne`.
+
+<Snippet id="reference/writes/update-operators/pull" twoslash />
+
+<Params>
+<Param name="paths" type="{ [path]: condition }">
+
+The array path and a condition for its elements.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/pull-2" />
+
+</FullType>
+
+### Other forms [#other-forms]
+
+With plain values, `{ $pull: { tags: "a" } }` gives `tags: ["b"]`, `{ $pull: { scores: { $lt: 4 } } }` gives `scores: [5]`, and `{ $pull: { tags: { $in: ["a", "b"] } } }` leaves an empty array.
+
+### When not to use it [#pull.when-not-to-use]
+
+To remove the first or last element, use [`$pop`](#pop). To remove specific values as a list, use [`$pullAll`](#pull-all).
+
+---
+
+## $pullAll [#pull-all]
+
+`$pullAll` removes from an array every element equal to any value in a list. It's `$pull` for the case "remove exactly these values".
+
+<Snippet id="reference/writes/update-operators/pull-all" twoslash />
+
+<Params>
+<Param name="paths" type="{ [path]: element[] }">
+
+The array path and a list of values to remove.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/pull-all-2" />
+
+</FullType>
+
+### When not to use it [#pull-all.when-not-to-use]
+
+If you need to remove by a condition rather than by equality, use [`$pull`](#pull).
+
+---
+
+## $pop [#pop]
+
+`$pop` removes **one** element from an array: the last (`1`) or the first (`-1`). Use it for queues and stacks.
+
+<Snippet id="reference/writes/update-operators/pop" twoslash />
+
+<Params>
+<Param name="paths" type="{ [path]: 1 | -1 }">
+
+`1` removes the last element, `-1` the first.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/pop-2" />
+
+</FullType>
+
+### Errors [#pop.errors]
+
+<Snippet id="reference/writes/update-operators/pop-errors" />
+
+### When not to use it [#pop.when-not-to-use]
+
+To remove elements by a condition, use [`$pull`](#pull).
+
+---
+
+## $bit [#bit]
+
+`$bit` runs a bitwise operation on an integer field: `and`, `or`, or `xor`. Use it for flags packed into one number.
+
+<Snippet id="reference/writes/update-operators/bit" twoslash />
+
+<Params>
+<Param name="paths" type="{ [path]: { and: n } | { or: n } | { xor: n } }">
+
+The path of an integer field (`number` or `bigint`) and **one** operation with an integer value.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/update-operators/bit-2" />
+
+</FullType>
+
+### Errors [#bit.errors]
+
+<Snippet id="reference/writes/update-operators/bit-errors" />
+
+### When not to use it [#bit.when-not-to-use]
+
+For ordinary numbers, not flags, use [`$inc`](#inc) and [`$set`](#set).
+
+---
+
+## Positional paths [#positional-paths]
+
+When a field sits inside an array element, you need to add to the path **which** elements to change. Without that, the server doesn't run a path "through an array". There are four ways. An index (`"scores.0"`). The positional operator `$`, the first element found by the **filter**. The `$[]` operator, all elements. And `$[name]`, the elements chosen by an `arrayFilters` condition.
+
+<Snippet id="reference/writes/update-operators/positional-paths" twoslash />
+
+The positional operator `$` takes the element the filter found in the same array. So the filter needs a condition on that array or on a path below it (`lines.sku`), at the top level of the filter or inside `$and`, `$or`, `$nor`. Without a condition, the server rejects the update as soon as it finds a document. Typemo catches this earlier, before sending.
+
+<Snippet id="reference/writes/update-operators/positional-paths-2" />
+
+The `$[]` and `$[name]` operators don't need a condition in the filter.
+
+The `arrayFilters` rules are described in the [`arrayFilters` option](./writes.mdx#array-filters). Each `$[name]` needs its own filter, there must be no extra filters, and a pipeline doesn't accept them. The compiler checks the filters against the array element. For `lines.$[l].qty`, `l.sku` and `l.qty` are available.
+
+---
+
+## The same path in two operators [#path-conflict]
+
+One path can't be changed by two operators. The server rejects such an update (code 40), and Typemo notices earlier, at parse time.
+
+<Snippet id="reference/writes/update-operators/path-conflict" />
+
+The other update parsing errors.
+
+<Snippet id="reference/writes/update-operators/path-conflict-2" />
+
+An operator that isn't listed here isn't supported. The accepted ones are `$set`, `$setOnInsert`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$currentDate`, `$rename`, `$push`, `$addToSet`, `$pull`, `$pullAll`, `$pop`, and `$bit`.

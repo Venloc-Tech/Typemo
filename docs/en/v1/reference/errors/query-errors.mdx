@@ -1,0 +1,167 @@
+---
+title: Query errors
+description: "QueryError, DocumentNotFoundError, VersionError, KeysetTokenError, and EachAsyncError: when they are thrown, their fields, and how to handle them"
+icon: SearchX
+---
+
+Query errors come up in three cases. A query can't be built, a query found nothing where you demanded a result, or a document was changed between the read and the write. These are situations of your application, not database failures. The record is missing, a page token is corrupted, two people edited one document. Each situation has its own class, so a handler answers the client by class, not by text.
+
+If you're new here, read the [Error handling](../../errors/handling.mdx) guide first. The shared class tree is in [Error hierarchy](./hierarchy.mdx).
+
+The examples use an account model with a document version. The version is needed for [`VersionError`](#version-error) and doesn't get in the way of the other errors.
+
+<Snippet id="reference/errors/query-errors/intro" title="accounts/account.ts" twoslash />
+
+Errors of the neighboring groups are described on other pages: [data errors](./data-errors.mdx), [server errors](./server-errors.mdx), and [configuration and connection errors](./configuration-errors.mdx).
+
+---
+
+## QueryError [#query-error]
+
+`QueryError` is thrown when a query or update **can't be built**. Typemo notices this while assembling the plan, and nothing goes to the server. That happens with `undefined` in a filter (the driver would silently search for `null`), with an empty `$and`, `$or`, or `$nor`, with a projection that mixes including and excluding fields, with a `limit` of zero or less, with an empty update, with a `merge()` of a query from another model, with iterating a query through `for await`, and with `batchSize(0)`.
+
+The server would accept such queries and do something other than what you meant, or reject them with an obscure text. Typemo says plainly what is wrong and how to fix it. In the example the filter is built from a value that turned out to be missing.
+
+<Snippet id="reference/errors/query-errors/query-error" twoslash />
+
+Here are the texts of the other cases on the same model.
+
+<Snippet id="reference/errors/query-errors/query-error-2" />
+
+The value in the text is printed together with its type. `"3"` is a string, not a number, and `limit` doesn't accept it, so cast values from a page URL to numbers yourself. With `limit(0)` and `batchSize(0)` the problem is the database itself. It reads zero as "no limit" and "default size", and zero is easy to get from an empty query parameter. The query itself isn't an async iterator. To walk through results in batches, call `.cursor()` on it, as the message suggests.
+
+### Fields [#fields]
+
+<Params title="Error fields">
+<Param name="path" type="string | undefined">
+
+The dotted path to the place in the input where the problem is, if known. For example `title` or `$or`. Errors like `limit` have no path, and the field is `undefined`.
+
+</Param>
+</Params>
+
+### When not to use it [#query-error.when-not-to-use]
+
+`QueryError` is about building a query. If a filter names a field that isn't in the model, you get [`StrictModeError`](./data-errors.mdx#strict-mode-error). If a value can't be cast to the field type, you get [`CastError`](./data-errors.mdx#cast-error). Catch the classes you need explicitly, because a general `catch` on `QueryError` won't catch them.
+
+---
+
+## DocumentNotFoundError [#document-not-found-error]
+
+`DocumentNotFoundError` is thrown when you demanded a result with [`.orFail()`](../query/reading.mdx#or-fail) and nothing was found. It also fires if a write with `orFail` touched no documents. Without `.orFail()`, a read would return `null` (or an empty array), and an update would report `matchedCount: 0`. The error is handy where a missing document is an exception for you. "Account from the page URL not found" becomes one `catch` instead of a chain of `null` checks.
+
+<Snippet id="reference/errors/query-errors/document-not-found-error" twoslash />
+
+The `operation` field names the method you called. It's `findById` for a lookup by identifier, `findByIdAndUpdate`, `findOneAndUpdate`, `find`, `replaceOne`, or `deleteOne`, and the error was checked on each of them. Internal operation names aren't in the text. The filter **deliberately doesn't make it** into the error. It may contain personal data, and Mongoose kept it in the `query` field and printed it with the error.
+
+### Other situations [#other-cases]
+
+A save of a document that managed to get deleted throws the same error. You read the document, another process or a person deleted it, then you changed a field and called [`$save`](../documents/document-api.mdx#save). The write didn't find the document. Typemo checks this with one read, to tell a deletion from a version conflict ([`VersionError`](#version-error)). The text in this case is `Account.save: the document is no longer in the collection (deleted since it was read, or out of the scope of the operation's policies); nothing was written`.
+
+The second reason in parentheses means the document stayed in the database, but the operation's policies (tenant, soft delete) no longer see it. For a versioned document the text is the same. `DocumentNotFoundError` arrives instead of `VersionError`, because the document doesn't exist at all.
+
+<Params title="Error fields">
+<Param name="operation" type="string">
+
+The method that found nothing: `findOne`, `findById`, `updateOne`, `deleteOne`, or `save`.
+
+</Param>
+<Param name="model" type="string">
+
+The model name.
+
+</Param>
+</Params>
+
+### Answering the client [#response]
+
+In a request handler this error almost always means a 404 response from your application. You define the response class yourself, and in the documentation examples it's `__NotFound__`.
+
+<Snippet id="reference/errors/query-errors/response" twoslash />
+
+### When not to use it [#document-not-found-error.when-not-to-use]
+
+If a missing document is a normal outcome for you, for example when checking whether a name is free, don't use `.orFail()`. You'll get `null` and check it yourself. And to find out only whether a document exists, use [`exists`](../query/reading.mdx#model.exists).
+
+---
+
+## VersionError [#version-error]
+
+`VersionError` is thrown on [`$save`](../documents/document-api.mdx#save) of a versioned document if someone else managed to change it after you read it. This is optimistic concurrency. Typemo doesn't hold a lock while the user works. It remembers the document's version (the `__v` field) and at write time checks that the database has the same version. If the version is different, the write doesn't happen, and the other edits stay intact.
+
+The error is possible for a model that inherits `Versioned(...)`. With the schema option `optimisticConcurrency: true`, every write becomes conditional. Without it, the writes that depend on the positions of array elements are protected. In the example there are two instances of one document, the first is saved, and the second is stale.
+
+<Snippet id="reference/errors/query-errors/version-error" twoslash />
+
+What to do with the error is up to you. You can reread the document and repeat the change, show the user the conflict, or refuse. Typemo repeats nothing itself, because it doesn't know whether your edit can be applied to the new data.
+
+<Params title="Error fields">
+<Param name="model" type="string">
+
+The model name.
+
+</Param>
+<Param name="version" type="number">
+
+The version the document was read with.
+
+</Param>
+<Param name="modifiedPaths" type="readonly string[]">
+
+The paths the failed write was changing. The array is frozen.
+
+</Param>
+</Params>
+
+### When not to use it [#version-error.when-not-to-use]
+
+If a conflict isn't a problem for you, as with a counter, don't save the document again. Use the atomic update [`updateOne`](../writes/writes.mdx#update-one) with `$inc`, which doesn't read or compare the version. And when several related writes must go through together, you need a [transaction](../transactions/transactions.mdx#transaction).
+
+---
+
+## KeysetTokenError [#keyset-token-error]
+
+`KeysetTokenError` is thrown when the next-page token passed to [`keysetPage`](../query/keyset.mdx#model.keyset-page) is rejected. The token comes from a client, and you can't trust it. The client could have corrupted it, truncated it, substituted a token from another sort, or built one by hand.
+
+So Typemo checks the token before touching the database. First the signature, if one is configured. Then the length and alphabet, the structure, and whether the keys match the sort. Every value is cast to the field type, and objects and operators are not allowed.
+
+`KeysetTokenError` is a descendant of [`QueryError`](#query-error). Its `path` field is always `"after"`, and its text always starts with `keysetPage: invalid cursor —` and names the reason.
+
+<Snippet id="reference/errors/query-errors/keyset-token-error" twoslash />
+
+These reasons appear in the text.
+
+- `it cannot be read`: the token can't be parsed, and `cause` holds the original parse error.
+- `not base64url`: the token has stray characters.
+- `it was made for another sort`: a token from another sort.
+- `longer than 4096 characters`: the token is too long.
+
+The other reasons (a wrong or missing signature, extra keys, a value of the wrong type) are described in the code and weren't reproduced here.
+
+A corrupted token is an input error, so your application's response should be 400, not 500. Don't try to "repair" the token. Start from the first page.
+
+### When not to use it [#keyset-token-error.when-not-to-use]
+
+If pages are numbered by a number and not a token, you don't need this error. Use `skip` and `limit`, but keep in mind the cost of large offsets. How to choose is described in the [Keyset pagination](../../queries/keyset-pagination.mdx) guide.
+
+---
+
+## EachAsyncError [#each-async-error]
+
+`EachAsyncError` is thrown at the end of `eachAsync(fn, { continueOnError: true })` if some calls of your function failed. With this option the walk doesn't stop at the first error. The cursor is read to the end, and the errors pile up and come out in one batch, in the order the documents arrived. Without `continueOnError`, the first error of your function interrupts the walk and arrives as is, and the `EachAsyncError` class isn't created.
+
+<Snippet id="reference/errors/query-errors/each-async-error" twoslash />
+
+<Params title="Error fields">
+<Param name="errors" type="readonly unknown[]">
+
+Every error of your function, in document order. The array is frozen. An item has the type `unknown`, because your function may throw anything, and Typemo wraps nothing.
+
+</Param>
+</Params>
+
+The first of the errors is available as the standard `cause` too. Logs that print only the `cause` chain will show at least one reason.
+
+### When not to use it [#each-async-error.when-not-to-use]
+
+If the walk must stop at the first failure, don't turn on `continueOnError`, and the error of your function arrives as is. For handling large result sets, read the [Large results](../../queries/large-results.mdx) guide, and for the cursor, the [Cursor](../query/cursor.mdx#each-async) reference.

@@ -1,0 +1,159 @@
+---
+title: Full-text and vector search
+description: "Search articles by words with a relevance score, and learn what searching by meaning takes: text and search indexes, $text, $search, and $vectorSearch"
+icon: TextSearch
+---
+
+To find documents by words rather than by an exact value, you need **full-text search**. The [`$text`](../reference/query/filter-operators.mdx#text) condition looks for words in fields with a text index, accounts for word forms ("query" finds "queries"), and can compute a relevance score.
+
+To search by meaning, where documents are similar in what they say even if the words differ, there's **vector search**. It compares numeric vectors of texts (embeddings) and works only in MongoDB Atlas and in a local Atlas environment.
+
+If you're new to MongoDB indexes, here's what matters. An index is a structure the database builds in advance to search fast. `$text` needs a special kind, a **text index**. Without one, the query doesn't get slow. It fails with an error.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the article model from `articles/article.ts`. The indexes were created with [`init()`](../reference/connection/connection.mdx#connection.init). The model itself doesn't create indexes in the database. A [sync](../collections/index-sync.mdx) does. The collection has three articles.
+
+- "Typed queries": the text says "queries in mongodb", 5 views.
+- "Mongo tips": the text has "typed" three times and "queries", 50 views.
+- "Cooking": the text is "pasta", 500 views.
+
+<Snippet id="queries/text-and-vector-search/prerequisites" title="articles/article.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Find articles with the words and get a relevance score for each. The text index on `title` and `body` is described with the [`@Index`](../reference/schemas/index-decorators.mdx) decorator, and [`.textScore`](../reference/query/search-and-explain.mdx#text-score) adds a `score` field to the rows.
+
+<Snippet id="queries/text-and-vector-search/quick-start" twoslash />
+
+The score depends on the data and the server version. Compare the values with each other, not with the numbers in the docs. We'll go through search step by step below.
+
+## Find documents by words [#text-search]
+
+Say a user types words on a search page, and you need the articles where they appear. [`$text`](../reference/query/filter-operators.mdx#text) takes a `$search` string and looks for **any** of the words. The string `"typed pasta"` finds both the articles about types and the article about pasta. Words are compared by their stem, so "query" finds "queries".
+
+<Snippet id="queries/text-and-vector-search/text-search" title="articles/search.service.ts" twoslash />
+
+You can combine search with ordinary conditions, and they apply together. For example, this is how you search only among articles with at least ten views.
+
+<Snippet id="queries/text-and-vector-search/text-search-2" twoslash />
+
+### Exclude a word and find a phrase [#exclude-word-and-phrase]
+
+The search string understands two special forms. A word with a minus excludes documents that contain it, and a phrase in double quotes is searched as a whole.
+
+<Snippet id="queries/text-and-vector-search/exclude-word-and-phrase" twoslash />
+
+To respect case, add `$caseSensitive: true`, and then `"TYPED"` won't find the word "typed". `$language` sets the language for word stems. The server rejects an unknown language with `ServerError: unsupported language: "xx" for text index version 3 (code 2 BadValue)`.
+
+## Sort by relevance [#sort-by-relevance]
+
+`$text` alone doesn't say which article matched best. [`.textScore`](../reference/query/search-and-explain.mdx#text-score) adds a number to each row, the score, and the database orders rows by it. The field is called `score`, and you can pass another name as the first argument. It's in both the row and its type, and without the `.textScore` call it isn't there. Even if you pick fields with `.select`, the score field is added on its own.
+
+<Snippet id="queries/text-and-vector-search/sort-by-relevance" twoslash />
+
+To put the best articles first, pass the `{ sort: true }` option. Typemo sends the sort `{ score: { $meta: "textScore" } }`, and the database orders the rows by descending score itself.
+
+<Snippet id="queries/text-and-vector-search/sort-by-relevance-2" twoslash />
+
+The sort happens on the server, so a [`.limit`](../reference/query/reading.mdx#limit) after it cuts off the worst rows, not random ones. `.textScore("score", { sort: true }).limit(1)` returns one article, "Typed queries", which has the higher score. Without sorting by score the order of rows isn't defined, and the limit would take either of the two.
+
+[`.sort`](../reference/query/reading.mdx#sort) knows the name of the score field too. `.sort({ score: -1 })` does the same as `{ sort: true }`, but puts the score where you want among the sort keys. That way articles with equal scores can be ordered by another field as well.
+
+<Snippet id="queries/text-and-vector-search/sort-by-relevance-3" twoslash />
+
+The score can only be sorted in descending order. The database ranks matches from the best, and it has no reverse order. So `.sort({ score: 1 })` doesn't compile, and in untyped code it gives a `QueryError`, as covered in [Troubleshooting](#troubleshooting). The `{ sort: true }` option puts the score after the keys you've already passed to `.sort`. `.sort({ views: -1 }).textScore("score", { sort: true })` orders by views first.
+
+## Set up a text index [#configure-text-index]
+
+A text index is described in the model. A collection can have **only one**, but it can cover several fields. There are two ways to describe it: the [`@Index`](../reference/schemas/index-decorators.mdx) decorator with the `"text"` kind for each field, as above, or the `text: true` option on the field itself. Fields with this option are merged into one index.
+
+<Snippet id="queries/text-and-vector-search/configure-text-index" title="articles/article.ts" twoslash />
+
+Both fields go into the `title_text_body_text` index. A repeated [`init()`](../reference/connection/connection.mdx#connection.init) on this model goes through calmly: the index already exists, `inSync` is `true`, and the `created` list is empty. Two separate `@Index` decorators with text keys are an error: `ConfigurationError: Two: a collection has at most one text index; "text: true" fields are merged into one, so remove the extra @Index text (found title_text, body_text)`.
+
+If one field matters more than another, set **weights** (`weights`) in the `@Index` options. Words from a field with a higher weight affect the score more. Below, the title weighs ten times as much as the text. The collection has two articles, one with the title "typed" and the text "other words", the other with the title "other" and the text "typed typed typed". The word "typed" in the title gives a score of 10, and three occurrences in the text give 1.75.
+
+<Snippet id="queries/text-and-vector-search/configure-text-index-2" twoslash />
+
+## Search by meaning and Atlas Search [#vector-and-atlas-search]
+
+A text index searches by words and their forms. It won't find "automobile" for the query "car". For that MongoDB Atlas has two features.
+
+- **Atlas Search**, the `$search` stage: fuzzy search, highlighting, facets.
+- **Vector search**, the `$vectorSearch` stage: the documents closest in meaning among the vectors.
+
+Both work only in Atlas or a local Atlas environment, not on a regular MongoDB server. And you build them not in a `find` query but in an [aggregation](../aggregation/search.mdx).
+
+Their indexes are called **search indexes** and are described with the [`@SearchIndex`](../reference/schemas/index-decorators.mdx) decorator. The decorator only writes the description into the model, and a sync, [`Model.syncSearchIndexes`](../reference/collections/model-indexes.mdx#model.sync-search-indexes), creates the index. The vector lives in a field of type `Vector`, described with `Spec.vector` along with the number type and the dimension.
+
+<Snippet id="queries/text-and-vector-search/vector-and-atlas-search" title="articles/document.ts" twoslash />
+
+The query itself is a `vectorSearch` stage in an aggregation pipeline. You name the index, the vector field, the query vector, and the number of results. An embedding model, that is your code, builds the query vector.
+
+<Snippet id="queries/text-and-vector-search/vector-and-atlas-search-2" title="articles/similar.service.ts" twoslash />
+
+<Callout type="warning">
+
+Vector search and `$search` were **not run** for these docs, because the test server isn't Atlas. On a regular server they fail with a `ServerError` and the text `Using $search and $vectorSearch aggregation stages requires additional configuration. (code 31082 SearchNotEnabled)`. The server's full text, with advice to connect to Atlas, is in the `serverMessage` field.
+
+The same goes for [`Model.syncSearchIndexes`](../reference/collections/model-indexes.mdx#model.sync-search-indexes): `Using Atlas Search Database Commands and the $listSearchIndexes aggregation stage requires additional configuration. (code 31082 SearchNotEnabled)`. The code above was checked by the compiler, and its behavior on Atlas is described from the product's code. Every stage parameter is in the [Stages](../reference/aggregation/stages.mdx) reference.
+
+</Callout>
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether the words match**.
+
+- **The user searches for the same words as in the text**, and word stems and a relevance score are enough: use `$text`. It works on any MongoDB server and needs only a text index.
+- **You need fuzzy search, highlighted matches, or facets**: Atlas Search (`$search`).
+- **You need to search by meaning, not by words**: vector search.
+
+The last two are available only in Atlas.
+
+## When not to use it [#when-not-to-use]
+
+You don't need any of these to search for an exact value like a SKU or an email. An ordinary filter on a field with a regular index is faster and more reliable. A text index doesn't search prefixes or substrings either. It works with whole words, and "pas" won't find "pasta". For filters like "starts with", use `$regex` and an index, as covered in [Filters](./filters.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**`text index required for $text query`.** You searched with `$text` in a collection without a text index. The query fails with a `ServerError` and the text `text index required for $text query (code 27 IndexNotFound)`. Without the index the search doesn't run at all. Usually the index is either not described in the model, or described but not created. Indexes have to be created at deploy time. [`init()`](../reference/connection/connection.mdx#connection.init) creates the missing ones, and [`Model.syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes) brings the model's indexes in line with the description.
+
+**`query requires text score metadata`.** You called `.textScore()`, but the filter has no `$text`. Text search computes the score, and without it there's nothing to compute: `ServerError: query requires text score metadata, but it is not available (code 40218 Location40218)`. The compiler doesn't check this. Remove `.textScore()` or add `$text`.
+
+<Snippet id="queries/text-and-vector-search/troubleshooting" twoslash />
+
+**An ascending score.** You wanted to show the worst matches first and wrote `.sort({ score: 1 })`. The compiler rejects that sort, because the score field only allows the direction `-1`. If the sort is built without types, the query isn't built and throws `QueryError: sort: "score" is the text score, which sorts from the best match only: use -1 (or textScore("score", { sort: true }))`.
+
+That's down to the database itself. It ranks matches from best to worst, and `$meta: "textScore"` has no "ascending score" order. Sort in descending order, and get the reverse order by reversing the array in code.
+
+<Snippet id="queries/text-and-vector-search/troubleshooting-2" twoslash />
+
+## Full example [#full-example]
+
+Here it all comes together: a word search with a score, sorting by it on the server, and excluding a word. Code that isn't part of Typemo and that you write yourself is marked `__…__`.
+
+<Snippet id="queries/text-and-vector-search/full-example" title="articles/search.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose you wrote `.sort({ score: { $meta: "textScore" } })` and the `$meta` projection by hand, and they could drift from the type. In Typemo [`.textScore`](../reference/query/search-and-explain.mdx#text-score) adds the score, and it lands in the row type right away. Typemo writes the `$meta` sort itself, through the `{ sort: true }` option or an ordinary `.sort({ score: -1 })`.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Search and the query plan" href="../reference/query/search-and-explain.mdx">
+  `.textScore` and `.explain` with exact types and errors.
+</Card>
+<Card title="Search in aggregation" href="../aggregation/search.mdx">
+  `$search`, `$searchMeta`, `$vectorSearch`, and merging the results of several searches.
+</Card>
+<Card title="Indexes" href="../schemas/indexes.mdx">
+  Describe text, compound, and search indexes in the model.
+</Card>
+<Card title="Define and sync search indexes" href="../collections/search-indexes.mdx">
+  Create Atlas search indexes and compare them with the description in the model.
+</Card>
+</Cards>

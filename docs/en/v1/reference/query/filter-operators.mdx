@@ -1,0 +1,420 @@
+---
+title: Filter operators
+description: "Every filter operator Typemo accepts: which fields it applies to, what it means, and which errors it throws"
+icon: Filter
+---
+
+A filter is an object that tells the database which documents you want, for example `{ price: { $gte: 20 } }`. The key is a model field. The value is either the field's value itself or an **operator object**, that is, keys with `$`, each of which sets one condition. This page describes every operator Typemo accepts. For each one it says which fields it applies to, what it means, and when Typemo refuses to run it.
+
+If you're new to this, read the guide [Filters](../../queries/filters.mdx) first. This page is the reference. The methods that accept a filter are described in the reference [Reading](./reading.mdx), and chains of conditions like `.where("price").gte(20)` in the reference [Chained conditions](./conditions.mdx).
+
+All the examples use one product model. It has required numbers, an array of strings, an optional date, a field that can be `null`, an array of nested documents, a numeric field for bit masks, and a point on a map.
+
+<Snippet id="reference/query/filter-operators/intro" title="models/product.ts" twoslash />
+
+The collection holds three products.
+
+- `Keyboard` costs 50, has 10 in stock, the tags `office` and `usb`, a release date of January 10, 2025, `note` equal to `null`, two variations (`K-1` with a quantity of 4 and `K-2` with a quantity of 0), `flags` equal to 5, and a point in Paris.
+- `Mouse` costs 20, has 0 in stock, the tag `usb`, a release date of June 1, 2025, `note` equal to `"sale"`, one variation (`M-1`, 7 units), `flags` equal to 2, and a point in Berlin.
+- `Monitor` costs 300, has 3 in stock, no tags, no release date and no point, `note` equal to `null`, no variations, and `flags` equal to 7.
+
+The results in the `// →` comments are the names of the products found, sorted alphabetically.
+
+---
+
+## How a condition is written [#condition-syntax]
+
+A condition on a field is written in one of two forms. The short form is the value itself. `{ price: 50 }` means "`price` equals 50", the same as [`$eq`](#eq). The long form is an operator object, for example `{ price: { $gte: 20, $lt: 300 } }`. Several operators in one object work together, as "and".
+
+The compiler knows the type of each field and suggests only the operators that fit. A string has `$regex`, a number has `$mod` and the bit operators, and an array has `$all`, `$size`, and `$elemMatch`. An operator that doesn't fit won't compile. At run time Typemo checks the same thing again, because a filter is often built from data the compiler can't see. So it always rejects three things.
+
+First, an unknown operator. MongoDB would answer it with a server error or, worse, understand the filter differently than you expected. Typemo throws a [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error) before the query is sent.
+
+<Snippet id="reference/query/filter-operators/condition-syntax" />
+
+Second, an operator where a value is expected. That's what an attempt to smuggle an operator through client data looks like. The client sends an object `{ "$gt": "" }` in the password field instead of a string, so the condition holds for any password. Typemo rejects such a filter.
+
+<Snippet id="reference/query/filter-operators/condition-syntax-2" />
+
+Third, `$where`. It runs JavaScript on the server, and Typemo doesn't support it at all. There are three reasons, and the error text names them all. Code in a query runs with the database's privileges, it can't be checked against the schema, and client data that lands in such a string becomes executable code. The Mongoose vulnerability CVE-2025-23061 worked through `$where` in populate.
+
+<Snippet id="reference/query/filter-operators/condition-syntax-3" />
+
+Write conditions that ordinary operators can't express with [`$expr`](#expr). It takes typed expressions instead of a string with code.
+
+---
+
+## Comparison [#comparison]
+
+### $eq [#eq]
+
+`$eq` checks that the field equals the value. The short form `{ price: 50 }` does the same. Use `$eq` when you want to show the equality explicitly, or when you need the operator inside [`$not`](#not) or [`.where`](./conditions.mdx#where).
+
+<Snippet id="reference/query/filter-operators/eq" twoslash />
+
+It applies to fields of any type. For an array field the value can be an element or the whole array. `{ tags: "usb" }` finds products that have `usb` among their tags, and `{ tags: ["usb"] }` finds only those with exactly one tag, and that tag is `usb`. You can compare `null` only with a field that can be `null`. A comparison with a required or optional field is rejected, and you check for a missing field with [`$exists`](#exists).
+
+### $ne [#ne]
+
+`$ne` checks that the field doesn't equal the value. Documents with no such field at all match too, because for the database "no field" means "not equal".
+
+<Snippet id="reference/query/filter-operators/ne" twoslash />
+
+It applies to fields of any type, like [`$eq`](#eq).
+
+### $gt, $gte, $lt, $lte [#gt-gte-lt-lte]
+
+`$gt` means "greater than", `$gte` "greater than or equal", `$lt` "less than", and `$lte` "less than or equal". Together they set a range, for example `{ price: { $gte: 20, $lt: 300 } }`.
+
+<Snippet id="reference/query/filter-operators/gt-gte-lt-lte" twoslash />
+
+They apply to values that have an order. These are numbers (`number`, `bigint`), strings, dates, `ObjectId` identifiers, `Decimal128`, `Timestamp`, and `Binary`. A boolean field has no order, and `{ flag: { $gt: 1 } }` won't compile. Documents without the field don't make it into the result.
+
+---
+
+## Sets of values [#sets]
+
+### $in [#in]
+
+`$in` checks that the field equals one of the values in the list. It's a short form of a long `$or` of several equalities. Use it to pick products from a list of names or users from a list of identifiers.
+
+<Snippet id="reference/query/filter-operators/in" twoslash />
+
+It applies to fields of any type. For an array field the condition holds if at least one element of the array is in the list. The operand must be an array. `{ price: { $in: 5 } }` won't compile, and if such a filter arrives at run time, Typemo throws a [`CastError`](../errors/data-errors.mdx#cast-error).
+
+<Snippet id="reference/query/filter-operators/in-2" />
+
+### $nin [#nin]
+
+`$nin` is the opposite of [`$in`](#in): the field equals none of the values in the list. Documents without this field match, as with [`$ne`](#ne).
+
+<Snippet id="reference/query/filter-operators/nin" twoslash />
+
+---
+
+## Existence and type [#existence-and-type]
+
+### $exists [#exists]
+
+`$exists` checks whether the document has the field. `{ $exists: true }` means the field is there, and `{ $exists: false }` means it isn't. This is the only correct way to find documents where a field isn't set, because Typemo forbids comparing with `undefined`.
+
+<Snippet id="reference/query/filter-operators/exists" twoslash />
+
+A field with the value `null` exists. `{ note: { $exists: true } }` returns all three products, including those whose `note` is `null`. To find exactly `null` (and documents without the field along with it), compare with `null` directly.
+
+<Snippet id="reference/query/filter-operators/exists-2" twoslash />
+
+A comparison with `null` is allowed only for fields that can be `null`. For the `released` field, the filter `{ released: null }` won't compile, and if it arrives at run time, Typemo throws a `CastError`.
+
+<Snippet id="reference/query/filter-operators/exists-3" />
+
+It applies to fields of any type.
+
+### $type [#type]
+
+`$type` checks the BSON type of the value in the database. It's useful when a field has historically held values of different types. It accepts a type alias (`"string"`, `"date"`, `"null"`, `"long"`, `"objectId"`, and others), the word `"number"` for any numeric type, a type number, or a non-empty list of them.
+
+<Snippet id="reference/query/filter-operators/type" twoslash />
+
+It applies to fields of any type. An unknown alias gives a `CastError` with the text `Cast to BSON type alias failed at path "name.$type" for "nope" (string): $type takes a BSON type alias or number (or a list of them) [type]`.
+
+---
+
+## Strings [#strings]
+
+### $regex [#regex]
+
+`$regex` checks a string against a regular expression. It accepts a pattern string or a `RegExp`. Flags (`i`, `m`, `x`, `s`, `u`) are set for a pattern string in the neighboring `$options`, and for a `RegExp` they're written in the expression itself.
+
+<Snippet id="reference/query/filter-operators/regex" twoslash />
+
+It applies only to string fields, including strings in an array. `{ price: { $regex: "5" } }` won't compile, and at run time Typemo throws a `StrictModeError`.
+
+<Snippet id="queries/filters/troubleshooting-6" />
+
+`$options` without `$regex` is an error too.
+
+<Snippet id="reference/query/filter-operators/regex-2" />
+
+Don't put a string from a client into the pattern without escaping it. The special characters in it become part of the expression.
+
+---
+
+## Numbers and bits [#numbers-and-bits]
+
+### $mod [#mod]
+
+`$mod` checks the remainder of a division: `{ $mod: [divisor, remainder] }`. With it you can, for example, pick prices that are multiples of 100.
+
+<Snippet id="reference/query/filter-operators/mod" twoslash />
+
+It applies to numeric fields (`number`, `bigint`). The divisor and the remainder are integers, and a zero divisor is rejected.
+
+<Snippet id="reference/query/filter-operators/mod-2" />
+
+### $bitsAllSet, $bitsAnySet, $bitsAllClear, $bitsAnyClear [#bits]
+
+The four bit operators check individual bits of an integer. `$bitsAllSet` requires all the given bits to be set, `$bitsAnySet` at least one set, `$bitsAllClear` all clear, and `$bitsAnyClear` at least one clear. You can give the bits as a list of positions (position 0 is the lowest bit), as a single mask number, or as a `Binary` value.
+
+In the model, the `flags` field stores permissions as bits. `Keyboard` has 5 (bits 0 and 2), `Mouse` has 2 (bit 1), and `Monitor` has 7 (bits 0, 1, and 2).
+
+<Snippet id="reference/query/filter-operators/bits" twoslash />
+
+They apply to integers and to `Binary` fields. For other fields Typemo throws a `StrictModeError`, and for an operand that isn't a mask, a `CastError`.
+
+<Snippet id="reference/query/filter-operators/bits-2" />
+
+---
+
+## Arrays [#arrays]
+
+An array field accepts everything its element accepts. `{ tags: "usb" }`, `{ tags: { $in: [...] } }`, and `{ tags: { $regex: "^u" } }` check whether at least one element matches. There are three operators of their own for arrays.
+
+### $all [#all]
+
+`$all` checks that the array contains all the listed values, in any order and possibly together with others.
+
+<Snippet id="reference/query/filter-operators/all" twoslash />
+
+It applies only to arrays. For a field that isn't an array you get a `StrictModeError`, and for an operand that isn't an array, a `CastError`.
+
+<Snippet id="reference/query/filter-operators/all-2" />
+
+### $size [#size]
+
+`$size` checks the length of the array. `{ tags: { $size: 0 } }` finds products with no tags. The number must be an integer of at least zero.
+
+<Snippet id="reference/query/filter-operators/size" twoslash />
+
+It applies only to arrays. For the numeric field, `{ price: { $size: 1 } }` won't compile, and at run time it's an error.
+
+<Snippet id="reference/query/filter-operators/size-2" />
+
+`$size` checks only the exact length. A condition like "at least three elements" can't be written with it. For such conditions, keep the length in a separate field or use [`$expr`](#expr).
+
+### $elemMatch [#elem-match]
+
+`$elemMatch` requires **one and the same element** of the array to satisfy all the conditions at once. Without it, conditions on nested fields are checked independently and can hold on different elements. This is one of the most common traps.
+
+`Keyboard` has two variations, `K-1` with a quantity of 4 and `K-2` with a quantity of 0. You need a product that has a variation `K-1` with zero stock. The form without `$elemMatch` finds `Keyboard`, though there's no such variation. `sku` matched on one element, and `qty` on another.
+
+<Snippet id="reference/query/filter-operators/elem-match" twoslash />
+
+For an array of nested documents the operand is a filter of those documents. For an array of scalars it's an object of operators over the element, for example `{ scores: { $elemMatch: { $gte: 8, $lt: 10 } } }`. It applies only to arrays, and an empty operand object is rejected.
+
+---
+
+## Logic [#logic]
+
+### $not [#not]
+
+`$not` reverses a condition. It accepts an operator object (without a nested `$not`) or a `RegExp`. Notice that documents without the field match under `$not`, because the condition didn't hold for them.
+
+<Snippet id="reference/query/filter-operators/not" twoslash />
+
+It applies to fields of any type, and a `RegExp` only to string ones. If a condition can be expressed by the opposite operator, use that, for example `$lte` instead of `$not` with `$gt`.
+
+### $and [#and]
+
+`$and` requires all the conditions of the list to hold. The list can't be empty. Usually you don't need `$and`, because several keys in one filter already work as "and". You need it when a condition on the same field or the same operator has to be repeated.
+
+<Snippet id="reference/query/filter-operators/and" twoslash />
+
+### $or [#or]
+
+`$or` requires at least one condition of the list to hold.
+
+<Snippet id="reference/query/filter-operators/or" twoslash />
+
+### $nor [#nor]
+
+`$nor` requires that none of the conditions of the list holds.
+
+<Snippet id="reference/query/filter-operators/nor" twoslash />
+
+An empty list isn't allowed for `$and`, `$or`, and `$nor`. The server rejects it for all three, and a list of conditions is often built from client data and can turn out empty. So Typemo checks it ahead of time and names the operator. It throws a [`QueryError`](../errors/query-errors.mdx#query-error) right when the method is called.
+
+<Snippet id="reference/policies/violations/empty-logical" />
+
+For `$and` and `$nor` the text is the same, with their name. If you called `.and([])`, `.or([])`, or `.nor([])` of the chain, it starts with the method name (`and:`, `or:`, `nor:`).
+
+---
+
+## Expressions, schema, sampling [#expressions-schema-sampling]
+
+### $expr [#expr]
+
+`$expr` compares document fields with each other or with a computed value. It accepts a function that builds the expression through `fn` (the same expressions as in aggregations). The compiler checks that the fields exist and that the operations fit their types. An expression isn't written as a string with code, like `$where`.
+
+<Snippet id="reference/query/filter-operators/expr" twoslash />
+
+Here the product's price is compared with ten times its stock. You can't write such a condition with ordinary operators, because both operands are document fields. Expressions are covered in more detail in the [aggregation reference](../aggregation/index.mdx).
+
+### $jsonSchema [#json-schema]
+
+`$jsonSchema` keeps only documents that match a JSON Schema. It helps to find documents with a broken structure, for example ones left over from an old version of the model.
+
+<Snippet id="reference/query/filter-operators/json-schema" twoslash />
+
+### $sampleRate [#sample-rate]
+
+`$sampleRate` selects a random share of documents, a number from 0 to 1. Use it for a quick estimate on a sample, for example when debugging on a large collection. The value 1 selects all documents.
+
+### $comment [#comment]
+
+`$comment` attaches a comment to the query. It's visible in the profiler and the server logs and doesn't affect the result. It's allowed only at the top level of the filter, and Typemo rejects it at the field level.
+
+<Snippet id="reference/query/filter-operators/comment" />
+
+The [`.comment`](./options.mdx#comment) method sets a comment for the whole query, not only the filter.
+
+### $text [#text]
+
+`$text` searches for words through a text index. It needs a text index on the collection, and without one the query ends with the server error `ServerError: text index required for $text query (code 27 IndexNotFound)`. The full walkthrough, including the `textScore` relevance score, is in the reference [Search and the query plan](./search-and-explain.mdx#text-score).
+
+---
+
+## Geo queries [#geo-queries]
+
+Geo operators work with fields that store a point or a shape in GeoJSON format, and with coordinate pairs `[longitude, latitude]`. `$near` and `$nearSphere` require a `2dsphere` index on the field. In the model it's declared with the decorator `@Index({ place: "2dsphere" })`, and it's created during [index sync](../../collections/index-sync.mdx). Coordinates are finite numbers, and a string instead of a number is rejected with a `CastError`.
+
+<Snippet id="reference/query/filter-operators/geo-queries" />
+
+The easiest way to build shapes with coordinates is the [`GeoJson`](#geo-json) helper. It checks the range and the closing of the ring before the query goes to the database.
+
+### $near [#near]
+
+`$near` returns documents sorted from the nearest point to the farthest. The `$maxDistance` option limits the distance in meters, and `$minDistance` sets a lower bound. The result is already sorted by distance, so you usually don't add `.sort` to it.
+
+<Snippet id="reference/query/filter-operators/near" twoslash />
+
+Without `$maxDistance`, all documents with a point come back, from nearest to farthest: `["Keyboard", "Mouse"]`.
+
+### $nearSphere [#near-sphere]
+
+`$nearSphere` does the same as [`$near`](#near), but computes distances on a sphere. For GeoJSON fields the result matches `$near`, and the difference shows with old fields that hold coordinate pairs.
+
+<Snippet id="reference/query/filter-operators/near-sphere" twoslash />
+
+### $geoWithin [#geo-within]
+
+`$geoWithin` keeps documents whose shape lies entirely inside the given area. An index isn't required.
+
+<Snippet id="reference/query/filter-operators/geo-within" twoslash />
+
+### $geoIntersects [#geo-intersects]
+
+`$geoIntersects` keeps documents whose shape intersects the given one. For a point it's the same as "the point lies inside".
+
+<Snippet id="reference/query/filter-operators/geo-intersects" twoslash />
+
+---
+
+## GeoJson [#geo-json]
+
+`GeoJson` is a class with static methods that build GeoJSON values for geo operators. It can build a point, a line, and a polygon. You need it in two cases. First, you assemble the shape not as a literal right in the filter but separately, in a variable or a function. Then TypeScript infers `coordinates` as `number[]`, and geo operators accept only an exact pair or a ring of the right length. Second, the coordinates come from data, and you need to check them before the query, not after the server's answer.
+
+<Snippet id="reference/query/filter-operators/geo-json" twoslash />
+
+The result fits wherever a geo operator or a model field expects GeoJSON. That means `$near`, `$nearSphere`, `$geoIntersects`, `$geoWithin` (a polygon), and a field value in [`create`](../writes/writes.mdx#create). The methods send nothing to the database and don't depend on the model.
+
+Every position is checked the way the `2dsphere` index checks it. It's two numbers (the third is an optional altitude), all finite, with longitude from −180 to 180 and latitude from −90 to 90. The order is always **longitude, then latitude**. The helper can't guess that you swapped the numbers if both fall within the allowed limits.
+
+### GeoJson.point [#geo-json.point]
+
+Builds a point `{ type: "Point", coordinates: [longitude, latitude] }`.
+
+<Returns type="GeoJsonPoint">
+
+A new point object. The coordinate array is a copy, and changing your numbers after the call doesn't affect it.
+
+</Returns>
+
+<Params>
+<Param name="longitude" type="number" required>
+
+The longitude, a number from −180 to 180.
+
+</Param>
+<Param name="latitude" type="number" required>
+
+The latitude, a number from −90 to 90.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/filter-operators/geo-json-point" />
+
+</FullType>
+
+### GeoJson.lineString [#geo-json.line-string]
+
+Builds a line `{ type: "LineString", coordinates: [...] }` from two or more positions: a route, a road, a border. It fits `$geoIntersects` and a field value.
+
+<Snippet id="reference/query/filter-operators/geo-json-line-string" twoslash />
+
+<Returns type="GeoJsonLineString">
+
+A new line object. The positions are copied.
+
+</Returns>
+
+<Params>
+<Param name="...positions" type="[GeoPosition, GeoPosition, ...GeoPosition[]]" required>
+
+The positions of the line, each `[longitude, latitude]`. The compiler requires at least two, and a call with one position doesn't compile.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/filter-operators/geo-json-line-string-2" />
+
+</FullType>
+
+### GeoJson.polygon [#geo-json.polygon]
+
+Builds a polygon `{ type: "Polygon", coordinates: [rings] }`. The first ring is the outer boundary, and the following ones are holes inside it. It fits `$geoWithin`, `$geoIntersects`, and a field value.
+
+<Snippet id="reference/query/filter-operators/geo-json-polygon" twoslash />
+
+<Returns type="GeoJsonPolygon">
+
+A new polygon object. The rings and positions are copied.
+
+</Returns>
+
+<Params>
+<Param name="...rings" type="[GeoLinearRing, ...GeoLinearRing[]]" required>
+
+The rings, the outer one first, then the holes. A ring is closed (the last position equals the first) and has at least four positions. The compiler checks the number of positions, and the closing is checked at the call.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/filter-operators/geo-json-polygon-2" />
+
+</FullType>
+
+### Errors [#errors]
+
+An invalid position or ring gives a [`CastError`](../errors/data-errors.mdx#cast-error). It's thrown right when the method is called, before any query.
+
+<Snippet id="reference/query/filter-operators/errors" />
+
+The first line is a longitude or latitude out of range (`GeoJson.point(200, 10)`). The second is a non-numeric or infinite coordinate (`GeoJson.point(Number.NaN, 1)`). The third is an unclosed ring, and the fourth is one that's too short. The fifth is a line with fewer than two positions, that is, `GeoJson.lineString` from code without types with one position. The server would reject such a line only on write. In the error path for a line and a polygon there's the number of the position or ring, for example `coordinates.1` and `coordinates.0.3`. The compiler checks the same number of positions. `GeoJson.lineString([0, 0])` and a polygon with three positions in the ring don't compile, and in code without types a `CastError` stops them.
+
+<Snippet id="reference/query/filter-operators/errors-2" twoslash />
+
+You can catch the `CastError` at the boundary of your application and tell the client the coordinates are wrong.
+
+### When you don't need GeoJson [#when-not-to-use]
+
+If the shape is written as a literal right in the filter, as in the examples above, the compiler already infers an exact type for it, and the helper adds nothing. You need it when the shape lives apart from the query, or when the coordinates need checking. Typemo lets a plain object `{ type: "Point", coordinates: [200, 100] }` through. Only the server checks the range, when the document is written, and the answer comes as a `ServerError`.
+
+Geo queries with indexes and GeoJSON types are covered in more detail in the guide [Geo queries](../../queries/geo.mdx).

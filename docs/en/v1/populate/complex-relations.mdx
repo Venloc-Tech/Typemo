@@ -1,0 +1,135 @@
+---
+title: Relations inside nested data
+description: "Load nested relations, references inside subdocuments and Maps, different models by refPath, and chains through virtual fields"
+icon: Network
+---
+
+Sometimes a reference isn't right in a document's field but deeper, and [`.populate`](../reference/populate/populate.mdx#populate) follows a path to reach it. A post points to its author, the author to their posts, a comment to its post. A reference can hide in an array of subdocuments or in a Map, or it can point to a model that depends on the data. Each case has its own path notation: dots for nesting, `$*` for Map values, and `refPath` for picking the model.
+
+If you haven't populated simple relations yet, start with [Show related data](./basics.mdx).
+
+## What you need [#prerequisites]
+
+The client and the blog models from [Show related data](./basics.mdx). The model is extended here. A post has attachments with the uploader, a Map of reviewers, and a feed of events with a polymorphic reference. The database holds the same two users, two tags, and three posts, and the post "Hello" has more data.
+
+- Three attachments. Bob uploaded `a.png`, Alice uploaded `b.png`, and `c.png` has no uploader.
+- The reviewers `lead` (Bob) and `second` (Alice).
+- The comments `c1` (Bob) and `c2` (Alice).
+
+The feed has two events. One points to the post "Hello", the other to the comment `c1`.
+
+## Quick start [#quick-start]
+
+How you write the path depends on where the reference hides. A dot means going inside, into a subdocument or a related model. `$*` means the values of a Map. Each variant fits on one line.
+
+<Snippet id="populate/complex-relations/quick-start" twoslash />
+
+Below we'll cover each case separately.
+
+## A nested relation through a dot [#nested-path-populate]
+
+A comment needs its post, and the post needs its author. The path `post.author` means "first populate `post`, then populate `author` on the loaded posts". Typemo does this in two queries in a row, because the author identifiers are known only after the posts are loaded.
+
+<Snippet id="populate/complex-relations/nested-path-populate" twoslash />
+
+If a nested path needs its own options, use the [`populate`](../reference/populate/populate.mdx#object-options.populate) option inside the object. Then `select` applies to the author, not to the post.
+
+<Snippet id="populate/complex-relations/nested-path-populate-2" twoslash />
+
+`post.author` and `{ path: "post", populate: "author" }` are equivalent. While you don't need options, use the dot, and switch to an object when you do. The compiler checks the path segment by segment up to seven levels deep, and suggests the first three.
+
+## References inside an array of subdocuments [#refs-in-subdocuments]
+
+A post has attachments, and each records who uploaded it. The path goes through the array: `attachments.uploader`. Typemo collects the identifiers from every element of the array and loads them in one query.
+
+<Snippet id="populate/complex-relations/refs-in-subdocuments" title="blog/models.ts" twoslash />
+
+<Snippet id="populate/complex-relations/refs-in-subdocuments-2" twoslash />
+
+For an attachment without an uploader, `uploader` stays empty, since there's no reference and nothing to fill in. If the same loaded document appears in several elements, it's one shared object in all those places. Change it through one attachment, and the change is visible through another, unless you ask for [`clone: true`](../reference/populate/populate.mdx#clone).
+
+A path works the same way through a nested object (`shipping.carrier`) and through a nested array. There's one rule. Segments through embedded documents are written as ordinary fields, and the last segment is the reference field.
+
+## A Map of references [#link-map]
+
+A post's reviewers are stored in a `Map<string, Ref<User>>` by role, `lead` and `second`. The path to the Map's values is written with an asterisk: `reviewers.$*`. Without it, Typemo can't tell whether you mean the keys or the values, and it stops.
+
+<Snippet id="populate/complex-relations/link-map" twoslash />
+
+On a document such a Map has the type `ReadonlyMap<string, HydratedDoc<User> | null>`. A value whose document wasn't found stays in the Map as `null`, and you reach it through `?.`. `get` works, but the compiler won't allow `set`. You change the Map through identifiers and [`$set`](../reference/documents/document-api.mdx#set). In a `.plain()` result the Map stays a Map, and in `.lean()` it becomes a plain object. If a Map value isn't a reference but a subdocument with a reference inside, the path continues after `$*`, for example `notes.$*.author`.
+
+## One reference to different models [#dynamic-ref]
+
+The event feed stores a reference that points sometimes to a post and sometimes to a comment. Such a reference is called **polymorphic**: the model is chosen by the data. The `refPath` option names the neighboring field `kind`, which holds the model's name.
+
+<Snippet id="populate/complex-relations/dynamic-ref" title="blog/models.ts" twoslash />
+
+You populate it as usual.
+
+<Snippet id="populate/complex-relations/dynamic-ref-2" twoslash />
+
+After populate the type of `target` is a union of posts and comments, plus `null` if the document is missing. So narrow it before reading fields. You can also choose the model with a function, through `refModel`, as covered in [Reference other models](../schemas/references.mdx).
+
+You can't populate anything below a polymorphic reference, because its target isn't one model. `populate("target.author")` gives `QueryError: populate "target.author": "target" is a polymorphic reference (refPath/refModel); nothing below it can be populated`.
+
+## Chains through virtual fields [#virtual-chains]
+
+For an author you need their posts, for the posts their comments, and for the comments their authors. Virtual fields ([`@Virtual`](../reference/schemas/virtual.mdx)) take part in paths on a par with references. You can write the chain as one path or as nested objects.
+
+<Snippet id="populate/complex-relations/virtual-chains" twoslash />
+
+You need a nested object when one of the links needs options, such as a limit on comments.
+
+<Snippet id="populate/complex-relations/virtual-chains-2" twoslash />
+
+Each link is a separate query. A chain of three links costs three queries plus the main one. If the chain is longer than two or three links, or computes something along the way, consider an aggregation, see [Load related data faster](./performance.mdx).
+
+## How to choose the path notation [#how-to-choose]
+
+Ask yourself where the reference lives relative to the document's root.
+
+- **In the document itself**: the field name is enough.
+- **Inside an embedded document or an array of them**: write the path with dots.
+- **In a Map value**: add `$*`.
+- **In a related model**: continue the path with a dot. When a link needs its own options, nest an object in `populate`.
+
+## When not to use it [#when-not-to-use]
+
+If you need only part of a chain, don't load all of it, because each link costs a query and data volume. If the main document is filtered by a field somewhere deep in the chain, say comments on posts by authors from Moscow, populate won't help. It runs after the read, and this needs an aggregation with [`$lookup`](../reference/aggregation/stages.mdx#lookup). And if there are many polymorphic targets and you need them as a list, it's often simpler to store `kind` and load each group with its own query.
+
+## Troubleshooting [#troubleshooting]
+
+**A Map isn't filled without `$*`.** You gave the Map field's name without the asterisk.
+
+<Snippet id="populate/complex-relations/troubleshooting" twoslash />
+
+The compiler answers `TS2345`. The parameter type shows why: `Argument of type '"reviewers"' is not assignable to parameter of type 'PopulateObject | "Invalid populate path \"reviewers\": \"reviewers\" is not a reference"'`. If the path came from data and the compiler never saw it, at runtime a `QueryError` suggests the right path: `populate "reviewers": "reviewers" is a Map: its values are "reviewers.$*"`.
+
+**Populate below a polymorphic reference.** `populate("target.author")` is forbidden, because there's no single model under `refPath`. Populate `target`, narrow the type, and load the targets' relations with a separate call for each model.
+
+**A typo in the middle of the path.** For example, `autor` instead of `author`.
+
+<Snippet id="populate/complex-relations/troubleshooting-2" twoslash />
+
+The compiler names the segment, `Invalid populate path "post.autor": unknown field "autor"`, as part of the `TS2345` error text, as above. The path is checked segment by segment, and the error points to the first wrong one.
+
+## Full example [#full-example]
+
+<Snippet id="populate/complex-relations/full-example" title="blog/feed.service.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Populate a document you already have" href="./document-populate.mdx">
+  Load a relation on a document you've already read, and remove it again.
+</Card>
+<Card title="Make sure a reference is populated" href="./type-checks.mdx">
+  Narrow the type of a polymorphic target and make sure a relation is loaded.
+</Card>
+<Card title="Load related data faster" href="./performance.mdx">
+  What chains cost and when it's time to switch to `$lookup`.
+</Card>
+<Card title=".populate" href="../reference/populate/populate.mdx">
+  Every option: `match`, `options`, `justOne`, `retainNullValues`, `required`, `clone`, `transform`.
+</Card>
+</Cards>

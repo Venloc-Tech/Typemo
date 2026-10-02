@@ -1,0 +1,115 @@
+---
+title: Search in aggregation
+description: "Build Atlas Search and vector search queries, combine their results, and get a relevance score"
+icon: Search
+---
+
+An ordinary MongoDB text index searches by words, but it can't do fuzzy search, highlighting, or search by meaning. For that, MongoDB Atlas has **Atlas Search** (the `$search` stage) and **vector search** (the `$vectorSearch` stage). You build them not in `find` but in an aggregation pipeline, and they always come **first**. In Typemo these are the [`search`](../reference/aggregation/stages.mdx#search), [`searchMeta`](../reference/aggregation/stages.mdx#search-meta), and [`vectorSearch`](../reference/aggregation/stages.mdx#vector-search) methods. To combine several searches, there's [`rankFusion`](../reference/aggregation/stages.mdx#rank-fusion), [`scoreFusion`](../reference/aggregation/stages.mdx#score-fusion), and [`score`](../reference/aggregation/stages.mdx#score).
+
+<Callout type="warning">
+
+This page is written from the product's code. Atlas Search doesn't work on the docs test server, which answers `ServerError: Using $search and $vectorSearch aggregation stages requires additional configuration. (code 31082 SearchNotEnabled)`. The server's full text is in the error's `serverMessage` field: `Please connect to Atlas or an AtlasCLI local deployment to enable`. Running the examples verified that they all compile and that the pipelines build into the stages shown below (`plan()`). Search results on Atlas weren't obtained for these docs, so there are no comments with returned rows here.
+
+</Callout>
+
+Search by plain words and a full-text index without Atlas are covered in [Full-text and vector search](../queries/text-and-vector-search.mdx). How to declare and sync search indexes is covered in [Define and sync search indexes](../collections/search-indexes.mdx).
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and a blog article model. It has the search index `articles_text` for `$search` and the vector index `vec` for the `embedding` field, both declared as described in the search indexes guide.
+
+<Snippet id="aggregation/search/prerequisites" title="blog/article.ts" twoslash />
+
+## Quick start [#quick-start]
+
+`search` takes the index name and a search operator, such as `text`. [`fn.meta`](../reference/aggregation/expr-misc.mdx#fn.meta) gives the relevance score.
+
+<Snippet id="aggregation/search/quick-start" twoslash />
+
+Below we'll cover operators, vector search, and combining results.
+
+## Search by words with conditions [#text-search-with-filter]
+
+The `text` operator searches for words in a field, and `compound` combines several conditions.
+
+- `must`: required.
+- `should`: preferred, raises the score.
+- `mustNot`: exclude.
+- `filter`: a filter that doesn't affect the score.
+
+The `path` field is checked against the model, so a typo won't compile.
+
+<Snippet id="aggregation/search/text-search-with-filter" twoslash />
+
+The pipeline builds into `{"$search":{"index":"articles_text","compound":{"must":[{"text":…}],"should":[{"phrase":…}]}}}`. `search` has other operators too: `phrase`, `autocomplete`, `equals`, `range`, `regex`, `wildcard`, `near`, `queryString`, `moreLikeThis`, plus `highlight`, `count`, and `sort`. The full list is in the [Stages](../reference/aggregation/stages.mdx#search) reference.
+
+Through [`Model.aggregate`](../reference/aggregation/pipeline.mdx#model.aggregate), `search` is also called as the first stage. If the model has [hidden fields](../schemas/hidden-and-sensitive.mdx#hidden-in-aggregation), Typemo removes them with a `$unset` stage and puts it right after the search, not before it. The server accepts `$search`, `$searchMeta`, and `$vectorSearch` only first. The pipeline that's sent starts like this: `[{ $search: … }, { $unset: ["…"] }, …]`.
+
+<Snippet id="aggregation/search/text-search-with-filter-2" title="blog/articles.service.ts" twoslash />
+
+## Get search metadata [#search-meta]
+
+[`searchMeta`](../reference/aggregation/stages.mdx#search-meta) returns information about the search, not documents: how many matches there are in total and how they're distributed across facets. With it you can show "128 articles found" without fetching the articles themselves.
+
+<Snippet id="aggregation/search/search-meta" twoslash />
+
+## Search by meaning [#semantic-search]
+
+[`vectorSearch`](../reference/aggregation/stages.mdx#vector-search) finds the documents whose vector is closest to the query vector. Your code builds the query vector with an embedding model. Typemo checks that `path` is a model field, and it accepts an array of numbers or a binary vector.
+
+- `limit`: how many documents to return.
+- `numCandidates`: how many candidates to consider. More means more accurate and slower.
+- `exact: true` turns on exact search instead of approximate.
+- `filter` selects documents by indexed fields before the comparison.
+
+<Snippet id="aggregation/search/semantic-search" title="blog/similar.service.ts" twoslash />
+
+## Combine text and vector search [#hybrid-search]
+
+Text search finds exact words, vector search finds similar meaning, and together they give a better list. [`rankFusion`](../reference/aggregation/stages.mdx#rank-fusion) takes named sub-pipelines and combines their results by position in each list. `weights` set the weight of each sub-pipeline. This is also a first stage, and it needs MongoDB 8.1 or newer.
+
+<Snippet id="aggregation/search/hybrid-search" twoslash />
+
+The names in `weights` are checked against the sub-pipeline names, and the weight of a sub-pipeline that doesn't exist won't compile. [`scoreFusion`](../reference/aggregation/stages.mdx#score-fusion) (MongoDB 8.2+) combines by **scores** instead of positions. It needs a `normalization`, `"none"`, `"sigmoid"`, or `"minMaxScaler"`, to bring the scores of different searches to one scale. [`score`](../reference/aggregation/stages.mdx#score) (MongoDB 8.2+) sets a document's score with an expression.
+
+## How to choose [#how-to-choose]
+
+Ask yourself what has to match: the words or the meaning.
+
+- **Words, their forms, phrases, fuzzy matches**: `search`.
+- **Meaning**: `vectorSearch`.
+- **Both**: `rankFusion` if the order in the lists matters, or `scoreFusion` if the scores themselves matter.
+
+If you only need search by words without Atlas, a text index in [`find`](../reference/query/reading.mdx#model.find) is enough.
+
+## When not to use it [#when-not-to-use]
+
+If your server isn't Atlas, these stages won't run. Use [`$text`](../queries/text-and-vector-search.mdx) with a text index. For plain selection by a field's value, an ordinary filter in `find` is enough. Atlas Search pays off when you need relevance.
+
+## Troubleshooting [#troubleshooting]
+
+**A search that isn't the first stage.** `search`, `searchMeta`, `vectorSearch`, `rankFusion`, and `scoreFusion` are called only on an empty pipeline. After another stage they won't compile.
+
+<Snippet id="aggregation/search/troubleshooting" twoslash />
+
+Put the search first and `limit` after it.
+
+**`ServerError` on an ordinary server.** These stages work only on Atlas and in an Atlas CLI local deployment. On a plain `mongod` you get a `ServerError` with the text from the top of the page. Your code is fine. Run the app on Atlas or take the search out of the pipeline.
+
+## Full example [#full-example]
+
+<Snippet id="aggregation/search/full-example" title="blog/search.service.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Full-text and vector search" href="../queries/text-and-vector-search.mdx">
+  Search without Atlas: `$text`, a text index, and relevance.
+</Card>
+<Card title="Define and sync search indexes" href="../collections/search-indexes.mdx">
+  Describe the indexes that `search` and `vectorSearch` need.
+</Card>
+<Card title="Stages" href="../reference/aggregation/stages.mdx#search">
+  Every `search` operator and the parameters of the combining stages.
+</Card>
+</Cards>

@@ -1,0 +1,574 @@
+---
+title: TypemoClient
+description: "The database client: connect, db, aggregate, ready, onStateChange, close, transaction, use, instrument, unsafeDriver, and the client options"
+icon: Plug
+---
+
+`TypemoClient` holds one connection to MongoDB. It opens and closes the connection, tracks its state, hands out a [`Connection`](./connection.mdx) for each database, and runs transactions. Models are bound to the connection of their client. Typemo has no global client. You create a client yourself and pass it wherever it's needed.
+
+If you're new here, read the guide [Connect to the database](../../connection/connect.mdx) first. This page is a reference, the place to come back to for details.
+
+Inside the client lives one `MongoClient` of the official `mongodb` driver. The connection pool, retries, server selection, and reconnection stay with the driver. Typemo adds the state, waiting for readiness, and its own checks of the settings.
+
+All the examples use the same account model.
+
+<Snippet id="connection/clients-and-extensions/prerequisites" title="accounts/account.ts" twoslash />
+
+The rest lives in the neighboring references. Models and databases are in [`Connection`](./connection.mdx), global settings are in [`Typemo`](./typemo.mdx), and states are in [`ConnectionState`](./connection-state.mdx).
+
+---
+
+## TypemoClient.connect [#typemo-client.connect]
+
+`TypemoClient.connect` creates a client and connects it right away. It's the most common start: one line at application or script startup, and the client is ready.
+
+<Snippet id="reference/connection/typemo-client/typemo-client-connect" twoslash />
+
+<Returns type="Promise<TypemoClient>">
+
+The connected client. If the connection fails, the promise rejects with [`ConnectionError`](../errors/configuration-errors.mdx#connection-error). No client is returned in that case, so there's nothing to close.
+
+</Returns>
+
+<Params>
+<Param name="uri" type="string" required>
+
+The connection string, `mongodb://` or `mongodb+srv://`. Anything else, such as `localhost:27017` without a scheme, gives a `ConfigurationError` before any attempt to connect.
+
+</Param>
+<Param name="options" type="TypemoClientOptions" default="{}">
+
+Driver options and Typemo's own options. For details, see the section [Client options](#client-options).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/connection/typemo-client/typemo-client-connect-2" />
+
+</FullType>
+
+### When the connection fails [#connection-failed]
+
+If the server is unavailable, the driver waits `serverSelectionTimeoutMS` for a suitable server (30 seconds by default) and gives up. Typemo turns that error into a `ConnectionError` with a `failure` field that shows the reason. The wait in the example is short, and nobody listens on the port.
+
+<Snippet id="reference/connection/typemo-client/connection-failed" twoslash />
+
+`failure` has four values. `closed` means the client is already closed. `server-selection` means no server was found, as above. `network` is a network failure. `authentication` means the server rejected the credentials. The first two were checked on a real database, and the others are described from the code.
+
+### When it doesn't fit [#typemo-client.connect.when-not-to-use]
+
+If you need the client in advance and can connect later, use [`new TypemoClient`](#new-typemo-client) and call [`client.connect`](#client.connect) at the right moment.
+
+---
+
+## new TypemoClient [#new-typemo-client]
+
+The constructor creates a client and does **not** connect it. You need it when the client has to exist before the connection. For example, modules import a ready client, and the application connects at startup.
+
+<Snippet id="reference/connection/typemo-client/new-typemo-client" twoslash />
+
+Until you call [`client.connect`](#client.connect), model operations don't fail. They wait for the connection, but no longer than `readyTimeoutMS`. For details, see the section [`client.ready`](#client.ready).
+
+<Params>
+<Param name="uri" type="string" required>
+
+The connection string, same as in [`TypemoClient.connect`](#typemo-client.connect).
+
+</Param>
+<Param name="options" type="TypemoClientOptions" default="{}">
+
+The client options. Typemo copies and checks the object, and the object itself stays untouched.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/connection/typemo-client/new-typemo-client-2" />
+
+</FullType>
+
+### Configuration errors [#configuration-errors]
+
+The constructor checks all options and throws `ConfigurationError`, that is, before any network access.
+
+<Snippet id="reference/connection/typemo-client/configuration-errors" />
+
+The first line is an address without `mongodb://`. The second is a `dbName` that doesn't match the database from the connection string. The third is an old timeout option. The rest are empty or invalid values. Two "default" databases would send operations to the wrong place. And one [`timeoutMS`](#client-options) replaced the driver's three old timeouts, so Typemo doesn't accept them and suggests the replacement.
+
+---
+
+## client.connect [#client.connect]
+
+`client.connect` connects a client created with [`new TypemoClient`](#new-typemo-client). Calling it again is safe. While the client is connecting or already connected, you get the same result without a new connection.
+
+<Snippet id="reference/connection/typemo-client/client-connect" twoslash />
+
+<Returns type="Promise<this>">
+
+The same client. If the connection fails, the promise rejects with `ConnectionError`, the client state goes back to `idle`, and you can call `connect` again.
+
+</Returns>
+
+A closed client can't be reconnected. Create a new one.
+
+<Snippet id="reference/connection/typemo-client/client-connect-2" />
+
+<FullType>
+
+<Snippet id="reference/connection/typemo-client/client-connect-3" />
+
+</FullType>
+
+---
+
+## client.db [#client.db]
+
+`client.db` returns a [`Connection`](./connection.mdx), one database of this client together with its models. The call does nothing over the network, and the server creates the database on the first write.
+
+<Snippet id="reference/connection/typemo-client/client-db" twoslash />
+
+<Returns type="Connection">
+
+The connection to the database. For one name you always get the same object, so the models registered on it aren't lost between calls.
+
+</Returns>
+
+<Params>
+<Param name="name" type="string" default="client.options.dbName">
+
+The database name. Typemo doesn't accept an empty string and throws `ConfigurationError` with the text `TypemoClient.db: a database name`. Without an argument it takes the default database: `dbName`, the database from the connection string, or `test`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/connection/typemo-client/client-db-2" />
+
+</FullType>
+
+[`connection.useDb`](./connection.mdx#connection.use-db) does the same, only from a connection.
+
+---
+
+## client.connection [#client.connection]
+
+`client.connection` is a shorthand for `client.db()`, the connection to the default database.
+
+<Snippet id="reference/connection/typemo-client/client-connection" twoslash />
+
+The type is `Connection`. Get a model through [`client.connection.model(Account)`](./connection.mdx#connection.model) or `client.db().model(Account)`.
+
+---
+
+## client.aggregate [#client.aggregate]
+
+`client.aggregate` runs a database-level aggregation that isn't tied to a model. That covers running operations (`$currentOp`), literal documents (`$documents`), local sessions (`$listLocalSessions`), and server sessions (`$listSessions`). Use the method when you have a client but neither a model nor a connection, for example in a server health check. The plan is built by [`Pipeline.database`](../aggregation/pipeline.mdx#pipeline.database), [`Pipeline.admin`](../aggregation/pipeline.mdx#pipeline.admin), and [`Pipeline.sessions`](../aggregation/pipeline.mdx#pipeline.sessions).
+
+<Snippet id="reference/connection/typemo-client/client-aggregate" twoslash />
+
+The method does the same as [`connection.aggregate`](./connection.mdx#connection.aggregate) of the connection to the default database. `Pipeline.database()` runs in the `client.options.dbName` database, `Pipeline.admin()` in `admin`, and `Pipeline.sessions()` in `config.system.sessions`.
+
+The operation goes through the common operation pipeline. Its events for [`client.instrument`](#client.instrument) arrive with `model: null` and `collection: null`, and for `Pipeline.sessions` the collection is `"system.sessions"`. Inside `client.transaction` it takes part on its own, and `timeoutMS` and Typemo errors work as they do for models. Hooks don't run, because the operation has no model to declare them on.
+
+<Returns type="AggregateQuery<R>">
+
+An aggregation query typed by the rows of the plan. `await` gives an array of rows, `.cursor()` returns them one by one, and `.explain()` shows the server plan.
+
+</Returns>
+
+<Params>
+<Param name="plan" type="AggregatePlan<R>" required>
+
+The plan from `.plan()` of the `Pipeline.database()`, `Pipeline.admin()`, or `Pipeline.sessions()` builder.
+
+</Param>
+<Param name="options" type="ModelAggregateOptions">
+
+`session` (`null` runs outside the current transaction), `timeoutMS`, and `policy`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/connection/connection/connection-aggregate-2" />
+
+</FullType>
+
+The errors are the same as on the connection. If you pass something that isn't an aggregation plan, you get a `QueryError` (`client.aggregate: an aggregation plan of Pipeline.database(), Pipeline.admin() or Pipeline.sessions()`). A plan over a model's collection gives a `ConfigurationError` (`client.aggregate: the plan reads the collection "accounts"; run it with the model's aggregate()`). The scenarios are covered in the guide [Database-level queries](../../aggregation/database-level.mdx).
+
+---
+
+## client.ready [#client.ready]
+
+`client.ready` waits until the client is connected. You rarely need it, because ordinary model operations wait for the connection themselves. Use it when you have to wait explicitly, for example before starting an HTTP server, and you don't call `connect` yourself.
+
+<Snippet id="reference/connection/typemo-client/client-ready" twoslash />
+
+If the client is already connected, the method returns at once. Otherwise it waits for `connect` to finish, but no longer than the limit. When the time runs out, you get a `TimeoutError` with the field `kind: "connection"`. We got the text below for a client whose `connect` was never called.
+
+<Snippet id="reference/connection/typemo-client/client-ready-2" />
+
+<Params>
+<Param name="timeoutMS" type="number" default="client.options.readyTimeoutMS">
+
+How long to wait for the connection, in milliseconds. Zero means wait without a limit.
+
+</Param>
+</Params>
+
+Returns `Promise<void>`. After `close` the method throws `ConnectionError` with `failure: "closed"`. If `connect` finished with an error, everyone waiting in `ready` gets the same error.
+
+<FullType>
+
+<Snippet id="reference/connection/typemo-client/client-ready-3" />
+
+</FullType>
+
+### Operations before connect [#operations-before-connect]
+
+A model operation started before `connect` doesn't fail and isn't queued for a retry. It continues once the client connects. The wait limit is the operation's own `timeoutMS`, or the client's `readyTimeoutMS` without it. When the limit runs out, the operation fails with the same `TimeoutError`.
+
+<Snippet id="reference/connection/typemo-client/operations-before-connect" twoslash />
+
+---
+
+## client.state [#client.state]
+
+`client.state` is the current state of the client, one of `idle`, `connecting`, `connected`, `unavailable`, and `closed`. Typemo derives it from the driver's topology events, so it's the same for a single server, a replica set, a sharded cluster, and a load balancer. Each state and the transitions are described on the page [`ConnectionState`](./connection-state.mdx).
+
+The type is [`ConnectionState`](./connection-state.mdx), a read-only property.
+
+---
+
+## client.onStateChange [#client.on-state-change]
+
+`client.onStateChange` subscribes a function to state changes. It's useful for readiness checks, metrics, and logs: "connected", "lost the server", "closed the client".
+
+<Snippet id="reference/connection/typemo-client/client-on-state-change" twoslash />
+
+<Returns type="() => void">
+
+A function that cancels the subscription.
+
+</Returns>
+
+<Params>
+<Param name="listener" type="(state: ConnectionState) => void" required>
+
+Receives the new state after every change. Repeated events with the same state don't reach the subscriber. It doesn't get the initial `idle` either. Learn it through [`client.state`](#client.state).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/connection/typemo-client/client-on-state-change-2" />
+
+</FullType>
+
+---
+
+## client.close [#client.close]
+
+`client.close` closes the client. The driver ends the sessions and closes the connection pool. The client stays in the `closed` state forever, and all operations fail with `ConnectionError` with `failure: "closed"`.
+
+<Snippet id="reference/connection/typemo-client/client-close" twoslash />
+
+Operations that were waiting for the connection at the moment of closing also fail with `ConnectionError` and `failure: "closed"`, but with the text `TypemoClient "default" was closed`. Operations started after closing get `TypemoClient "default" is closed; create a new client`. The whole client closes, and with it every `Connection` you got through [`client.db`](#client.db).
+
+<Params>
+<Param name="force" type="boolean" default="false">
+
+Goes to the driver's `close`. Close even if operations are still running.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/connection/typemo-client/client-close-2" />
+
+</FullType>
+
+---
+
+## client[Symbol.asyncDispose] [#client.async-dispose]
+
+Declare the client with `await using`, and it closes itself at the end of the block, even if an error was thrown inside. The method calls [`client.close`](#client.close) without arguments.
+
+<Snippet id="reference/connection/typemo-client/client-async-dispose" twoslash />
+
+<FullType>
+
+<Snippet id="reference/connection/typemo-client/client-async-dispose-2" />
+
+</FullType>
+
+---
+
+## client.name [#client.name]
+
+The client name in observability events. It comes from the `name` option and defaults to `"default"`. It helps when the application has several clients and you need to tell from the log where an operation came from. The type is `string`, read-only.
+
+---
+
+## client.options [#client.options]
+
+The client options after checking. Among them are `client.options.dbName`, `client.options.readyTimeoutMS`, `client.options.name`, `client.options.validateReads` (whether [strict reading](#validate-reads) is on, with `"development"` already resolved), `client.options.driver` (what went to the driver), and `client.options.keysetSecrets` (the token signing keys, copies as bytes). The object is frozen. It shows the result of merging, so the `dbName` from the connection string is visible here.
+
+<Snippet id="reference/connection/typemo-client/client-options" twoslash />
+
+---
+
+## client.supportsTransactions [#client.supports-transactions]
+
+Whether the server supports transactions. For a replica set, a sharded cluster, and a load balancer it's `true`, and for a single `mongod` it's `false`. While the client hasn't connected and the topology is unknown, the value is `undefined`. The property helps in a readiness check, to notice a wrong server configuration before the first failed transaction.
+
+<Snippet id="reference/connection/typemo-client/client-supports-transactions" twoslash />
+
+---
+
+## client.server [#client.server]
+
+The first host from the connection string, `{ address, port }`, or `undefined` if the string has no host. For a replica set it's the first listed address, not necessarily the server that served the operation. The value goes into the observability attributes.
+
+---
+
+## client.startSession [#client.start-session]
+
+`client.startSession` opens an explicit driver session, for example to pass it to a query through `.session()`. You usually don't need it, because [`client.transaction`](#client.transaction) creates and closes a session itself. Like [`client.ready`](#client.ready), the method waits for the client to be ready.
+
+<Snippet id="reference/connection/typemo-client/client-start-session" twoslash />
+
+You have to close the session, and Typemo doesn't do it. For manual sessions, see the guide [Manual sessions](../../transactions/sessions.mdx).
+
+<Params>
+<Param name="options" type="ClientSessionOptions">
+
+The driver session parameters.
+
+</Param>
+</Params>
+
+Returns `Promise<ClientSession>`. Throws `ConnectionError` if the client is closed, and `TimeoutError` if the connection wasn't established in time.
+
+---
+
+## client.transaction [#client.transaction]
+
+`client.transaction` runs a function in a transaction. Model operations inside the function join it on their own, and you don't need to pass a session. On transient server failures the driver repeats the whole function, so it may run more than once. That's why it must have no side effects outside the database, such as emails and payments. For the full description, see the guide [Transactions](../../transactions/transactions.mdx) and the [transactions reference](../transactions/transactions.mdx).
+
+<Snippet id="reference/connection/typemo-client/client-transaction" twoslash />
+
+Transactions don't nest. A call inside a transaction of the same client throws `ConfigurationError`.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/troubleshooting" />
+
+Transactions need a replica set or a sharded cluster. On a single `mongod` (`client.supportsTransactions` is `false`) the call throws `ConfigurationError` before the function runs and anything is written.
+
+<Snippet id="reference/connection/typemo-client/client-transaction-2" />
+
+You can check this in advance with [`client.supportsTransactions`](#client.supports-transactions).
+
+<Params>
+<Param name="fn" type="(scope: TransactionScope) => Promise<R>" required>
+
+The transaction function. It receives a `TransactionScope` with the session and the attempt number (`scope.attempt`, which is 1 for the first run).
+
+</Param>
+<Param name="options" type="TransactionOptions" default="{}">
+
+The read level (`readConcern`: `local`, `majority`, or `snapshot`), the write acknowledgment at commit (`writeConcern`), the overall deadline (`timeoutMS`), and the commit time limit on the server (`maxCommitTimeMS`).
+
+</Param>
+</Params>
+
+<Returns type="Promise<R>">
+
+What the function returned, after the commit. An error from your function arrives unchanged (`caught === thrown`), while a server or commit error arrives as a Typemo error. If the transaction's `timeoutMS` runs out, you get a [`TimeoutError`](../errors/server-errors.mdx#timeout-error) with `kind: "transaction"` and a filled-in `timeoutMS`.
+
+</Returns>
+
+A retry is dangerous for a document loaded **before** the transaction and changed inside it (`doc.balance -= 10`, then `$save()`). It changes twice, and we ended up with 80 instead of 90 out of 100. Load documents inside the function, or change them with an atomic write (`$inc`). For a walkthrough with an example, see the guide [Transactions](../../transactions/transactions.mdx#external-documents).
+
+You can't run operations inside a transaction concurrently with `Promise.all`. The server can't do that, and Typemo refuses itself with an error that names both operations, `Account.create: the session is in use by Account.create, which has not finished; …`.
+
+<FullType>
+
+<Snippet id="reference/connection/typemo-client/client-transaction-3" />
+
+</FullType>
+
+At the connection level, [`connection.transaction`](./connection.mdx#connection.transaction) does the same.
+
+Whether a call is already inside a transaction of this client is told by [`client.currentTransaction`](../transactions/transactions.mdx#client.current-transaction). Transactions don't nest, and a wrapper that's called both from outside and from inside a transaction uses it to decide whether to open its own.
+
+---
+
+## client.instrument [#client.instrument]
+
+`client.instrument` subscribes an observer to the operations of **this** client. It receives the start and end of an operation, the steps, the errors, and the transaction events. The OpenTelemetry and Sentry integrations run on this. While there are no subscribers, observability costs nothing.
+
+<Snippet id="reference/connection/typemo-client/client-instrument" twoslash />
+
+<Params>
+<Param name="subscriber" type="InstrumentationSubscriber" required>
+
+An object with a `handle` function and optional settings `driverCommands`, `poolEvents`, `steps`, `sensitive`, `includeTenant`, and `wrap`. For the full list, see the reference [Events](../observability/events.mdx).
+
+</Param>
+</Params>
+
+<Returns type="Subscription">
+
+An object with an `unsubscribe()` method. Calling it again does nothing. It also works with `using`, and the subscription is removed on leaving the block.
+
+</Returns>
+
+<Snippet id="reference/connection/typemo-client/client-instrument-2" twoslash />
+
+If a subscriber asks for driver command events (`driverCommands: true`) and the client was created without `monitorCommands: true`, you get a `ConfigurationError`. Typemo won't let you silently end up without events.
+
+<Snippet id="reference/connection/typemo-client/client-instrument-3" />
+
+To subscribe to all clients at once, use [`Typemo.instrument`](./typemo.mdx#typemo.instrument). For working with events, see the guide [Operation events](../../observability/events.mdx).
+
+---
+
+## client.instrumentation [#client.instrumentation]
+
+The list of the client's subscribers together with the global ones. [`client.instrument`](#client.instrument) works with it, and `instrument` itself is usually enough for you. The field is open for integrations.
+
+---
+
+## client.use [#client.use]
+
+`client.use` registers a schema extension for the models of **this** client. The extension name becomes a valid key in `ext` of `@Prop` and `@Schema`, and its checks parse every value when the schema is compiled. You also need to declare the key for the compiler through `declare module "@venloc/typemo"`, as in the example below. Without the declaration the extension name won't pass type checking. If every client needs the extension, register it through [`Typemo.use`](./typemo.mdx#typemo.use).
+
+<Snippet id="reference/connection/typemo-client/client-use" twoslash />
+
+Register an extension before the first model of the client. A later extension wouldn't check the schemas that are already compiled. The registry closes with the first **successful** model compilation of this client. If the compilation failed, for example because of an unknown key in `ext`, the registry stays open, and you can still register the extension you need.
+
+<Snippet id="reference/connection/typemo-client/client-use-2" />
+
+The first is a registration after the first model. The second is a repeated name, taken on this client or globally. The guide is [Multiple clients and extensions](../../connection/clients-and-extensions.mdx). For how extensions work, see the reference [Extensions](../extensions/extensions.mdx).
+
+<Params>
+<Param name="extension" type="TypemoExtension" required>
+
+An object `{ name, validateProp?, validateSchema? }`. At least one check is required. The name can't be empty and can't start with `$`. A check receives the value and throws an error if it's wrong. That error becomes the `cause` of the `ConfigurationError`.
+
+</Param>
+</Params>
+
+---
+
+## client.unsafeDriver [#client.unsafe-driver]
+
+`client.unsafeDriver` returns the driver's real `MongoClient`. You need it for what Typemo doesn't wrap: admin commands, GridFS, and driver features models don't have. Everything you do through it bypasses Typemo completely. Tenant isolation, soft delete, hidden fields, `sensitive` masks, audit, hooks, and events don't apply. It's a method, not a property, so the bypass stands out at the call site.
+
+<Snippet id="reference/connection/typemo-client/client-unsafe-driver" twoslash />
+
+The method returns the same `MongoClient` on every call, and model operations don't use it. The guide is [Driver access](../../connection/driver-access.mdx).
+
+<FullType>
+
+<Snippet id="reference/connection/typemo-client/client-unsafe-driver-2" />
+
+</FullType>
+
+---
+
+## Client options [#client-options]
+
+The options type is `TypemoClientOptions`. It holds all the driver's `MongoClientOptions` except three old timeouts, plus five of Typemo's own options. The driver options are described in the `mongodb` driver documentation, and here are only those that Typemo adds or restricts.
+
+<Snippet id="reference/connection/typemo-client/client-options-2" twoslash />
+
+<Params title="Typemo's own options">
+<Param name="dbName" type="string" default="the database from the connection string, otherwise test">
+
+The default database for `client.connection` and `client.db()`. If the database is given both in the connection string and here, and the names differ, the constructor throws `ConfigurationError`. Otherwise part of the code would write to the wrong place.
+
+</Param>
+<Param name="name" type="string" default="default">
+
+The client name in events and in error texts. You need it when there are several clients.
+
+</Param>
+<Param name="readyTimeoutMS" type="number" default="10000">
+
+How long an operation waits for the connection if it has no `timeoutMS` of its own. Zero means wait without a limit. Negative and fractional values are forbidden.
+
+</Param>
+<Param name="keysetSecret" type="string | Uint8Array | (string | Uint8Array)[]">
+
+The signing key for keyset pagination tokens (`nextCursor`), HMAC-SHA256. The signature stops the client from forging or editing the position. There is none by default, because the token is a position, not an access right, and the query filter applies on every page. The key must be at least 32 bytes, and a string is taken as UTF-8. For rotation pass a list. The first key signs, and all of them verify. With a key set, a token without a signature or with a foreign signature is rejected with a `KeysetTokenError`.
+
+</Param>
+<Param name="validateReads" type="boolean | &quot;development&quot;" default="false">
+
+Strict reading. Every document read is checked against the schema, and a value of another type gives a `CastError`. `true` turns the check on always, and `"development"` turns it on everywhere except `NODE_ENV=production`. For details, see the section [validateReads](#validate-reads).
+
+</Param>
+</Params>
+
+<Params title="Driver options that Typemo restricts">
+<Param name="timeoutMS" type="number">
+
+The client-side deadline of an operation, a non-negative integer. It replaces three old timeouts.
+
+</Param>
+<Param name="socketTimeoutMS, waitQueueTimeoutMS, wtimeoutMS" type="number">
+
+Not accepted either in the options or in the connection string (`?waitQueueTimeoutMS=5`). Typemo throws `ConfigurationError` and suggests `timeoutMS`. One client deadline for the whole operation replaces three timeouts, each of which limited only its own stage.
+
+</Param>
+<Param name="BSON options (useBigInt64, promoteLongs, and others)" type="—">
+
+Typemo sets them itself, because the form of the data (for example, int64 as `bigint`) is part of the type contract. You can repeat Typemo's value but not change it. `useBigInt64: false` gives `ConfigurationError: options: BSON options conflict with Typemo — useBigInt64: false (required: true)`.
+
+</Param>
+<Param name="monitorCommands" type="boolean" default="false">
+
+Required if a [`client.instrument`](#client.instrument) subscriber asks for driver command events (`driverCommands: true`).
+
+</Param>
+</Params>
+
+<FullType label="Full options type">
+
+<Snippet id="reference/connection/typemo-client/client-options-3" />
+
+</FullType>
+
+### validateReads [#validate-reads]
+
+By default Typemo doesn't check a document it read against the schema. Data written by a model has already passed casting and validation, and checking every field on every read would cost time. But data also gets into a collection around the model: another program, a migration script on the driver, an old version of the schema. Such a document can bring a number in `title`, and your code receives it typed as `string`.
+
+The `validateReads` option turns on **strict reading**. Before a document becomes the result, Typemo checks the type of each of its fields. A mismatch is a [`CastError`](../errors/data-errors.mdx#cast-error) with the field path.
+
+<Snippet id="reference/connection/typemo-client/validate-reads" twoslash />
+
+The check applies to `find`, `findOne`, `findById`, and `findOneAnd*` in every result form (document, `.lean()`, `.plain()`, cursor), and to the documents that `populate` fills in. It checks what's in the document. A field the projection didn't load isn't an error, and a key outside the schema isn't checked.
+
+Arrays, `Map`, subdocuments, and discriminators are checked against their own schemas, and the error path contains the index or key (`lines.1.sku`, `scores.x`). `null` is allowed only on a field with `nullable: true`, otherwise the reason of the error is `null`. For `hidden` and `sensitive` fields the value in the error is masked. Aggregation rows, `distinct`, and change stream events aren't checked, since they aren't model documents in the model's shape.
+
+The value `"development"` turns the check on if `process.env.NODE_ENV` isn't `"production"`. Typemo reads the variable once, when the client is created.
+
+<Snippet id="reference/connection/typemo-client/validate-reads-2" twoslash />
+
+If `NODE_ENV` isn't set, the check is on as well. So in production set `NODE_ENV=production` or use `false`. You can change the client's decision for one query with [`.validateReads(enabled)`](../query/options.mdx#validate-reads): turn the check on for one read or off for a heavy report.
+
+Strict reading doesn't replace validation on write. It finds data that's already corrupted but doesn't repair it. If the errors come from one source, fix the source, and fix the documents in the database with a migration. When only your model writes to the collection, you don't need the option.
+
+---
+
+## When `TypemoClient` doesn't fit [#when-not-to-use]
+
+If you need an operation that Typemo doesn't wrap, use [`client.unsafeDriver`](#client.unsafe-driver) and remember that policies don't apply to it. Several databases on one server don't need separate clients. Call [`client.db`](#client.db) with the name you need, and the connection pool is shared between the databases.

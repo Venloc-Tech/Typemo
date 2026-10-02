@@ -1,0 +1,204 @@
+---
+title: Window operators
+description: "Reference for fn.rank, fn.shift, fn.derivative, fn.expMovingAvg, withWindow, and WindowSpec: the operators of the setWindowFields stage"
+icon: PanelTop
+---
+
+A **window function** computes a value for each document by looking at its neighbors. That could be the previous order, all of a customer's orders up to this point, or the neighbors within a week. Unlike [`group`](./stages.mdx#group), it doesn't collapse documents. The same number remain, and each one gets a new field. Window operators go in the `output` of the [`setWindowFields`](./stages.mdx#set-window-fields) stage. Ordinary [accumulators](./accumulators.mdx) (`fn.sum`, `fn.avg`, `fn.push`, and others) work there too if you add a window to them with [`withWindow`](#with-window).
+
+If you're starting out, read the guide [Window functions](../../aggregation/windows.mdx). This page is a reference for the operators, `withWindow`, and the `WindowSpec` type.
+
+All examples use one shop order model: a number, an optional number, an array of numbers, and a date.
+
+<Snippet id="reference/aggregation/accumulators/intro" title="shop/order.ts" twoslash />
+
+The collection holds six orders. Alice made two (120 and 80), Bob two (45 and 200), and Carol two (60 and 95), in that order by date. Unless stated otherwise, the window is partitioned by customer (`partitionBy`) and ordered by date (`sortBy`). The `sort` and `project` stages after `setWindowFields` are there only for readability. [`.plain()`](./pipeline.mdx#plain) returns the rows.
+
+The operators differ in their requirements, and the compiler checks them. The functions `fn.rank`, `fn.denseRank`, `fn.documentNumber`, `fn.shift`, `fn.expMovingAvg`, and `fn.linearFill` need a `sortBy`, because without an order, "previous" and "place in the list" mean nothing. `fn.derivative` and `fn.integral` also require an explicit window. Without `sortBy`, the compiler refuses.
+
+<Snippet id="reference/aggregation/window-operators/intro" twoslash />
+
+There's also a server rule that the compiler knows. `fn.rank`, `fn.denseRank`, `fn.documentNumber`, and `fn.linearFill` accept a `sortBy` of exactly one field, because the server doesn't compute a rank over two keys. A call with two fields doesn't compile.
+
+<Snippet id="reference/aggregation/window-operators/intro-2" twoslash />
+
+The error text names the result field and the rule: `$setWindowFields output "place" needs a sortBy with exactly one field (rank, denseRank, documentNumber and linearFill: a server rule)`. If you get around the types with a cast, the stage builder throws the same reason.
+
+<Snippet id="reference/aggregation/window-operators/intro-3" />
+
+## Numbering and shift [#numbering-and-shift]
+
+### fn.rank [#fn.rank]
+
+`fn.rank` returns the document's place in the `sortBy` order. Equal values share a place, and the next place is skipped (1, 1, 3). It takes no arguments and returns `number`.
+
+<Snippet id="reference/aggregation/window-operators/fn-rank" twoslash />
+
+Here the window covers the whole collection (no `partitionBy`) and is ordered by customer name. Both of Alice's orders have the same `sortBy` value, and both got place 1. Bob got place 3, and place 2 is skipped. Places 3 and 5 are assigned the same way.
+
+### fn.denseRank [#fn.dense-rank]
+
+`fn.denseRank` works like `fn.rank`, but doesn't skip places after equal values (1, 1, 2).
+
+<Snippet id="reference/aggregation/window-operators/fn-dense-rank" twoslash />
+
+On the same data the places run in sequence: 1, 1, 2, 2, 3, 3.
+
+### fn.documentNumber [#fn.document-number]
+
+`fn.documentNumber` returns the document's sequence number in the window, starting at 1. Equal values get different numbers. On the data above these are the numbers 1 to 6, even though there are only three `sortBy` values.
+
+<Snippet id="reference/aggregation/window-operators/fn-document-number" twoslash />
+
+### fn.shift [#fn.shift]
+
+`fn.shift` returns the `output` value of the document shifted by `by` positions. A minus shifts back, and a plus shifts forward. If there's no such document, the result is `null`, or `default` if it's set. `default` is a constant, not an expression.
+
+<Snippet id="reference/aggregation/window-operators/fn-shift" twoslash />
+
+A customer's first order has no previous one, so `previous` is `null`. You can substitute a value instead of `null`.
+
+<Snippet id="reference/aggregation/window-operators/fn-shift-2" twoslash />
+
+A forward shift looks at the next order.
+
+<Snippet id="reference/aggregation/window-operators/fn-shift-3" twoslash />
+
+## Rate and area [#rate-and-area]
+
+### fn.derivative [#fn.derivative]
+
+`fn.derivative` returns the average rate of change of `input` between the window's bounds. It accepts `{ input, unit }`, where `unit` sets the time unit if `sortBy` runs over dates. The result is `number | null`, and `null` means it can't be computed.
+
+The operator needs an explicit window size. A bare `fn.derivative` doesn't count as a stage output, and the compiler asks for `withWindow`.
+
+<Snippet id="reference/aggregation/window-operators/fn-derivative" twoslash />
+
+With a window of two adjacent documents, the operator computes the change in the amount per day between orders.
+
+<Snippet id="reference/aggregation/window-operators/fn-derivative-2" twoslash />
+
+For Alice it came out as `(80 - 120) / 7 = -5.71` per day, because a week separates the orders. The first order has no left neighbor, and the result is `null`.
+
+### fn.integral [#fn.integral]
+
+`fn.integral` returns the area under the curve of `input` along `sortBy`. Like `fn.derivative`, it requires `withWindow` and accepts `{ input, unit }`. The result is `number | null`.
+
+<Snippet id="reference/aggregation/window-operators/fn-integral" twoslash />
+
+For Alice's second order the area is 700. There are seven days between the orders, and the average of 120 and 80 is 100.
+
+## Moving values [#moving-values]
+
+### fn.expMovingAvg [#fn.exp-moving-avg]
+
+`fn.expMovingAvg` computes an exponential moving average. It accepts `input` and either `N` (the number of periods) or `alpha` (the weight of the newest value), but not both. The result is `number | null`.
+
+<Snippet id="reference/aggregation/window-operators/fn-exp-moving-avg" twoslash />
+
+With `N: 2`, the weight of the newest value is 2/3. Alice's second value is `120 · 1/3 + 80 · 2/3`, that is, `93.33`.
+
+### fn.linearFill [#fn.linear-fill]
+
+`fn.linearFill` fills gaps by linear interpolation between known values. It accepts a number or a date and returns the same value with the gaps closed. It needs a `sortBy` of one field. Here the window covers the whole collection, because not every order has a discount.
+
+<Snippet id="reference/aggregation/window-operators/fn-linear-fill" twoslash />
+
+The gap between discounts 10 and 5 became `7.5`.
+
+### fn.locf [#fn.locf]
+
+`fn.locf` (last observation carried forward) carries the last known value forward. It accepts any value. The server doesn't require `sortBy`, but without it "last" isn't defined.
+
+<Snippet id="reference/aggregation/window-operators/fn-locf" twoslash />
+
+The gaps got the last known discount. After 10 came tens, and after 5 came fives again.
+
+## Window statistics [#window-stats]
+
+### fn.covariancePop [#fn.covariance-pop]
+
+`fn.covariancePop` computes the population covariance of two quantities. It accepts two numbers and works with a window. The result is `number | null`.
+
+<Snippet id="reference/aggregation/window-operators/fn-covariance-pop" twoslash />
+
+The covariance of order amount and discount over the whole collection is −25. Where there's no discount, 0 is used.
+
+### fn.covarianceSamp [#fn.covariance-samp]
+
+`fn.covarianceSamp` computes the sample covariance. Its divisor is one less.
+
+<Snippet id="reference/aggregation/window-operators/fn-covariance-samp" twoslash />
+
+On the same data, the sample covariance is −30.
+
+### fn.minMaxScaler [#fn.min-max-scaler]
+
+`fn.minMaxScaler` maps a value onto the range `[min, max]` (`[0, 1]` by default) using the window's minimum and maximum. It accepts `{ input, min, max }` and returns `number`. It needs MongoDB 8.2 or later. The smallest order (45) became 0, and the largest (200) became 1.
+
+<Snippet id="reference/aggregation/window-operators/fn-min-max-scaler" twoslash />
+
+## withWindow [#with-window]
+
+`withWindow` adds a window to an accumulator that can work in a window: `fn.sum`, `fn.avg`, `fn.min`, `fn.max`, `fn.push`, `fn.count`, `fn.first`, `fn.top`, and others. That turns an ordinary accumulator into a window function. A sum "from the start to the current document", for example, gives a running total.
+
+<Snippet id="reference/aggregation/window-operators/with-window" twoslash />
+
+Alice's second order got `running: 200`, the sum of 120 and 80. `withWindow` isn't a method but a standalone function, and you import it from `@venloc/typemo`.
+
+The result is a window function, not an accumulator. You need an order when the window bound isn't `"unbounded"`, so `setWindowFields` without `sortBy` won't accept such a function.
+
+<Snippet id="reference/aggregation/window-operators/with-window-2" twoslash />
+
+<Params>
+<Param name="expr" type="ExprNode" required>
+
+The accumulator to add a window to. Only accumulators that allow a window are accepted. For `fn.rank`, `fn.shift`, and similar operators the server sets the window, and the compiler refuses.
+
+<Snippet id="reference/aggregation/window-operators/with-window-3" twoslash />
+
+</Param>
+<Param name="window" type="WindowSpec" required>
+
+A window by document positions or by a range of the `sortBy` value. For details, see the section [`WindowSpec`](#window-spec).
+
+</Param>
+</Params>
+
+If `expr` isn't an operator object, `withWindow` throws a `ConfigurationError` with the text `withWindow takes an accumulator expression such as fn.sum(f.x)`.
+
+You can also define a window by a value range. Then the bounds are a distance along the `sortBy` field, and for dates the `unit` is added to them. Here is the sum of a customer's orders over the last 10 days.
+
+<Snippet id="reference/aggregation/window-operators/with-window-4" twoslash />
+
+Bob's second order was placed 14 days after the first. The first order isn't in its window, so `last10` is 200. Alice's and Carol's orders are 7 days apart, and their sums include the previous order.
+
+Instead of a sum, any accumulator with a window works, for example a moving average of two adjacent orders.
+
+<Snippet id="reference/aggregation/window-operators/with-window-5" twoslash />
+
+<FullType>
+
+<Snippet id="reference/aggregation/window-operators/with-window-6" />
+
+</FullType>
+
+## WindowSpec [#window-spec]
+
+`WindowSpec` is the window type in `withWindow`. You can define a window in two ways.
+
+`{ documents: [from, to] }` counts the bounds in documents relative to the current one. `-1` is the previous one, `0` or `"current"` is the current one, `1` is the next one, and `"unbounded"` removes the bound.
+
+`{ range: [from, to], unit? }` counts the bounds by the value of the `sortBy` field, that is, by distance in numbers or, for dates, in `unit` units. The units are `"year"`, `"quarter"`, `"week"`, `"month"`, `"day"`, `"hour"`, `"minute"`, `"second"`, and `"millisecond"`.
+
+A bound is the `WindowBound` type, that is, a number, `"current"`, or `"unbounded"`.
+
+<Snippet id="reference/aggregation/window-operators/window-spec" twoslash />
+
+The window `documents: ["unbounded", "unbounded"]` covers the whole partition and doesn't need `sortBy`. Any other window and any `range` window needs `sortBy`, and the compiler checks that.
+
+## When not to use it [#when-not-to-use]
+
+- **You need one value per group, not for every document.** Use [`group`](./stages.mdx#group) and [accumulators](./accumulators.mdx).
+- **You need to fill gaps with new documents, not values.** There are the [`densify`](./stages.mdx#densify) and [`fill`](./stages.mdx#fill) stages for that.
+- **You need a sum over an array inside one document.** Use [`fn.sum`](./accumulators.mdx#fn.sum) in `project`.

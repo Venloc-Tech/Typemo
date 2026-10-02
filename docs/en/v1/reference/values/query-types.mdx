@@ -1,0 +1,129 @@
+---
+title: Query types
+description: "The types of filters, updates, projections, sorts, paths, and results: Filter, Update, Projection, Sort, Paths, PathValue, QueryResult, and ResultOf"
+icon: Braces
+---
+
+When you write `Posts.find({ views: { $gt: 10 } })`, the compiler checks the filter against the model. It knows the fields, their types, and the allowed operators. The types that do this are public, and you can use them in your own functions, for example to take a filter as a parameter without losing the check. This page describes the types of filters (`Filter`), updates (`Update`), projections (`Projection`), sorts (`Sort`), paths (`Paths`, `FilterPaths`, `PathValue`), and results (`QueryResult`, `ResultOf`).
+
+If you're looking for a guide to queries, start with the [Reading](../../queries/index.mdx) section. This page covers the types under the [`find`](../query/reading.mdx#model.find) and [`updateOne`](../writes/writes.mdx#update-one) methods. The document form types are described on the [Form types](./form-types.mdx) page.
+
+The examples use the blog model from the [Related data](../populate/populate.mdx) section: a post with a reference to its author, tags, a map of reviewers, and virtual fields.
+
+The types on this page are [`Filter`](#filter), [`FilterPaths`](#filter-paths), [`Paths`](#paths), [`PathValue`](#path-value), [`Update`](#update), [`Projection`](#projection), [`Sort`](#sort), [`QueryResult`](#query-result), and [`ResultOf`](#result-of).
+
+---
+
+## Filter [#filter]
+
+`Filter<T>` is the search conditions for documents of model `T`. The keys are the model's fields, and the values are a field value or operators (`$gt`, `$in`, `$regex`, `$or`, and the rest from the [Filter operators](../query/filter-operators.mdx) section). You need the type where a filter is built apart from the call: in a service function that takes conditions as a parameter, in a shared constant, in a helper for several queries. It catches a typo in a field and a comparison with the wrong type before the code runs.
+
+<Snippet id="reference/values/query-types/filter" twoslash />
+
+A typo in a field name stops compilation.
+
+<Snippet id="reference/values/query-types/filter-2" twoslash />
+
+The compiler suggests a fix: `Object literal may only specify known properties, but 'veiws' does not exist in type … Did you mean to write 'views'?`. The second type parameter, `Loose`, serves only the internal builders (it's the constraint of a method's generic parameter). In your own code, leave it at the default.
+
+<FullType>
+
+<Snippet id="reference/values/query-types/filter-3" />
+
+</FullType>
+
+The type is declared invariant (`in out`), so comparing two filters doesn't make the compiler walk the whole tree of fields. Without that, a ready `const f: Filter<User>` passed to `find` or to a generic function would lead to a `TS2589` error.
+
+## FilterPaths [#filter-paths]
+
+`FilterPaths<T>` is all the keys a filter can name. These are the model's read paths, array elements by index (`tags.0`), and map entries (`reviewers.lead`). It's wider than [`Paths`](#paths), because a filter can address an array element and a map key, and a projection and a sort can't.
+
+<Snippet id="reference/values/query-types/filter-paths" twoslash />
+
+## Paths [#paths]
+
+`Paths<T>` is all the read paths of a model. These are the data fields (without methods and virtual fields) and dotted paths through embedded documents and arrays of such documents, down to five levels (`MaxPathDepth`). Unions of embedded classes give the paths of each member. Projection and sort are built on `Paths` and accept only paths from it.
+
+<Snippet id="reference/values/query-types/paths" twoslash />
+
+Virtual fields (`comments`, `commentCount`) aren't in the paths. They aren't stored, so you can't filter, sort, or select by them.
+
+## PathValue [#path-value]
+
+`PathValue<T, P>` is the type of the value at path `P` of model `T`, with filter rules. Through an array it takes the element type, a numeric segment after an array also gives an element, and a segment after a map gives the map's value. If the path isn't in the model, the result is `never`. The type is useful for generic functions that take a path and a value.
+
+<Snippet id="reference/values/query-types/path-value" twoslash />
+
+Mind the difference. The path `tags` gives the array itself, and the path `tags.0` gives its element. A segment after an array (a number or the field name of an embedded document) always steps into the element.
+
+## Update [#update]
+
+`Update<T>` is the update document of model `T`. It holds only operators (`$set`, `$inc`, `$push`, `$unset`, and the rest from the [Update operators](../writes/update-operators.mdx) section), each with its own paths. An operator applies only to paths of a suitable type: `$inc` to numbers, `$push` to arrays. That's how the compiler catches an `$inc` of a string and a write to an immutable field. A pipeline update isn't included here, and the pipeline builder sets it ([`UpdatePipelines`](../writes/pipeline-updates.mdx)).
+
+<Snippet id="reference/values/query-types/update" twoslash />
+
+`$inc` on a string doesn't compile.
+
+<Snippet id="reference/values/query-types/update-2" twoslash />
+
+The compiler answers `TS2353: Object literal may only specify known properties, and 'title' does not exist in type …`. `$inc` has only the model's numeric paths, and `title` isn't among them. The `Loose` parameter, as in `Filter`, is for the internal builders.
+
+## Projection [#projection]
+
+`Projection<T>` is a projection. It's the model's read paths with the flag `1` or `0` (for arrays also `$slice` and `$elemMatch`), plus additions of hidden fields like `"+secret": true`. You can't mix inclusion and exclusion, except for `_id`. The type suggests paths and limits the values to the flags. [`select`](../query/reading.mdx#select) accepts a projection declared with this type. You can build it apart from the query, keep it in a constant, and pass it as a parameter.
+
+<Snippet id="reference/values/query-types/projection" twoslash />
+
+The result depends on how the projection is written. The compiler reads a literal in `select` itself exactly: in `exact` you get precisely the selected fields and `_id`. A projection declared with the type `Projection<Post>` isn't known in advance, so in `rows` all the model's fields are optional. The compiler doesn't know which ones you selected. Read the required fields in such a result with `?` or a check for `undefined`. The optionality applies only to the top level, and the paths are checked at runtime. A typo in a key gives `StrictModeError: projection: "nope" is not a field of Post [unknown-path]`.
+
+For the same reason `select` accepts a `Record<string, 0 | 1>` dictionary built from data, and a projection from a client through `untrusted(fields, "projection")`. Their result is just as wide, and the runtime check protects against foreign paths. For more on projections, see the [Projections and the result type](../../queries/projections.mdx) guide.
+
+## Sort [#sort]
+
+`Sort<T>` is a sort. It's an object (the key order is the sort order) or a list of `[field, direction]` pairs. The direction is `1` and `-1`, or the words `"asc"`, `"desc"`, `"ascending"`, `"descending"`. The paths come from `SortPath<T>`, that is `Paths<T>` and `_id`.
+
+The second parameter, `Sort<T, Score>`, names the query's text score fields ([`.textScore`](../query/search-and-explain.mdx#text-score)). Their direction is only `ScoreDirection`, that is `-1`, `"desc"`, or `"descending"`, because the database ranks matches from best to worst. The query builder fills in this parameter itself.
+
+<Snippet id="reference/values/query-types/sort" twoslash />
+
+You need a list of pairs when the key order matters and you build the sort from data. The property order of a JavaScript object is well defined only for ordinary string keys.
+
+## QueryResult [#query-result]
+
+`QueryResult<Many, Found, Doc>` is what a query turns into after `await`. It's a list (`Doc[]`), one document (`Doc`, if the query ends in `.orFail()`), or one document or `null`. This type sets the difference between `find`, `findOne`, and `findOne().orFail()`.
+
+<Snippet id="reference/values/query-types/query-result" twoslash />
+
+## ResultOf [#result-of]
+
+`ResultOf<Q>` is what you get after `await` of a query `Q`. Use it when you need to name the result type of someone else's query. It works like `Awaited<Q>`, but it's written for Typemo queries.
+
+<Snippet id="reference/values/query-types/result-of" twoslash />
+
+## When not to use these types [#when-not-to-use]
+
+While a query is written in the same place as the call, the types are inferred on their own. `Posts.find({ views: { $gt: 10 } })` doesn't need `Filter`. Explicit types are needed at the boundary of your own function, when a filter, update, projection, or sort arrives as a parameter or sits in a shared constant.
+
+## Common mistakes [#common-mistakes]
+
+### A filter from user input doesn't compile [#input-filter-type]
+
+A value built from a request body has the type `unknown`, and `Filter<Post>` doesn't accept it. That's by design, because Typemo doesn't let an unknown structure go to the database. Check the input (with a validation schema or [`untrusted`](../policies/soft-delete-and-untrusted.mdx#untrusted)) and build the filter from known fields.
+
+### An empty update document [#empty-update]
+
+`Update<Post>` without operators compiles, but an empty update is pointless. At runtime the write method answers with the error `QueryError: update: an empty update changes nothing`. Make sure at least one operator is set.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Form types" href="./form-types.mdx">
+  `Lean`, `Plain`, `ObjectForm`, `PlainJson`, `CreateInput`, `UpdateInput`.
+</Card>
+<Card title="Filter operators" href="../query/filter-operators.mdx">
+  All the operators `Filter` accepts.
+</Card>
+<Card title="Update operators" href="../writes/update-operators.mdx">
+  All the operators `Update` accepts.
+</Card>
+</Cards>

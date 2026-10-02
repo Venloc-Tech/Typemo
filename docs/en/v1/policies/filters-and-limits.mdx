@@ -1,0 +1,81 @@
+---
+title: Don't wipe a collection with an empty filter
+description: "Typemo stops an empty filter in a bulk write, an empty logical operator, undefined, and a non-positive limit before they reach the database"
+icon: Filter
+---
+
+Some values mean something quite different to the database than a person thinks.
+
+- An empty filter means "every document".
+- `limit: 0` means "no limit".
+- The driver sends `undefined` as `null`.
+- The server rejects an empty `$or`, and if you quietly "fix" it, the meaning of the query changes.
+
+Typemo stops these values before anything is sent. The checks always work, and you can't turn them off.
+
+## What you need [#prerequisites]
+
+A user model.
+
+<Snippet id="policies/filters-and-limits/prerequisites" title="users/user.ts" twoslash />
+
+## Quick start [#quick-start]
+
+<Snippet id="policies/filters-and-limits/quick-start" twoslash />
+
+The compiler already stops an empty `{}` literal in these calls. Only a filter that turned out empty at runtime can reach the database, for example one built from a client's JSON.
+
+## An empty filter in a write [#empty-filter-in-writes]
+
+`updateOne`, `updateMany`, `deleteOne`, `deleteMany`, `replaceOne`, and `findOneAnd*` with an empty filter are rejected before sending. That includes `updateOne({})`. An empty filter would pick an arbitrary document of the collection, and the database doesn't promise which one. Changing or deleting "some" document is no safer than changing all of them.
+
+The error is the same, including inside `bulkWrite`: `deleteMany with an empty filter would affect every document; pass a filter, or Filters.all() to mean every document on purpose [empty-filter]`. For the `One` forms and `findOneAnd*`, the text names the same call but reads differently, because only one document would be affected: `deleteOne with an empty filter would change or remove an arbitrary document; …`. The `empty-filter` reason and the fix don't depend on the form. In a read, an empty filter is allowed, and `find({})` returns everything.
+
+A `{}` literal in `updateOne`, `updateMany`, `deleteOne`, `deleteMany`, and `replaceOne` won't compile. The compiler names the same rule before you even run the code.
+
+<Snippet id="policies/filters-and-limits/empty-filter-in-writes" twoslash />
+
+A filter typed as `Filter<User>` compiles, because the compiler doesn't know whether it's empty. In `findOneAnd*` a `{}` literal compiles too, and the error comes only at runtime. Dynamic filters like `Record<string, unknown>` are also checked only at runtime.
+
+If "everything" is exactly what you mean, write [`Filters.all()`](../reference/policies/violations.mdx#filters.all). It's a real filter, `{ _id: { $exists: true } }`, with no type argument, and the intent is visible both in the code and in the command log. There's more in [Empty filters in writes](../writes/empty-filters.mdx).
+
+## Empty logical operators [#empty-logical]
+
+An empty `$or`, `$and`, or `$nor` gives `QueryError: filter: $or must be a non-empty array (at "$or")`. For `$nor` and `$and` the text has their name. A list of conditions is usually built from data, and an empty list looks like "no conditions". The server rejects such an operator, and if you silently drop it, the query finds everything. Check the list before you build the filter.
+
+## undefined instead of a value [#undefined-instead-of-value]
+
+`{ name: undefined }` gives `QueryError: filter: undefined at "name" (use $exists: false / $unset; undefined is never a value)`, and in an update `update: undefined at "$set.age" …`. The driver would send `null` here. Leave the key out, or use `$exists: false` and `$unset`.
+
+## An empty update [#empty-update]
+
+An empty update shouldn't look like a success. `{}` gives `QueryError: update: an empty update changes nothing`, and `{ $set: {} }` gives `update: operator "$set" is empty`. An update pipeline with no stages is a `QueryError` too, with the text `an update pipeline needs at least one stage`. If you pass an array instead of a builder function, the error tells you the right way: `update: an update pipeline is built with the pipeline builder: updateOne(filter, (p) => p.set({ … })), not passed as an array`.
+
+## limit and skip [#limit-and-skip]
+
+`limit(0)`, `limit(-1)`, and `limit(1.5)` give `QueryError: limit must be a positive integer, got 0 (number)`. A string won't do either: `limit("3")` returns `limit must be a positive integer, got "3" (string)`. For `skip(-1)` the text is `skip must be a non-negative integer, got -1 (number)`. The value's type is printed next to it, so you see right away that a string came in instead of a number.
+
+In the driver, `0` means "no limit". A zero is easy to get from an empty query parameter, and then you dump the whole collection by accident. If you don't need a limit, don't call `limit`. For the same reason `batchSize(0)` is rejected too, because the driver reads zero as "the default size".
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether you want to change every document**. If yes, write `Filters.all()`. If not, the filter became empty by mistake, and you need to find out where it came from.
+
+## When not to use it [#when-not-to-use]
+
+In a read an empty filter is fine, and `find()` returns everything. The restriction applies only to writes.
+
+## Troubleshooting [#troubleshooting]
+
+**`[empty-filter]` in a write, even though you passed a filter.** This happens in `updateOne` or `deleteOne` too. Most likely the client sent no conditions, and the code built an empty object from them. Check the input, and don't turn "no conditions" into "everything".
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Empty filters in writes" href="../writes/empty-filters.mdx">
+  How to change and delete everything on purpose, and where an empty filter comes from.
+</Card>
+<Card title="Policy violations" href="../reference/policies/violations.mdx">
+  The reasons and texts of every strictness error.
+</Card>
+</Cards>

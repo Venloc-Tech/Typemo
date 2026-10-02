@@ -1,0 +1,99 @@
+---
+title: JSON Schema and Standard Schema
+description: "Use a model's schema for server-side validation and in outside form and validation libraries"
+icon: FileCheck
+---
+
+A model's schema describes the data once, but it can be useful in two more formats.
+
+- **JSON Schema** is the format MongoDB uses to check documents on the server. A collection validator is built from the schema, and the server rejects invalid documents even when another program writes them.
+- **Standard Schema** is a common interface for checking values that forms, API routers, and other libraries understand. Every model is such a validator itself, so you can check input without knowing anything about Typemo.
+
+It works the other way around too. A query can check its results with someone else's schema.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the user model from `users/user.ts`. It has a name with checks and a role with two values.
+
+## Quick start [#quick-start]
+
+The `validator: true` option turns on the server-side validator, and the model's `~standard` property checks input.
+
+<Snippet id="schemas/json-and-standard-schema/quick-start" title="users/signup.ts" twoslash />
+
+Below we'll cover both directions.
+
+## Validate on the server [#server-validation]
+
+The [`validator`](../reference/schemas/schema.mdx#validator) option builds a `$jsonSchema` from the schema and hands it to the server when the collection is created. The validator is a second line of defense. Typemo's checks stay in place, and the server protects the data from other programs and from writes that go around Typemo. You can see what the server received through the driver, which takes [`client.unsafeDriver`](../reference/connection/typemo-client.mdx#client.unsafe-driver).
+
+<Snippet id="schemas/json-and-standard-schema/server-validation" title="users/inspect-validator.ts" twoslash />
+
+The result shows how it's built. A field's type becomes a `bsonType`, `required` is collected from the required fields and `_id`, and `enum` and length bounds carry over as is. Strictness is absolute, with `additionalProperties: false` at every level, so the server rejects an extra field.
+
+The server can't express your `validate` functions, date bounds, or Map key rules. Only Typemo checks those. The [`validationLevel`](../reference/schemas/schema.mdx#validation-level) and [`validationAction`](../reference/schemas/schema.mdx#validation-action) options set the level and the action. More in [Special collections](./special-collections.mdx#server-validator).
+
+You can get the same document in code without creating a collection. [`JsonSchemaGenerator.generate`](../reference/schemas/json-and-standard-schema.mdx#json-schema-generator.generate) takes a model (or its `schema`) and returns the `$jsonSchema`. And [`JsonSchemaGenerator.validator`](../reference/schemas/json-and-standard-schema.mdx#json-schema-generator.validator) returns everything that goes to the server: the validator, the level, and the action.
+
+<Snippet id="schemas/json-and-standard-schema/server-validation-2" title="users/inspect-validator.ts" twoslash />
+
+## Check input with the model's Standard Schema [#validate-input]
+
+A model has a `~standard` property. It takes what `create` accepts and returns the cast data. The check casts types, trims spaces and lowercases according to the field options, fills in default values, and runs `required` and every `validate`. It returns either the value or a list of problems with their paths.
+
+<Snippet id="schemas/json-and-standard-schema/validate-input" title="users/signup.ts" twoslash />
+
+The core comes up with the `_id` itself, and the check doesn't require service fields (timestamps, the version). Here are the problems it finds.
+
+- A value outside `enum`: `must be one of "user", "admin"` with the path `["role"]`.
+- An extra field: `not a field of User` with the path `["extra"]`.
+- Not an object at all: `Cast to User failed for 5 (number): expected an object [type]` with an empty path.
+
+The check doesn't write to the database, so it suits forms. A library that reads Standard Schema gets ready-made problem texts.
+
+`~standard` is part of the common interface. Its `version` is `1`, and its `vendor` is `"typemo"`. [`StandardSchema.isSchema`](../reference/schemas/json-and-standard-schema.mdx#standard-schema.is-schema) helps you make sure you're looking at such a validator. [`StandardSchema.of`](../reference/schemas/json-and-standard-schema.mdx#standard-schema.of) returns the same validator. It takes a model or its `schema`, and `StandardSchema.of(Users)` behaves like `Users["~standard"]`.
+
+## Check a query result with someone else's schema [#validate-with-foreign-schema]
+
+[`.parse`](../reference/query/contracts.mdx#parse) works in the other direction. It checks every row of a query result with any Standard Schema validator (zod, valibot, arktype, or your own) without plugging it into the core. The query must read through `.lean()` or `.plain()`. The problems of all rows are collected into one [`ValidationError`](../reference/errors/data-errors.mdx#validation-error). Below, the validator is written by hand so the example doesn't depend on third-party packages.
+
+<Snippet id="schemas/json-and-standard-schema/validate-with-foreign-schema" title="users/report.ts" twoslash />
+
+Contracts are covered in detail in [Checking the response shape](../queries/contracts.mdx).
+
+## How to choose [#how-to-choose]
+
+Ask yourself: **who besides your application can write to the collection?**
+
+- **Nobody**: a server-side validator is unnecessary, and Typemo's checks are enough.
+- **Scripts, other services, manual edits**: turn on `validator`.
+
+You need Standard Schema when the check has to happen at the edge of your application, in a form or a handler, before the model. And `.parse` is for when data comes from the database and you want to check its shape, for example after a migration.
+
+## When not to use it [#when-not-to-use]
+
+Don't turn on `validator` if the schema changes often. The server will reject documents until you update the collection. Don't replace Typemo's checks with the server's, since the server doesn't know your `validate` functions. And don't call `~standard.validate` before a write, because `create` checks the data itself.
+
+## Troubleshooting [#troubleshooting]
+
+**The generator got a class instead of a model.** `JsonSchemaGenerator.generate(User)` with the `User` class itself won't work. It needs a model obtained from the connection, or its `schema`. The compiler won't accept a class, and in untyped code you get `ConfigurationError: JsonSchemaGenerator.generate: a model (connection.model(Entity)) or its schema (model.schema) is expected, got function`. Pass `client.db().model(User)` or `Users.schema`.
+
+**The server rejected a write that Typemo accepted.** The server answers `Document failed validation` if the document was written around Typemo, for example through the driver. That's what the validator is for. But if the application's own writes are rejected this way, the schema on the server has fallen behind the class. Update the collection's settings as described in [Create collections with options](../collections/create.mdx#change-collection-options).
+
+## Full example [#full-example]
+
+<Snippet id="schemas/json-and-standard-schema/full-example" title="users/signup.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="JsonSchemaGenerator and StandardSchema" href="../reference/schemas/json-and-standard-schema.mdx">
+  Every method and type, and the exact rules for building the `$jsonSchema`.
+</Card>
+<Card title="Checking the response shape" href="../queries/contracts.mdx">
+  How to check and describe the shape of a query result.
+</Card>
+<Card title="Special collections" href="./special-collections.mdx">
+  The server validator's level and action, and other collection properties.
+</Card>
+</Cards>

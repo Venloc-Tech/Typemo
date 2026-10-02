@@ -1,0 +1,130 @@
+---
+title: Manual sessions
+description: "Open a session yourself, run a transaction in it, pass it to operations and documents, and remember to close it"
+icon: KeyRound
+---
+
+If you want to control a transaction yourself, open a session with [`client.startSession`](../reference/transactions/transactions.mdx#start-session) and pass it to operations with [`.session()`](../reference/query/options.mdx#session). A **session** is a context on the server where related operations run. A transaction is only one of the things you can start in it.
+
+Usually you don't need this, because [`client.transaction`](../reference/transactions/transactions.mdx#transaction) does it all for you. A manual session helps when your code decides about the commit. Say you're putting together several parts of your code, and each one gets the session as an argument. Or you need driver features that `transaction` doesn't offer.
+
+In return, the work that `transaction` does on its own falls to you.
+
+- Pass the session to every operation.
+- Close the session.
+- Run operations one at a time.
+
+Forget the session in one call, and that call quietly writes outside the transaction. Below you'll see how to avoid that.
+
+If you're new to transactions, read [Transactions](./transactions.mdx) first. It solves the same task in a simpler way.
+
+## What you need [#prerequisites]
+
+A connected client from `db/client.ts` and the account model from `accounts/account.ts`. The database holds two accounts: `Main` with a balance of 100 and `Savings` with 50.
+
+<Snippet id="connection/driver-access/prerequisites" title="db/client.ts" twoslash />
+
+<Snippet id="reference/transactions/transactions/intro" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Open a session, start a transaction in it with the driver's tools, pass the session to operations, and close it in `finally`. The driver method `withTransaction` commits the transaction itself and retries it after transient failures.
+
+<Snippet id="reference/transactions/transactions/start-session" twoslash />
+
+After the commit the `Manual` record shows up in the collection. Below we'll cover how to pass the session, how to commit by hand, and which rules apply.
+
+## Pass the session to an operation [#pass-session]
+
+Queries take the session through [`.session()`](../reference/query/options.mdx#session), writes through the `session` option. An explicit session doesn't attach itself to anything. An operation without it runs outside the transaction, even if you opened the transaction on the line above.
+
+<Snippet id="transactions/sessions/pass-session" twoslash />
+
+Here the transaction is committed by hand: `startTransaction`, then the operations, then `commitTransaction`. If something breaks, call `abortTransaction` in the `catch` block. Otherwise the transaction stays open until the server itself closes it.
+
+Before the commit, the changes are visible only inside the transaction. Inside, the account balance is already 60, while outside it's still 100. After the commit, 60 is visible outside too. `abortTransaction` rolls the changes back. The `Extra` record exists inside the transaction (count 1), not outside it (0), and after the rollback it's gone everywhere (0).
+
+## A document loaded in a session [#document-in-session]
+
+A document loaded with a session remembers it. [`$save`](../reference/documents/document-api.mdx#save) picks up the same session, so you don't pass it a second time. To find out a document's session, call [`$session`](../reference/documents/document-api.mdx#session). The same method with an argument sets or clears it.
+
+<Snippet id="transactions/sessions/document-in-session" twoslash />
+
+If the session has ended but you still need the document, clear it with `$session(null)`. Otherwise saving in a closed session fails with a [`DriverError`](../reference/errors/configuration-errors.mdx#driver-error) and the text `Use of expired sessions is not permitted`.
+
+## Leave the transaction on purpose [#leave-transaction]
+
+Sometimes an operation inside [`client.transaction`](../reference/transactions/transactions.mdx#transaction) has to bypass the transaction. For example, a log entry that must stay even if the transaction rolls back. Pass `session(null)`, and `{ session: null }` to writes.
+
+<Snippet id="transactions/sessions/leave-transaction" twoslash />
+
+The transaction rolled back, but the write with `session(null)` stayed, and the `Savings` balance grew by 100, to 150. This is a deliberate exception. Use it only when the write really has to survive a rollback.
+
+## Rules for concurrent operations [#concurrency-rules]
+
+One session can't run several writes at the same time. Typemo doesn't send such an attempt to the server and refuses on its own with a [`StrictModeError`](../reference/errors/data-errors.mdx#strict-mode-error) whose reason is `concurrent-session`.
+
+The server behaves differently in this situation, but equally badly. These are the library authors' measurements, and the examples on this page don't reproduce them. Inside a transaction the server answers with a conflict error. Outside a transaction it accepts concurrent writes in one session but silently drops some of them. Silent data loss is worse than a refusal, so Typemo refuses.
+
+- **Inside a transaction**, operations run one at a time.
+- **In a session without a transaction**, any number of reads can run at once, but a write runs only alone.
+
+Two reads in one session, `countDocuments` and `find`, went through. Two concurrent writes, and a write next to a read, were refused.
+
+<Snippet id="transactions/sessions/concurrency-rules" />
+
+A rejected operation never reaches the server, so the session keeps working after such an error. Put `await` before every operation, and the rule won't affect you.
+
+## Read and write settings [#read-write-settings]
+
+Read levels and write acknowledgment are set when the transaction starts, not on operations. For example, `session.startTransaction({ readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } })`. An operation inside the transaction with its own `readConcern`, `writeConcern`, `readPreference` (other than `primary`), or `timeoutMS` gets a `StrictModeError` with the reason `transaction-option`. That applies to a transaction opened by hand, too. Here's what `find().session(session).readConcern("majority")` returned inside one.
+
+<Snippet id="reference/policies/violations/transaction-option" />
+
+The server doesn't let a single operation override the transaction's settings, and the driver would silently drop them. Typemo tells you right away. In a session without a transaction, operations may use these options.
+
+## How to choose [#how-to-choose]
+
+Ask yourself whether you need to decide yourself when to commit the transaction.
+
+- **No**: use [`client.transaction`](../reference/transactions/transactions.mdx#transaction). It passes the session on its own, retries the function after transient failures, rolls back the state of documents, and closes the session.
+- **Yes**: for example, the commit depends on a response from an external system, or you're putting together several parts of your code. Then open the session yourself, and passing and closing it is up to you.
+
+## When not to use it [#when-not-to-use]
+
+A single write, a read without a transaction, and an ordinary transaction of several writes don't need a manual session. You rarely need one, and people reach for it mostly out of habit from Mongoose, where there was no other way. If a session is opened only for `startTransaction` and `commitTransaction` around ordinary operations, replace all of it with `client.transaction`.
+
+## Troubleshooting [#troubleshooting]
+
+**A write survives the rollback.** You opened a transaction but forgot to pass the session to one operation. That operation bypassed the transaction and survived the rollback. This is how the `Forgot` record, written without a session, stayed after `abortTransaction`, and the collection held 1 document.
+
+<Snippet id="transactions/sessions/troubleshooting" twoslash />
+
+An explicit session doesn't attach itself to operations. Only `client.transaction` does that. If you don't want to watch every call, use it.
+
+**The session isn't closed.** The session was opened, but `endSession` never ran, for example because of an exception. Then it stays open on the server. Close the session in `finally`, and it closes even on an error. `session.hasEnded` tells you whether it's closed.
+
+**Concurrent writes in one session.** A `Promise.all` of two writes in one session is refused with `concurrent-session`. Run the writes one after another, each with `await`.
+
+## Full example [#full-example]
+
+Everything in one file: a manual session with a commit and a rollback, a document loaded in the session, and closing the session. Code that isn't part of Typemo is marked `__…__`.
+
+<Snippet id="transactions/sessions/full-example" title="accounts/manual-transfer.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Transactions" href="./transactions.mdx">
+  The simpler way: `client.transaction` passes the session, retries the function, and closes the session for you.
+</Card>
+<Card title="Transactions in the reference" href="../reference/transactions/transactions.mdx">
+  The arguments of `startSession` and `transaction`, the settings, and `TransactionScope`.
+</Card>
+<Card title="Query options" href="../reference/query/options.mdx">
+  The `.session()` method and the other query options.
+</Card>
+<Card title="Driver access" href="../connection/driver-access.mdx">
+  Call the driver directly and pass it the transaction's session.
+</Card>
+</Cards>

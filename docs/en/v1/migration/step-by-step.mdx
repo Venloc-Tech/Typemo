@@ -1,0 +1,128 @@
+---
+title: Step-by-step migration
+description: "How to move an app from Mongoose to Typemo one collection at a time while both libraries work with the same database"
+icon: Footprints
+---
+
+You don't have to move the whole app in one release. Both libraries read and write the same MongoDB documents, so you can describe a Typemo class for one collection and leave the rest on Mongoose for now. Below is the order that keeps this safe, and the places where the two libraries get in each other's way.
+
+They can work together because Typemo stores data in the ordinary MongoDB format and uses the same driver and the same `ObjectId` classes as Mongoose. Neither of them adds hidden bookkeeping markup to documents. This was checked in both directions. Typemo read, changed, and saved a document Mongoose had created with timestamps, and Mongoose read the result with nothing lost. And the other way round.
+
+## What you need [#prerequisites]
+
+A Mongoose 9 app with a `Post` model in the `posts` collection with timestamps, and a MongoDB both libraries can reach. The examples are built around a blog. Mongoose code is shown only where the difference matters.
+
+<Steps>
+<Step>
+
+### Prepare the project [#prepare-project]
+
+Install the packages and turn on decorators in `tsconfig`, as in [Quick start](../getting-started/quick-start.mdx). The core decorators need only the `experimentalDecorators` flag. You don't install or load `reflect-metadata` (`import "reflect-metadata"`), because the core keeps its own metadata. You don't need `emitDecoratorMetadata` either. Typemo doesn't read `design:type`, and a field's type is always named explicitly: `@Prop(() => String)`.
+
+If your Mongoose project already turns these flags on for other libraries, keep them. They don't bother Typemo. And if the project has no other decorators, take a look at the [TC39 decorator package](../decorators-tc39/tc39.mdx), which doesn't need `experimentalDecorators`.
+
+Typemo requires the latest versions of MongoDB, the `mongodb` driver, and `bson`. If your Mongoose sits on a different driver, update it first, otherwise the `ObjectId` classes will differ. Then connect the client next to the existing Mongoose connection. More in the [Connect to the database](../connection/connect.mdx) guide.
+
+</Step>
+<Step>
+
+### Describe a class over an existing collection [#describe-existing-collection]
+
+Set the collection name explicitly. Mongoose derives it from the model name in the plural, while Typemo takes exactly what's written in [`collection`](../reference/schemas/schema.mdx#collection). Add the bookkeeping fields with base classes that mirror the Mongoose options. [`Timestamped`](../reference/schemas/base-classes.mdx#timestamped) replaces `timestamps: true`, and [`Versioned`](../reference/schemas/base-classes.mdx#versioned) replaces `__v`.
+
+<Snippet id="migration/step-by-step/describe-existing-collection" title="posts/post.ts" twoslash />
+
+The class describes the document in the form Mongoose created it in. You don't need to declare an empty array for `tags`. An array field without `default` and without `required` starts as `[]` in Typemo, as in Mongoose. A document read from the database without that key also gives `[]`. So code with `post.tags.length` keeps working on both old and new documents.
+
+If your Mongoose documents have their own `_id` type (a code string, a number, a `UUID`), don't declare `_id` in the class by hand. The [`EntityWithId`](../reference/schemas/base-classes.mdx#entity-with-id) base class sets its type in one line.
+
+<Snippet id="migration/step-by-step/describe-existing-collection-2" title="countries/country.ts" twoslash />
+
+The `_id` from `EntityWithId` is immutable, and on `create` without a `default` it's required, otherwise you get `Validation failed: "_id": the field is required [required]`. `findById`, references, and `populate` on such a model work with the string. More, including `UUID` and a numeric counter, in the [Use your own _id type](../schemas/custom-ids.mdx) guide.
+
+Fields that exist in the database but aren't described in the class (say, an old `legacy` field) are left alone by Typemo when it reads and saves the document, and they stay in the database. It's stricter only with subdocuments, see [`UnknownFieldsError`](../reference/errors/data-errors.mdx#unknown-fields-error).
+
+</Step>
+<Step>
+
+### Don't create indexes blindly [#no-blind-indexes]
+
+Typemo doesn't create indexes on startup, and [`syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes) drops the ones that aren't in the class. If Mongoose or a DBA created indexes the class doesn't know about, syncing will remove them. So look at the plan first.
+
+<Snippet id="migration/step-by-step/no-blind-indexes" twoslash />
+
+The collection had a `legacy_1` index that isn't in the class. `dryRun` showed it would be dropped and changed nothing. Move such indexes into the class with [`@Index`](../reference/schemas/index-decorators.mdx#index) decorators or [`@Prop`](../reference/schemas/prop.mdx#index) options, and only then run the sync for real.
+
+</Step>
+<Step>
+
+### Replace plugins with policies [#replace-plugins-with-policies]
+
+If in Mongoose you restricted data to an organization with a plugin or a hook, Typemo has a schema policy for that. Its field is marked with the [`@Tenant()`](../reference/schemas/field-markers.mdx#tenant) decorator next to `@Prop`. Without the mark, a schema with the `tenant` option won't build: `ConfigurationError: Order: the tenant field "tenantId" must be marked @Tenant() (declare it @Prop(...) @Tenant() tenantId!: TenantField<T>)`. Soft delete and audit are turned on with the `softDelete` and `audit` options, not with plugins.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/prerequisites" title="orders/order.ts" twoslash />
+
+While both libraries work with the collection, remember that the tenant policy applies only to Typemo queries. Mongoose queries don't see it. So don't move part of a collection's code to the tenant. Move the whole collection. More in the section on two libraries below. The [Split data by organization](../policies/tenants.mdx) guide and the [A multi-tenant app](../recipes/multi-tenant.mdx) recipe show how to open a tenant scope for the duration of a request.
+
+</Step>
+<Step>
+
+### Switch reads first, then writes [#switch-reads-then-writes]
+
+Start with reads. They don't change data, and the differences show up right away: an unknown field in a filter, `undefined`, a string instead of a number. Then move the model's writes: `create`, `updateOne`, `findOneAndUpdate`. Unless you have to, don't change one collection from both libraries in one scenario, because the hooks and plugins of one don't fire on the writes of the other (more on that below).
+
+Look up the replacement for each method in [API mapping](../reference/migration/api-mapping.mdx), and the behavior differences with their reasons in [Behavior differences](./behavior-differences.mdx). What's missing entirely is collected in [What Typemo doesn't have](./missing-features.mdx).
+
+</Step>
+<Step>
+
+### Remove Mongoose from the collection [#remove-mongoose-from-collection]
+
+Once every access to the collection goes through Typemo, delete the Mongoose model and schema. And once the last model is moved, remove the `mongoose` package and the global connection.
+
+</Step>
+</Steps>
+
+## Living with two libraries at once [#side-by-side]
+
+Until the move is finished, the collection has two owners, and each one's rules apply only inside its own library.
+
+**Policies aren't shared.** Tenant, soft delete, and audit work only on Typemo operations. A Mongoose query to the same collection knows nothing about them and returns other tenants' data or deleted documents. So move a collection with policies as a whole, not method by method.
+
+**Hooks and plugins aren't shared.** A Mongoose `pre("save")` doesn't fire on a Typemo write, and vice versa. If a hook maintains an invariant, for example normalizes an email, write through one library during the move. Or duplicate the hook in the Typemo class with the [`@Pre`](../reference/hooks/pre-post.mdx#pre) decorator.
+
+**Value checks differ too.** On a write, Mongoose casts `"42"` to a number, and Typemo refuses. Mongoose writes data by its schema, and Typemo by the class. If the schemas have drifted apart, the reading side gets whatever is in the database. Typemo doesn't check values on read, and only Mongoose casts them to the schema type.
+
+**Transactions don't carry over between the libraries.** A Mongoose session and a [`client.transaction`](../reference/connection/typemo-client.mdx#client.transaction) know nothing about each other. Do the writes of one transaction with one library.
+
+## How to choose which collection to start with [#how-to-choose]
+
+Ask yourself what happens if this collection starts behaving more strictly. Start with a simple schema that has few hooks, no `Mixed`, and data under your control. The first strictness errors show where the app relied on silent casting. Move collections with plugins, discriminators, and `Mixed` last. They need new solutions, not a simple method swap.
+
+## When not to use it [#when-not-to-use]
+
+If the app runs fine, the schema hardly changes, and the document type doesn't worry you, the move won't pay off. You'd pay with time for strictness you don't need. And don't touch what depends on `Mixed` and `strict: false` until you decide how to describe such data. More about the cost in [Why switch](./why.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**An index disappeared after syncing.** `syncIndexes` brought the indexes exactly in line with the class and dropped the extra ones. Restore the index, declare it in the class, and run `syncIndexes` again. Next time, run it with `dryRun: true`.
+
+**A `ConfigurationError` about the tenant when creating the model.** A schema with the `tenant` option doesn't know which field to fill in. Add `@Tenant()` next to `@Prop` on a field of type `TenantField<T>`, as in the step about policies.
+
+**`create` rejects a document without `_id`.** A model on `EntityWithId` without a `default` requires an identifier: `Validation failed: "_id": the field is required [required]`. In Mongoose such a document without `_id` wouldn't save either (`MongooseError: document must have an _id before saving`). Pass `_id` or set a factory in `default`, as described in [Use your own _id type](../schemas/custom-ids.mdx).
+
+**An error when saving a document Mongoose created.** A subdocument has a field that isn't in the class. Typemo doesn't silently erase it and throws [`UnknownFieldsError`](../reference/errors/data-errors.mdx#unknown-fields-error). Add the field to the class or deliberately agree to lose it, as described in [Handle fields that aren't in the schema](../documents/unknown-fields.mdx).
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="API mapping" href="../reference/migration/api-mapping.mdx">
+  A replacement for every Mongoose method and option.
+</Card>
+<Card title="Behavior differences" href="./behavior-differences.mdx">
+  What changes in working code and why.
+</Card>
+<Card title="Why switch" href="./why.mdx">
+  What you get and what it costs.
+</Card>
+</Cards>

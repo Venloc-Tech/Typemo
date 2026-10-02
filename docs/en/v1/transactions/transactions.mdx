@@ -1,0 +1,164 @@
+---
+title: Transactions
+description: "Write several documents so they apply together or not at all, and keep your code correct when the function is retried"
+icon: ArrowLeftRight
+---
+
+A transfer between accounts, an order with its line items, an invoice and its journal entry. In each of these, half a change is worse than none. One failure between two writes, and the money leaves one account but never reaches the other. Run such writes in one call of [`client.transaction`](../reference/transactions/transactions.mdx#transaction), and they apply together or not at all.
+
+A **transaction** is a group of operations that other readers see only as a whole, after the commit. On an error the database rolls all of it back. You don't need to pass a session anywhere, because the operations inside the function join the transaction on their own. The hard part is elsewhere. After a transient server failure the function runs again, and the code in it has to survive that. Most of this page is about that.
+
+Transactions need a replica set (several MongoDB servers holding copies of the same data, though one server is enough for transactions) or a sharded cluster. On a standalone `mongod`, `transaction` throws a [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configuration-error) before your function even starts. [`client.supportsTransactions`](../reference/connection/typemo-client.mdx#client.supports-transactions) checks this in advance. See [Connect to the database](../connection/connect.mdx) for details.
+
+## What you need [#prerequisites]
+
+A connected client from `db/client.ts` and the account model from `accounts/account.ts`. The database holds two accounts: `Main` with a balance of 100 and `Savings` with 50.
+
+<Snippet id="connection/driver-access/prerequisites" title="db/client.ts" twoslash />
+
+<Snippet id="reference/transactions/transactions/intro" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Pass a function to [`client.transaction`](../reference/transactions/transactions.mdx#transaction). Everything it does to the database applies at once, and `transaction` returns the function's result.
+
+<Snippet id="transactions/transactions/quick-start" twoslash />
+
+If the function throws, both writes roll back and the error reaches you as is. A connection has the same call: [`connection.transaction`](../reference/connection/connection.mdx#connection.transaction) hands it over to its client. We'll cover the tasks and the traps below.
+
+## Transfer money between accounts [#transfer-money]
+
+A transfer reads a balance, checks that there's enough, and changes two documents. Keep the check inside the transaction, so that the decision "there's enough money" and the debit itself become one unit. If there isn't enough, throw your own error, and the transaction rolls back everything it has done so far.
+
+<Snippet id="transactions/transactions/transfer-money" title="accounts/accounts.service.ts" twoslash />
+
+The balance changes with an atomic `$inc` write, not with "read, subtract, write". `$inc` doesn't depend on whatever a previous attempt left in memory, so the function gives the right result no matter how many times it's retried.
+
+After a transfer of 30 the balances are 70 and 80. A transfer of 500 threw `insufficient funds`, and the balances stayed `[70, 80]`. The debit would have rolled back even if the first write had already gone through.
+
+## Rollback on error [#rollback-on-error]
+
+Any error inside the function rolls the transaction back. It doesn't matter whose error it is: yours, a schema check, or a unique index. Everything the function did before it rolls back too. In the example, the first write takes 1 from `Main`, and the second tries to create an account with a name that's already taken.
+
+<Snippet id="transactions/transactions/rollback-on-error" twoslash />
+
+The debit is undone, and `Main` still has 70. The error arrives unwrapped, so catch it by class, the same as outside a transaction. See [Error handling](../errors/handling.mdx) for details. Your own error comes back exactly as you threw it, and `caught === thrown` here is `true`.
+
+## Run operations one at a time [#run-sequentially]
+
+Inside a transaction, run operations one by one, each with `await`. The server doesn't support concurrent operations in one transaction and answers with an error, and the driver calls this case undefined behavior. So Typemo refuses on its own, without waiting for the server, with a [`StrictModeError`](../reference/errors/data-errors.mdx#strict-mode-error) whose reason is `concurrent-session`.
+
+People most often run into this with `Promise.all` over a list. It looks harmless, but it's not allowed in a transaction. The error names both operations: the one you started and the one that hasn't finished yet. A plain loop works.
+
+<Snippet id="transactions/transactions/run-sequentially" twoslash />
+
+The loop changed both accounts. The `Promise.all` of two reads inside the transaction failed.
+
+<Snippet id="reference/policies/violations/concurrent-session" />
+
+The rule covers operations that share a session, which means every operation inside a transaction. It doesn't get in the way of sequential code. Walking a cursor and writing after each document, for example, works fine.
+
+## The function may run more than once [#retries]
+
+The server marks some failures as a transient transaction error. Say two transactions changed the same document, and the second one lost. Then the driver runs your function again **from the very beginning**. Hence the rule: inside the function, write to the database and do nothing else. An email, a payment in an external service, or a write to a file repeats on every attempt, and the transaction can't roll it back.
+
+Here the email goes out from inside the function, and the first attempt hits a transient failure on a write. In the end the email is sent twice.
+
+<Snippet id="transactions/transactions/retries" twoslash />
+
+In the wrong version the list of sent emails is `["email", "email"]`. In the right one it has a single entry, added after the commit. If the email must go out no matter what, write it to an "outbox" collection in the same transaction and send it from a separate process.
+
+The attempt number comes in the function's argument. [`scope.attempt`](../reference/transactions/transactions.mdx#transaction-scope) is 1 on the first run, 2 on the first retry, and so on. It's handy for logs and tests, but don't build logic on it.
+
+### Documents loaded outside [#external-documents]
+
+Retries affect documents too. If you load a document **before** the transaction and change it inside, a retry applies the change on top of the already changed values. The function subtracted 10 from a balance of 100, the save hit a transient failure, and on the retry it saw 90, subtracted another 10, and saved 80 instead of 90. Between attempts Typemo marks the document as changed again, but it can't undo your assignments.
+
+Read documents inside the function, and change numbers atomically with `$inc`, as in the transfer above. Then the result is the same however many retries there are.
+
+## Limit the total time [#total-timeout]
+
+By default a transaction waits until the driver is done retrying. To limit that time, pass [`timeoutMS`](../reference/transactions/transactions.mdx#transaction-options). It's the deadline for the whole transaction, retries included.
+
+<Snippet id="transactions/transactions/total-timeout" twoslash />
+
+Transaction settings go here, not on individual operations. [`readConcern`](../reference/transactions/transactions.mdx#transaction-options) decides which data the transaction reads, and `writeConcern` decides how many nodes acknowledge the commit. If an operation inside the transaction brings its own `readConcern`, `writeConcern`, `readPreference` (other than `primary`), or `timeoutMS`, it gets a `StrictModeError` with the reason `transaction-option`. The server wouldn't let it override the transaction's settings, and the driver would silently drop them.
+
+When the time runs out, you get a [`TimeoutError`](../reference/errors/server-errors.mdx#timeout-error). For example, a transaction with `timeoutMS: 200` whose query hung for 400 ms failed with `kind: "transaction"`, `timeoutMS: 200`, and the text `transaction timed out after 200 ms (timeoutMS)`. If a single operation's deadline ran out, meaning the query's `timeoutMS`, the kind is `"operation"`. So `kind` tells you whose deadline expired.
+
+## How to choose [#how-to-choose]
+
+Ask yourself whether you have two writes where half is worse than nothing.
+
+- **One write**: you don't need a transaction. A write to one document is atomic on its own.
+- **Several related writes**: use a transaction.
+- **Several writes where a partial result is acceptable**: `insertMany` or `bulkWrite` is enough. A bulk load is one example, where the skipped rows are loaded again later.
+
+Between `transaction` and a manual session, choose by who decides when to commit. `transaction` creates and closes the session itself, retries the function, and rolls back the state of documents. You need a manual session only if you control the commit yourself. That's covered in [Manual sessions](./sessions.mdx).
+
+## When not to use it [#when-not-to-use]
+
+A single write, a read, or unrelated writes don't need a transaction. It adds overhead and restrictions (operations one at a time, no settings of their own on individual operations) and holds server resources while it's open. Don't wrap long calls to external services in it. While you wait for a response, the transaction stays open and the chance of a conflict grows.
+
+An atomic counter or flag is one `updateOne` with `$inc` or `$set`. Uniqueness comes from an index, not from a transaction, see [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicate-key-error).
+
+## Troubleshooting [#troubleshooting]
+
+**A driver write survives the rollback.** Inside the transaction you called the driver directly, the transaction rolled back, and the write stayed. Driver calls don't join the transaction on their own. Only model operations do that. Pass the session explicitly, from the function's argument.
+
+<Snippet id="transactions/transactions/troubleshooting" twoslash />
+
+With `session: scope.session` the write rolls back with the transaction, and after the error in the function the collection has no document (`0`). Without that argument the document would stay. For direct driver calls, see [Driver access](../connection/driver-access.mdx).
+
+**A transaction inside a transaction.** If you call `transaction` from the function of another transaction on the same client, you get a `ConfigurationError`.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/troubleshooting" />
+
+MongoDB has no nested transactions. A nested call would either have to join silently or become a separate transaction with its own outcome, and Typemo doesn't make that choice for you. Move the shared part into a function that doesn't call `transaction` itself and works inside the transaction that's already open.
+
+**A model of another client inside a transaction.** A transaction belongs to one client, and a model of another client can't join it. Instead of a silent write that bypasses the transaction, you get a `ConfigurationError`. Its text suggests passing `session(null)` to leave the transaction explicitly.
+
+<Snippet id="transactions/transactions/troubleshooting-2" />
+
+With `session(null)` the call goes through and returns its result outside the transaction.
+
+**After a retry the balance is 80, not 90.** The document was loaded before the transaction, changed with arithmetic inside, and saved. After a transient failure the change landed in the database twice. On the retry the function works with the same object in memory, which already holds 90 from the first attempt, and subtracts another 10.
+
+<Snippet id="transactions/transactions/troubleshooting-3" twoslash />
+
+The second version saves 90, because both attempts read 100 from the database. An atomic `updateOne` with `$inc`, as in the transfer above, is even safer, since it doesn't care what's in memory. Assigning a fixed value, such as `doc.status = "closed"`, is fine. It's the same on every attempt.
+
+**A transaction doesn't start on a standalone server.** A standalone `mongod` has no transactions, and `client.transaction` throws a [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configuration-error) right away. The function isn't called, and nothing is written to the database. The error text names both the cause and the way out. Here's what you get from a `mongod` without a replica set, where `client.supportsTransactions` is `false`.
+
+<Snippet id="reference/connection/typemo-client/client-transaction-2" />
+
+A single-node replica set is enough for development. Still, check `client.supportsTransactions` when your app starts. Then it stops right away with a clear message, not on the first money transfer.
+
+## Full example [#full-example]
+
+Everything in one file: a transfer between accounts, an email after the commit, and a response to the client. Code that isn't part of Typemo is marked `__…__`.
+
+<Snippet id="transactions/transactions/full-example" title="accounts/accounts.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose you passed the session to every operation (`{ session }`), and if you forgot it in one call, that call silently ran outside the transaction. In Typemo, model operations inside `transaction` join it on their own, including `populate`, cursors, aggregations, and bulk writes. The driver handles retries after transient failures. Documents saved in a failed attempt are marked as changed again. That was a known trap in Mongoose, where the repeated `save` sent the wrong write.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Manual sessions" href="./sessions.mdx">
+  Start and commit a transaction yourself and pass the session to operations.
+</Card>
+<Card title="Transactions" href="../reference/transactions/transactions.mdx">
+  Every argument of `transaction`, the settings, `TransactionScope`, and the exact types.
+</Card>
+<Card title="Error handling" href="../errors/handling.mdx">
+  Catch `DuplicateKeyError`, `TimeoutError`, and other errors inside and outside a transaction.
+</Card>
+<Card title="Connect to the database" href="../connection/connect.mdx">
+  A replica set for transactions and a `supportsTransactions` check at startup.
+</Card>
+</Cards>

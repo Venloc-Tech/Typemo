@@ -1,0 +1,149 @@
+---
+title: Transactions and policies per request
+description: "@Transactional on service methods, the tenant and actor from the HTTP request via PolicyInterceptor, and access to all tenants via @AllTenants in NestJS"
+icon: ShieldCheck
+---
+
+In Typemo you don't pass a transaction or a policy context as parameters. An operation finds the transaction and the tenant of the current async call on its own. In a NestJS app that means two things. You declare a transaction with the `@Transactional()` decorator on a method, and `PolicyInterceptor` puts the tenant and the actor into the context, once for all handlers. If these core mechanisms are new to you, read [Transactions](../../transactions/index.mdx) and [Pass the tenant and actor through the whole request](../../policies/policy-context.mdx) first.
+
+## What you need [#prerequisites]
+
+The app from the [Connect Typemo to NestJS](./setup.mdx) guide, running on a MongoDB replica set. A replica set is several MongoDB servers holding copies of the same data. One node is enough, but transactions don't work on a standalone `mongod`. The models are an account and an organization's order, and the order's `tenantId` field is marked as the tenant.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/prerequisites" title="orders/order.ts" twoslash />
+
+## Quick start [#quick-start]
+
+A transaction is a decorator on a service method, and an app-wide interceptor takes care of the tenant.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/quick-start" title="main.ts" twoslash />
+
+Below we'll go through each part task by task.
+
+## Transfer money in a transaction [#transfer-money]
+
+A transfer changes two accounts, and half a transfer is worse than none. [`@Transactional()`](../../reference/integrations/nestjs.mdx#transactional) runs the method in a client transaction. Every operation inside, including in the methods it calls, joins the transaction on its own. The transaction commits when the method's promise resolves and rolls back when it rejects.
+
+The method has to be async. A synchronous method with the decorator won't compile, because a transaction is asynchronous by nature. An error inside the method reaches the caller as is. A method that created an account and then threw returned that error, and no account was left in the database.
+
+Models from two databases of the same client (`forFeature(…, { db })`) go into one transaction. A write to the main database and to the archive, with an error at the end, rolled back in both.
+
+## Survive a retry [#survive-retry]
+
+The server aborted the transaction with a transient error, for example because of a write conflict or a primary change. The core retries the whole transaction, which means **the method runs again**. When the first insert failed, the method ran twice, and the result was committed once.
+
+So the method has to survive a retry. Read documents inside the method and change amounts with atomic operators like `$inc`, as in the quick start. If a document is loaded **before** the call and changed with arithmetic inside (`account.balance -= 10`), the change is applied twice on a retry. Details are in [`client.transaction`](../../reference/connection/typemo-client.mdx#client.transaction).
+
+## Call a transactional method from another one [#nested-transactional-call]
+
+The "write a ledger entry" method is called both on its own and from the "transfer" method, which has already opened a transaction. MongoDB transactions don't nest, so without an option such a call is a core error. The `join: true` option of [`@Transactional`](../../reference/integrations/nestjs.mdx#transactional) tells the method to run inside this client's transaction if one is already open, and to open its own otherwise.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/nested-transactional-call" title="ledger/ledger.service.ts" twoslash />
+
+A method that joined doesn't commit or roll back the transaction itself. Whoever opened it does. So an error inside `entry` goes out, and the whole `pair` transaction rolls back. With an error in the second `entry`, not a single record was left in the database. On a transient server error the whole outer transaction is retried, and the joined method runs again with it.
+
+Inside a transaction of **another** client, `join` won't silently open a second transaction. It throws an error. A write on the other client wouldn't roll back together with the outer transaction.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/nested-transactional-call-2" />
+
+You can't set transaction options (`timeoutMS`, `readConcern`) together with `join`. They belong to the outer transaction, and the compiler won't let it through.
+
+## A transaction on another client [#other-client-transaction]
+
+The app has two clients, and you need a transaction on the second one. The `client` option names it, and the other options are the core's transaction options.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/other-client-transaction" title="billing/billing.service.ts" twoslash />
+
+An unknown name is an error at call time, not a transaction "somewhere".
+
+<Snippet id="integrations/nestjs/transactions-and-policies/other-client-transaction-2" />
+
+## A transaction on a route handler [#transaction-on-route]
+
+The handler makes two writes itself, and you'd rather not move them into a service. You can put the decorator on a controller method too, in any order with `@Post()`. The route metadata is carried over to the wrapper. `POST /accounts/pair`, where the handler created an account and failed before the second one, returned 500, and no account was left in the database.
+
+## The tenant from the request [#tenant-from-request]
+
+The app serves several organizations, and every request must see only its own organization's data. [`PolicyInterceptor`](../../reference/integrations/nestjs.mdx#policy-interceptor) runs each handler inside [`PolicyContext.run`](../../reference/policies/policy-context.mdx#policy-context.run) with the tenant from the request.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/tenant-from-request" title="main.ts" twoslash />
+
+Services know nothing about the tenant. `Orders.find()` in a service gets the organization filter on its own, and `Orders.create` sets `tenantId` on its own. The context lives through the handler's whole async chain, both after `await` and in the `Observable` stream the handler returns. Out of 20 concurrent requests from two organizations, every response held only that organization's orders.
+
+If the tenant isn't in a header but in the user that authentication put on the request, declare your own request type.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/tenant-from-request-2" title="main.ts" twoslash />
+
+The resolver is synchronous, because the context opens before the handler is called. Get the tenant earlier, in an authentication guard or middleware.
+
+## A request without a tenant [#query-without-tenant]
+
+There's no header. The resolver returned `undefined`, no tenant is set, and the tenant model rejects the operation with the core error [`StrictModeError`](../../reference/errors/data-errors.mdx#strict-mode-error) with the reason `tenant`. With [`TypemoExceptionFilter`](./http.mdx) the client gets this response.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/query-without-tenant" />
+
+Nothing happens silently. A request without an organization doesn't turn into a request across all organizations. Models without a tenant policy work without a tenant too.
+
+## Access to all tenants [#all-tenants]
+
+An admin route has to see everyone. [`@AllTenants()`](../../reference/integrations/nestjs.mdx#all-tenants) on a handler or a controller replaces the request's tenant with `allTenants: true`.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/all-tenants" title="admin/admin.controller.ts" twoslash />
+
+Orders `A-1` and `A-2` of the `acme` organization and `G-1` of `globex` came back as `["acme:A-1", "acme:A-2", "globex:G-1"]`. Access to all tenants is an explicit decision on the route, not a side effect of an empty header.
+
+## How to choose between the decorator and `client.transaction` [#how-to-choose]
+
+Ask yourself whether all of the method's work should run in the transaction.
+
+- **All of it**: use `@Transactional()`. The transaction boundary is visible right in the method declaration.
+- **Only part of it**: for example, read first, then write atomically, and send an email outside the transaction. Inject the client with [`@InjectClient`](../../reference/integrations/nestjs.mdx#inject-client) and wrap that part in [`client.transaction`](../../reference/connection/typemo-client.mdx#client.transaction).
+
+## When not to use it [#when-not-to-use]
+
+A single write operation is atomic on its own, and a transaction around one `updateOne` adds nothing. An app with one organization doesn't need the policy interceptor. And outside HTTP, in queues and scheduled jobs, the interceptor doesn't work. There, open the context yourself with `PolicyContext.run`.
+
+## Troubleshooting [#troubleshooting]
+
+**Transactions do not nest.** A method with `@Transactional()` called another method with `@Transactional()`.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/troubleshooting" />
+
+MongoDB has no nested transactions. Mark the inner method `@Transactional({ join: true })`. Then it runs inside the outer transaction, and when called on its own, it opens its own (see [Call a transactional method from another one](#nested-transactional-call)).
+
+**The method refuses to run outside the app.**
+
+<Snippet id="integrations/nestjs/transactions-and-policies/troubleshooting-2" />
+
+The object was created with `new`, bypassing Nest, and the app didn't link it to its client. Get the service from the container (`moduleRef.get`), and in a unit test add [`provideClientMock`](./testing.mdx).
+
+**PolicyInterceptor works in HTTP handlers only.** The interceptor is attached to a microservice or a WebSocket gateway. Open the context yourself there.
+
+## Full example [#full-example]
+
+A transfer service with a transaction and an organization's order controller. The interceptor and the filter are attached in `main.ts`.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/full-example" title="main.ts" twoslash />
+
+<Callout type="migration" title="Coming from @nestjs/mongoose">
+
+`connection.transaction(async (session) => …)`, where `session` is passed to every operation, is replaced by `@Transactional()` without a session. Operations find the transaction on their own. Mongoose had no tenant at all, and the organization filter was added to every query by hand.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Errors, ids, and the request body" href="./http.mdx">
+  How transaction and policy errors turn into HTTP responses.
+</Card>
+<Card title="Split data by organization" href="../../policies/tenants.mdx">
+  How the tenant policy works without Nest and what it checks.
+</Card>
+<Card title="Transactions" href="../../transactions/index.mdx">
+  Retries, rolling back participants, and the limits of MongoDB transactions, without Nest.
+</Card>
+<Card title="@Transactional in the reference" href="../../reference/integrations/nestjs.mdx#transactional">
+  Options, binding to the app, and errors.
+</Card>
+</Cards>

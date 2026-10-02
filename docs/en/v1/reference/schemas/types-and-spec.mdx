@@ -1,0 +1,132 @@
+---
+title: "Types and Spec"
+description: "The BSON classes from Types and the Spec builders: which field types they define, how a value looks in code, and what they throw on a bad value."
+icon: Boxes
+---
+
+The field type in [`@Prop`](./prop.mdx#prop) comes from a function that returns a **specification**. That can be an ordinary constructor (`String`, `Number`, `Date`, `BigInt`), a class from `Types`, or an object built with `Spec`. This page describes both sets. `Types` holds ready-made BSON value classes, and `Spec` holds builders for composite types (Map, union, binary data, vector). Use this page when you need to choose between `Number` and `Types.Int32`, or to declare a map field.
+
+For a guide to choosing a type, with examples, see [Choose a field type](../../schemas/field-types.mdx). This page is the reference.
+
+The examples build on one model with fields of different types. Each field appears in the section that covers it. The results in the `// →` comments come from a real MongoDB.
+
+---
+
+## Types [#types]
+
+`Types` is a namespace of BSON value classes. You use them to create values and declare fields. They are `Types.ObjectId`, `Types.UUID`, `Types.Decimal128`, `Types.Int32`, `Types.Double`, `Types.Timestamp`, `Types.Binary`, and also `Types.Long`, `Types.MinKey`, and `Types.MaxKey`. All of them are MongoDB driver classes re-exported from one place. A value created with `Types.ObjectId` and a value read from the database belong to the same class, so `instanceof` doesn't let you down.
+
+Not every class can become a field. `Types.Long` isn't a field type, so use `BigInt` for int64. `Types.MinKey` and `Types.MaxKey` aren't supported as legacy BSON types. In both cases the model doesn't build and throws `ConfigurationError` with the text `Long is not a field type: use BigInt (int64 is a bigint)` or `MinKey is not supported as a field type (legacy BSON types)`.
+
+<TypeTable
+  type={{
+    "Number": { description: "A JavaScript number. Stored as int32 or double, depending on the value.", type: "number" },
+    "Types.Int32": { description: "Integers in the int32 range only. A fractional number or a number outside the range throws `CastError`.", type: "number" },
+    "Types.Double": { description: "A floating-point number. Always stored as a double.", type: "number" },
+    "BigInt": { description: "int64 (`long`). Accepts a `bigint` and a decimal string, and a number only if it's a safe integer. In JSON and in the `$toPlain()` result it comes out as a decimal string.", type: "bigint" },
+    "Types.Decimal128": { description: "An exact decimal number. Accepts a `Decimal128` and a decimal string. In JSON and in the `$toPlain()` result it comes out as a string.", type: "Decimal128" },
+    "Types.ObjectId": { description: "A MongoDB identifier. Also accepts a 24-character hexadecimal string.", type: "ObjectId" },
+    "Types.UUID": { description: "A UUID (binary data, subtype 4). Also accepts a string in UUID format.", type: "UUID" },
+    "Types.Timestamp": { description: "MongoDB's internal timestamp. Don't confuse it with `Date`.", type: "Timestamp" },
+    "Types.Binary": { description: "Binary data of subtype 0.", type: "Binary" },
+  }}
+/>
+
+Three cases are worth showing in action. Unlike `Number`, `Types.Int32` won't let you write a fractional number.
+
+<Snippet id="reference/schemas/types-and-spec/types" twoslash />
+
+`BigInt` and `Types.Decimal128` store numbers that don't fit into an exact `number`. In the `$toPlain()` result and in JSON they become strings, because otherwise the client would get a JavaScript number that lost precision.
+
+<Snippet id="reference/schemas/types-and-spec/types-2" twoslash />
+
+Every write method and filter accepts a string in place of `ObjectId` and `UUID`. `Decimal128` takes a decimal string (`"1.10"`) just like `Types.Decimal128.fromString("1.10")`. `BigInt` takes a `bigint` and a decimal string, including in `$inc`, `$mul`, `$min`, and `$max`. A malformed decimal string for `BigInt` throws `CastError` with the text `a string must be a decimal integer (no sign +, leading zeros, -0, spaces, exponent or prefix) [format]`. At runtime, a plain number for `BigInt` is accepted only if it's a safe integer. Otherwise you get `CastError` with the hint `pass a bigint (5n) or a decimal integer string ("5")`. For `Decimal128`, a number is accepted through its decimal notation, but the types don't allow such input.
+
+All the forms of each type (document, `.lean()` result, `$toPlain()`, JSON) are collected in [Value forms](../values/value-forms.mdx).
+
+### Types.Binary [#types.binary]
+
+Binary data of subtype 0. The value is a `Types.Binary` instance, and the `$toPlain()` result gives a `Uint8Array`. For another subtype, use [`Spec.binary`](#spec.binary).
+
+---
+
+## Spec [#spec]
+
+`Spec` is a class with static builders. Each returns a frozen specification object that you pass to `@Prop(() => Spec.xxx(...))`. The function around the specification is already lazy, so `Spec` needs no extra functions inside. `@Prop(() => Spec.map(Address))` is safe whatever order the classes are declared in.
+
+### Spec.map [#spec.map]
+
+`Spec.map(value, options?)` describes a dictionary field. Its keys are strings and its values have the given type. In the database it's stored as a nested document, and in code it's a `Map<string, V>`. Use it when the keys aren't known in advance, such as grades by subject or settings by name.
+
+<Snippet id="reference/schemas/types-and-spec/spec-map" twoslash />
+
+Keys are checked right away. An empty key, a key with a dot, a key starting with `$`, and `__proto__` are forbidden. MongoDB would read the dot as a path and the `$` as an operator.
+
+<Snippet id="reference/schemas/types-and-spec/spec-map-2" twoslash />
+
+A `null` value in a map is forbidden until you allow it explicitly. `Spec.map(Number, { nullable: true })` gives `Map<string, number | null>`, and the values are stored as BSON null. Without the flag you get `Cast to number failed at path "scores.a" for null: null is not allowed on a path that is not nullable [null]`.
+
+<Params>
+<Param name="of" type="TypeSpec" required>
+
+The specification of the values. Any valid field type works, including a class with `@Schema` or an array.
+
+</Param>
+<Param name="options.nullable" type="true">
+
+`{ nullable: true }` allows `null` in the values. The types accept only `true`. The object from `Spec.map` keeps the option as it was passed, in the `nullable` field (the `MapSpec` type declares it as `nullable?: unknown`). Without the option there's no field. That's why any other value doesn't slip through silently. That means `false`, `"yes"`, or `1` from code without types, and also a copy of the specification such as `{ ...Spec.map(Number), nullable: false }`. When the model is built you get `ConfigurationError` `F.x: Spec.map options: "nullable" must be true`, where `F.x` is the class and field. To forbid `null`, leave the option out.
+
+</Param>
+</Params>
+
+`$toPlain()` and `$toObject()` leave the `Map` as it is, and `$toJSON()` turns it into an ordinary object.
+
+### Spec.union [#spec.union]
+
+`Spec.union(A, B, …)` describes a field that can be one of several scalar types, such as `string | number`. The value is checked by its own type, and **exactly one** member must accept it. There must be at least two members. A union of classes is a job for discriminators, so read [`@Discriminator`](./discriminator.mdx#discriminator).
+
+<Snippet id="reference/schemas/types-and-spec/spec-union" twoslash />
+
+Members that accept the same values break the build. `Number` and `Types.Int32` together throw `ConfigurationError` (`union members number and int32 accept the same values (exactly one member must claim a value)`). With one member the error is different: `a union needs at least two members`. The compiler also requires at least two arguments.
+
+### Spec.binary [#spec.binary]
+
+`Spec.binary({ subtype })` describes binary data of the given subtype. Subtype 0 is `Types.Binary`, 4 is `Types.UUID`, and 9 is `Spec.vector`. The others, such as custom subtypes from 128, are declared with this builder.
+
+<Snippet id="reference/schemas/types-and-spec/spec-binary" twoslash />
+
+### Spec.vector [#spec.vector]
+
+`Spec.vector({ dtype, dimensions? })` describes a BSON **vector** (binary data of subtype 9) for vector search. `dtype` sets the element type: `"int8"`, `"float32"`, or `"packedBit"`. `dimensions` is the exact number of elements, if it's fixed. Without it, any non-zero length fits. The field is declared with the [`Vector`](./field-markers.mdx#vector) type.
+
+<Snippet id="reference/schemas/types-and-spec/spec-vector" twoslash />
+
+As input, you can pass a vector as an ordinary array of numbers (`number[]`), a typed array (`Float32Array` for `float32`, `Int8Array` for `int8`), or a ready `Binary` of subtype 9 with the same element type, for example from `Types.Binary.fromFloat32Array`. The input types allow `Vector` and `number[]`. At runtime, another typed array is rejected, because a `Float32Array` into `int8` would round the values silently (`Cast to Vector<int8, 2> failed at path "v" for a Float32Array: expected a subtype-9 Binary, a number[] or an Int8Array of int8 [type]`). A vector and an ordinary `Binary` are the same class, and the [`Vector`](./field-markers.mdx#vector) marker tells them apart. Their forms in the `$toPlain()` result differ: `number[]` and bytes.
+
+### Spec.isSpecObject [#spec.is-spec-object]
+
+`Spec.isSpecObject(value)` returns `true` for an object built with `Spec.*`. Tools that read the result of the type function in `@Prop` need it. You don't call it in an ordinary model.
+
+## Specification types [#spec-types]
+
+The exported types are `TypeSpec` (anything the function in `@Prop` can return), `ScalarSpec`, `EntityClass`, `MapSpec`, `MapSpecOptions`, `MapSpecBuilder`, `UnionSpec`, `BinarySpec`, `VectorSpec`, and `SpecValue`. `SpecValue<S>` computes the field type from a specification.
+
+<Snippet id="reference/schemas/types-and-spec/spec-types" twoslash />
+
+## When not to use it [#when-not-to-use]
+
+If the keys are known in advance, you don't need `Spec.map`. Describe the nested object with a class using [`@Schema({ nested: true })`](./schema.mdx#nested), and the fields are validated one by one and show up in hints. If values of different classes live in one collection, use [`@Discriminator`](./discriminator.mdx#discriminator) rather than `Spec.union`. For a list of values of one type, `[X]` is enough.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Choose a field type" href="../../schemas/field-types.mdx">
+  How to choose a field type and how a value looks in code and in the database.
+</Card>
+<Card title="Store a dictionary with arbitrary keys" href="../../schemas/maps.mdx">
+  `Spec.map` on real tasks: keys, forbidden characters, changes.
+</Card>
+<Card title="Field marker types" href="./field-markers.mdx">
+  `Vector` and the other types that declare fields.
+</Card>
+</Cards>

@@ -1,0 +1,175 @@
+---
+title: "SoftDelete and untrusted"
+description: "SoftDelete.restore and SoftDelete.purge for soft-deleted documents, and untrusted and Untrusted.check for data from a client request"
+icon: ShieldAlert
+---
+
+This page has four elements. [`SoftDelete.restore`](#soft-delete.restore) and [`SoftDelete.purge`](#soft-delete.purge) do what an ordinary delete on a model with [soft delete](./schema-options.mdx#soft-delete) can't. They bring marked documents back or erase them for good. [`untrusted`](#untrusted) and [`Untrusted.check`](#untrusted.check) mark data from a client request and refuse it if a query operator hides inside. If you're new here, read the guides [Delete with a way to restore](../../policies/soft-delete.mdx) and [Accept a filter from a client request](../../policies/untrusted-input.mdx).
+
+The examples in the first half are a blog. A post has a title and a deletion marker.
+
+<Snippet id="policies/soft-delete/quick-start" title="posts/post.ts" twoslash />
+
+## SoftDelete.restore [#soft-delete.restore]
+
+`restore` brings back documents marked as deleted. Their marker becomes `null` again. Ordinary model operations don't see deleted documents, so they can't do it. `restore` is useful for an "Undo delete" button, for a trash bin, and for fixing a mistaken cleanup.
+
+It's an ordinary write of the model. It's lazy, and nothing is sent until `await`. [`.session()`](../query/options.mdx#session) and [`.policy()`](../query/options.mdx#policy), hooks, audit, and the tenant policy work with it. Inside it calls `updateMany` with `onlyDeleted`, so `restore` doesn't touch live documents.
+
+<Snippet id="reference/policies/soft-delete-and-untrusted/soft-delete-restore" twoslash />
+
+<Returns type="WriteBuilder<UpdateResult>">
+
+A write builder. After `await` you get the update result. `matchedCount` is how many deleted documents matched the filter, and `modifiedCount` is how many were restored. If no deleted documents match, both counters are zero, and there's no error.
+
+</Returns>
+
+<Params>
+<Param name="model" type="Model<T>" required>
+
+A model with `softDelete` turned on. For a model without soft delete Typemo throws `ConfigurationError: SoftDelete.restore: Plain has no soft delete; declare @Schema({ softDelete })`. This happens right at the call, not at `await`.
+
+</Param>
+<Param name="filter" type="Filter<T>" required>
+
+Which deleted documents to bring back. The filter can name any path of the model. It's required and follows the same rules as the `updateMany` filter. An empty filter is rejected with a [`StrictModeError`](./violations.mdx#empty-filter), and "all deleted" is written as `Filters.all()` (see [Empty filters in writes](../../writes/empty-filters.mdx)).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/policies/soft-delete-and-untrusted/soft-delete-restore-2" />
+
+</FullType>
+
+## SoftDelete.purge [#soft-delete.purge]
+
+`purge` erases soft-deleted documents for good. You need it for emptying the trash after a retention period and for requests like "delete my data". An ordinary delete on a model with the policy only marks the document.
+
+`purge` never touches live documents, because it works in "only deleted" mode. If you get the filter wrong, you won't erase a live record by accident. The document has to be deleted the ordinary way first.
+
+<Snippet id="policies/soft-delete/restore-and-purge" twoslash />
+
+<Returns type="WriteBuilder<DeleteResult>">
+
+A write builder. After `await` you get the delete result, where `deletedCount` is how many documents were erased. A live document doesn't match the filter. The counter is then zero, and there's no error.
+
+</Returns>
+
+<Params>
+<Param name="model" type="Model<T>" required>
+
+A model with `softDelete` turned on. Without it you get `ConfigurationError: SoftDelete.purge: Plain has no soft delete; declare @Schema({ softDelete })`.
+
+</Param>
+<Param name="filter" type="Filter<T>" required>
+
+Which deleted documents to erase. The rules are the same as for `restore`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/policies/soft-delete-and-untrusted/soft-delete-purge" />
+
+</FullType>
+
+Under the hood `purge` is a [`deleteMany`](../writes/writes.mdx#delete-many) with `onlyDeleted: true` and `hardDelete: true`. You can pass the same two flags through [`.policy()`](../query/options.mdx#policy), but that's intended only for `purge`. A single `deleteOne` with `hardDelete: true` alone erases a live document for good. `hardDelete` only turns off the conversion of a delete into a marker, and visibility is decided by `onlyDeleted`.
+
+## untrusted [#untrusted]
+
+`untrusted(value, place?)` marks **data from a client request**: the request body, the query string, or parsed JSON. Mark it before you put it into a filter, an update, or a projection. The second argument says where the data will go, and it changes only the error text.
+
+Inside a marked value, a key that starts with `$` is forbidden at any depth. Otherwise a client could replace a value with an operator. Say the application searches `find({ name: req.body.name })`, and the client sends `{"name": {"$ne": "zzz"}}`. The condition "name equals" turns into "name is not zzz", and every document is found. A key with `+` is forbidden too. In a projection `+path` adds a [hidden field](../schemas/field-markers.mdx#hidden), and a client could get a password hash.
+
+<Snippet id="reference/policies/soft-delete-and-untrusted/untrusted" title="users/users.service.ts" twoslash />
+
+The function returns the same value it received, unchanged. It checks only the shape, that is, the keys. It doesn't look at types, ranges, or allowed fields, so `untrusted` is an **additional** defense, not a replacement for input validation. Validate the data with a validation schema and build the filter yourself from the validated values. `untrusted` catches what the validation missed.
+
+The ban applies at any depth, including arrays and `Map`. Below is an error at array depth. The text comes from a real run.
+
+<Snippet id="reference/policies/soft-delete-and-untrusted/untrusted-2" twoslash />
+
+### UntrustedPlace [#untrusted-place]
+
+The `UntrustedPlace` type is `"filter" | "update" | "projection"`, the place the data will go. The check is the same for all three, and only the error wording changes. It explains what an operator threatens in that particular place. Without an argument, a filter is assumed. The texts come from a real run.
+
+<Snippet id="reference/policies/soft-delete-and-untrusted/untrusted-place" />
+
+A key with `+` is named by place too. In a projection it would add a hidden field, and in a filter and an update it isn't a field name at all.
+
+<Snippet id="reference/policies/soft-delete-and-untrusted/untrusted-place-2" />
+
+If you pass a place other than these three, Typemo throws a `QueryError`. That's possible only without types: `untrusted(value, place): place must be "filter", "update" or "projection", got string "nope"`.
+
+For a key with `+` in a projection, which is the usual case, the message looks like this: `untrusted value: "+passwordHash" at "+passwordHash" — a "+path" key inside data from outside would select a Hidden field; validate the input and build the projection yourself [sanitize]`.
+
+<Returns type="V">
+
+The same value and the same type. Nothing is copied or converted.
+
+</Returns>
+
+<Params>
+<Param name="value" type="V" required>
+
+Data from a client request. Values that are data by definition aren't checked: dates, regular expressions, binary representations, and BSON values.
+
+</Param>
+<Param name="place" type="UntrustedPlace" default='"filter"'>
+
+Where the data will go, `"filter"`, `"update"`, or `"projection"`. It changes only the error text.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/policies/soft-delete-and-untrusted/untrusted-place-3" />
+
+</FullType>
+
+### What untrusted doesn't do [#untrusted-limits]
+
+It doesn't check a value you didn't mark. You have to mark every value that came from the outside world. It doesn't turn an object into a scalar, and it doesn't check whether this field may be queried at all.
+
+Typemo's filter allows field operators (`$gt`, `$ne`) as an ordinary condition. So without `untrusted` the filter `{"name":{"$ne":"zzz"}}` from JSON counts as valid and runs as "name is not zzz". Without `untrusted` only type casting can reject it, if the value doesn't fit the field. For example, `null` for a required string gives `CastError: Cast to string failed at path "title.$ne" for null: null is not a value of this path (it is not nullable); an absent field is { $exists: false } [null]`.
+
+## Untrusted.check [#untrusted.check]
+
+`Untrusted.check` does the same check as [`untrusted`](#untrusted), but as an explicit call and without returning the value. Use it when you need to check a value rather than pass it through a function. For example, to check a whole settings object before saving.
+
+<Snippet id="reference/policies/soft-delete-and-untrusted/untrusted-check" twoslash />
+
+<Returns type="void">
+
+Returns nothing. If it finds a key with `$` or `+` inside, it throws a [`StrictModeError`](./violations.mdx#sanitize) with the reason `sanitize`, and the error's `path` shows where it was found. If `place` isn't one of the three valid values, it throws a [`QueryError`](../errors/query-errors.mdx#query-error). Circular references don't cause an endless traversal.
+
+</Returns>
+
+<Params>
+<Param name="value" type="unknown" required>
+
+What to check.
+
+</Param>
+<Param name="place" type="UntrustedPlace" default='"filter"'>
+
+Where the value will go. It picks the error wording, as in [`untrusted`](#untrusted). It comes second, right after the value. The method has no other parameters, and the traversal of nested objects and the protection against cycles work inside.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/policies/soft-delete-and-untrusted/untrusted-check-2" />
+
+</FullType>
+
+## When it doesn't fit [#when-not-to-use]
+
+Soft delete doesn't replace an archive. Marked documents stay in the same collection and take up space, and unique indexes without a partial condition keep counting them (see [the `softDelete` option](./schema-options.mdx#soft-delete)).
+
+`untrusted` doesn't replace input validation. The strict filter rules, including protection against unknown operators and `$where`, always work without it. For more, see [Policy violations](./violations.mdx#sanitize).

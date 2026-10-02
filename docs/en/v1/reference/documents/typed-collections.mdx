@@ -1,0 +1,284 @@
+---
+title: Typed collections
+description: "StrictArray, SubdocumentArray, TypedMap, and Subdocument: every method, the MongoDB operator behind it, and what is forbidden"
+icon: Layers
+---
+
+In a document, arrays, Maps, and nested objects aren't plain `Array`, `Map`, and `{}`. They are **typed collections**. They remember what was done to them and use that log to build the shortest update for [`$save`](./document-api.mdx#save). There are four kinds.
+
+- [`StrictArray`](#strict-array) is an array of values.
+- [`SubdocumentArray`](#subdocument-array) is an array of subdocuments.
+- [`TypedMap`](#typed-map) is a Map.
+- [`Subdocument`](#subdocument) is a nested object.
+
+A plain array and a plain Map don't know they were changed. All you can do blindly is overwrite the whole field, and then two clients editing the same array overwrite each other. A typed collection sends an exact operation (`$push`, `$pull`, `$set` of one element), so concurrent changes aren't lost. In return, you can write only through the collection's methods. The types close indexes and `length` for writing.
+
+If you're new here, read the [Arrays and Maps in a document](../../documents/typed-collections.mdx) and [Work with nested objects](../../documents/subdocuments.mdx) guides first. This page is the reference.
+
+The examples use the order from the [Document API](./document-api.mdx). It has an array of strings `tags`, an array of subdocuments `lines`, a nested object `address`, and a Map `fees`.
+
+<Snippet id="reference/documents/typed-collections/intro" title="models/order.ts" twoslash />
+
+The compiler's hover shows which kind each field has.
+
+<Snippet id="reference/documents/typed-collections/intro-2" twoslash />
+
+The rule is simple. An array of classes is a `SubdocumentArray`, any other array is a `StrictArray`, a `Map` is a `TypedMap`, and a class is a `Subdocument`. Scalars (strings, numbers, dates, `ObjectId`) stay as they are. In a `lean()` result and in `$toObject()`, `$toPlain()`, and `$toJSON()`, collections become plain arrays and objects. They are typed only inside a document.
+
+Here is how an array field looks in each form. For `tags!: string[]` and `renewals!: Date[]` it comes out like this.
+
+| Form | `tags` | `renewals` |
+|---|---|---|
+| document | `StrictArray<string>` | `StrictArray<Date>` |
+| `.lean()` | `string[]` | `Date[]` |
+| `.plain()`, `$toPlain()`, `$toObject()` | `string[]` | `Date[]` |
+| `$toJSON()` | `string[]` | `string[]` |
+
+JSON turns dates into ISO strings, so `renewals` is `string[]` there. In every other form it stays `Date[]`. The forms of the other types are in the [Value forms](../values/value-forms.mdx) reference.
+
+<Snippet id="reference/documents/typed-collections/intro-3" twoslash />
+
+An array field without `required` and without `default` gets `[]` on `create` and `Model.new`. Reading a document that lacks the key also gives `[]`, and the next `$save` writes it. `lean()` returns the document as it's stored, so without the key. An array with `required: true` has no default, and `create` refuses it without a value.
+
+For methods and options not listed here, see the [Document API](./document-api.mdx).
+
+---
+
+## StrictArray [#strict-array]
+
+`StrictArray<T>` is an array of values in a document. Its type is `ReadonlyArray<T>`, so you can read, iterate, copy, and serialize it like a plain array. `for…of`, `map`, `filter`, spread, `JSON.stringify`, and `structuredClone` work, and `map` and `filter` return plain arrays. You can write only with the methods below. Each one casts the values to the element type immediately, so [`CastError`](../errors/data-errors.mdx#cast-error) arrives on the method call, not on save. Then the method records the change in the array's log.
+
+Assignment by index and writing `length` don't compile, and the type has no `fill` method.
+
+<Snippet id="reference/documents/typed-collections/strict-array" twoslash />
+
+<Snippet id="reference/documents/typed-collections/strict-array-2" twoslash />
+
+Use [`set`](#strict-array.set) and [`clear`](#strict-array.clear) instead. A write by index doesn't say what you meant: replace an element, insert, or shift. A method does, and Typemo sends exactly that.
+
+What Typemo sends to the database on `$save` depends on the method.
+
+<TypeTable
+  type={{
+    "push(...items)": { description: "Appends to the end. The `$push` operator with `$each`.", type: "number" },
+    "unshift(...items)": { description: "Adds to the start. `$push` with `$each` and `$position: 0`.", type: "number" },
+    "addToSet(...items)": { description: "Adds only the missing values. `$addToSet` with `$each`.", type: "T[]" },
+    "pull(...values)": { description: "Removes every element equal to the values. `$pullAll`.", type: "T[]" },
+    "pop()": { description: "Removes the last one. `$pop: 1`. A second `pop` in the same save rewrites the array.", type: "T | undefined" },
+    "shift()": { description: "Removes the first one. `$pop: -1`.", type: "T | undefined" },
+    "set(index, value)": { description: "Replaces an existing element. `$set` of the path `tags.<index>`.", type: "this" },
+    "splice(start, deleteCount?, ...items)": { description: "Like `Array#splice`. `$set` of the whole array.", type: "T[]" },
+    "sort(compare?)": { description: "Sorts in place. `$set` of the whole array.", type: "this" },
+    "reverse()": { description: "Reverses in place. `$set` of the whole array.", type: "this" },
+    "clear()": { description: "Removes everything. `$set` of an empty array.", type: "this" },
+    "replace(values)": { description: "Replaces the whole content. `$set` of the whole array.", type: "this" },
+    "$toObject()": { description: "A copy without tracking. An array with the elements in their object form.", type: "ObjectData<T>[]" },
+    "$toPlain(options?)": { description: "The same as the document's `$toPlain()` for this path.", type: "PlainFormOf<T, false>[]" },
+  }}
+/>
+
+Take the "second `pop`" in the table. One `$pop` means "remove the last element **at write time**". A second `pop` can't be written with the same operator on the same path, so Typemo writes the whole array. The same goes for mixed methods. If you call different ones in one save (`push` and `pull`), Typemo doesn't merge them and writes the whole array.
+
+### StrictArray.push [#strict-array.push]
+
+`push(...items)` appends elements to the end and, like `Array#push`, returns the new length. Values are cast to the element type on the call.
+
+<Snippet id="reference/documents/typed-collections/strict-array-push" twoslash />
+
+### StrictArray.unshift [#strict-array.unshift]
+
+`unshift(...items)` adds elements to the start and returns the new length. The database receives `$push` with `$position: 0`.
+
+<Snippet id="reference/documents/typed-collections/strict-array-unshift" twoslash />
+
+### StrictArray.addToSet [#strict-array.add-to-set]
+
+`addToSet(...items)` adds only the values that aren't in the array yet and returns the ones it added. Values are compared by content, and BSON values through `equals`. In the database it's `$addToSet`.
+
+<Snippet id="reference/documents/typed-collections/strict-array-add-to-set" twoslash />
+
+### StrictArray.pull [#strict-array.pull]
+
+`pull(...values)` removes every element equal to the values and returns the removed ones. The `$pullAll` operator works by value, not by position. If another client managed to shift the array, that changes nothing.
+
+<Snippet id="reference/documents/typed-collections/strict-array-pull" twoslash />
+
+### StrictArray.pop [#strict-array.pop]
+
+`pop()` removes the last element and returns it, or `undefined` for an empty array. The database receives `$pop: 1`. Two `pop` calls before a save turn into a write of the whole array.
+
+<Snippet id="reference/documents/typed-collections/strict-array-pop" twoslash />
+
+### StrictArray.shift [#strict-array.shift]
+
+`shift()` removes the first element and returns it. The database receives `$pop: -1`.
+
+<Snippet id="reference/documents/typed-collections/strict-array-shift" twoslash />
+
+### StrictArray.set [#strict-array.set]
+
+`set(index, value)` replaces an existing element. It's what you'd write as `tags[1] = value`, but the type doesn't allow that. The index must exist. To add an element, use [`push`](#strict-array.push).
+
+<Snippet id="reference/documents/typed-collections/strict-array-set" twoslash />
+
+An index outside the array throws [`TypemoError`](../errors/hierarchy.mdx#typemo-error).
+
+<Snippet id="reference/documents/typed-collections/strict-array-set-2" />
+
+### StrictArray.splice [#strict-array.splice]
+
+`splice(start, deleteCount?, ...items)` works like `Array#splice` and returns the removed elements. Positions shift, so the database receives `$set` of the whole array.
+
+<Snippet id="reference/documents/typed-collections/strict-array-splice" twoslash />
+
+### StrictArray.sort [#strict-array.sort]
+
+`sort(compare?)` sorts in place and returns the same array. The order may have changed for every element, so the save rewrites the whole array.
+
+<Snippet id="reference/documents/typed-collections/strict-array-sort" twoslash />
+
+### StrictArray.reverse [#strict-array.reverse]
+
+`reverse()` reverses the array in place and returns it. The database receives `$set` of the whole array.
+
+### StrictArray.clear [#strict-array.clear]
+
+`clear()` removes all elements and returns the array. It replaces `length = 0`. The database receives `$set` of an empty array.
+
+<Snippet id="reference/documents/typed-collections/strict-array-clear" twoslash />
+
+### StrictArray.replace [#strict-array.replace]
+
+`replace(values)` replaces the whole content and returns the array. The new values are cast on the call, and the database receives `$set` of the whole array.
+
+<Snippet id="reference/documents/typed-collections/strict-array-replace" twoslash />
+
+### Array errors [#array-errors]
+
+A value of the wrong type is reported right on the method call.
+
+<Snippet id="reference/documents/typed-collections/array-errors" />
+
+Typemo finds writes that bypass the methods (through a cast to `any` or plain JavaScript) on `$save`. Every collection keeps a shadow copy and its state is checked against it. Typemo doesn't try to guess what you meant. `$save` refuses with [`DirectWriteError`](../errors/data-errors.mdx#direct-write-error) and suggests which method to use. [`$getChanges`](./document-api.mdx#get-changes) doesn't throw the error and puts the same text under the `$problems` key.
+
+<Snippet id="reference/documents/typed-collections/array-errors-2" />
+
+An array may be loaded partially (a `$slice`, positional, or `$elemMatch` projection). Then any change that would overwrite the unloaded elements throws [`PartialArrayError`](../errors/data-errors.mdx#partial-array-error). Those are `splice`, `sort`, `reverse`, `replace`, `clear`, `set` by index, `pop`, and `shift`. Operations that don't depend on positions are allowed: `push`, `unshift`, `addToSet`, `pull`.
+
+<Snippet id="reference/documents/typed-collections/array-errors-3" />
+
+`$getChanges` shows the texts of `PartialArrayError`, like those of `DirectWriteError`, in `$problems` without throwing. The reasons for these restrictions are explained in the [Arrays and Maps in a document](../../documents/typed-collections.mdx) guide.
+
+---
+
+## SubdocumentArray [#subdocument-array]
+
+`SubdocumentArray<T>` is an array of subdocuments, meaning elements described by a class. All the rules of [`StrictArray`](#strict-array) apply here. You can write only through methods, there is one log, and the shadow copy is checked on save. There are three differences. The elements are [`Subdocument<T>`](#subdocument) with their own `$` methods. The methods accept a subdocument, a class instance, or plain data to build a subdocument from. And the array can search by `_id`.
+
+Editing a field inside an element is recorded as `$set` on a path with an index (`lines.0.qty`). The index is computed at save time, not at assignment. If the order of elements changed between the edit and the save, the write still lands in the element you accessed.
+
+The methods `push`, `unshift`, `addToSet`, `pop`, `shift`, `splice`, `sort`, `reverse`, `set`, `clear`, and `replace` work as in `StrictArray` and produce the same operators. Where `StrictArray` expects a value, `SubdocumentArray` accepts a subdocument or data for one. If the stored elements have fields the schema lacks, the array can't be written again. `reverse`, `sort`, `splice`, `clear`, `replace`, and `set` answer with [`UnknownFieldsError`](../errors/data-errors.mdx#unknown-fields-error), while `push`, `pull`, `pop`, and `shift` go through. See the [Unknown fields](./unknown-fields.mdx) reference for details. What follows covers only how `SubdocumentArray` differs.
+
+### SubdocumentArray.create [#subdocument-array.create]
+
+`create(input)` builds a new subdocument of the class that isn't attached to anything. The data is cast on the call, and `_id` appears right away if the class has one. To put the subdocument into the array, pass it to `push`, `unshift`, `set`, or a similar method.
+
+<Snippet id="reference/documents/typed-collections/subdocument-array-create" twoslash />
+
+### SubdocumentArray.id [#subdocument-array.id]
+
+`id(id)` returns the element with that `_id`, or `undefined`. The argument is an `ObjectId` or its hexadecimal string. The value is cast by the type of the element's `_id`, so an identifier from a request URL doesn't need to be wrapped in `ObjectId` by hand. In the type, the method exists only on arrays of classes that have an `_id` field. For a class without `_id` the call doesn't compile.
+
+<Snippet id="reference/documents/typed-collections/subdocument-array-id" twoslash />
+
+<Snippet id="reference/documents/typed-collections/subdocument-array-id-2" twoslash />
+
+### SubdocumentArray.pull [#subdocument-array.pull]
+
+`pull(...items)` removes the elements given as subdocuments of this array or by their `_id` (`ObjectId` or string), and returns the removed ones. The database receives `$pull` by `_id`. It doesn't depend on positions, so it's safe under concurrent changes. An identifier for elements without `_id` throws [`TypemoError`](../errors/hierarchy.mdx#typemo-error).
+
+<Snippet id="reference/documents/typed-collections/subdocument-array-pull" twoslash />
+
+### Changing a field inside an element [#element-field-change]
+
+Assigning an element's field is recorded precisely. Replacing a whole element through `set` is recorded as `$set` of the element. If one save combines an edit of a field inside an element with an operation on the array itself, such as `push`, both operators touch the same path, and Typemo writes the whole array.
+
+<Snippet id="reference/documents/typed-collections/element-field-change" twoslash />
+
+A subdocument may be invalid (`qty: -1`). `push` accepts it, and [`$validate`](./document-api.mdx#validate) and `$save` reject it. Casting happens on the call, while rules like `min` and `max` are checked during validation. A value of the wrong type (`sku: 5`) throws `CastError` right on the call.
+
+<Snippet id="reference/documents/typed-collections/element-field-change-2" />
+
+For subdocuments of a class with `_id`, `addToSet` compares elements **by value, `_id` included**. A new subdocument has its own `_id`, so it always counts as missing and gets added.
+
+---
+
+## TypedMap [#typed-map]
+
+`TypedMap<V>` is a Map field of a document. You declare it as `Map<string, V>` with `Spec.map`. Its type is `ReadonlyMap<string, V>`, so you read, iterate, and get values as with a plain Map. Writes go only through `set`, `delete`, and `clear`. In the database a Map is stored as a nested object, so changes turn into operations on the paths `fees.<key>`.
+
+The key is checked on the call. It must be a non-empty string, must not contain a dot (a dot would read as a path), must not start with `$` (operators are written that way), and must not be `__proto__`. The value is also cast on the call by the value type, and the error arrives immediately as [`CastError`](../errors/data-errors.mdx#cast-error).
+
+### TypedMap.set [#typed-map.set]
+
+`set(key, value)` sets the value and returns the Map. The database receives `$set` of the path `fees.<key>`.
+
+<Snippet id="reference/documents/typed-collections/typed-map-set" twoslash />
+
+Here is what happens with a wrong key and a wrong value.
+
+<Snippet id="reference/documents/typed-collections/typed-map-set-2" />
+
+### TypedMap.delete [#typed-map.delete]
+
+`delete(key)` removes the key and returns `true` if it existed. The database receives `$unset` of the path `fees.<key>`. Deleting a missing key changes nothing and returns `false`.
+
+<Snippet id="reference/documents/typed-collections/typed-map-delete" twoslash />
+
+### TypedMap.clear [#typed-map.clear]
+
+`clear()` removes all entries. The value in the update is an empty `Map`, and the database gets an empty object in place of the whole Map. Map values may be subdocuments with fields outside the schema. Then `clear()`, like `set` on an existing key, answers with [`UnknownFieldsError`](../errors/data-errors.mdx#unknown-fields-error), because writing the Map again would erase those fields. `delete(key)` is allowed.
+
+<Snippet id="reference/documents/typed-collections/typed-map-clear" twoslash />
+
+### Writing around the methods [#bypass-methods]
+
+`Map.prototype.set.call(order.fees, …)` and any other write that bypasses the methods is rejected on save.
+
+<Snippet id="reference/documents/typed-collections/bypass-methods" />
+
+---
+
+## Subdocument [#subdocument]
+
+`Subdocument<T>` is a nested object of a document or an element of a [`SubdocumentArray`](#subdocument-array). It has the fields of class `T` (with their document types) and a set of `$` methods. The subdocument stores the reference to its parent once and computes the path and position at call time. After `unshift` or `splice` they don't go stale.
+
+A subdocument field is assigned as usual: `order.address.city = "Rome"` gives `$set` of the path `address.city`. The subdocument field itself can't be replaced by assignment. Replace it through the document's [`$set`](./document-api.mdx#set) or the parent's `$set`.
+
+<Snippet id="reference/documents/typed-collections/subdocument" twoslash />
+
+<TypeTable
+  type={{
+    "$parent()": { description: "The nearest owner, another subdocument or the root document. `undefined` for a detached one.", type: "object | undefined" },
+    "$parentArray()": { description: "The array the subdocument sits in. `undefined` for a single subdocument and for a detached one.", type: "SubdocumentArray<T> | undefined" },
+    "$index()": { description: "The current position in the array, computed on the call. `-1` if the subdocument isn't in an array.", type: "number" },
+    "$fullPath()": { description: "The full path inside the root document (`lines.1`, `address`). `undefined` for a detached one.", type: "string | undefined" },
+    "$ownerDocument()": { description: "The root document. `undefined` for a detached one.", type: "object | undefined" },
+    "$isNew()": { description: "Repeats the owner document's answer, `true` until it's inserted. `true` for a detached one.", type: "boolean" },
+    "$isModified(path?)": { description: "Whether the subdocument's own fields (or `path` inside it) changed since the last load or save.", type: "boolean" },
+    "$isRoot()": { description: "Always `false`, because this is a subdocument. `true` for the root document. In a document hook it narrows `this` to `HydratedDoc<T>`.", type: "this is HydratedDoc<T>" },
+    "$set(key, value)": { description: "Replaces one field with type casting. The only way to replace a container or a subdocument in a field.", type: "this" },
+    "$toObject()": { description: "A copy without tracking. Plain objects and arrays, BSON values as they are.", type: "ObjectDoc<T>" },
+    "$toPlain(options?)": { description: "The same as the document's `$toPlain()` for this path. `{ hidden: true }` adds the hidden fields of subdocuments.", type: "Plain<T, false>" },
+  }}
+/>
+
+<Snippet id="reference/documents/typed-collections/subdocument-2" twoslash />
+
+The root document has `$isNew()`, `$isModified()`, and `$isRoot()` too. That's why a hook declared in a subdocument class can call them without knowing where it runs. A subdocument's `$isNew()` repeats the answer of its document. The entries of a new order are new, and the entries of a loaded order aren't, even ones added a moment ago. `$isModified()` looks only at the subdocument's own fields, so an entry that was added and not yet touched answers `false`.
+
+<Snippet id="reference/documents/typed-collections/subdocument-3" twoslash />
+
+A value of the wrong type in `$set` throws `CastError` immediately, as with the document's `$set`.
+
+<Snippet id="reference/documents/typed-collections/subdocument-4" />

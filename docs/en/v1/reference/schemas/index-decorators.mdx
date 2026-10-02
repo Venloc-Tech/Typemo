@@ -1,0 +1,159 @@
+---
+title: "@Index and @SearchIndex"
+description: "Class-level compound, partial, TTL, text, and wildcard indexes, plus Atlas Search indexes: their options and checks."
+icon: ListTree
+---
+
+A field option sets an index on a single field: [`index`](./prop.mdx#index), [`unique`](./prop.mdx#unique), [`expires`](./prop.mdx#expires), or [`text`](./prop.mdx#text). Class decorators describe everything else. `@Index` covers ordinary MongoDB indexes: compound, partial, time-to-live, text, and wildcard. `@SearchIndex` covers Atlas Search and vector search indexes. This page spells out their options and validation rules.
+
+For tasks, see the guide [Indexes](../../schemas/indexes.mdx). This page is the reference.
+
+The examples use a note model with an owner, a date, an email, an active flag, a title, and a body. The results in `// →` come from a real MongoDB.
+
+---
+
+## @Index [#index]
+
+`@Index(fields, options?)` declares a class index. The first argument is an object `{ path: direction }`, and the keys follow the order of the index keys. The direction is `1` (ascending), `-1` (descending), `"hashed"`, `"text"`, `"2dsphere"`, or `"2d"`. The compiler checks the paths against the class, including those in `partialFilterExpression`, `weights`, and `wildcardProjection`. A typo doesn't compile, and you don't need an explicit `<Note>` type. The decorator is repeatable, and each use adds another index. Identical indexes merge. Two indexes with the same name or keys and different options throw `ConfigurationError` (`two indexes named or keyed "by_owner" with different definitions`).
+
+<Snippet id="reference/schemas/index-decorators/index" twoslash />
+
+A typo in a field name stops compilation, and the message names the path.
+
+<Snippet id="reference/schemas/index-decorators/index-2" twoslash />
+
+The message text is `@Index: "ownr" is not a field of the class`. Indexes are created by [`connection.init()`](../connection/connection.mdx#connection.init) and [`connection.syncAll()`](../connection/connection.mdx#connection.sync-all) unless the [`autoIndex`](./schema.mdx#auto-index) option is off. The model itself doesn't build indexes. The created indexes matched the declared ones: the server showed `by_owner`, `email_active`, `ttl`, and the rest with the same keys and options.
+
+<Params>
+<Param name="fields" type="IndexFields" required>
+
+The index keys, in order. A path is a class path (dotted for nested fields) or a wildcard, `"$**"` or `"path.$**"`.
+
+</Param>
+<Param name="options" type="IndexOptions">
+
+The index options, each described below.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/schemas/index-decorators/index-3" />
+
+</FullType>
+
+---
+
+## name [#name]
+
+`name` is the index name. Without it, the server picks a name from the keys, such as `owner_1_createdAt_-1`. A name of your own helps when a query hint or a migration refers to the index.
+
+---
+
+## unique [#unique]
+
+`unique: true` keeps two documents with the same key value out of the collection. A write that violates the constraint throws [`DuplicateKeyError`](../errors/server-errors.mdx#duplicate-key-error). Unlike `unique` on a field, `@Index` doesn't check `required`. For an optional field, add `partialFilterExpression` so documents without a value stay out of the index.
+
+<Snippet id="reference/schemas/index-decorators/unique" twoslash />
+
+---
+
+## sparse [#sparse]
+
+`sparse: true` indexes only the documents that have the field. You can't combine it with `partialFilterExpression`, which throws `ConfigurationError` (`@Index({"a":1}): "sparse" and "partialFilterExpression" cannot be combined (server rule)`). For new indexes, use `partialFilterExpression`. It expresses the same thing and more.
+
+---
+
+## partialFilterExpression [#partial-filter-expression]
+
+`partialFilterExpression` is a filter that lets only matching documents into the index. The index gets smaller, and uniqueness applies only among those documents. The server doesn't accept every filter. It allows equality, `$exists: true`, `$gt`, `$gte`, `$lt`, `$lte`, `$type`, `$in`, and top-level `$and`/`$or`. Typemo's `PartialFilter` type describes exactly this set. Paths are checked against the class, and an unknown path is both a compile error (`@Index: partialFilterExpression "zz" is not a field of the class`) and a build error (`partialFilterExpression "zz" is not a field of the class`).
+
+---
+
+## expireAfterSeconds [#expire-after-seconds]
+
+`expireAfterSeconds` is the lifetime of documents in seconds after the date value. This is a TTL index, and MongoDB itself deletes old documents through it. The index must be **on a single field of type `Date`**, or you get `ConfigurationError` (`@Index({"a":1}): expireAfterSeconds (TTL) needs a single-field index on a Date field`). For a single-field TTL, the [`expires`](./prop.mdx#expires) field option is simpler.
+
+<Snippet id="reference/schemas/index-decorators/expire-after-seconds" twoslash />
+
+---
+
+## collation [#collation]
+
+`collation` sets the rules for comparing strings in the index: language, case, and accents. An index without its own rules inherits the collection's ([`collation`](./schema.mdx#collation) of the schema). Text indexes and `2d` don't support collation, so when the collection has one, declare them with `collation: { locale: "simple" }`. Otherwise you get `ConfigurationError`.
+
+---
+
+## weights [#weights]
+
+`weights` are the field weights of a **text** index. The higher the weight, the more a match in that field counts. The keys are class fields (`@Index: weights."x" is not a field of the class`). A collection has one text index. Fields with `text: true` together with a text `@Index` throw `ConfigurationError`.
+
+<Snippet id="reference/schemas/index-decorators/weights" twoslash />
+
+The server built the index with the weights `title: 5` and `body: 1`. It stores a text index's keys in a service form (`_fts`, `_ftsx`) and writes the default weight itself. Typemo accounts for that. A second [`connection.init()`](../connection/connection.mdx#connection.init) on such a model creates nothing and doesn't fail.
+
+### default_language [#default-language]
+
+The default language of the text index. It sets the stemming rules and the stop words.
+
+### language_override [#language-override]
+
+A document field whose value overrides the language for that document.
+
+---
+
+## wildcardProjection [#wildcard-projection]
+
+`wildcardProjection` sets which paths to include (`1`) or exclude (`0`) from a wildcard index `{ "$**": 1 }`. The keys are class fields.
+
+<Snippet id="reference/schemas/index-decorators/wildcard-projection" twoslash />
+
+---
+
+## hidden [#hidden]
+
+`hidden: true` hides the index from the query planner without deleting it, and the index keeps being updated. That lets you check what happens without the index before you drop it.
+
+---
+
+## @SearchIndex [#search-index]
+
+`@SearchIndex({ name, type?, definition })` declares an Atlas Search or vector search index. The decorator only records the description, and the server creates the index during sync. A plain `mongod` doesn't support such indexes. On it, [`connection.init()`](../connection/connection.mdx#connection.init) throws [`SyncError`](../errors/configuration-errors.mdx#sync-error), and the failure list holds the server's `SearchNotEnabled` response (code 31082), because Atlas Search commands need extra setup. This hasn't been checked on Atlas.
+
+<Snippet id="reference/schemas/index-decorators/search-index" twoslash />
+
+<Params>
+<Param name="options.name" type="string" required>
+
+The index name.
+
+</Param>
+<Param name="options.type" type="&quot;search&quot; | &quot;vectorSearch&quot;" default="&quot;search&quot;">
+
+The kind of index: full-text or vector.
+
+</Param>
+<Param name="options.definition" type="Record<string, unknown>" required>
+
+The index definition in the form the Atlas API expects. Typemo doesn't check its contents.
+
+</Param>
+</Params>
+
+In the schema description ([`describe()`](./schema-info.mdx#describe)), search indexes sit in a separate `searchIndexes` field rather than in `indexes`. Each has a name and a definition, in declaration order.
+
+## When not to use it [#when-not-to-use]
+
+An index on a single field is simpler to declare with a field option ([`index`](./prop.mdx#index), [`unique`](./prop.mdx#unique)). Typemo forbids uniqueness on an optional field without `sparse`, and `@Index` with `partialFilterExpression` is the right way around that. Settings for the whole collection live in [`@Schema`](./schema.mdx#schema).
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Indexes" href="../../schemas/indexes.mdx">
+  How to choose an index and how Typemo creates and reconciles indexes.
+</Card>
+<Card title="@Prop" href="./prop.mdx">
+  The field options `index`, `unique`, `sparse`, `expires`, and `text`.
+</Card>
+</Cards>

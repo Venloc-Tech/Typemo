@@ -1,0 +1,115 @@
+---
+title: "@Discriminator"
+description: "Subclasses that share one collection: declaring a discriminator class, the key value, the Discriminators type, and the errors the decorator throws."
+icon: GitBranch
+---
+
+`@Discriminator` declares a class as a **discriminator** of a base class. A discriminator is a subclass whose documents live in the same collection as the base's documents and differ by the value of a special field. The `shapes` collection stores circles and squares, each with its own fields, and a query on the base model returns all of them. This page explains how the value is written, what checks the decorator makes, and what happens on errors.
+
+For a guide with examples, see [Inheritance and discriminators](../../schemas/discriminators.mdx). This page is the reference.
+
+The examples use a base class `Shape` (field `name`) and two subclasses, `Circle` (field `radius`) and `Square` (field `side`). The collection holds three documents. The first example creates the circle `c` with radius 2 and the square `s` with side 3, and the second creates the document `base` through the base model.
+
+---
+
+## @Discriminator [#discriminator]
+
+`@Discriminator("circle")` writes a value into the document's key field. By default the key is called `__t`, and the [`discriminatorKey`](./schema.mdx#discriminator-key) option renames it. Typemo picks the class on read by this value, so a document with `__t: "circle"` becomes an instance of `Circle`. A subclass's fields are the base's fields plus its own. It doesn't need its own `@Schema` and takes the root's options.
+
+Pass the value as a **literal** and declare the key in the class with the same literal: `declare readonly __t: DiscriminatorValue<"circle">`. Then the `.lean()` and `.plain()` results carry the literal, and a union of subclasses narrows by the key. Without the declaration, the decorator doesn't compile.
+
+<Snippet id="reference/schemas/discriminator/discriminator" twoslash />
+
+<Params>
+<Param name="value" type="string">
+
+The literal written into the key. Without it, the class name would be used at runtime, but the type can't check that, so a call without a value doesn't compile: `@Discriminator(): pass the value as a literal — @Discriminator("value") with declare readonly __t: DiscriminatorValue<"value"> (the class-name default cannot be checked by the type)`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/schemas/discriminator/discriminator-2" />
+
+</FullType>
+
+### Queries on the base and child models [#base-and-child-queries]
+
+A subclass's model sees only its own documents, and the base's model sees all of them. A document is created by the class whose name matches its value.
+
+<Snippet id="reference/schemas/discriminator/base-and-child-queries" twoslash />
+
+A document created through the base model gets no key and stays a plain `Shape`.
+
+### A field that doesn't belong to the class [#foreign-field]
+
+A field of another subclass is rejected during casting.
+
+<Snippet id="reference/schemas/discriminator/foreign-field" twoslash />
+
+---
+
+### The key value is immutable [#key-immutable]
+
+A document's kind is chosen once, at creation. The key is declared as `DiscriminatorValue<…>`, which makes it immutable. Assigning to it doesn't compile, and an update that includes the key is rejected before it reaches the database. If you bypass the types with a cast, assigning in a loaded document throws nothing, but the first `$save()` throws `StrictModeError` with the reason `immutable`.
+
+<Snippet id="reference/schemas/discriminator/key-immutable" twoslash />
+
+<Snippet id="reference/schemas/discriminator/key-immutable-2" twoslash />
+
+`$unset` on the key behaves the same way. To change the kind, create a document of the new kind and delete the old one.
+
+---
+
+## Discriminators [#discriminators]
+
+`Discriminators<C>` is the type of the discriminator key in the **base** class, the one that lists its subclasses with the [`discriminators`](./schema.mdx#discriminators) option. The parameter `C` is the union of the subclass types, for example `declare readonly __t?: Discriminators<Circle | Square>`. The key is optional because a document created through the base model has no kind. Like `DiscriminatorValue`, the type marks the key as immutable and filled in by the core ([marker types](./field-markers.mdx#discriminators)).
+
+Without the list, the base model returns documents of which only the base fields are known. The compiler doesn't know `radius` and `side`, so you have to state the kind by hand. With the list, a read through the base model returns the union "base without a key, or any of the subclasses". That holds for documents, `.lean()` and `.plain()` results, JSON, and cursors. Checking the key narrows the union, and inside the `shape.__t === "circle"` branch the circle's fields are available.
+
+<Snippet id="reference/schemas/discriminator/discriminators" twoslash />
+
+The branch with no checks gets the base document. It has neither a key nor the subclass fields, which is why `base` came out as `0`. The circle `c` with radius 2 covers about 13 units, and the square `s` with side 3 covers 9. A document narrows by either a key check or an `instanceof` check. A query on a subclass's model still returns only its own type.
+
+With your own key name, declare the type on that key: `discriminatorKey: "kind"` and `declare readonly kind?: Discriminators<Click>`. The schema build checks the list, and an extra, missing, or repeated class throws `ConfigurationError` ([texts](./schema.mdx#discriminators)). A declaration without the `discriminators` option, an option without a declaration, and different classes in the type and in the list are compile errors with the same messages.
+
+<FullType>
+
+<Snippet id="reference/schemas/discriminator/discriminators-2" />
+
+</FullType>
+
+---
+
+## Errors [#errors]
+
+The compiler checks the key declaration. If the class has no `declare readonly __t: DiscriminatorValue<"…">`, the error names what to add.
+
+<Snippet id="reference/schemas/discriminator/errors" twoslash />
+
+The message text is `@Discriminator("circle"): declare the discriminator key with its value in the class — declare readonly __t: DiscriminatorValue<"circle"> (or your discriminatorKey instead of __t)`. If the literal in the class differs from the one in the decorator, the message is `@Discriminator: the class declares __t as "d", but the value is "c"`.
+
+The build catches the rest, and it's always a `ConfigurationError`. A repeated value is found when `model()` is called for **any** class of the hierarchy, even one the repeat doesn't concern: `Square: discriminator value "x" is already used by Circle in the hierarchy of Shape`. The other cases:
+
+- a decorator on a class with no base throws immediately, when the class is declared: `Orphan: @Discriminator needs a base class (class X extends Base)`
+- a subclass with its own `@Schema`: `Circle: a discriminator uses its root's schema options; remove @Schema (root: Shape)`
+- a hierarchy root with no `@Schema`: `Circle: the root of its discriminator hierarchy (Shape) has no @Schema`
+- a `discriminatorKey` that isn't declared as a string field of the base (without `discriminators`): `Shape: discriminatorKey "kind" is not a declared field (declare it as a string field, or list the discriminators and declare readonly kind?: Discriminators<…>)`
+- a key that isn't a string or is `nullable`: `Shape: the discriminator key "kind" must be a non-nullable string field`
+- a `discriminators` list that disagrees with the hierarchy: see the texts in [`@Schema`](./schema.mdx#discriminators)
+
+## When not to use it [#when-not-to-use]
+
+If the kinds differ only by the value of one field and have no fields of their own, an [`enum`](./prop.mdx#enum) on an ordinary field is enough. Classes in different collections aren't linked by inheritance, because they're two models. Values of scalar types in one field are a job for [`Spec.union`](./types-and-spec.mdx#spec.union).
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Inheritance and discriminators" href="../../schemas/discriminators.mdx">
+  Queries on the base and child models, on real tasks.
+</Card>
+<Card title="@Schema" href="./schema.mdx">
+  The `discriminatorKey` and `discriminators` options and the other root schema options.
+</Card>
+</Cards>

@@ -1,0 +1,130 @@
+---
+title: Validate field values
+description: "Restrict field values with bounds, length, allowed values, format, and your own checks, including on updates, and take the resulting error apart"
+icon: ShieldCheck
+---
+
+A Typemo schema checks field values in two stages. First the library casts the value to the field type and rejects what doesn't fit, such as a string instead of a number or a malformed identifier. Then it applies the **rules** from the field options: [`min`](../reference/schemas/prop.mdx#min), [`maxLength`](../reference/schemas/prop.mdx#max-length), [`enum`](../reference/schemas/prop.mdx#enum), [`match`](../reference/schemas/prop.mdx#match), and your own [`validate`](../reference/schemas/prop.mdx#validate) function. An invalid value never reaches the database. MongoDB itself checks nothing until you set up a collection validator.
+
+A broken rule gives a [`ValidationError`](../reference/errors/data-errors.mdx#validation-error), and a value of the wrong type gives a [`CastError`](../reference/errors/data-errors.mdx#cast-error). They're different errors, and that helps. The first says "the type is right, but the value isn't allowed", the second says "this isn't the right type at all". If a value can't be cast, the field gives a single `CastError`, and its rules aren't checked. All the invalid values are collected into one `ValidationError`.
+
+## What you need [#prerequisites]
+
+A model described as in [Define a model](./define-model.mdx). The examples build a model of a user who signs up on a website and add rules to it one at a time.
+
+## Quick start [#quick-start]
+
+You write rules in the `@Prop` options. A broken rule stops `create`, and the error text names the field and the reason.
+
+<Snippet id="schemas/validation/quick-start" title="users/user.ts" twoslash />
+
+The library found both problems at once and listed them in one message, in the order of the schema's fields. You don't have to fix them one by one and rerun the request. Below we'll go through the rules by situation.
+
+## Limit a number or a date [#number-and-date-limits]
+
+`min` and `max` set the lower and upper bounds. They work for `Number`, `Types.Int32`, `Types.Double`, `BigInt`, and `Date`, and the bound must have the same type as the field. Both bounds are inclusive.
+
+<Snippet id="schemas/validation/number-and-date-limits" twoslash />
+
+`min` greater than `max` is a mistake in the description, not in the data. It shows up when you get the model as `ConfigurationError: Person.age: "min" is greater than "max"`.
+
+## Limit a string [#string-limits]
+
+A string has several rules.
+
+- [`minLength`](../reference/schemas/prop.mdx#min-length) and [`maxLength`](../reference/schemas/prop.mdx#max-length) set the length.
+- [`match`](../reference/schemas/prop.mdx#match) with a regular expression sets the shape.
+- [`enum`](../reference/schemas/prop.mdx#enum) sets the allowed values.
+
+For `enum`, declare the field type as a union of the same values so the compiler knows them too.
+
+<Snippet id="schemas/validation/string-limits" twoslash />
+
+The `g` and `y` flags on a regular expression are forbidden. With them, the expression remembers the position of the last search (`lastIndex`), and the same check would answer differently for the same value. The library rejects this when you get the model.
+
+## Normalize a string [#normalize-string]
+
+The [`trim`](../reference/schemas/prop.mdx#trim), [`lowercase`](../reference/schemas/prop.mdx#lowercase), and [`uppercase`](../reference/schemas/prop.mdx#uppercase) options don't check anything. They transform the string on assignment. They run **before** the length and shape checks. Spaces at the edges don't count as characters, and the case doesn't get in the way of `match`. This lets you normalize a login or a currency code instead of rejecting input because of its case.
+
+<Snippet id="schemas/validation/normalize-string" twoslash />
+
+`lowercase` and `uppercase` together on one field are a description error: `"lowercase" and "uppercase" together`.
+
+## Write your own check [#custom-check]
+
+If the built-in rules aren't enough, pass a function to [`validate`](../reference/schemas/prop.mdx#validate). It gets the value and returns `true` if everything is fine, or a string with the error text. The function can be async, so you can ask an external system whether a login is taken. You can also pass a list of functions. **All** of them run, and the error contains every message.
+
+<Snippet id="schemas/validation/custom-check" twoslash />
+
+The second argument, `context`, tells you where the check runs. For a whole document it's `document:save`, and for a value from an update it's, for example, `update:updateOne`. So one function can behave differently on create and on update. Empty values don't reach the check. `null` and a missing field are the job of [`required`](./required-and-null.mdx) and `nullable`.
+
+## Check an update [#validate-update]
+
+Rules work not only in `create` but in updates too. [`updateOne`](../reference/writes/writes.mdx#update-one), [`updateMany`](../reference/writes/writes.mdx#update-many), [`findOneAndUpdate`](../reference/writes/writes.mdx#find-one-and-update), and [`replaceOne`](../reference/writes/writes.mdx#replace-one) check values before sending them to the database, and `trim` and `lowercase` work there as well. Even for `$inc` the library computes the result and checks it. If the value would go out of bounds, the query stops.
+
+<Snippet id="schemas/validation/validate-update" twoslash />
+
+The check runs before the database is contacted, so a query that breaks a rule changes nothing. [`insertMany`](../reference/writes/writes.mdx#insert-many) works the same way: if even one document fails, none is written. Filters, on the other hand, aren't checked against `min`, `enum`, and the other rules. They're only cast by the field type. You can search for a value that you couldn't write.
+
+## Check a loaded document [#check-populated]
+
+On a loaded document, the changed fields are checked on [`$save`](../reference/documents/document-api.mdx#save), and without a write by the [`$validate`](../reference/documents/document-api.mdx#validate) method. That way you can check a form without touching the database.
+
+A plain assignment (`user.age = "x"`) doesn't cast the value right away. The cast happens on the next `$validate()` or `$save()`, a wrong type gives a `CastError` before any rules, and nothing goes to the database. Document methods like `$set`, like `create`, cast the value immediately. [`Model.validate`](../reference/documents/model-document-methods.mdx#model.validate) works differently and collects every problem, and a cast error lands in `issues` with the reason `cast`. More in [Validate a document before saving](../documents/validation.mdx).
+
+<Snippet id="schemas/validation/check-populated" twoslash />
+
+## Take the error apart [#inspect-error]
+
+`ValidationError` collects every problem in the `issues` field. Each one has a `path` (the path to the field, split into parts), a `reason`, and a `message`. The `errors` property groups them by path. The reasons are `required`, `min`, `max`, `minLength`, `maxLength`, `enum`, `match`, and `validator`. This comes in handy when you need to show the error to the user next to the right form field.
+
+<Snippet id="schemas/validation/inspect-error" twoslash />
+
+The problems follow the order of the schema's fields, not the keys of your request: `login` first, then `age`, as they're declared in the class. Inside nested objects and arrays the path is longer, for example `lines.0.qty` (see [Store lists of values and subdocuments](./arrays.mdx)).
+
+## How to choose [#how-to-choose]
+
+Ask yourself: **can the rule be expressed as a value rather than code?**
+
+- **Yes**: bounds, length, allowed values, and shape. Use the options. They're visible in the description, work the same on create and on update, and are checked when the model is built.
+- **The rule depends on the outside world or on the operation's context** (uniqueness in another system, a checksum): write your own `validate` function.
+
+Don't check uniqueness within a collection with a function. There's [`unique`](../reference/schemas/prop.mdx#unique) for that, and the server guarantees it.
+
+## When not to use it [#when-not-to-use]
+
+`@Prop` rules run on the application side. Another program that writes to the same collection directly bypasses them. If you need protection on the server, set up a collection validator: see [JSON Schema and Standard Schema](./json-and-standard-schema.mdx) and the [`validator`](../reference/schemas/schema.mdx#validator) option in `@Schema`. [`Model.validate`](../reference/documents/model-document-methods.mdx#model.validate) checks arbitrary data without a collection, such as a request body. And `@Prop` won't check that a value matches another field of the document, because the rules see only one field.
+
+## Troubleshooting [#troubleshooting]
+
+**The value is wrong, but the check didn't fire.** `create({ age: "20" })` gives a `CastError`, not a `ValidationError`. The value is cast to the type first, and a string doesn't become a number. If you catch only `ValidationError`, the type error slips past. Catch both classes or their common parent (see [Error hierarchy](../reference/errors/hierarchy.mdx)).
+
+**The `validate` function isn't called for `null`.** An empty value never reaches `validate`. `null` and a missing field are decided by the `required` and `nullable` options, not by your function. If the field must not be empty, add `required: true`.
+
+**`trim` doesn't work on a value in a filter.** `find({ login: "  ann " })` doesn't find `ann`. `trim` and `lowercase` transform the value being written, and a filter is only cast by type. Normalize the string yourself before searching.
+
+## Full example [#full-example]
+
+One file with a model that has different rules, a sign-up with error handling, and an update. Code that isn't part of Typemo is marked `__…__`.
+
+<Snippet id="schemas/validation/full-example" title="users/users.service.ts" twoslash />
+
+<Callout type="migration">
+
+The `min`, `max`, `minLength`, `maxLength`, `enum`, `match`, `trim`, `lowercase`, `uppercase`, and `validate` options are familiar from Mongoose. The difference is that in Typemo the rules are also checked on updates (`updateOne`, `updateMany`, `findOneAndUpdate`, `replaceOne`) without a `runValidators` flag, and the `validate` function returns `true` or an error text. "Wrong type" and "wrong value" are different errors: `CastError` and `ValidationError`.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Define nested objects and subdocuments" href="./nested-and-subdocuments.mdx">
+  How rules work inside nested structures and what error paths look like.
+</Card>
+<Card title="Validate a document before saving" href="../documents/validation.mdx">
+  `$validate`, taking the error apart, and checking data without a document.
+</Card>
+<Card title="@Prop" href="../reference/schemas/prop.mdx">
+  Every validation option with its exact error text and build rules.
+</Card>
+</Cards>

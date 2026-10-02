@@ -1,0 +1,879 @@
+---
+title: Pipeline and Model.aggregate
+description: "Reference for the pipeline entry points (collection, database, server, sessions), the two plan forms, and the aggregation query methods"
+icon: Workflow
+---
+
+This page covers every way to start a **pipeline**, a chain of **stages** through which MongoDB passes documents. It also covers the aggregation query methods, that is, what you get from [`Model.aggregate`](#model.aggregate) and what you can add to it. Database-wide aggregations (`Pipeline.database`, `Pipeline.admin`, `Pipeline.sessions`) are run by [`connection.aggregate`](../connection/connection.mdx#connection.aggregate) and [`client.aggregate`](../connection/typemo-client.mdx#client.aggregate). Their query is the same as the one from `Model.aggregate`. The stages themselves are described in the reference [Stages](./stages.mdx), and the expressions inside stages on the `expr-*` pages.
+
+If you're starting out, read the guide [Your first aggregation](../../aggregation/first-aggregation.mdx) first. This page is a reference, the place you come back to for a detail.
+
+All examples use one model, a shop order. It has required fields, a `BigInt` field (after aggregation it shows the difference between result kinds), an index on `status` (for the `hint`), and a hidden field `internalNote`.
+
+<Snippet id="reference/aggregation/pipeline/intro" title="models/order.ts" twoslash />
+
+The collection holds three orders. Alice, `paid`, 120, 10 points, note `vip`. Bob, `open`, 40, 5 points. Alice, `paid`, 60, 7 points. The results in the `// →` comments come from this data. The identifiers in them are shortened to `"…"`, because the database issues them anew every time the data is loaded.
+
+The pipeline builder is immutable. Each stage returns a new builder, and the previous one stays as it was. The compiler catches mistakes in the shape of fields, and row types are computed by stage: after `group`, a row is no longer an order but a group. For the builder and its stages, see [Stages](./stages.mdx).
+
+---
+
+## Pipeline.from [#pipeline.from]
+
+`Pipeline.from` starts a pipeline over a model's collection. That's how you build an aggregation ahead of time, separately from a query. You get a builder, add stages, and call [`.plan()`](#pipeline-builder.plan) at the end, which produces a ready plan for [`Model.aggregate`](#model.aggregate). You don't usually call `Pipeline.from` yourself. `Model.aggregate((p) => …)` does it for you and passes such a builder to the callback.
+
+Pipeline rows start as the model's stored documents, but **without hidden fields** ([`Hidden`](../../schemas/hidden-and-sensitive.mdx)). A pipeline that silently read a hidden field would put a password or a note into a report, so Typemo removes such fields in the first stage. To keep a hidden field you need, name it in `options.include`.
+
+<Snippet id="reference/aggregation/pipeline/pipeline-from" twoslash />
+
+<Returns type="PipelineBuilder<…, &quot;collection&quot;, &quot;empty&quot;>">
+
+An empty builder over the source's stored documents. While it has no stages, it has no [`.plan()`](#pipeline-builder.plan). The compiler rejects an empty pipeline.
+
+</Returns>
+
+<Params>
+<Param name="source" type="EntityClass | Model" required>
+
+An entity class or a model. The source sets the field types and the collection the pipeline reads from.
+
+</Param>
+<Param name="options.hint" type="string | { [path]: 1 | -1 | &quot;text&quot; | … }">
+
+The index the server must use. Give a name (`"status_1"`) or a key specification (`{ status: 1 }`). The compiler checks the paths, and `Pipeline.from` also checks at run time that such an index is declared in the schema.
+
+</Param>
+<Param name="options.collation" type="CollationOptions">
+
+The string sorting rule for the whole aggregation.
+
+</Param>
+<Param name="options.allowDiskUse" type="boolean">
+
+Lets stages write temporary files to disk when memory runs out.
+
+</Param>
+<Param name="options.comment" type="string">
+
+A comment on the command. It's visible in the server log and in the profiler. The query's [`.comment`](#comment) does the same.
+
+</Param>
+<Param name="options.batchSize" type="number">
+
+How many documents the cursor gets in one exchange with the server. The query's [`.batchSize`](#batch-size) does the same.
+
+</Param>
+<Param name="options.bypassDocumentValidation" type="boolean">
+
+Skips checking documents against the collection's validation rules when the `$out` and `$merge` stages write into it.
+
+</Param>
+<Param name="options.include" type="readonly HiddenPath[]">
+
+Paths of hidden fields to keep in the rows. The compiler accepts only paths marked `Hidden` and adds them to the row type.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/pipeline-from-2" />
+
+</FullType>
+
+### Hidden fields [#hidden-fields]
+
+Without `include`, the hidden field is in the rows neither in the type nor in the data. With `include`, it appears in both.
+
+<Snippet id="reference/aggregation/pipeline/hidden-fields" twoslash />
+
+The same query without `include` would return this row without the `internalNote` key. You can't include a hidden field through `Orders.aggregate((p) => …)`, because the callback has no `options`. If you need it, build the plan with `Pipeline.from(…, { include })` and pass it to `aggregate`.
+
+### Index hint [#index-hint]
+
+`hint` is checked against the schema at the moment you call `Pipeline.from`, not when the query reaches the database. If the schema doesn't declare such an index, you get the error right away.
+
+<Snippet id="reference/aggregation/pipeline/index-hint" twoslash />
+
+A path that isn't in the model stops the compiler. If the path exists but has no index (`total` isn't indexed), Typemo stops it.
+
+<Snippet id="reference/aggregation/pipeline/index-hint-2" />
+
+Without this check, the server would reject the `hint`, and only at run time. The error would come from the database, not from the place where you wrote it.
+
+---
+
+## Pipeline.database [#pipeline.database]
+
+`Pipeline.database` starts a pipeline that reads the whole database instead of a collection. You need it for aggregations that have no documents of their own. The [`documents`](./stages.mdx#documents) stage produces literal documents, and [`listLocalSessions`](./stages.mdx#list-local-sessions) and [`listClusterCatalog`](./stages.mdx#list-cluster-catalog) read internal server data.
+
+Such a plan has no model, and [`Model.aggregate`](#model.aggregate) doesn't accept it. [`connection.aggregate`](../connection/connection.mdx#connection.aggregate) (this connection's database) and [`client.aggregate`](../connection/typemo-client.mdx#client.aggregate) (the client's default database) run it. It's an ordinary Typemo operation, with transactions, `timeoutMS`, Typemo errors, a cursor, and `explain`, but without hooks. For examples, see the guide [Database-level queries](../../aggregation/database-level.mdx).
+
+<Snippet id="reference/aggregation/pipeline/pipeline-database" twoslash />
+
+<Returns type="PipelineBuilder<never, &quot;database&quot;, &quot;empty&quot;>">
+
+An empty builder not tied to a collection. A row starts as `never`, and the stages set the row types.
+
+</Returns>
+
+<Params>
+<Param name="options" type="AggregateOptions<never>">
+
+The same settings as in [`Pipeline.from`](#pipeline.from): `collation`, `allowDiskUse`, `comment`, `batchSize`, and `bypassDocumentValidation`. They go into the command as they are. `hint` and `include` make no sense here, because the plan has no schema to check them against.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/pipeline-database-2" />
+
+</FullType>
+
+The database where the plan runs depends on what launched it. `connection.aggregate` takes its connection's database, and `client.aggregate` takes the client's default database. Pass such a plan to `Model.aggregate`, and you get an error instead of a read from someone else's database. The error text was obtained by running it.
+
+<Snippet id="aggregation/system/troubleshooting" />
+
+The internal stages are tied to the place they run, and the compiler checks this. [`documents`](./stages.mdx#documents) and [`listClusterCatalog`](./stages.mdx#list-cluster-catalog) are available in both `Pipeline.database()` and `Pipeline.admin()`. [`currentOp`](./stages.mdx#current-op) exists only in `Pipeline.admin()`, and [`listSessions`](./stages.mdx#list-sessions) only in `Pipeline.sessions()`.
+
+---
+
+## Pipeline.admin [#pipeline.admin]
+
+`Pipeline.admin` is the same as [`Pipeline.database`](#pipeline.database), but for the `admin` database. It holds the internal stages the server allows only there. They are [`currentOp`](./stages.mdx#current-op) (what's running right now), [`queryStats`](./stages.mdx#query-stats), [`querySettings`](./stages.mdx#query-settings), [`listSampledQueries`](./stages.mdx#list-sampled-queries), and [`shardedDataDistribution`](./stages.mdx#sharded-data-distribution).
+
+<Snippet id="reference/aggregation/pipeline/pipeline-admin" twoslash />
+
+<Returns type="PipelineBuilder<never, &quot;admin&quot;, &quot;empty&quot;>">
+
+An empty builder for the `admin` database. In the plan `target.admin` is `true`, so `connection.aggregate` and `client.aggregate` know where to send the pipeline. An `admin` plan runs in `admin` no matter which connection you launch it from.
+
+</Returns>
+
+<Params>
+<Param name="options" type="AggregateOptions<never>">
+
+The same settings as in [`Pipeline.database`](#pipeline.database).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/pipeline-admin-2" />
+
+</FullType>
+
+For more on internal aggregations, see the guide [System aggregations](../../aggregation/system.mdx).
+
+---
+
+## Pipeline.sessions [#pipeline.sessions]
+
+`Pipeline.sessions` starts a pipeline over the `config.system.sessions` collection. The server accepts the [`listSessions`](./stages.mdx#list-sessions) stage only there. Over any other collection it answers `$listSessions may only be run against config.system.sessions`.
+
+That's why `listSessions` exists only on `Pipeline.sessions()` and not on `Pipeline.from`, `Model.aggregate`, `Pipeline.database()`, or `Pipeline.admin()`. The compiler won't let you put a stage where the server would reject it anyway. After it, the ordinary stages are available (`match`, `project`, `sort`, `group`).
+
+<Snippet id="reference/aggregation/pipeline/pipeline-sessions" twoslash />
+
+`client.aggregate` and `connection.aggregate` run the plan. It always goes to `config.system.sessions`, no matter which connection you launch it from. In operation events, `collection` is `"system.sessions"` and `database` is `"config"`.
+
+<Returns type="PipelineBuilder<never, &quot;sessions&quot;, &quot;empty&quot;>">
+
+An empty builder tied to `config.system.sessions`. The plan is read-only and has no [`out`](./stages.mdx#out) or [`merge`](./stages.mdx#merge).
+
+</Returns>
+
+<Params>
+<Param name="options" type="AggregateOptions<never>">
+
+The same settings as in [`Pipeline.database`](#pipeline.database).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/pipeline-sessions-2" />
+
+</FullType>
+
+Put `listSessions` in the wrong place or add a write, and the compiler stops you right away. The compiler produced these messages.
+
+<Snippet id="reference/aggregation/pipeline/pipeline-sessions-3" twoslash />
+
+The server doesn't write fresh sessions to `config.system.sessions` immediately, so on a freshly started server the result is empty. The [`listLocalSessions`](./stages.mdx#list-local-sessions) stage in `Pipeline.database()` shows the sessions that one node knows and hasn't written yet.
+
+---
+
+## Pipeline.update [#pipeline.update]
+
+`Pipeline.update` builds a **pipeline update**. These are the stages that `updateOne` and `updateMany` accept instead of an ordinary document with operators. With it, a field is computed from other fields of the same document: double an amount, or join a name from two parts. An ordinary operator like `$set` can't do that.
+
+In this mode the builder has only six stages: [`addFields`](./stages.mdx#add-fields), [`set`](./stages.mdx#set), [`project`](./stages.mdx#project), [`unset`](./stages.mdx#unset), [`replaceRoot`](./stages.mdx#replace-root), and [`replaceWith`](./stages.mdx#replace-with). It has no other methods, so the compiler won't let you add `group` where the server would reject it anyway.
+
+<Snippet id="reference/aggregation/pipeline/pipeline-update" twoslash />
+
+<Returns type="PipelineBuilder<StoredDocOf<Src>, &quot;update&quot;, &quot;empty&quot;>">
+
+An empty builder in update mode. Take the result through [`.build()`](#pipeline-builder.build), not `.plan()`. It isn't an aggregation but a list of stages for an update command.
+
+</Returns>
+
+<Params>
+<Param name="source" type="EntityClass | Model" required>
+
+The entity whose document the pipeline updates. It's needed only for the type, and the rows are its stored documents.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/pipeline-update-2" />
+
+</FullType>
+
+The model's [`updateOne`](../writes/writes.mdx#update-one) and [`updateMany`](../writes/writes.mdx#update-many) accept such a pipeline.
+
+Before sending, Typemo checks the pipeline against the model's schema. The update stops with a Typemo error if the pipeline does an `unset` of a required field, sets a constant of the wrong type, loses an immutable field, or is empty. For example, `unset("title")` on a model with a required `title` gives `ValidationError: Validation failed: "title": update.0.$unset: the field is required; the pipeline would remove it [required]`, and an empty pipeline gives `QueryError: an update pipeline needs at least one stage`. All the checks are described in the reference [Pipeline updates](../writes/pipeline-updates.mdx#update-pipelines).
+
+---
+
+## Pipeline.view [#pipeline.view]
+
+`Pipeline.view` builds a **view definition**: a pipeline stored on the server over another collection and read like an ordinary collection. A view stores not data but a way to get it.
+
+You don't usually call `Pipeline.view` directly, because [`TypedView.define`](../collections/typed-view.mdx#typed-view.define) does it. The method is useful when you create a view yourself and want a checked definition.
+
+The pipeline is checked against the view class. The rows must contain all the class's fields with compatible types, and if a field is missing or has the wrong type, the compiler names it. In view mode the builder has no [`out`](./stages.mdx#out) or [`merge`](./stages.mdx#merge), because a view can't write.
+
+<Snippet id="reference/aggregation/pipeline/pipeline-view" twoslash />
+
+<Returns type="ViewDefinition">
+
+A frozen object with two fields. `viewOn` is the name of the source collection, and `pipeline` is an array of serialized stages. You can pass the object to the driver's `create` command. This method doesn't create the view collection itself.
+
+</Returns>
+
+<Params>
+<Param name="view" type="EntityClass" required>
+
+The view row class. It's needed for type checking and isn't used at run time.
+
+</Param>
+<Param name="definition.on" type="EntityClass | Model" required>
+
+The source: the collection or another view that the pipeline reads.
+
+</Param>
+<Param name="definition.pipeline" type="(p) => ViewPipelineCheck<R, View>" required>
+
+The callback receives an empty builder in view mode and returns a pipeline with at least one stage. If the pipeline's rows don't fit the class, the callback returns a description of the problem instead of a pipeline. [`ViewPipelineCheck`](#view-pipeline-check) does that, and the compiler stops the call.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/pipeline-view-2" />
+
+</FullType>
+
+`ViewDefinition` is a public type with the fields `viewOn: string` and `pipeline: readonly PipelineStage[]`.
+
+### The pipeline doesn't fit the view class [#pipeline-class-mismatch]
+
+The view class describes the rows you'll read, so the pipeline must produce all its fields with compatible types. People usually go wrong in three ways: a class field gets lost in the rows, a field changes type, or `_id` disappears. The compiler produced the text of each error.
+
+<Snippet id="reference/aggregation/pipeline/pipeline-class-mismatch" twoslash />
+
+The first row lost `_id` (the class got it from `Entity`), the second lost `total`, and the third made `total` a string. The compiler answers each the same way: `Property 'error' is missing in type 'PipelineBuilder<…>' but required in type 'PathError<…>'`. The reason is written in the `PathError` itself: `the pipeline result does not match the fields of the view class: check the field "_id"` (in the second and third rows the field is named `"total"`).
+
+You can't write a result in a view at all. In view mode the builder has no `out` or `merge`, so `p.out("copy")` doesn't compile, and a callback that returns a write gets the reason `a view pipeline cannot end with $out or $merge (MongoDB does not allow them in a view)`.
+
+---
+
+## ViewPipelineCheck [#view-pipeline-check]
+
+`ViewPipelineCheck<R, V>` is the type [`Pipeline.view`](#pipeline.view) uses to decide what to return from the pipeline callback. If the pipeline's rows `R` fit the class `V`, the type equals `R` itself and nothing changes. Otherwise it equals a `PathError` with the reason text, and the compiler prints that text instead of a long intersection of the pipeline type with the error type. You don't need to read the type itself. It exists so the error shows "check the field "_id"" and not a wall of type output.
+
+The type checks two conditions. The pipeline must not end with a write, because the server forbids `$out` and `$merge` in a view. And every field of the class must be in the pipeline's rows with a compatible type. `_id` is required if the class declares it (`Entity` provides it) and optional if it doesn't.
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/view-pipeline-check" />
+
+</FullType>
+
+A write target is also checked against the row's fields. For [`out`](./stages.mdx#out) and [`merge`](./stages.mdx#merge), the same field check applies to the target model.
+
+---
+
+## Pipeline.watch [#pipeline.watch]
+
+`Pipeline.watch` builds a pipeline for a **change stream**. The rows of such a pipeline are driver events (`ChangeStreamDocument`), not model documents. That's why you can filter and rewrite events but can't group them.
+
+Only [`match`](./stages.mdx#match), [`project`](./stages.mdx#project), [`addFields`](./stages.mdx#add-fields), [`set`](./stages.mdx#set), [`unset`](./stages.mdx#unset), [`replaceRoot`](./stages.mdx#replace-root), [`replaceWith`](./stages.mdx#replace-with), and [`redact`](./stages.mdx#redact) are available. You can put [`changeStreamSplitLargeEvent`](./stages.mdx#change-stream-split-large-event) at the very end.
+
+<Snippet id="reference/aggregation/pipeline/pipeline-watch" twoslash />
+
+<Returns type="PipelineBuilder<ChangeStreamDocument<…>, &quot;watch&quot;, &quot;empty&quot;>">
+
+An empty builder in change stream mode. The rows are change events of the source's documents.
+
+</Returns>
+
+<Params>
+<Param name="source" type="EntityClass | Model" required>
+
+The entity whose collection the change stream listens to.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/pipeline-watch-2" />
+
+</FullType>
+
+[`Model.watch`](../change-streams/watch.mdx) opens the change stream, not this method. This one only prepares the stages. For a `$changeStream` stage inside an ordinary aggregation, there's [`changeStream`](./stages.mdx#change-stream).
+
+---
+
+## PipelineBuilder.plan [#pipeline-builder.plan]
+
+`.plan()` finishes a top-level pipeline and returns an **aggregation plan** (`AggregatePlan`), a frozen object with the source, the stages, and the options. [`Model.aggregate`](#model.aggregate), [`connection.aggregate`](../connection/connection.mdx#connection.aggregate), and [`client.aggregate`](../connection/typemo-client.mdx#client.aggregate) accept it.
+
+The method exists only on a builder that already has a stage, and only on those that run as a standalone aggregation: `Pipeline.from`, `Pipeline.database`, `Pipeline.admin`, and `Pipeline.sessions`. The plan knows neither a model nor launch parameters (`session`, `timeoutMS`), so it runs on any model of its collection. How it differs from the plan a query returns is explained in the section [The two plan forms](#plan-forms).
+
+<Snippet id="reference/aggregation/pipeline/pipeline-builder-plan" twoslash />
+
+<Returns type="AggregatePlan<Row>">
+
+A frozen plan with the fields `op` (always `"aggregate"`), `target` (where the pipeline reads from), `pipeline` (the stages), and `options` (`hint`, `collation`, `allowDiskUse`, `comment`, `batchSize`, `bypassDocumentValidation`, and `include` from `Pipeline.from(…, options)`). `target` comes in three kinds: `{ kind: "collection", collection, entity, discriminator }`, `{ kind: "database", admin }`, and `{ kind: "sessions" }`. The row type (`Row`) lives only in the type and doesn't exist at run time.
+
+</Returns>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/pipeline-builder-plan-2" />
+
+</FullType>
+
+The compiler rejects an empty pipeline. If the builder comes from untyped code, Typemo itself throws the error.
+
+<Snippet id="reference/aggregation/pipeline/pipeline-builder-plan-3" />
+
+The server would reject an empty aggregation too, but the Typemo text names the reason and the cure.
+
+## PipelineBuilder.build [#pipeline-builder.build]
+
+`.build()` returns only the array of stages, without the source and options. You need it where the stages don't go into a Typemo aggregation: a sub-pipeline (`lookup`, `facet`), a view definition, an update or change stream pipeline, or the driver.
+
+<Snippet id="reference/aggregation/pipeline/pipeline-builder-build" twoslash />
+
+<Returns type="readonly PipelineStage[]">
+
+A frozen array of serialized stages. Each stage is an object like `{ $match: … }`.
+
+</Returns>
+
+---
+
+## Model.aggregate [#model.aggregate]
+
+`Model.aggregate` runs an aggregation over the model's collection. It passes documents through a pipeline and returns the result rows. It's the most common path. For order reports, sums, grouping, and joining collections, you write a callback, and Typemo passes it a builder over the stored documents.
+
+Like [`find`](../query/reading.mdx#model.find), the method doesn't go to the database right away. It returns an **aggregation query** (`AggregateQuery`) that goes to the server on `await`. You can add options to the query and get the result as an array, a cursor, the server's plan, or a result checked against a schema.
+
+<Snippet id="reference/aggregation/pipeline/model-aggregate" twoslash />
+
+<Returns type="AggregateQuery<Row>">
+
+An aggregation query. After `await` you get an array of rows, and the compiler computes the row type by stage. The query is immutable: each method (`.plain()`, `.session()`, …) returns a new query, and the old one doesn't change.
+
+</Returns>
+
+<Params>
+<Param name="build" type="(p) => StagedPipeline | TerminalPipeline | AggregatePlan" required>
+
+A callback that receives an empty builder over the model's stored documents, or a ready plan from [`Pipeline.from`](#pipeline.from). The pipeline must have at least one stage. The [`out`](./stages.mdx#out) and [`merge`](./stages.mdx#merge) stages finish the pipeline and turn the query into a write, and such a query has no rows.
+
+</Param>
+<Param name="options.session" type="ClientSession | null">
+
+An explicit session. `null` runs the query outside the current transaction. The [`.session`](#session) method does the same.
+
+</Param>
+<Param name="options.timeoutMS" type="number">
+
+A client-side time limit in milliseconds. The [`.timeoutMS`](#timeout-ms) method does the same.
+
+</Param>
+<Param name="options.policy" type="PolicyValues">
+
+Policy values for this aggregation: tenant, actor, and soft delete mode. The [`.policy`](#policy) method does the same.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/model-aggregate-2" />
+
+</FullType>
+
+### Rows without a schema [#rows-without-schema]
+
+A model's stored documents pass through the schema, but aggregation rows don't. The result of `group` or `project` has no class to build it from. So the values stay as the driver returned them: an identifier is an `ObjectId`, and the `points` field is a `bigint`. [`.plain()`](#plain) shows how to hand them to a client.
+
+<Snippet id="reference/aggregation/pipeline/rows-without-schema" twoslash />
+
+### One query, one run [#one-query-one-run]
+
+A read query runs once per object. A second `await` of the same query returns the same rows and doesn't go to the database. To run it again, call [`.exec({ force: true })`](#exec).
+
+<Snippet id="reference/aggregation/pipeline/one-query-one-run" twoslash />
+
+### Another collection [#foreign-collection]
+
+A plan is built over one collection. Give a model the plan of another collection, and the error comes right at the call, before any contact with the database. A model's policies belong to its collection and don't cover someone else's data. The texts differ for a plan of another collection, a database plan, and a sessions plan, and they were obtained by running them.
+
+<Snippet id="reference/aggregation/pipeline/foreign-collection" />
+
+[`connection.aggregate`](../connection/connection.mdx#connection.aggregate) and [`client.aggregate`](../connection/typemo-client.mdx#client.aggregate) run database and sessions plans. If the first argument is neither a callback nor a plan, the method throws a `QueryError`.
+
+<Snippet id="reference/aggregation/pipeline/foreign-collection-2" />
+
+### Transactions and policies [#transactions-and-policies]
+
+Inside [`transaction`](../transactions/transactions.mdx#transaction), the query automatically runs in the transaction's session.
+
+<Callout type="migration">
+
+In Mongoose, `Model.aggregate` has no row types, the result is always `any[]`, and hidden (`select: false`) fields get into the pipeline as they are. In Typemo the row type is computed by stage, and the first stage removes hidden fields.
+
+</Callout>
+
+---
+
+## .plain [#plain]
+
+`.plain()` turns rows into ordinary objects that are safe to serialize to JSON and hand to a client. Identifiers, `bigint`, `Decimal128`, and `UUID` become strings, `Date` and `RegExp` stay, binary data becomes `Uint8Array`, and a vector becomes an array of numbers.
+
+<Snippet id="reference/aggregation/pipeline/plain" twoslash />
+
+An aggregation query has no `.lean()`, and doesn't need one. Aggregation rows are never model documents. They're always data as the driver returned it. There's only one other kind of result, `.plain()`.
+
+<Returns type="AggregateQuery<PlainValue<Row>>">
+
+A new query with the same pipeline. The rows are the `.plain()` result, and the row type is `PlainValue` of the previous one. A repeated `.plain()` returns the same query, so rows aren't converted twice. After it, [`.parse`](#parse), [`.expect`](#expect), and [`.cursor`](#cursor) are available.
+
+</Returns>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/plain-2" />
+
+</FullType>
+
+A row has no schema, so a stored `Map` field in it is an ordinary object, and `.plain()` leaves it an object. Only a schema can turn it into a `Map`. For the kinds of result, see the concept [How to read types in your editor](../../concepts/reading-types.mdx).
+
+---
+
+## .cursor [#cursor]
+
+`.cursor()` returns rows one at a time as they're read from the database, instead of collecting the whole result into an array. You need it for large reports and exports: memory holds one row, not the whole result.
+
+<Snippet id="reference/aggregation/pipeline/cursor" twoslash />
+
+<Returns type="QueryCursor<Row>">
+
+A cursor of rows. Its methods are described in the reference [Cursor](../query/cursor.mdx). If the query had [`.plain()`](#plain), [`.parse`](#parse), or [`.mask`](#mask), the cursor applies them to each row at the moment it reads it.
+
+</Returns>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/cursor-2" />
+
+</FullType>
+
+---
+
+## .exec [#exec]
+
+`.exec()` runs the query and returns a promise of rows. It's the same as `await query`, with one setting: you can force the query to run again.
+
+<Snippet id="reference/aggregation/pipeline/exec" twoslash />
+
+<Returns type="Promise<Row[]>">
+
+The result rows. An ordinary read runs once per object and then returns the cached result.
+
+</Returns>
+
+<Params>
+<Param name="options.force" type="boolean">
+
+`true` runs the query again, even if it already ran.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/exec-2" />
+
+</FullType>
+
+### A write through aggregation [#write-via-aggregation]
+
+An aggregation that ends in [`out`](./stages.mdx#out) or [`merge`](./stages.mdx#merge) is a write, and Typemo treats it differently. A second `await` of the same query doesn't repeat the write but throws an error. A silent repeated write would erase or double the result.
+
+<Snippet id="reference/aggregation/pipeline/write-via-aggregation" twoslash />
+
+<Snippet id="reference/aggregation/pipeline/write-via-aggregation-2" />
+
+If you really want to write again, say so explicitly: `write.exec({ force: true })`. The error names `aggregate`, the method you called.
+
+---
+
+## .explain [#explain]
+
+`.explain()` asks the server for the **query plan**: which indexes it will choose and how many documents it will scan. You don't get rows. You need the method when an aggregation is slow and you need to understand why.
+
+<Snippet id="reference/aggregation/pipeline/explain" twoslash />
+
+<Returns type="Promise<ExplainResult>">
+
+The server's answer. The keys `queryPlanner`, `executionStats`, and `serverInfo` are always in it, and `executionStats` appears at a verbosity of at least `"executionStats"`.
+
+</Returns>
+
+<Params>
+<Param name="verbosity" type="&quot;queryPlanner&quot; | &quot;executionStats&quot; | &quot;allPlansExecution&quot;" default="&quot;queryPlanner&quot;">
+
+How detailed the answer is. `queryPlanner` shows the chosen plan, `executionStats` runs the query and adds counters, and `allPlansExecution` also shows the rejected plans. Any other value (you can pass one only by bypassing the types) gives a `QueryError` before any contact with the database.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/explain-2" />
+
+</FullType>
+
+Read queries have the same method: [`.explain`](../query/search-and-explain.mdx#explain).
+
+---
+
+## .parse [#parse]
+
+`.parse(schema)` checks every result row against a **Standard Schema**. That's a shared validation interface that zod, valibot, arktype, and Typemo's model schemas (`~standard`) implement. The result rows become whatever the schema returned. You need the method at the boundary with the outside world. The server may return something unexpected, and `parse` stops it before the rows go any further.
+
+<Snippet id="reference/aggregation/pipeline/parse" twoslash />
+
+<Returns type="ParsedQuery<Output[]>">
+
+A query that returns checked rows, that is, the schema's output. It waits for asynchronous schemas. `.parse` has the same set of methods as described in the read query's [`.parse`](../query/contracts.mdx#parse). `.cursor()` checks rows as it reads them.
+
+</Returns>
+
+<Params>
+<Param name="schema" type="StandardSchema" required>
+
+Any object with a `~standard` property.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/parse-2" />
+
+</FullType>
+
+If a row doesn't fit, you get a `ValidationError`, and the path in it starts with the row number.
+
+<Snippet id="reference/aggregation/pipeline/parse-3" />
+
+Both rows are named in one message, because all rows are checked, not just the first.
+
+---
+
+## .expect [#expect]
+
+`.expect<Shape>()` checks the result **contract** at compile time. The row must have exactly the shape you expect. At run time the method does nothing and costs nothing. You need it when the result goes to a consumer with a fixed shape, such as an API response or a report. When the pipeline changes, the compiler tells you the shape has drifted.
+
+<Snippet id="reference/aggregation/pipeline/expect" twoslash />
+
+<Returns type="AggregateQuery<Row>">
+
+The same query. If the row shape doesn't match exactly, the compiler reports what's missing (`missing`), what's extra (`extra`), and what has a different type (`mismatch`). For contracts, see the reference [`.expect`](../query/contracts.mdx#expect).
+
+</Returns>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/expect-2" />
+
+</FullType>
+
+---
+
+## .mask [#mask]
+
+`.mask(spec)` hides values in the result rows before the calling code sees them: an email, a card number, any row paths. The keys are paths of the pipeline's **final** row. The value is `"mask"` (replace with `"?"`) or a mask function from [`Mask`](../query/masks.mdx#mask-presets).
+
+<Snippet id="reference/aggregation/pipeline/mask" twoslash />
+
+<Returns type="MaskedQuery<…>">
+
+A query that returns masked rows. Hooks, events, and the audit see the real rows. `.cursor()` masks each row as it reads it.
+
+</Returns>
+
+<Params>
+<Param name="spec" type="{ [path]: &quot;mask&quot; | MaskFunction }" required>
+
+Paths of the final row. Aggregation has no `"sensitive"` preset, and only the listed paths are masked. Hiding a field completely is a job for [`project`](./stages.mdx#project) or [`unset`](./stages.mdx#unset).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/mask-2" />
+
+</FullType>
+
+A path that isn't in the final row stops the aggregation. A mask that hid nothing would be a silent hole in your protection. The error text was obtained by running it.
+
+<Snippet id="reference/aggregation/pipeline/mask-3" />
+
+All the masks and their presets are described in the reference [Masks](../query/masks.mdx#mask).
+
+---
+
+## .session [#session]
+
+`.session(session)` runs the query in the given session, usually one you opened by hand. Inside [`transaction`](../transactions/transactions.mdx#transaction), Typemo supplies the session itself, so you rarely need the method.
+
+<Snippet id="reference/aggregation/pipeline/session" twoslash />
+
+<Returns type="AggregateQuery<Row>">
+
+A new query with the given session.
+
+</Returns>
+
+<Params>
+<Param name="session" type="ClientSession | null" required>
+
+A driver session. `null` runs the query outside the current transaction, for example for a report that doesn't need isolation.
+
+</Param>
+</Params>
+
+For details, see the [read query's `.session`](../query/options.mdx#session).
+
+---
+
+## .policy [#policy]
+
+`.policy(values)` sets policy values for this aggregation on top of the current ones: tenant, actor, and the visibility of deleted documents. You need it in a background job, where there's no incoming request for Typemo to take the tenant from.
+
+<Snippet id="reference/aggregation/pipeline/policy" twoslash />
+
+<Returns type="AggregateQuery<Row>">
+
+A new query with the merged policy values. An unknown key gives a `QueryError` instead of being silently ignored. For example, `aggregate.policy: unknown policy value "nope" (known: tenant, allTenants, actor, includeDeleted, onlyDeleted, hardDelete)`.
+
+</Returns>
+
+<Params>
+<Param name="values" type="PolicyValues" required>
+
+An object with the optional fields `tenant`, `allTenants`, `actor`, `includeDeleted`, `onlyDeleted`, and `hardDelete`.
+
+</Param>
+</Params>
+
+For details, see the [read query's `.policy`](../query/options.mdx#policy).
+
+---
+
+## .batchSize [#batch-size]
+
+`.batchSize(n)` sets how many rows the cursor gets from the server in one exchange. The smaller the size, the less memory goes to a batch and the more exchanges there are. You need the method together with [`.cursor()`](#cursor) on large exports.
+
+<Snippet id="reference/aggregation/pipeline/batch-size" twoslash />
+
+<Returns type="AggregateQuery<Row>">
+
+A new query. The value must be a positive integer, and zero, a negative number, and a non-integer give a `QueryError`. Zero is rejected on purpose. The driver reads `0` as "the server default", and an accidental zero would silently cancel your batch size.
+
+</Returns>
+
+<Params>
+<Param name="n" type="number" required>
+
+The batch size, a positive integer.
+
+</Param>
+</Params>
+
+<Snippet id="reference/aggregation/pipeline/batch-size-2" />
+
+Among read queries, only `find` has `.batchSize`: [`.batchSize`](../query/options.mdx#batch-size).
+
+---
+
+## .comment [#comment]
+
+`.comment(text)` attaches a comment to the command, visible in the server log and the profiler. It helps tell a heavy report from other queries when you investigate slow operations.
+
+<Snippet id="reference/aggregation/pipeline/comment" twoslash />
+
+<Returns type="AggregateQuery<Row>">
+
+A new query with the comment.
+
+</Returns>
+
+<Params>
+<Param name="comment" type="string" required>
+
+The comment text.
+
+</Param>
+</Params>
+
+For details, see the [read query's `.comment`](../query/options.mdx#comment).
+
+---
+
+## .timeoutMS [#timeout-ms]
+
+`.timeoutMS(ms)` limits the time of the whole operation on the client side. If the server doesn't finish in time, the driver aborts the query. That way a report doesn't hold a connection forever.
+
+<Snippet id="reference/aggregation/pipeline/timeout-ms" twoslash />
+
+<Returns type="AggregateQuery<Row>">
+
+A new query. A negative or non-integer value gives an error.
+
+</Returns>
+
+<Snippet id="reference/aggregation/pipeline/timeout-ms-2" />
+
+<Params>
+<Param name="ms" type="number" required>
+
+The time in milliseconds, a non-negative integer.
+
+</Param>
+</Params>
+
+For details, see the [read query's `.timeoutMS`](../query/options.mdx#timeout-ms).
+
+---
+
+## .readPreference [#read-preference]
+
+`.readPreference(mode)` chooses which member of a replica set (several MongoDB servers holding copies of the same data) to read from: the primary, a secondary, or the nearest. That way heavy reports don't load the primary server.
+
+<Snippet id="reference/aggregation/pipeline/read-preference" twoslash />
+
+<Returns type="AggregateQuery<Row>">
+
+A new query with the chosen mode.
+
+</Returns>
+
+<Params>
+<Param name="mode" type="ReadPreferenceMode" required>
+
+A driver read mode: `"primary"`, `"primaryPreferred"`, `"secondary"`, `"secondaryPreferred"`, or `"nearest"`.
+
+</Param>
+</Params>
+
+For details, see the [read query's `.readPreference`](../query/options.mdx#read-preference).
+
+---
+
+## .readConcern [#read-concern]
+
+`.readConcern(level)` sets the read isolation level, that is, what the server may show. For example, only data confirmed by a majority (`"majority"`). You need the method when a report must not see data that will later be rolled back.
+
+<Snippet id="reference/aggregation/pipeline/read-concern" twoslash />
+
+<Returns type="AggregateQuery<Row>">
+
+A new query with the chosen level.
+
+</Returns>
+
+<Params>
+<Param name="level" type="ReadConcernLevel" required>
+
+A driver level: `"local"`, `"available"`, `"majority"`, `"linearizable"`, or `"snapshot"`.
+
+</Param>
+</Params>
+
+Inside a transaction, the transaction's own settings apply, so a read level there gives an error.
+
+<Snippet id="reference/aggregation/pipeline/read-concern-2" />
+
+For details, see the [read query's `.readConcern`](../query/options.mdx#read-concern).
+
+---
+
+## .build [#build]
+
+On an aggregation query, `.build()` returns the **execution plan** (`AggregateExecutionPlan`): the pipeline, options, and entity that go into the operation. You need it for debugging. You see what your callback turned into and which launch parameters the query calls added to it. For more, see the section [The two plan forms](#plan-forms).
+
+<Snippet id="reference/aggregation/pipeline/build" twoslash />
+
+<Returns type="AggregateExecutionPlan">
+
+A frozen execution plan. It isn't the same as [`PipelineBuilder.plan`](#pipeline-builder.plan). The execution plan has the entity and launch parameters, while the builder's plan has only the source and stages.
+
+</Returns>
+
+---
+
+## The two plan forms [#plan-forms]
+
+In aggregation, "plan" names two different objects. They look alike, but you get them differently and use them for different things, so they're easy to mix up.
+
+**`AggregatePlan`** is the pipeline plan. The builder's [`.plan()`](#pipeline-builder.plan) returns it. It holds the source (`target`), the stages, and the pipeline options, with no model and no launch parameters. That's why you can build a plan in one module and run it anywhere. A collection plan goes to a model of the same collection through [`Model.aggregate`](#model.aggregate), and a database or sessions plan goes through [`connection.aggregate`](../connection/connection.mdx#connection.aggregate) and [`client.aggregate`](../connection/typemo-client.mdx#client.aggregate).
+
+**`AggregateExecutionPlan`** is the execution plan. The query's [`.build()`](#build) returns it once the pipeline is tied to a model. It holds the model's entity (`entity`), the stages (`pipeline`), the pipeline options (`aggregateOptions`), and the parameters of this run (`options`: `session`, `timeoutMS`, `policy`, `comment`, `batchSize`, and so on). The operation pipeline runs exactly this. The type is exported so a function can accept and return such a plan, but you rarely build one by hand.
+
+<Snippet id="reference/aggregation/pipeline/plan-forms" twoslash />
+
+The stages are the same in both plans. What differs is the wrapper and what's added to it. `AggregatePlan` has `target`, and `AggregateExecutionPlan` has `entity` instead. The pipeline options (`hint`, `collation`, `allowDiskUse`, and so on) live in `options` in the first and in `aggregateOptions` in the second, because `options` is taken by the launch parameters. There's no way back. You can't pass an `AggregateExecutionPlan` to `aggregate`, which accepts only an `AggregatePlan`.
+
+<FullType>
+
+<Snippet id="reference/aggregation/pipeline/plan-forms-2" />
+
+</FullType>
+
+A question tells you which plan you need: are you describing a pipeline or looking at what will run? If you're describing, take the `AggregatePlan` from `.plan()`. If you're debugging or writing a test for the parameters that went into the operation, look at the `AggregateExecutionPlan` from `.build()`. For a database plan (`connection.aggregate`), `entity` is an internal class named after the method called (`connection` or `client`), because such an aggregation has no model.
+
+---
+
+## When not to use it [#when-not-to-use]
+
+Do you need model documents with methods and virtual fields, not report rows? Use [`find`](../query/reading.mdx#model.find), because aggregation doesn't return documents. For a simple count or a list of unique values, there are [`countDocuments`](../query/reading.mdx#model.count-documents) and [`distinct`](../query/reading.mdx#model.distinct), which are simpler and need no pipeline.
+
+For a result that's stored permanently, see [`TypedView.define`](../collections/typed-view.mdx#typed-view.define) (a view that's computed on every read) and [materialized views](../collections/materialized.mdx) (the result is written to a collection).

@@ -1,0 +1,254 @@
+---
+title: "@venloc/typemo/testing"
+description: "Test data factories and index usage checks: defineFactory, explainIndexUsage, expectIndexScan, and expectCollScan"
+icon: FlaskConical
+---
+
+The `@venloc/typemo/testing` entry point of the package collects tools for testing your application. It has **factories** for test data, which the compiler checks, and query plan checks that fail a test when a query stops using an index. The entry point depends only on the core. It doesn't pull in a test server or other packages, and you start the test database yourself.
+
+How to use all of this is covered in the guide [Test your app](../../testing/testing-apps.mdx).
+
+The examples use an account model. The values come from a run against a real database. The collection holds three accounts, `Account 1`, `Account 2`, and `Account 3`, and `title` has a unique index.
+
+<Snippet id="reference/observability/sentry/intro" title="accounts/account.ts" twoslash />
+
+---
+
+## defineFactory [#define-factory]
+
+`defineFactory` creates a factory. You describe an ordinary document once, and in a test you set only what matters for that test. The factory is typed by the model. Rename a model field and the factory breaks, not the test, silently. A function of the sequence number (1, 2, …) builds the data, so unique fields don't collide.
+
+<Snippet id="reference/testing/testing/define-factory" twoslash />
+
+<Params>
+<Param name="model" type="FactoryModel<T>" required>
+
+The model that saves the documents. Any Typemo model works, it only needs `entity` and `create`.
+
+</Param>
+<Param name="defaults" type="(n: number) => CreateInput<T>" required>
+
+Default values by sequence number. `CreateInput<T>` is what `create` accepts, so required fields are required here too.
+
+</Param>
+</Params>
+
+<Returns type="Factory<T>">
+
+A frozen factory object, see [`Factory`](#factory). The defaults and overrides don't change, and every call builds a new object.
+
+</Returns>
+
+<FullType>
+
+<Snippet id="reference/testing/testing/define-factory-2" />
+
+</FullType>
+
+---
+
+## Factory [#factory]
+
+`Factory` is what `defineFactory` returned. The sequence counter is shared by all methods, and each `build` increases it by one.
+
+<TypeTable
+  type={{
+    "build(overrides?)": { description: "The data of one document (defaults, then overrides) without saving it. As the second call overall, `build({ balance: 5 })` gave `{ title: \"Account 2\", balance: 5 }`.", type: "(overrides?: FactoryOverrides<T>) => CreateInput<T>" },
+    "buildMany(count, overrides?)": { description: "The data of `count` documents. If `count` isn't a non-negative integer, you get `TypemoError: defineFactory: count must be a non-negative integer, got -1`.", type: "(count: number, overrides?: FactoryOverrides<T>) => CreateInput<T>[]" },
+    "create(overrides?)": { description: "Builds one document, saves it through `model.create`, and returns it.", type: "(overrides?: FactoryOverrides<T>) => Promise<HydratedDoc<T>>" },
+    "createMany(count, overrides?)": { description: "Builds and saves `count` documents one at a time, in sequence order. The same condition on `count` as in `buildMany`.", type: "(count: number, overrides?: FactoryOverrides<T>) => Promise<HydratedDoc<T>[]>" },
+    "reset()": { description: "Returns the counter to the start, so the next number is 1 again. Call it between tests if unique fields shouldn't depend on the run order.", type: "() => void" },
+  }}
+/>
+
+An override is an object with some of the fields, or a function of the sequence number. As the third call, `accounts.build((n) => ({ title: "VIP " + n }))` gave `{ title: "VIP 3", balance: 100 }`. An override replaces a field entirely, and nested objects aren't merged.
+
+<FullType>
+
+<Snippet id="reference/testing/testing/factory" />
+
+</FullType>
+
+`FactoryOverrides` and `FactoryModel` are argument types and don't need a section of their own.
+
+---
+
+## explainIndexUsage [#explain-index-usage]
+
+`explainIndexUsage` asks the database for the query plan (`explain("executionStats")`) and turns the server's answer into a short report. It shows the stages, the indexes, and how many documents were read. Use it where you want to look at the plan yourself, for example when debugging or in a check of your own.
+
+<Snippet id="reference/testing/testing/explain-index-usage" twoslash />
+
+The server runs a query on a unique index with the `EXPRESS_IXSCAN` stage. The index finds the document and the server reads it in full, so `docsExamined` is 1 and `covered` is `false`. If the query needs only the index fields, there's no need to read the document. Then `docsExamined` is zero and `covered` is `true`.
+
+<Snippet id="reference/testing/testing/explain-index-usage-2" twoslash />
+
+<Params>
+<Param name="query" type="Explainable" required>
+
+A `find` or `findOne` query or an aggregation of a model, that is, anything with an `explain` method.
+
+</Param>
+</Params>
+
+<Returns type="Promise<IndexUsage>">
+
+A frozen [`IndexUsage`](#index-usage) report.
+
+</Returns>
+
+If the server returns no plan, the function throws `TypemoError: explainIndexUsage: the server returned no plan`.
+
+<Callout type="warning">
+
+`covered` is `true` only when the query goes through an index, doesn't read the whole collection, has no `FETCH` stage, and the server read no documents (`docsExamined` is zero). `EXPRESS_IXSCAN` has no `FETCH` stage, but it does read the document. So the absence of `FETCH` isn't enough, and `findById` and `find` by a unique field give `covered: false`. To make a query covered, limit it to the index fields with [`select`](../query/reading.mdx#select) and drop `_id` if it isn't in the index.
+
+</Callout>
+
+<FullType>
+
+<Snippet id="reference/testing/testing/explain-index-usage-3" />
+
+</FullType>
+
+---
+
+## IndexUsage [#index-usage]
+
+`IndexUsage` is a report on how a query reads the collection. `explainIndexUsage`, `expectIndexScan`, and `expectCollScan` return it, and `IndexUsageError` keeps it in `usage`.
+
+<TypeTable
+  type={{
+    "stages": { description: "The stages of the winning plan, outermost first, for example `[\"LIMIT\", \"FETCH\", \"IXSCAN\"]`.", type: "readonly string[]" },
+    "indexes": { description: "The indexes the plan goes through (`IXSCAN`, `DISTINCT_SCAN`, `COUNT_SCAN`, `EXPRESS_IXSCAN`).", type: "readonly string[]" },
+    "collectionScan": { description: "Some stage reads the whole collection (`COLLSCAN`).", type: "boolean" },
+    "usesIndex": { description: "The plan reads through an index.", type: "boolean" },
+    "docsExamined": { description: "How many documents the server read (`totalDocsExamined`).", type: "number" },
+    "keysExamined": { description: "How many index keys the server read.", type: "number" },
+    "docsReturned": { description: "How many documents the query returned.", type: "number" },
+    "covered": { description: "The result came from the index alone. There is no `FETCH` or `COLLSCAN`, and `docsExamined` is zero. See the warning under `explainIndexUsage`.", type: "boolean" },
+  }}
+/>
+
+---
+
+## expectIndexScan [#expect-index-scan]
+
+`expectIndexScan` fails the test if the query reads the whole collection or doesn't use an index. An index is easy to lose. Rename a field or change the order of the keys, and the query quietly becomes slow. The check turns that loss into a red test.
+
+<Snippet id="reference/testing/testing/expect-index-scan" twoslash />
+
+<Params>
+<Param name="query" type="Explainable" required>
+
+A `find` or `findOne` query or an aggregation.
+
+</Param>
+<Param name="options" type="ExpectIndexOptions" default="{}">
+
+Extra expectations. `index` is the name of the index that must be used. `maxDocsExamined` is a ceiling on the documents read. `covered: true` means the result comes only from the index, without reading documents (`docsExamined` is zero).
+
+</Param>
+</Params>
+
+<Returns type="Promise<IndexUsage>">
+
+The report, if the plan meets the expectations.
+
+</Returns>
+
+**Errors.** [`IndexUsageError`](#index-usage-error) with the list of problems and the plan. The texts come from a real run.
+
+- No index: `the query is not served by an index: it scans the whole collection (COLLSCAN). plan: COLLSCAN; examined 3 documents, returned 3`.
+- Wrong index: `the query is not served by an index: it does not use the index "nope_1" (it uses: title_1). plan: EXPRESS_IXSCAN; examined 1 documents, returned 1`.
+
+If there is neither `COLLSCAN` nor an index, the text is `it uses no index`. Exceeding `maxDocsExamined` gives `it examined N documents, more than M`. An unmet `covered` requirement gives `it is not covered by the index (it fetches documents)`. Several problems are joined with `; `.
+
+The opposite check is [`expectCollScan`](#expect-coll-scan).
+
+<FullType>
+
+<Snippet id="reference/testing/testing/expect-index-scan-2" />
+
+</FullType>
+
+---
+
+## ExpectIndexOptions [#expect-index-options]
+
+An object of optional expectations for [`expectIndexScan`](#expect-index-scan): `index?: string`, `maxDocsExamined?: number`, and `covered?: boolean`. Each field is described there.
+
+<FullType>
+
+<Snippet id="reference/testing/testing/expect-index-options" />
+
+</FullType>
+
+---
+
+## expectCollScan [#expect-coll-scan]
+
+`expectCollScan` fails the test if the query does **not** read the whole collection. Use it when the missing index is intentional. Say, a rare report on a field that isn't worth an index, and you want to notice if someone adds one or the query changes.
+
+<Snippet id="reference/testing/testing/expect-coll-scan" twoslash />
+
+<Params>
+<Param name="query" type="Explainable" required>
+
+A query or an aggregation.
+
+</Param>
+</Params>
+
+<Returns type="Promise<IndexUsage>">
+
+The report, if the query reads the whole collection.
+
+</Returns>
+
+The error looks like this: `IndexUsageError: the query does not scan the collection. plan: EXPRESS_IXSCAN; examined 1 documents, returned 1`.
+
+<FullType>
+
+<Snippet id="reference/testing/testing/expect-coll-scan-2" />
+
+</FullType>
+
+---
+
+## Explainable [#explainable]
+
+`Explainable` is what the checks accept: any object with an `explain(verbosity?)` method. A `find` or `findOne` query and an aggregation of a model qualify. There is nothing more to describe, and the type is declared in the full type block under [`explainIndexUsage`](#explain-index-usage).
+
+---
+
+## IndexUsageError [#index-usage-error]
+
+`IndexUsageError` is the error of the `expectIndexScan` and `expectCollScan` checks. It extends `TypemoError` and keeps the [`IndexUsage`](#index-usage) of the plan that failed the check in `usage`. A test can print the details.
+
+<Snippet id="reference/testing/testing/index-usage-error" twoslash />
+
+<FullType>
+
+<Snippet id="reference/testing/testing/index-usage-error-2" />
+
+</FullType>
+
+---
+
+## When not to use it [#when-not-to-use]
+
+Plan checks are for tests and debugging. They run `explain`, which is an extra query. In production code, call [`.explain`](../query/search-and-explain.mdx#explain) directly.
+
+Start the test database with your application's own tools. `@venloc/typemo/testing` doesn't create one.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Test your app" href="../../testing/testing-apps.mdx">
+  A test database, factories, and index checks in a real test.
+</Card>
+<Card title="Query performance" href="../../queries/performance.mdx">
+  How to read a query plan and when to add an index.
+</Card>
+</Cards>

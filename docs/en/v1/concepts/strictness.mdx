@@ -1,0 +1,116 @@
+---
+title: Strictness
+description: "What Typemo treats as an error (unknown fields, undefined, empty filters, and wrong types) and where those errors get caught"
+icon: ShieldCheck
+---
+
+MongoDB accepts almost any query. A misspelled field in a filter, `undefined` in place of a value, an empty filter in a delete: the server either finds nothing or does the wrong thing, and it says nothing either way. Typemo does the opposite. Anything that can't be run unambiguously is an **error**, and such a query never reaches the database. This is called **strictness**, and it's always on. No option and no mode relaxes it.
+
+Below we'll cover what exactly Typemo refuses, how that differs from MongoDB itself, and when the error appears, at compile time or at runtime. One read of this page is enough. The rules of each policy are described in detail in [What data policies are](../policies/overview.mdx).
+
+The examples use bank accounts. Here's the class.
+
+<Snippet id="concepts/strictness/intro" title="accounts/account.ts" twoslash />
+
+## Unknown fields [#unknown-fields]
+
+MongoDB doesn't know which fields your documents have, and a misspelled name is as good as any other to it. The filter `{ ownr: "ann" }` returns an empty list, and `updateOne` with `$set: { nope: 1 }` happily adds a new field to the document. In the first case you'll decide there are no accounts. In the second you'll get a document with a junk field. Both times without an error.
+
+Typemo knows the fields of the class and checks every path in a filter, an update, a projection, and a sort. The compiler stops a typo right in your editor.
+
+<Snippet id="concepts/strictness/unknown-fields" twoslash />
+
+The compiler even suggests the right name (`Did you mean to write 'owner'?`). If the query is built on the fly and the compiler can't see the path, the runtime check kicks in and throws a [`StrictModeError`](../reference/errors/data-errors.mdx#strict-mode-error) with the reason `unknown-path`. The message starts with where the mistake is (`filter`, `$set`, `projection`, `sort`), then names the path and the model.
+
+<Snippet id="concepts/strictness/unknown-fields-2" twoslash />
+
+Documents that already have extra fields in the database, because another version of the schema wrote them, are a separate story. Typemo doesn't throw those fields away quietly. A save that would erase them throws an error. There's more on this on the [Handle fields that aren't in the schema](../documents/unknown-fields.mdx) page. An extra key when you create a document is an error too. `create({ owner: "x", balance: 1, bogus: 1 })` throws a [`CastError`](../reference/errors/data-errors.mdx#cast-error) with the reason `unknown-key` and the text `Cast to Account failed at path "bogus" for 1 (number): not a field of Account [unknown-key]`.
+
+The compiler accepts a filter typed as `Record<string, unknown>`, but it can't look inside. It doesn't know the keys of such an object and won't notice a typo. So dynamic filters are checked only at runtime, as in the example above, and an unknown path gives a `StrictModeError` before the database. If you know the shape of the query in advance, declare it as `Filter<Account>`, and the compiler will catch the typo.
+
+## undefined [#undefined]
+
+In JavaScript `undefined` usually means "no value", and the MongoDB driver sends it as `null` by default. So the filter `{ owner: undefined }` finds documents where the field is empty or missing altogether. What people usually expect is different: that there will be no filter on the owner at all. That's how an `undefined` from an optional parameter turns into a selection of someone else's or incomplete data.
+
+Typemo doesn't guess for you. To Typemo, `undefined` is an error, not a value. The compiler won't let it into a filter, because the type of the `owner` field is `string`, not `string | undefined`.
+
+<Snippet id="concepts/strictness/undefined" twoslash />
+
+If an `undefined` still makes it to runtime, you get a [`QueryError`](../reference/errors/query-errors.mdx#query-error) with the exact path. The message also says what you most likely meant.
+
+<Snippet id="concepts/strictness/undefined-2" twoslash />
+
+To find documents without a value, use `{ owner: { $exists: false } }`. To remove a field, use `$unset`. Both intentions are stated explicitly, and you can't mistake them for a data error.
+
+## Empty filters [#empty-filters]
+
+An empty filter `{}` in MongoDB means "every document". That's fine for a read and dangerous for a write. `deleteMany({})` deletes the whole collection, and `updateOne({}, …)` and `deleteOne({})` change or delete whatever document the server finds first. It's easy to end up with such a filter when conditions are built from optional parameters and none of them arrived. That's why Typemo doesn't let an empty filter into any write operation.
+
+- `updateOne` and `updateMany`.
+- `deleteOne` and `deleteMany`.
+- `replaceOne`.
+- `findOneAnd*`.
+
+An empty literal `{}` in these methods is stopped by the compiler already.
+
+<Snippet id="concepts/strictness/empty-filters" twoslash />
+
+A filter built at runtime can turn out empty, and the compiler can't see that. The runtime check stops such a filter. Here it's built from conditions that never showed up.
+
+<Snippet id="concepts/strictness/empty-filters-2" twoslash />
+
+If you really mean to touch everything, say so explicitly. `Filters.all()` allows "every document" and takes no arguments. [Empty filters in writes](../writes/empty-filters.mdx) covers which methods are checked and where an empty filter comes from.
+
+## Wrong types [#invalid-types]
+
+MongoDB doesn't compare the type in a query with the type of the field. To the server, the filter `{ balance: "10" }` matches nothing, because the string `"10"` and the number `10` are different values. Typemo doesn't quietly turn a string into a number. Either the value fits the field, or it's an error.
+
+The compiler notices a wrong type both in a write and in a filter.
+
+<Snippet id="concepts/strictness/invalid-types" twoslash />
+
+At runtime the same check throws a [`CastError`](../reference/errors/data-errors.mdx#cast-error), and the reason in brackets (`type`) says what's wrong. You need it because the compiler never saw data from an HTTP request or from files.
+
+<Snippet id="concepts/strictness/invalid-types-2" twoslash />
+
+The same goes for `null`. The filter `{ owner: { $ne: null } }` makes no sense for a field that can't be `null`, and Typemo tells you so: `Cast to string failed at path "owner.$ne" for null: null is not a value of this path (it is not nullable); an absent field is { $exists: false }`. Types with a safe string form (`ObjectId`, `UUID`, int64) accept a string, because it's unambiguous. There's more on the [MongoDB data types](./bson-types.mdx) page.
+
+## Data already in the database [#existing-data]
+
+All the checks above guard the way **into** the database: in a query, a filter, a write. So a document written by the model already has the declared types, and by default Typemo doesn't recheck it on read. Checking every field of every document read would cost time on every query and would find nothing in the model's own data.
+
+But the model isn't the only thing that writes to a collection. There may be a script on the driver, another service, an import, an old version of the schema. In such a document the `balance` field may hold the string `"12"`, and a normal read hands it to your code typed as `number`. For this case there's **strict reading**, and you turn it on explicitly: with the client option [`validateReads`](../reference/connection/typemo-client.mdx#validate-reads) or with a [`.validateReads()`](../reference/query/options.mdx#validate-reads) call on the query. Then the document is checked against the schema before it becomes a result.
+
+<Snippet id="concepts/strictness/existing-data" twoslash />
+
+The error is the same as on a write, a [`CastError`](../reference/errors/data-errors.mdx#cast-error) with the path and the reason. The only difference is that the text says the value came from the database. The value `"development"` turns the check on everywhere except `NODE_ENV=production`. In development and tests you see corrupted data right away, and in production reads don't pay for the check.
+
+This is the only Typemo check you turn on separately. It doesn't relax strictness. It adds a check for data that Typemo didn't write.
+
+## Compile time and runtime [#compile-time-and-runtime]
+
+Every rule is checked twice, and that's not duplication. The compiler sees your code: field names in literals, value types, `undefined`, a field that doesn't exist. It catches the mistake while you type. But data from a request, from a file, or from a filter built on the fly arrives after compilation. So the same checks run at runtime too, and they throw errors from the Typemo hierarchy with the exact path and reason.
+
+There's a simple consequence. If your types are written carefully, a runtime error means **bad input data**, not your typo. Put the `catch` at the edge of your application, where outside data comes in (a request handler, a job from a queue), not around every call. [Error handling](../errors/handling.mdx) shows how to set that up, and every reason with examples is listed in the [`StrictModeError`](../reference/policies/violations.mdx#strict-mode-error) reference.
+
+Strictness doesn't end with this page. Here's what else Typemo refuses.
+
+- `limit(0)`, with the error `limit must be a positive integer, got 0 (number)`. The value is printed together with its type, so you can see right away that `"3"` is a string.
+- An update that turned out empty after casting: `update: operator "$set" is empty`.
+- A write to an immutable field.
+
+Some checks live in policies that apply to every operation of a model. Among them are [strict paths](../policies/strict-paths.mdx), [empty filters and limits](../policies/filters-and-limits.mdx), and protection against [untrusted input](../policies/untrusted-input.mdx).
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="What data policies are" href="../policies/overview.mdx">
+  Rules that apply to every operation of a model and can't be turned off for a single query.
+</Card>
+<Card title="Empty filters in writes" href="../writes/empty-filters.mdx">
+  Which methods refuse an empty filter and how to delete everything on purpose.
+</Card>
+<Card title="How to read types in your editor" href="./reading-types.mdx">
+  How to make sense of a compiler message when a query doesn't compile.
+</Card>
+</Cards>

@@ -1,0 +1,166 @@
+---
+title: BsonGuards and BsonTypeTable
+description: "Runtime BSON value checks, the type table the forms are built from, and the BSON settings Typemo fixes"
+icon: ScanSearch
+---
+
+`BsonGuards` answers the question "what kind of value is this?" at runtime: an `ObjectId`, a `UUID`, a date, a map, or a plain object. `BsonTypeTable` is the table that records, for each MongoDB type, how it looks in a document, in the `.lean()` result, in the `.plain()` result, and in JSON. Both the types and the value forms are built from it.
+
+Both parts are useful when you write code over values whose type the compiler knows nothing about. For example, you parse data from an external source, write your own serializer, or write a function that takes `unknown`. In ordinary work with models you don't need them, because Typemo does the casting and the forms itself.
+
+For what a value looks like in each form, see [Value forms](./value-forms.mdx). This page covers the classes under them and the BSON settings Typemo fixes on the client.
+
+The elements of this page are [`BsonGuards`](#bson-guards), [`BsonTypeTag`](#bson-type-tag), [`BsonTypeTable`](#bson-type-table), and [`BsonOptions`](#bson-options).
+
+---
+
+## BsonGuards [#bson-guards]
+
+`BsonGuards` is a set of static checks that narrow the type of a value. Their main property is that they recognize BSON values by the service tag of the `bson` package, not through `instanceof`. A project can have two copies of `bson`, for example in a monorepo or in a nested dependency. Their classes differ, but the tags are the same. `instanceof` from one copy won't recognize a value from the other, and a check by tag will. Built-in types (`Date`, `RegExp`, `Map`) are checked by the `Object.prototype.toString` string tag for the same reason: a value can come from another execution context.
+
+<Snippet id="reference/values/bson-guards/bson-guards" twoslash />
+
+Mind the order of the checks. A BSON `UUID` is a binary value of a special kind, so `isBinary` returns `true` for it too. Put the narrower `isUuid` first.
+
+<Returns type="boolean">
+
+Each check returns `true` if the value fits, and narrows the type in the `if` branch. No check throws on any input, `null` and `undefined` included.
+
+</Returns>
+
+<Params>
+<Param name="value" type="unknown" required>
+
+Any value. All the checks take it as the single argument.
+
+</Param>
+</Params>
+
+The checks for values of the `bson` package.
+
+<TypeTable
+  type={{
+    "BsonGuards.tagOf": { description: "The BSON class name of the value (`\"ObjectId\"`, `\"Binary\"`, `\"Long\"`, …) or `undefined` if the value isn't from `bson`. The old name `ObjectID` is mapped to `ObjectId`.", type: "(value: unknown) => BsonTypeTag | undefined" },
+    "BsonGuards.isBsonValue": { description: "A value of any class of the `bson` package, that is, one `tagOf` recognizes.", type: "(value: unknown) => boolean" },
+    "BsonGuards.isObjectId": { description: "`ObjectId`.", type: "(value: unknown) => value is ObjectId" },
+    "BsonGuards.isDecimal128": { description: "`Decimal128`.", type: "(value: unknown) => value is Decimal128" },
+    "BsonGuards.isLong": { description: "The `Long` wrapper. The driver with Typemo's settings returns int64 as a `bigint`, so `Long` doesn't appear in data from the database.", type: "(value: unknown) => value is Long" },
+    "BsonGuards.isInt32": { description: "The `Int32` wrapper.", type: "(value: unknown) => value is Int32" },
+    "BsonGuards.isDouble": { description: "The `Double` wrapper.", type: "(value: unknown) => value is Double" },
+    "BsonGuards.isTimestamp": { description: "`Timestamp`.", type: "(value: unknown) => value is Timestamp" },
+    "BsonGuards.isBsonRegExp": { description: "`BSONRegExp`, not a native regular expression.", type: "(value: unknown) => value is BSONRegExp" },
+    "BsonGuards.isBsonSymbol": { description: "`BSONSymbol`.", type: "(value: unknown) => value is BSONSymbol" },
+    "BsonGuards.isCode": { description: "`Code`.", type: "(value: unknown) => value is Code" },
+    "BsonGuards.isDbRef": { description: "`DBRef`.", type: "(value: unknown) => value is DBRef" },
+    "BsonGuards.isMinKey": { description: "`MinKey`.", type: "(value: unknown) => value is MinKey" },
+    "BsonGuards.isMaxKey": { description: "`MaxKey`.", type: "(value: unknown) => value is MaxKey" },
+    "BsonGuards.isBinary": { description: "`Binary` of any subtype. `UUID` values and vectors pass too.", type: "(value: unknown) => value is Binary" },
+    "BsonGuards.isUuid": { description: "`Binary` of subtype 4 with exactly 16 bytes. On read, such a value becomes a `UUID`.", type: "(value: unknown) => value is UUID" },
+    "BsonGuards.isVector": { description: "`Binary` of subtype 9 (a vector). The vector header (element type, padding) isn't checked.", type: "(value: unknown) => value is Binary" },
+  }}
+/>
+
+The checks for built-in types and object shape.
+
+<TypeTable
+  type={{
+    "BsonGuards.isDate": { description: "A `Date`, including an invalid one (`Invalid Date`).", type: "(value: unknown) => value is Date" },
+    "BsonGuards.isValidDate": { description: "A `Date` whose time is a number.", type: "(value: unknown) => value is Date" },
+    "BsonGuards.isRegExp": { description: "A native `RegExp`.", type: "(value: unknown) => value is RegExp" },
+    "BsonGuards.isMap": { description: "`Map`.", type: "(value: unknown) => value is Map<unknown, unknown>" },
+    "BsonGuards.isSet": { description: "`Set`. The type table has no row for it, and the value can't be stored.", type: "(value: unknown) => value is Set<unknown>" },
+    "BsonGuards.isUint8Array": { description: "A `Uint8Array`, including a `Buffer`.", type: "(value: unknown) => value is Uint8Array" },
+    "BsonGuards.isOpaqueValue": { description: "A value stored as a whole, which a path doesn't enter. That's a `bson` value, a typed array, `Date`, `RegExp`, `Map`, `Set`, or `ArrayBuffer`. Plain objects and arrays aren't.", type: "(value: unknown) => boolean" },
+    "BsonGuards.isPlainObject": { description: "An object a path enters as an embedded document: a plain object or an instance of your class. Arrays, functions, and opaque values don't fit.", type: "(value: unknown) => value is Readonly<Record<string, unknown>>" },
+    "BsonGuards.isPojo": { description: "An object literal whose prototype is `Object.prototype` or `null` (`{ a: 1 }`, the result of `JSON.parse`). Class instances don't fit. Use it where the input accepts a key-to-value record, for example for a map field.", type: "(value: unknown) => value is Readonly<Record<string, unknown>>" },
+  }}
+/>
+
+An example shows the difference between the last two checks. An instance of your class `Foo` is an embedded document for `isPlainObject` and isn't one for `isPojo`.
+
+<Snippet id="reference/values/bson-guards/bson-guards-2" twoslash />
+
+### When not to use it [#bson-guards.when-not-to-use]
+
+To check that a value is an instance of your model, use the class itself and `instanceof`. `BsonGuards` doesn't know your classes. Check the structure of input data (required fields, format) with a validation schema. The checks on this page answer only the question about the type of a value.
+
+## BsonTypeTag [#bson-type-tag]
+
+`BsonTypeTag` is a union of the BSON class names that `tagOf` recognizes. They are `"ObjectId"`, `"Binary"`, `"Long"`, `"Decimal128"`, `"Double"`, `"Int32"`, `"Timestamp"`, `"BSONRegExp"`, `"BSONSymbol"`, `"Code"`, `"DBRef"`, `"MinKey"`, and `"MaxKey"`. `UUID` has no tag of its own, since it's a `Binary` of subtype 4.
+
+<Snippet id="reference/values/bson-guards/bson-type-tag" twoslash />
+
+## BsonTypeTable [#bson-type-table]
+
+`BsonTypeTable` is the single "MongoDB type to TypeScript type" table for all four forms. The document, the `.lean()` result, JSON, and the `.plain()` result take the type and behavior from one row. A row can't exist only on the type side or only on the runtime side, so the result type doesn't drift from the data. The class gives both the table data and the functions that convert between forms.
+
+<TypeTable
+  type={{
+    "BsonTypeTable.scalars": { description: "The scalar type rows by table key: `objectId`, `string`, `double`, `int32`, `long`, `decimal128`, `bool`, `date`, `binary`, `uuid`, `vector`, `regex`, `timestamp`, `minKey`, `maxKey`, `null`. A row has `key`, `bsonType` (the numeric code), `alias` (the name for `$type`), `forms` (the text of the types in the four forms), the check `is`, and the conversions `toJson` and `toPlain`.", type: "{ [K in BsonScalarKey]: BsonScalarRow<K> }" },
+    "BsonTypeTable.containers": { description: "The container rows: `array`, `object`, `map`.", type: "{ [K in BsonContainerKey]: BsonTypeRow<K> }" },
+    "BsonTypeTable.keys": { description: "All the row keys in table order, scalars first, then containers.", type: "readonly BsonTypeKey[]" },
+    "BsonTypeTable.kindOf": { description: "The key of the row the serializer assigns the value to. A number is `int32` if it's an integer in the int32 range (and not `-0`), and `double` otherwise. A `bigint` is `long`. A `Binary` is `uuid`, `vector`, or `binary`. For values the table doesn't have, it returns `undefined`.", type: "(value: unknown) => BsonTypeKey | undefined" },
+    "BsonTypeTable.toLean": { description: "From a document to the `.lean()` form. Maps become objects, and mutable values (`Date`, `Binary`, `RegExp`) are copied.", type: "<T>(value: T, path?: string) => LeanValue<T>" },
+    "BsonTypeTable.toJson": { description: "From a document to the JSON form.", type: "<T>(value: T, path?: string) => JsonValue<T>" },
+    "BsonTypeTable.toPlain": { description: "From a document to the `.plain()` form.", type: "<T>(value: T, path?: string) => PlainValue<T>" },
+    "BsonTypeTable.scalarToPlain": { description: "The `.plain()` form of one scalar, without containers. The fast path for reading by schema.", type: "(value: unknown, path: string) => unknown" },
+  }}
+/>
+
+Calls of `kindOf` and the conversions show what comes out for different values.
+
+<Snippet id="reference/values/bson-guards/bson-type-table" twoslash />
+
+The `path` parameter is optional. It's the path of the value in the document, it goes into the error text, and it shows where the unsuitable value was found.
+
+### Errors [#errors]
+
+Some values have no row in the table. These are a function, `undefined`, a symbol, a `Set`, the "raw" wrappers `Long`, `Int32`, and `Double`, and the deprecated `Code`, `DBRef`, and `BSONSymbol`. On such a value all three conversions (`toLean`, `toPlain`, `toJson`) throw a [`CastError`](../errors/data-errors.mdx#cast-error) with the reason `type`, at any depth. The error names the path to the value, instead of staying silent where a function could have been skipped. The text comes from a real run.
+
+<Snippet id="reference/values/bson-guards/errors" />
+
+A function inside a nested object, array, or Map gets the same answer, and the path shows where it sits.
+
+<Snippet id="reference/values/bson-guards/errors-2" />
+
+`toJson` also rejects `NaN` and the infinities, which JSON doesn't have: `CastError: Cast to JSON number failed at path "doc.n" for NaN (number): JSON has no NaN or Infinity [json]`. `toPlain` and `toLean` leave `NaN` and `Infinity` as numbers. In JavaScript they're ordinary numbers, and there's nothing to reject them with. So data from `.plain()` with a `NaN` turns into `null` in `JSON.stringify`, while `$toJSON()` refuses honestly. If `NaN` is possible in your data, check for it before serializing.
+
+### When not to use it [#bson-type-table.when-not-to-use]
+
+If you need the form of a model's document, call the document methods ([`$toPlain`](../documents/document-api.mdx#to-plain), [`$toJSON`](../documents/document-api.mdx#to-json)) or `.plain()` on a query. They know the schema: maps, hidden fields, references. `BsonTypeTable` works with a single value and doesn't know the schema.
+
+## BsonOptions [#bson-options]
+
+`BsonOptions` holds the BSON settings Typemo imposes on the driver, so data from the database matches the table. `int64` is always a `bigint`, binary data stays `Binary`, regular expressions are read as native `RegExp`, and `undefined` isn't silent. The settings can't be turned off. A conflicting value is an error, not a choice. `TypemoClient` applies them itself. This section is useful if you create a driver client by hand and want to pass it to Typemo, or to check your own options.
+
+<Snippet id="reference/values/bson-guards/bson-options" twoslash />
+
+<TypeTable
+  type={{
+    "BsonOptions.REQUIRED": { description: "The fixed values (`RequiredBsonOptions`): `useBigInt64: true`, `promoteValues: true`, `promoteLongs: true`, `promoteBuffers: false`, `bsonRegExp: false`, `ignoreUndefined: false`, `serializeFunctions: false`, `raw: false`, `enableUtf8Validation: true`.", type: "RequiredBsonOptions" },
+    "BsonOptions.apply": { description: "A new options object with the required settings, and the input isn't changed. A key set to a different value gives a `ConfigurationError`.", type: "<T extends object>(options: T) => Omit<T, FixedKey> & RequiredBsonOptions" },
+    "BsonOptions.verify": { description: "Checks already resolved options of a client, database, or collection (`.bsonOptions`). Each required setting must be set and equal to the required value.", type: "(resolved: BSONSerializeOptions, where: string) => void" },
+  }}
+/>
+
+The compiler watches for conflicts too. The `CompatibleBsonOptions<T>` type allows a required key to be only missing or equal to the required value. At runtime a conflict gives a [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error).
+
+<Snippet id="reference/values/bson-guards/bson-options-2" />
+
+`verify` requires every setting to be set explicitly. On options you didn't fill in, it lists all the keys: `ConfigurationError: users: BSON options conflict with Typemo — useBigInt64: false (required: true), promoteValues: undefined (required: true), …`. The `fieldsAsRaw` setting isn't supported at all, because raw fields bypass the type table.
+
+With `bsonRegExp: false`, regular expressions are read as native `RegExp`. They lack the BSON flags `x`, `l`, `u`, and the BSON flag `s` comes back as the JavaScript flag `g`. So Typemo writes only the `i` and `m` flags of a regular expression.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Value forms" href="./value-forms.mdx">
+  What each MongoDB type looks like in a document, the `.lean()` result, the `.plain()` result, and JSON.
+</Card>
+<Card title="Form types" href="./form-types.mdx">
+  The types that describe the forms in TypeScript.
+</Card>
+<Card title="Data errors" href="../errors/data-errors.mdx">
+  `CastError` and the reasons a value cast fails.
+</Card>
+</Cards>

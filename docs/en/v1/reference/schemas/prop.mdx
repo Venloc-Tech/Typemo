@@ -1,0 +1,411 @@
+---
+title: "@Prop"
+description: "The model field decorator and every option: what it does, which types it applies to, and the error it throws when misused."
+icon: Tag
+---
+
+`@Prop` declares a model field. It says what type of value is stored in the database and by what rules Typemo accepts, validates, and returns it. This page describes the decorator itself and **all** its options, each in its own section. Open it when you need to check what an option does, which types it applies to, and what happens on an error.
+
+To start your first model, the guide [Define a model](../../schemas/define-model.mdx) is a better place. It explains where the field type comes from and how a model ties to a collection. This page is the reference.
+
+The examples use small models with one or two options. The results in the `// →` comments come from a real MongoDB. The examples for `hidden`, `ref`, `refPath`, and `refModel` read documents created beforehand: the user `gina` with the hash `h`, the author `Ann`, and the bot `R2`.
+
+---
+
+## @Prop [#prop]
+
+`@Prop(() => Type, options)` records a field in the class description. The first argument is a **function that returns the runtime type**, for example `() => String`, `() => [Address]`, or `() => Types.ObjectId`. You have to state the type explicitly on every field. Typemo doesn't read `design:type` metadata, because it can't tell `int32` from `double`, doesn't know an array's element, and confuses `null` with a missing value. The function is there so a class from the end of the file or another module exists by the time the schema is built.
+
+Options and the field type are checked twice. First the compiler checks the options against the type you wrote in the class. `hidden: true` requires `Hidden<T>`, `default` requires `Defaulted<T>`, and `nullable: true` requires `| null` and vice versa. The second check runs when the model is built in [`client.db().model(...)`](../connection/connection.mdx). It catches the same things for code without types, and rules the compiler can't handle, such as `min` greater than `max`. A violation throws [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error) with the class and field name.
+
+<Snippet id="reference/schemas/prop/prop" twoslash />
+
+<Returns type="PropDecorator<S, O>">
+
+A property decorator. It only records the field in the class description, and [`model`](../connection/connection.mdx) builds the schema. On a static member, a method, or an accessor, it throws `ConfigurationError` immediately.
+
+</Returns>
+
+<Params>
+<Param name="type" type="() => TypeSpec" required>
+
+A function that returns the field's runtime type. It's a constructor (`String`, `Number`, `Boolean`, `Date`, `BigInt`, `RegExp`), a class from [`Types`](./types-and-spec.mdx#types), a class with [`@Schema`](./schema.mdx#schema), an array `[X]`, or the result of [`Spec`](./types-and-spec.mdx#spec). `Set`, `Map`, `Array`, and `Object` aren't supported. Use `[X]` and `Spec.map(X)` instead.
+
+</Param>
+<Param name="options" type="PropOptions<S>">
+
+The field options. Which ones are allowed depends on the type (see the table below). An option the type doesn't have is a compile error on the key, and in code without types it's a `ConfigurationError`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/schemas/prop/prop-2" />
+
+</FullType>
+
+### Which options apply to which types [#options-by-type]
+
+Any field accepts the common options. The rest depend on the value type. For an array, the options of the element type apply to the elements, while `text` and `expires` stay on the array itself.
+
+| Field type | Common | Additional |
+|---|---|---|
+| all types | `required`, `nullable`, `default`, `immutable`, `hidden`, `sensitive`, `dbName`, `index`, `unique`, `sparse`, `validate`, `get`, `set`, `ext` | — |
+| `String` | common | `enum`, `lowercase`, `uppercase`, `trim`, `match`, `minLength`, `maxLength`, `text`, `ref`, `refPath`, `refModel` |
+| `Number`, `Types.Double`, `Types.Int32` | common | `enum`, `min`, `max`, `ref`, `refPath`, `refModel` |
+| `BigInt` | common | `min`, `max` |
+| `Date` | common | `min`, `max`, `expires` |
+| `Types.ObjectId`, `Types.UUID` | common | `ref`, `refPath`, `refModel` |
+| a class with `@Schema` | common | `excludeIndexes` |
+| `Spec.map(X)` of strings, numbers, `ObjectId`, `UUID` | common | `ref`, `refPath`, `refModel` (apply to the values) |
+| the rest (`Boolean`, `Types.Decimal128`, `Types.Binary`, `Types.Timestamp`, `Spec.vector`, `RegExp`, `Spec.union`) | common | — |
+
+For example, `min` is an option for numbers and dates. A string doesn't have it.
+
+<Snippet id="reference/schemas/prop/options-by-type" twoslash />
+
+The compiler underlines the `min` key and says the string options type has no such property. Without types, the same thing happens when the model is built: `Wrong.title: "min" is not an option of this field type`.
+
+---
+
+## required [#required]
+
+`required: true` requires the field to be in the document. Without `nullable`, it can't be `null` either. Together with [`nullable: true`](#nullable), the key is required but `null` is allowed. The option is always explicit. Typemo doesn't infer it from `?` or `!`, because `?` describes a type in TypeScript, while being required is a rule for data. Those are two different decisions. It works on all types.
+
+The check runs when a document is created or replaced, in [`$validate`](../documents/document-api.mdx#validate), and on save.
+
+<Snippet id="reference/schemas/prop/required" twoslash />
+
+That's a [`ValidationError`](../errors/data-errors.mdx#validation-error) with the reason `required`. How a missing field differs from `null` is covered in the guide [Required fields, null, and missing values](../../schemas/required-and-null.mdx).
+
+---
+
+## nullable [#nullable]
+
+`nullable: true` declares `null` a valid value of the field. Without it, `null` doesn't pass. In MongoDB, a missing field and an explicit `null` are different states, and Typemo doesn't silently mix them up. It works on all types. The field type must contain `| null`, and the compiler checks this both ways.
+
+<Snippet id="reference/schemas/prop/nullable" twoslash />
+
+If you forget `| null` in the type, the compiler asks for it.
+
+<Snippet id="reference/schemas/prop/nullable-2" twoslash />
+
+The error message text is `@Prop "nickname": "nullable" is set, but the field type has no "| null"`. The reverse case, `| null` in the type without `nullable: true`, gives `@Prop "nickname": the field type has "| null", add nullable: true`.
+
+If `null` arrives at a field without `nullable`, type casting throws [`CastError`](../errors/data-errors.mdx#cast-error): `Cast to string failed at path "role" for null: null is not allowed on a path that is not nullable [null]`.
+
+With [`required: true`](#required), `nullable` gives the pair "the key is required, the value may be `null`". A document without the key doesn't save (`Validation failed: "phone": the field is required [required]`). `null` passes. `$unset` on such a field is forbidden (`Validation failed: "phone": the field is required; $unset would remove it [required]`). The field type is `T | null` without `?`. For examples, see the guide [Required fields, null, and missing values](../../schemas/required-and-null.mdx).
+
+---
+
+## default [#default]
+
+`default` sets the value that's filled in when the field is missing from the input. It takes a value or a function with no arguments. The function runs anew for each document, so `() => new Date()` gives a fresh date, and an array literal is copied. It works on all types. The field is declared as `Defaulted<T>`. This [marker](./field-markers.mdx#defaulted) tells the type that the field can be left out on creation and is always there on read. An array field doesn't need the marker, because an array with no value and no `default` becomes empty (`[]`) on its own. So `tags!: string[]` with `default: () => ["new"]` compiles, and `Defaulted<string[]>` is allowed but not required.
+
+<Snippet id="reference/schemas/prop/default" twoslash />
+
+The default value is checked when the model is built. `default: "x"` on a numeric field throws `ConfigurationError`: `D1.a: the "default" value is not a value of the field (got "x" (string)): expected a number [type]`. `default: null` is allowed only together with `nullable: true`, otherwise you get `D2.a: "default: null" on a field that is not nullable`.
+
+The compiler also watches the `default` and `Defaulted<T>` pair.
+
+<Snippet id="reference/schemas/prop/default-2" twoslash />
+
+The message is `@Prop "score": "default" is set, declare the field as Defaulted<T>`. In the other direction, `Defaulted<T>` without `default` gives `the field is Defaulted<T>, but "default" is missing`.
+
+---
+
+## immutable [#immutable]
+
+`immutable: true` forbids changing the value after the document is created. It works on all types, and the field is declared as `Immutable<T>`. Use it for things that must never change: the country of registration, an identifier in an external system, the creation date.
+
+An update operator on such a field is stopped by the compiler. An immutable field isn't among the valid `$set` paths.
+
+<Snippet id="reference/schemas/prop/immutable" twoslash />
+
+If the update is built in code without types, Typemo catches the same thing at runtime.
+
+<Snippet id="reference/schemas/prop/immutable-2" twoslash />
+
+Assigning in a loaded document doesn't throw right away, but you can't save such a change. In every case it's a [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error) with the reason `immutable`. `$save` after changing the field throws the same error with the same text. On an upsert, the field's value is written only through `$setOnInsert`. A whole-document replacement ([`replaceOne`](../writes/writes.mdx#replace-one)) must carry the field's stored value. If the document has no such field, you don't pass it. The server compares any mismatch, and a replacement with one doesn't get written. For details, see the guide [Immutable fields](../../schemas/immutable.mdx).
+
+---
+
+## hidden [#hidden]
+
+`hidden: true` removes the field from query results until you select it explicitly. A password hash or a service token won't leak into a response by mistake. It works on all types. The field is declared as `Hidden<T>`, and it's missing from the result type as well. The option replaces `select: false` from Mongoose.
+
+<Snippet id="reference/schemas/prop/hidden" twoslash />
+
+A hidden field is read if you select it explicitly. `select({ passwordHash: 1 })` returns only it and `_id`, and `select({ "+passwordHash": true })` adds it to the ordinary fields. But data that leaves the application doesn't carry the hidden field, even after such a selection. `.plain()` and `$toPlain()` always remove it. Only `.plain({ hidden: true })` and `.lean()` can show it.
+
+The compiler checks the `hidden: true` and `Hidden<T>` pair: `@Prop "passwordHash": "hidden" is set, declare the field as Hidden<T>` and, the other way around, `the field is Hidden<T>, add hidden: true`. For a guide, see [Hidden and sensitive fields](../../schemas/hidden-and-sensitive.mdx).
+
+---
+
+## sensitive [#sensitive]
+
+`sensitive` decides how a value looks **outside the database**: in the audit log, in observation events (and so in traces), and in error texts. It works on all types. The values are:
+
+- `"show"`: show the real value
+- `"mask"`: show `?`
+- `"hide"`: replace the value with `[hidden]`, and for a condition like `$gt`, the whole condition. The key stays, so you can see the field was there
+- `{ mask: (value) => json }`: your own mask function, typed by the field's value
+
+<Snippet id="reference/schemas/prop/sensitive" twoslash />
+
+A tag on the field outranks an observation subscriber's setting. The mask function is called only for a value of the declared type. A value that couldn't be cast (a number in a string field), an array element, and an operand of another type show as `?` without calling the function. If the function throws while the event or the error text is being prepared, the operation continues and shows `?`. The failure reaches subscribers as an `instrumentation.error` event, and without subscribers it goes to `console.error`. In the audit log, such a failure is an [`AuditError`](../errors/configuration-errors.mdx#audit-error). No log entry is created, and the transaction rolls back along with the write itself. Where masking applies is described in detail in the guide [Hidden and sensitive fields](../../schemas/hidden-and-sensitive.mdx).
+
+---
+
+## dbName [#db-name]
+
+`dbName` sets the field name in the database when it differs from the class property name. It works on all types. The value is a non-empty string with no dot and no leading `$`. In code, filters, and results, you use the property name. The `dbName` name is visible only in the database itself.
+
+<Snippet id="reference/schemas/prop/db-name" twoslash />
+
+Through the driver, the same document looks like `{ e: "a@b.c" }`. Two fields with the same `dbName`, or a `dbName` that matches another field's name, throw `ConfigurationError` (`fields "a" and "b" are both stored as "x" (dbName conflict)`). `_id` can't have a `dbName`.
+
+---
+
+## enum [#enum]
+
+`enum` limits a string or number to a given list of values. It takes an array or an object (a TypeScript `enum` works, and the values are taken from it). For an array, the option applies to each element. A field with a union of literals (`"user" | "admin"`) must have an `enum` with the same values. Conversely, a field with `enum` must have such a type. The compiler checks that they match.
+
+<Snippet id="reference/schemas/prop/enum" twoslash />
+
+The compiler catches mismatches. A field with literals and no `enum` gives `@Prop "role": the field is a literal union, list its members in "enum"`. If the list doesn't match the type, you get `"enum" values differ from the field's literal union`. At build time, an empty list gives `"enum" is empty`, and a value that doesn't fit the field's type gives `the enum value 1 is not a value of the field`.
+
+---
+
+## min [#min]
+
+`min` is the lower bound of the value. It works on `Number`, `Types.Double`, `Types.Int32` (a number), `BigInt` (a `bigint`), and `Date` (a date). The bound must be a value of the same type as the field.
+
+<Snippet id="reference/schemas/prop/min" twoslash />
+
+A bound of the wrong type, or `min` greater than `max`, throws `ConfigurationError`: `"min" is greater than "max"`.
+
+---
+
+## max [#max]
+
+`max` is the upper bound. The types and rules are the same as for [`min`](#min).
+
+<Snippet id="reference/schemas/prop/max" twoslash />
+
+---
+
+## minLength [#min-length]
+
+`minLength` is the minimum string length, a non-negative integer. It works on `String`. The length is counted after `trim` and case conversion, so spaces at the edges don't count.
+
+<Snippet id="reference/schemas/prop/min-length" twoslash />
+
+A non-integer or negative number, and `minLength` greater than `maxLength`, throw `ConfigurationError` (`"minLength"/"maxLength" must be non-negative integers`, `"minLength" is greater than "maxLength"`).
+
+---
+
+## maxLength [#max-length]
+
+`maxLength` is the maximum string length. The rules are the same as for [`minLength`](#min-length).
+
+<Snippet id="reference/schemas/prop/max-length" twoslash />
+
+---
+
+## match [#match]
+
+`match` is a regular expression the string must match. It works on `String`. The `g` and `y` flags are forbidden. Such an expression has state (`lastIndex`), and one check would give different answers for the same value.
+
+<Snippet id="reference/schemas/prop/match" twoslash />
+
+With the `g` flag, the model doesn't build: `"match" with the g or y flag is stateful (lastIndex); remove the flag`.
+
+---
+
+## trim [#trim]
+
+`trim: true` trims the spaces at the edges of a string on assignment. It works on `String`. Trimming runs before `lowercase`, `uppercase`, the length checks, and `match`.
+
+<Snippet id="reference/schemas/prop/trim" twoslash />
+
+---
+
+## lowercase [#lowercase]
+
+`lowercase: true` converts a string to lowercase on assignment. It works on `String`. It doesn't combine with `uppercase`.
+
+<Snippet id="reference/schemas/prop/lowercase" twoslash />
+
+Both options together throw `ConfigurationError`: `"lowercase" and "uppercase" together`.
+
+---
+
+## uppercase [#uppercase]
+
+`uppercase: true` converts a string to uppercase on assignment. The types and restrictions are the same as for [`lowercase`](#lowercase). It suits country or currency codes.
+
+<Snippet id="reference/schemas/prop/uppercase" twoslash />
+
+---
+
+## validate [#validate]
+
+`validate` is your own value check, a function or a list of functions. The function receives the value and a context. It returns `true` if all is well, or a string with the error text, and it can be asynchronous. It works on all types. It runs after type casting and only for values that aren't `null`, while a missing value and `null` are left to [`required`](#required) and [`nullable`](#nullable). From a list, all the checks run, and the error carries all the messages.
+
+<Snippet id="reference/schemas/prop/validate" twoslash />
+
+The second argument is the check context (see below), which tells the check where it was run. For a whole document it's `{ kind: "document", operation, path }`. For a value written by an update operator, it's `{ kind: "update", operation, operator, path, upsert, filter }`. The check works on update too. `updateOne` with `$set` called the same function with the context `update:updateOne`. A non-function in `validate` throws `ConfigurationError`.
+
+### Check context [#check-context]
+
+The context is an object of one of two kinds, told apart by the `kind` field, `"document"` or `"update"`. `@venloc/typemo` exports `DocumentValidationContext`, `UpdateValidationContext`, their union `ValidationContext`, and the type of the function itself, `FieldValidator<V>`. You can move a shared validator into a separate function with exact types.
+
+<Snippet id="reference/schemas/prop/check-context" twoslash />
+
+---
+
+## get [#get]
+
+`get` is a function that transforms the value when **reading through `$get`** and when serializing with the `getters: true` parameter (`$toObject`, `$toJSON`, `$toPlain`). It works on all types. It takes a value and returns a value of the same type.
+
+<Snippet id="reference/schemas/prop/get" twoslash />
+
+An ordinary property read (`label.tag`) doesn't call `get`. It works only through `$get` and when serializing with `getters: true`. It's also absent from the `lean()` result and from the values that go to the database.
+
+---
+
+## set [#set]
+
+`set` is a function that transforms the value on assignment, **after** type casting and the built-in transformations (`trim`, `lowercase`, `uppercase`). It works on all types. In the example above, `set` turned `"abc"` into `"ABC"` already in `Labels.new`.
+
+---
+
+## index [#index]
+
+`index` creates a single-field index. The values are `true` and `1` for ascending, `-1` for descending, and `"hashed"` for a hashed index. It works on all types. Compound indexes are described by the [`@Index`](./index-decorators.mdx#index) decorator.
+
+<Snippet id="reference/schemas/prop/index" twoslash />
+
+Any other value throws `ConfigurationError`: `"index" must be true, 1, -1 or "hashed"`. An index on `_id` is forbidden, because the server builds it as unique anyway.
+
+---
+
+## unique [#unique]
+
+`unique: true` creates a unique index. The server won't let a second document with the same value be written. It works on all types. One of three conditions is needed: `required: true`, `sparse: true`, or a partial `@Index`. This comes from MongoDB. Documents without the field are indexed as `null`, and a second such document would fail with a duplicate error.
+
+<Snippet id="reference/schemas/prop/unique" twoslash />
+
+Without `required` and `sparse`, the model doesn't build.
+
+<Snippet id="reference/schemas/prop/unique-2" />
+
+`unique` on a field with `nullable: true` is forbidden too. `null` values collide even in a sparse index (`"unique" on a nullable field — null values collide even in a sparse index; use a partial @Index`). A uniqueness violation on write is a [`DuplicateKeyError`](../errors/server-errors.mdx#duplicate-key-error).
+
+---
+
+## sparse [#sparse]
+
+`sparse: true` makes the field's index sparse, so only documents with that field get into it. It works on all types, but only together with `index` or `unique`. By itself it doesn't create an index, and `sparse` without them throws `ConfigurationError` (`"sparse" needs "index" or "unique"`).
+
+<Snippet id="reference/schemas/prop/sparse" twoslash />
+
+---
+
+## expires [#expires]
+
+`expires` is the lifetime of a document in seconds after the date value. It works on `Date` and on arrays of dates. A TTL index is built for it, and MongoDB itself deletes the document when the time is up. The value is a non-negative whole number, otherwise `ConfigurationError` (`"expires" is a non-negative whole number of seconds`).
+
+<Snippet id="reference/schemas/prop/expires" twoslash />
+
+The server checks TTL about once a minute, so the document doesn't vanish instantly.
+
+---
+
+## text [#text]
+
+`text: true` includes the field in the collection's text index. It works on `String` and on arrays of strings. A collection has only one text index, so fields with `text: true` merge into one. A separate text `@Index` next to them throws `ConfigurationError` (`a collection has at most one text index; "text: true" fields are merged into one, ...`).
+
+<Snippet id="reference/schemas/prop/text" twoslash />
+
+The text index's weights and language are set in [`@Index`](./index-decorators.mdx#index) through `weights`, `default_language`, and `language_override`. In that case, `text: true` isn't used on the fields.
+
+---
+
+## excludeIndexes [#exclude-indexes]
+
+`excludeIndexes: true` turns off, for this field, the indexes declared inside the subdocument class. It works on a field whose type is a class with `@Schema`. Use it when one subdocument is embedded in several collections and you don't need the indexes everywhere.
+
+<Snippet id="reference/schemas/prop/exclude-indexes" twoslash />
+
+---
+
+## ref [#ref]
+
+`ref` ties the field to a reference to a document of another model: `ref: () => User`. It works on `String`, numbers, `Types.ObjectId`, `Types.UUID` (the target model's `_id` type), on arrays of such values, and on `Spec.map` values. The field is declared as [`Ref<M>`](./field-markers.mdx#ref), and the compiler checks that the model in `ref` is the same as in the field type. It takes a function rather than a class because of declaration order.
+
+<Snippet id="reference/schemas/prop/ref" twoslash />
+
+The compiler complains in three cases. `ref` without `Ref<M>` in the type gives `@Prop "author": "ref" is set, but the field type is not Ref<Model>`. `Ref<M>` without `ref` gives `the field is Ref<Model>, add ref: () => Model`. A different model gives `"ref" points to another model than the field's Ref<Model>`. For a guide, see [Reference other models](../../schemas/references.mdx).
+
+---
+
+## refPath [#ref-path]
+
+`refPath` is needed when the field can refer to models of different classes. The value is the path of a field **in the same document** (or subdocument) that holds the target model's class name, `"User"` or `"Bot"`. The field is declared as `Ref<A | B>`, and both models must be registered on the connection.
+
+<Snippet id="reference/schemas/prop/ref-path" twoslash />
+
+`ref`, `refPath`, and `refModel` are mutually exclusive. Two at once throw `ConfigurationError` (`"ref", "refPath" and "refModel" are exclusive (one form of reference)`).
+
+---
+
+## refModel [#ref-model]
+
+`refModel` works like [`refPath`](#ref-path), except your function picks the model. It receives the document (or subdocument) with the reference and the identifier, and returns the model class. It helps when the selection rule is more complex than "the class name in a field".
+
+<Snippet id="reference/schemas/prop/ref-model" twoslash />
+
+---
+
+## ext [#ext]
+
+`ext` holds the options of registered extensions. This is metadata for integrations, the extension itself checks it, and it's frozen after the build. The key is the extension name. The option can't change an operation or a core policy. An extension reads it through [`SchemaInfo.extOf`](./schema-info.mdx#ext-of). An unregistered key is a compile error on that key.
+
+<Snippet id="reference/schemas/prop/ext" twoslash />
+
+How to declare an extension and its options is covered in the guide [Add your own field and schema options](../../extensions/custom-options.mdx).
+
+---
+
+## Errors common to all options [#common-errors]
+
+A type that isn't among the supported ones gives a compile error with ready advice.
+
+<Snippet id="reference/schemas/prop/common-errors" twoslash />
+
+The message reads `@Prop "tags": this type is not supported (no Set/Map/Array/Object: use [X], Spec.map(X) or a @Schema class)`. There are similar checks too. `the runtime type () => X does not match the field type` means the type from the function doesn't match the field's type. The others are `a VirtualRef field is declared with @Virtual, not @Prop` and `not a public field (private and protected fields cannot be schema fields)`.
+
+`@Prop` on a method or an accessor throws `ConfigurationError` when the class is declared: `Account: @Prop on "m", which is a method or an accessor (getters are virtuals and need no decorator)`. A value right at declaration (`a: number = 5`) is caught when the model is built: `Account: field(s) "a" get a value from an initializer or the constructor; use the "default" option — service fields are filled by Typemo`. `Set` as a field type in code without types gives `Account.a: Set is not supported: use an array [X] (with a unique validator if needed)`.
+
+The reverse also happens, when an own data property has no `@Prop` (for example `note = "x"`, or a field without an initializer under `useDefineForClassFields: true`). The build throws `ConfigurationError`: `Account: property "note" has no @Prop, so it is not a field of the schema (never stored, cast or loaded); decorate it with @Prop, declare it with "declare", or make it a getter or a method`. Methods, getters, and non-enumerable properties don't count.
+
+## When not to use it [#when-not-to-use]
+
+`@Prop` describes a field that's stored in the database. A value computed from other fields is a class getter with the type [`Computed<T>`](./field-markers.mdx#computed) and no decorator. A reference that pulls in documents through a reverse link and stores nothing is [`@Virtual`](./virtual.mdx#virtual). A compound or partial index is [`@Index`](./index-decorators.mdx#index). Settings for the whole collection belong to [`@Schema`](./schema.mdx#schema).
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Define a model" href="../../schemas/define-model.mdx">
+  `@Schema`, `@Prop`, `Entity`, and where the field type comes from.
+</Card>
+<Card title="Validate field values" href="../../schemas/validation.mdx">
+  `min`, `max`, `enum`, `match`, and your own `validate` on real tasks.
+</Card>
+<Card title="Field marker types" href="./field-markers.mdx">
+  `Defaulted`, `Hidden`, `Immutable`, `Ref`, and the other markers that pair with options.
+</Card>
+</Cards>

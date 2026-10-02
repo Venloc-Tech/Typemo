@@ -1,0 +1,109 @@
+---
+title: Store lists of values and subdocuments
+description: "Declare an array of values, an array of subdocuments, and nested arrays, and see how elements are checked and queried"
+icon: List
+---
+
+You declare an array in a schema with square brackets around the element type. `[String]` is a list of strings, `[Line]` is a list of subdocuments, and `[[Number]]` is a list of lists of numbers. Options of the element type (`enum`, `min`, `match`) apply to each element. Typemo checks the array itself as a whole. The value must be an array, and every element goes through its own casting and rules. The error path includes the element's position, so you see right away which one failed.
+
+[Arrays and Maps in a document](../documents/typed-collections.mdx) covers how to change an array in a loaded document (`push`, `pull`, `set`). Here we declare the schema and look at what the library does on its own when you write and query.
+
+## What you need [#prerequisites]
+
+A model described as in [Define a model](./define-model.mdx), and subdocuments from [Define nested objects and subdocuments](./nested-and-subdocuments.mdx). The examples build a shop order with tags and lines.
+
+## Quick start [#quick-start]
+
+An array of values is `[String]`, and an array of subdocuments is `[Line]`, where `Line` is a class with `@Schema`.
+
+<Snippet id="schemas/arrays/quick-start" title="orders/order.ts" twoslash />
+
+Each order line got its own `_id`, because `Line` extends `Entity`. Below we'll cover element rules, empty arrays, and queries.
+
+## Check the elements [#validate-elements]
+
+Each element is cast to the element type, and the error names its position. If something other than an array arrives, the error says an array is required. The library won't turn a string into a one-element list, since that kind of "help" would hide a mistake in the data.
+
+<Snippet id="schemas/arrays/validate-elements" twoslash />
+
+The paths `tags.1` and `lines.0.qty` contain the element's index, and for subdocuments the name of the field inside it too. A `null` in an array of strings is an error as well: `Cast to string failed at path "tags.1" for null: null is not allowed on a path that is not nullable [null]`.
+
+## Limit element values [#element-limits]
+
+Element options go on the array and apply to every element. For `enum`, declare the elements as a union of values. For numbers, `min` and `max` work.
+
+<Snippet id="schemas/arrays/element-limits" twoslash />
+
+Constraints on the array itself, such as the number of elements or being non-empty, aren't set with options. To require at least one element, write a check with [`validate`](./validation.mdx) on the array field.
+
+## Nest an array in an array [#nested-array]
+
+You declare an array inside an array with nested brackets, `[[Number]]`. The depth isn't limited. Each level is checked separately, and the error points to the position at the right level.
+
+<Snippet id="schemas/arrays/nested-array" twoslash />
+
+## An empty array by default [#empty-array-default]
+
+An array field without `required` and without `default` **becomes empty on its own**. `create`, `Model.new`, an upsert insert, and a new subdocument put in `[]` if you didn't pass a value. That way the type in the class (`tags!: string[]`) tells the truth: the list is always there. You don't need to declare `default: () => []` or `Defaulted<string[]>`. Nothing forbids them, and your own `default` replaces the empty array.
+
+<Snippet id="schemas/arrays/empty-array-default" twoslash />
+
+The `[]` is in the database too. The value is written together with the document, not filled in on read. In `CreateInput` the array is optional, so `Orders.create({ customer: "ann" })` compiles without `tags`.
+
+**Old documents** that have no array key in the database are read differently. A model document gives an empty array, and the next `$save` writes it to the database. `lean()` returns the document as it's stored, that is, without the key.
+
+<Snippet id="schemas/arrays/empty-array-default-2" twoslash />
+
+If the array must always be passed, declare it `required: true`. Such a field doesn't get an empty array by default, and `create` without it throws a `ValidationError` (`Validation failed: "tags": the field is required [required]`). An empty array counts as a passed value. `required` doesn't check for non-emptiness. That needs a [`validate`](./validation.mdx) check of its own.
+
+## Query by elements [#query-elements]
+
+You write a path through an array the same way as for a nested object. `"lines.sku"` finds orders where at least one line has that `sku`. The value at that path is cast by the element type. You can also add an element with the `$push` update operator. The new element is checked by the same rules, and in the error path the index is preceded by `+`, since that element isn't in the database yet.
+
+<Snippet id="schemas/arrays/query-elements" twoslash />
+
+## How to choose [#how-to-choose]
+
+Ask yourself: **do you need to find and change an individual element by an identifier?**
+
+- **No** (tags, grades, email addresses): an array of values, `[String]` or `[Number]`.
+- **Yes** (an order line, a comment): an array of subdocuments with `Entity`. Each element gets an `_id`.
+- **There may be a great many elements, or they live a life of their own**: move them to a separate collection with a reference ([Reference other models](./references.mdx)).
+
+## When not to use it [#when-not-to-use]
+
+A set of values where uniqueness matters and order doesn't is also stored as an array. When you work with a [document](../documents/typed-collections.mdx), the `addToSet` method adds to it. There's no separate "set" type, and `Set` isn't supported as a field type. A dictionary with keys you don't know in advance isn't an array but a [`Spec.map`](./maps.mdx). A fixed-length tuple is better described as a nested object with named fields.
+
+## Troubleshooting [#troubleshooting]
+
+**Assigning by index doesn't compile.** The compiler stops `order.tags[0] = "x"` on a loaded document. An index doesn't say what you meant to do, and writing the whole array would overwrite other people's edits. Use the collection's methods (see [Arrays and Maps in a document](../documents/typed-collections.mdx)).
+
+**A string instead of an array.** `tags: "gift"` gives a `CastError`, not a one-element list. The library doesn't guess intentions. Wrap the value yourself: `tags: ["gift"]`.
+
+**You expected an error for a missing array.** The document was created without `tags`, and there's no error, because Typemo put in `[]`. An array field without `required` is optional, and an empty list is its normal starting value. If the list must come from the calling code, declare the field with `required: true`. If it must be non-empty, add a [`validate`](./validation.mdx) check.
+
+## Full example [#full-example]
+
+One file with an order that has tags, lines, and a nested array. Code that isn't part of Typemo is marked `__…__`.
+
+<Snippet id="schemas/arrays/full-example" title="orders/orders.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose an array that isn't passed becomes an empty `[]`, and Typemo does the same, so you don't need a separate `default: () => []`. The `required: true` option makes an array required. Assigning by index and writing to `length` on a loaded document are closed off by the types. Change the array with methods, and the database receives the exact operation.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Store a dictionary with arbitrary keys" href="./maps.mdx">
+  A dictionary with keys you don't know in advance, and its limits.
+</Card>
+<Card title="Arrays and Maps in a document" href="../documents/typed-collections.mdx">
+  How to change an array of a loaded document with `push`, `pull`, and `set`.
+</Card>
+<Card title="Typed collections" href="../reference/documents/typed-collections.mdx">
+  Every method of `StrictArray` and `SubdocumentArray`.
+</Card>
+</Cards>

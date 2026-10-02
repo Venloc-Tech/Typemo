@@ -1,0 +1,157 @@
+---
+title: Run code when a document is saved
+description: "Hooks that cast fields before saving and react to validating, reading, and deleting a document and its subdocuments"
+icon: FileCheck
+---
+
+A document hook is a model method that Typemo calls around the events of a single document. There are four such events: save, validate, read from the database, and delete. In the hook, `this` is the document itself, or the subdocument if the class is embedded in another model. Read and change it like a normal object: trim the spaces from a title, fill in a service field, log that the document was saved.
+
+You write the hook once in the model, and it runs whichever way the document goes to the database. If you need to step into a query instead (its condition, update, or result), read [Hook into an operation](./operation-hooks.mdx). Model queries like `updateOne` and `deleteMany` don't fire document hooks. They have the `query.*` events.
+
+## What you need [#prerequisites]
+
+An account model that grows as you go down the page. `Accounts` is the model you get from the client with `client.db().model(Account)`.
+
+## Quick start [#quick-start]
+
+Document events are called `document.*`. Most of the time you need three hooks: cast a value before saving, log a success, and log an error.
+
+<Snippet id="hooks/document-hooks/quick-start" title="accounts/account.ts" twoslash />
+
+Hooks that only work with fields are fine with `this: Account`. The hooks below need document methods (`$isModified()`, `$getChanges()`), and they have their own type of `this`. It's covered in "See what goes to the database". Below we go through each event, one task at a time.
+
+## Cast a value before saving [#cast-before-save]
+
+The account title comes from a form with extra spaces around it. A `@Pre("document.save")` hook runs before the write and may change the document, and those changes reach the database.
+
+<Snippet id="hooks/document-hooks/cast-before-save" twoslash />
+
+[`create`](../reference/writes/writes.mdx#create) built the document and saved it. The hook ran before the write, and the title went to the database without spaces. The same hook runs on `$save` of a loaded document and on `Model.new(...)` followed by `$save`.
+
+The hook is called even when the document has no changes. `$save` without a single edit still fires `document.save`, so don't count on the hook running only on a real write. If an action is needed only for real changes, like a log entry or a recalculation, start the hook with an early return.
+
+<Snippet id="hooks/document-hooks/cast-before-save-2" twoslash />
+
+[`$isModified()`](../reference/documents/document-api.mdx#is-modified) returns `true` on a new document, so on `create` the hook runs in full. For a document without changes, validation (`document.validate`) doesn't run, but the `save` hooks and their `post` do.
+
+Every way to create or save a document fires `document.save`: `create`, `insertOne`, `insertMany`, `$save`, `bulkSave`, and an `insertOne` inside [`bulkWrite`](../writes/bulk.mdx#bulk-write-hooks). A rule that must apply to every insert only needs to go on `document.save`.
+
+## See what goes to the database [#preview-write]
+
+Before saving, you sometimes need to know whether the document is new and which fields changed. A class hook doesn't know where the class will end up: as the model of a collection or as a subdocument inside another model. Typemo runs the hook in both cases.
+
+That's why the type of `this` in a document hook is [`HookThis<"document.save", Account>`](../reference/hooks/pre-post.mdx#hook-this), that is, `HydratedDoc<Account> | Subdocument<Account>`. Both have the class fields and the `$isNew()` and `$isModified()` methods. Methods that only a root document has, like `$getChanges()` and `$save()`, become available after a [`this.$isRoot()`](../reference/documents/document-api.mdx#is-root) check. It narrows the type to `HydratedDoc<Account>`.
+
+<Snippet id="hooks/document-hooks/preview-write" twoslash />
+
+`Account` is a model, so `$isRoot()` returned `true`, and the hook reached `$getChanges()`. The first time, the hook ran on create, and `$getChanges()` showed the whole document. A new document sends every field to the database, including `_id` and the defaults. The second time, it ran on `$save` and showed the only change. Change tracking is covered in [Change and save a document](../documents/change-and-save.mdx).
+
+## React to validation [#on-validate]
+
+Sometimes, before validation, you need to fill in a field the validation depends on, or log that validation failed. Validation is a separate event, `document.validate`. It's nested inside `document.save` and also fires when you call [`$validate()`](../reference/documents/document-api.mdx#validate).
+
+<Snippet id="hooks/document-hooks/on-validate" twoslash />
+
+When a document with changes is saved, the order is:
+
+1. `pre(save)`.
+2. `pre(validate)`.
+3. Validation.
+4. `post(validate)` or `postError(validate)`.
+5. The write.
+6. `post(save)`.
+
+If validation fails, the write doesn't happen. `postError` fires for both `validate` and `save`, and the calling code gets a [`ValidationError`](../reference/errors/data-errors.mdx#validation-error).
+
+## Run code after a read [#after-read]
+
+Sometimes a document needs a computed value that isn't stored in the database. The `document.init` event fires when a document is created from data that was read. The `@Pre("document.init")` and `@Post("document.init")` hooks don't get the raw data, but they see the finished document.
+
+<Snippet id="hooks/document-hooks/after-read" twoslash />
+
+`findOne` returned a document, and the hook ran. `.lean()` and `.plain()` create no document, so the hook isn't called. Not creating documents is the whole point of `lean`.
+
+The hook also runs on `Model.hydrate(...)`, but there it can't be async. If a `document.init` hook returns a promise, `hydrate` throws a `ConfigurationError`, because a synchronous call can't wait for it. In that case, read the document with a query.
+
+## Run code on delete [#on-delete]
+
+Before deleting a document you may need to check a condition, and afterwards clean up related data. The document method [`$deleteOne`](../reference/documents/document-api.mdx#delete-one) fires `document.deleteOne`, and `@Post` gets a `DeleteResult`.
+
+<Snippet id="hooks/document-hooks/on-delete" twoslash />
+
+`$deleteOne` called both hooks around the delete. The model query `Accounts.deleteOne({ title: "Main" })`, on the other hand, does **not** fire this event. It fires `query.deleteOne`, and its hooks are described in [Hook into an operation](./operation-hooks.mdx). In the same way, `document.updateOne` belongs to the document method `$updateOne`, not to the model's `updateOne` query.
+
+## Subdocuments [#subdocuments]
+
+An account has entries, nested objects with their own model, and an entry has hooks too. Typemo runs subdocument hooks together with the root document's hooks. First comes the root's `pre`, then the `pre` of every subdocument in tree order. The `post` hooks go in reverse: subdocuments first, then the root.
+
+<Snippet id="hooks/document-hooks/subdocuments" twoslash />
+
+Subdocument hooks run strictly one after another, in array order, and never in parallel. Otherwise the order would be unpredictable. In a subdocument hook, `this` is the subdocument itself, a [`Subdocument<Line>`](../reference/documents/typed-collections.mdx#subdocument). It has the fields of the `Line` class and the methods it shares with the root document: `$isNew()`, `$isModified()`, and `$isRoot()`.
+
+- A subdocument's `$isNew()` reflects the document it belongs to. The entries of a new account are new, the entries of a loaded one aren't.
+- `$isModified()` looks at the subdocument's own fields.
+- `$isRoot()` returns `false` here. A subdocument has no root methods like `$getChanges()`, and without the check the type won't offer them.
+
+A subdocument's `validate` hooks run after its own paths are validated, and its `postError` gets only the errors of its own fields.
+
+Every document and subdocument whose `@Pre` hooks ran finishes with exactly one of two: `@Post` or `@PostError`. If the save failed, `@PostError(document.save)` is called on each of them, subdocuments first, then the root.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether the rule is about a document or about an operation**.
+
+- **About the document itself** (cast a field, fill in a service value, log that it was saved): use a document hook.
+- **About model queries** like `updateMany`, `deleteMany`, and `find`: you need an [operation hook](./operation-hooks.mdx). Document hooks don't run for them.
+- **Cast a field value on every write**: the [`@Prop`](../reference/schemas/prop.mdx) options `trim`, `lowercase`, and `validate` are enough.
+
+## When not to use it [#when-not-to-use]
+
+If a rule checks a field value, make it a field option, not a `document.validate` hook. Options also work in updates, while document hooks run only on save. And if you only want to watch saves, subscribe to [operation events](../observability/events.mdx). A subscriber can't break the app.
+
+## Troubleshooting [#troubleshooting]
+
+**A document hook didn't run on `updateOne`.** `Accounts.updateOne(...)` and `deleteOne(...)` fire `query.*` events, not `document.*`. To run the document hooks, load the document and call its methods: `$save`, `$updateOne`, or `$deleteOne`.
+
+**The hook changed `this`, but the database doesn't have the change.** A change in `@Post(document.save)` never reaches the database, because the write has already happened. Change the document in `@Pre`. Changes in `@Pre(document.validate)` count too, but it's called inside `save`. If the value has to be ready for validation, change it in `@Pre("document.save")`.
+
+**`this.$isNew` isn't found.**
+
+<Snippet id="hooks/document-hooks/troubleshooting" />
+
+You declared `this: Account`. That type is allowed, but it has only the class fields. Declare `this: HookThis<"document.save", Account>`, as in "See what goes to the database".
+
+**A hook with `this: HydratedDoc` doesn't compile.** You can't declare `this: HydratedDoc<Account>`. A class hook also runs when the class is embedded in another model, and a subdocument has no `$getChanges()` or `$save()`, so the call would fail at runtime. The compiler stops such a hook right at the decorator.
+
+<Snippet id="hooks/document-hooks/troubleshooting-2" />
+
+Declare `this: HookThis<"document.save", Account>` and check `this.$isRoot()` before calling root methods.
+
+## Full example [#full-example]
+
+Every document hook from this page in one file: casting the title, validation, a log of saves and errors, and subdocuments.
+
+<Snippet id="hooks/document-hooks/full-example" title="accounts/account.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, `pre("save")` and `pre("validate")` got the document as `this`, and `updateOne` and `deleteOne` were document hooks and query hooks at the same time. In Typemo, `document.updateOne` and `document.deleteOne` belong only to the document methods `$updateOne` and `$deleteOne`, and model queries use the `query.*` events. Subdocument hooks don't run in parallel like `saveSubdocs` in Mongoose, and the order is always the same.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Hook into an operation" href="./operation-hooks.mdx">
+  Hooks for `find`, `updateMany`, `deleteMany`, and `aggregate`: change a query or skip it.
+</Card>
+<Card title="Hook order and errors" href="./order-and-errors.mdx">
+  What runs first, what happens on an error, and how hooks behave in a transaction.
+</Card>
+<Card title="Change and save a document" href="../documents/change-and-save.mdx">
+  How a document tracks changes and what goes to the database on `$save`.
+</Card>
+<Card title="@Pre, @Post, and @PostError" href="../reference/hooks/pre-post.mdx">
+  Every document event with the result of each.
+</Card>
+</Cards>

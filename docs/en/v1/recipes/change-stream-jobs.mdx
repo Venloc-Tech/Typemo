@@ -1,0 +1,107 @@
+---
+title: Background jobs on a change stream
+description: "A handler that reacts to new writes through a change stream and, after a restart, picks up where it left off"
+icon: Radio
+---
+
+If you need to do something in response to writes to the database (send a receipt, update a search index, recompute a report), don't poll the collection on a timer. Watch for changes. A **change stream** is a stream of events MongoDB sends for every insert, update, and delete in a collection. Let's build a background handler that sends a receipt for every new order and, after a stop, continues from exactly the event where it stopped.
+
+The main difficulty of a background job is the restart. A change stream sees only events that happened after it was opened. Everything written while the handler was off is lost unless you take special measures. The **resume token** saves the day. It's a value by which the server resumes the stream from the right place. The handler saves it after each processed event and passes it on the next start.
+
+## What you need [#prerequisites]
+
+- A client connected as in [Connect to the database](../connection/connect.mdx), and a `shop` database.
+- MongoDB running as a replica set (several MongoDB servers holding copies of the same data, though a single server is enough). Change streams aren't available on a standalone `mongod`.
+- The basics of change streams from [Watch for changes](../change-streams/watch.mdx).
+- Your code that sends a receipt (`__sendReceipt__`).
+
+## Quick start [#quick-start]
+
+[`Model.watch`](../reference/change-streams/watch.mdx#model.watch) opens the stream, and a `for await` loop reads the events. `await Model.watch()` returns when the cursor is already open on the server. A write right after it gets into the stream, even if you start reading later.
+
+<Snippet id="recipes/change-stream-jobs/quick-start" twoslash />
+
+Next we turn this fragment into a long-running handler, with saving the token, resuming after a restart, and stopping.
+
+## Describe the models [#define-models]
+
+The order is what we watch. A checkpoint stores the token under the handler's name. Every background job has its own checkpoint, so the name is unique.
+
+<Snippet id="recipes/change-stream-jobs/define-models" title="jobs/models.ts" twoslash />
+
+The token is an ordinary object like `{ _data: "…" }`. Typemo has no field type for an arbitrary object, so the token is stored as a JSON string. `JSON.stringify` on save and `JSON.parse` on read return the same object.
+
+## Save and read the checkpoint [#checkpoint]
+
+There are two functions. One reads the token, or returns `undefined` on the first start, and the other writes a new one. The write goes through [`updateOne`](../reference/writes/writes.mdx#update-one) with `upsert`, so the first call creates the checkpoint, and the next ones update it.
+
+<Snippet id="recipes/change-stream-jobs/checkpoint" title="jobs/checkpoint.ts" twoslash />
+
+## Run the handler [#run-handler]
+
+The handler opens the stream from the saved place, processes one event after another, and saves the token after each. On the first start there's no token, and the stream starts from the current moment. The [`resumeAfter`](../reference/change-streams/watch.mdx#model-watch-options) option tells the server to continue right after the event with that token.
+
+<Snippet id="recipes/change-stream-jobs/run-handler" title="jobs/receipts.ts" twoslash />
+
+The order in `process` is deliberate: the work first, then the token. If the process crashes between them, the event comes again after a restart, and the receipt goes out twice. That's an "at least once" guarantee. In the reverse order, the token first and then the work, you'd get "at most once", and a crash between them would lose a receipt.
+
+For a receipt, a duplicate is usually more tolerable than a loss. But the handler still has to be **idempotent**, meaning a repeated event mustn't break the result. Check that the receipt for this order hasn't been sent yet.
+
+Stopping works by a signal. `abort` closes the stream, the `for await` loop ends without an error, and `runReceiptWorker` returns on its own.
+
+## Check a restart [#check-restart]
+
+We check exactly what happens in real life. Stop the handler, write orders while it's off, and start it again. No order is lost, and the ones already processed aren't repeated.
+
+<Snippet id="recipes/change-stream-jobs/check-restart" title="jobs/receipts.test.ts" twoslash />
+
+The 300-millisecond pause after the start gives the handler time to read the token and open the stream. Until then, a write doesn't become an event. The second start began from the saved token and first got `A-2`, written during the downtime. `A-1` didn't come again, because the token already pointed past it.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **which is worse: losing an event or processing it twice**.
+
+- **A repeat is dangerous**, as with a payment or an email: you need idempotent processing and the "at least once" guarantee, as above.
+- **An event can be lost**, as with a cache update that will go stale anyway: you can save the token before the work.
+- **You only need to react to writes through a document**: a [document hook](../hooks/document-hooks.mdx) is enough. It's simpler, but it doesn't see `updateMany` or writes from other processes.
+
+## When not to use it [#when-not-to-use]
+
+If the work isn't urgent and can wait minutes, polling by a "processed" field is simpler. It doesn't need a replica set. If the event matters only inside the same process that caused it, you don't need the database as a bus. Call the function directly. And remember that change streams don't work on a standalone `mongod`.
+
+## Troubleshooting [#troubleshooting]
+
+**An order written before the first start isn't processed.** The handler opens the stream from the current moment, and on the first start there's no token yet. An order written earlier, while the handler was off or still reading the token, produces no event and doesn't get into the stream. Process the backlog separately, with a query by a "receipt not sent" field, and keep the change stream for what happens after the start.
+
+A write that comes right after `await Orders.watch()` isn't lost, though. By that point the cursor is already open.
+
+**Events were lost after a restart.** If the token isn't saved, the stream starts from the current moment, and everything written during the downtime is lost. Save the token after every event, not once an hour. The less often you save it, the more events repeat after a crash.
+
+**The handler hangs on stop.** The stream isn't closed, and `for await` waits for events. Close the stream on the stop signal, as in `runReceiptWorker`. [`close`](../reference/change-streams/watch.mdx#close) ends the loop without an error.
+
+## Full example [#full-example]
+
+<Snippet id="recipes/change-stream-jobs/full-example" title="jobs/receipts.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, `Model.watch()` also returns the driver's stream, but the events arrive raw (`_id` as `ObjectId`, fields with database names), and you have to strip hidden fields yourself. Here the events are typed, documents come with the field names from your code, hidden fields are removed, and `fullDocument` is in the type of the insert event.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Watch for changes" href="../change-streams/watch.mdx">
+  Event filters, the document before and after, hidden fields, and stopping a change stream.
+</Card>
+<Card title="Model.watch and events" href="../reference/change-streams/watch.mdx#model.watch">
+  Every change stream option and event type.
+</Card>
+<Card title="Change history" href="./change-history.mdx">
+  An audit log instead of a change stream, when you need history rather than a reaction.
+</Card>
+<Card title="Caching responses" href="./caching.mdx">
+  How to invalidate a cache on a change stream event.
+</Card>
+</Cards>

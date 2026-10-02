@@ -1,0 +1,155 @@
+---
+title: Clients, databases, and connections
+description: "Client options from configuration, connection retries, lazy startup, and several clients and databases in a NestJS app"
+icon: Cable
+---
+
+In a NestJS app the module creates the Typemo client. It takes the options, connects with retries, hands the client to providers, and closes it on shutdown. This page is about controlling all that: how to take the connection string from configuration, whether to wait for the database on startup, how to set up the client before the first model, and how to keep several clients and databases in one app.
+
+## What you need [#prerequisites]
+
+The app from the [Connect Typemo to NestJS](./setup.mdx) guide, with the `Account` entity and the accounts module. For the configuration examples, the app has its own `Config` provider with a `mongoUri` field.
+
+## Quick start [#quick-start]
+
+If the connection string lives in configuration, use [`forRootAsync`](../../reference/integrations/nestjs.mdx#typemo-module.for-root-async) with a factory.
+
+<Snippet id="integrations/nestjs/connections/quick-start" title="app.module.ts" twoslash />
+
+Below we'll go through each option task by task.
+
+## Options from configuration [#options-from-config]
+
+The connection string and the database name live in configuration, which Nest provides as well. `forRootAsync` has three sources of options, and you pick exactly one.
+
+`useFactory` with `inject` is a function that receives the providers from `inject` in order, as in the quick start above. Declare the parameters with types, because the module doesn't know what you listed in `inject`.
+
+`useClass` is a class with a `createTypemoOptions()` method. The module creates it itself and injects its dependencies.
+
+<Snippet id="integrations/nestjs/connections/options-from-config" title="database.config.ts" twoslash />
+
+`useExisting` is the same kind of class, except a module from `imports` already provides it. The Typemo module takes that instance and doesn't create its own.
+
+All three return [`TypemoModuleFactoryOptions`](../../reference/integrations/nestjs.mdx#typemo-module-factory-options): `uri`, the core client options, and the module options. The only thing the result can't contain is the client `name`. That's the next section.
+
+## Name the client [#client-name]
+
+You need a client name if the app has more than one client or if you want the name in observability events. It's set with the `name` option and becomes part of the client and model tokens. In `forRootAsync` the name sits **next to** the factory.
+
+<Snippet id="integrations/nestjs/connections/client-name" title="app.module.ts" twoslash />
+
+Nest needs the name while it builds the module graph, before the factory is called. So it has no place in the factory's result, and the compiler checks that.
+
+<Snippet id="integrations/nestjs/connections/client-name-2" twoslash />
+
+If the types are bypassed, startup fails right away, without trying to connect.
+
+<Snippet id="integrations/nestjs/connections/client-name-3" />
+
+## Retry the connection [#retry-connection]
+
+The database comes up at the same time as the app, in containers for example, and the first attempts may fail. [`retryAttempts`](../../reference/integrations/nestjs.mdx#retry-attempts) sets the total number of attempts (9 by default), and [`retryDelay`](../../reference/integrations/nestjs.mdx#retry-delay) sets the pause between them (3000 ms).
+
+<Snippet id="integrations/nestjs/connections/retry-connection" title="app.module.ts" twoslash />
+
+Every failed attempt writes a line to the Nest log with the client name and the kind of error. It doesn't write the connection string, since that can contain a password and hosts.
+
+<Snippet id="integrations/nestjs/connections/retry-connection-2" />
+
+Only errors a retry can fix are retried: no server, network problems. A wrong password stops the attempts right away, because nine attempts with the same password would give nine identical refusals. When the attempts run out, startup fails with the error of the last attempt, and the client is closed.
+
+One attempt lasts up to the driver's `serverSelectionTimeoutMS`, 30 seconds by default. So the default nine attempts stretch over several minutes. If you need to fail fast, reduce both.
+
+## Start without a database [#start-without-database]
+
+Sometimes the app has to come up even when the database isn't reachable, during development or when container readiness is checked separately. [`lazyConnection: true`](../../reference/integrations/nestjs.mdx#lazy-connection) doesn't wait for the connection.
+
+<Snippet id="integrations/nestjs/connections/start-without-database" title="app.module.ts" twoslash />
+
+The client connects in the background with the same retries. An operation called before the connection is ready waits for it no longer than `readyTimeoutMS`, and if the connection failed, it gets a [`ConnectionError`](../../reference/errors/configuration-errors.mdx#connection-error). When the attempts are exhausted, the module writes one line to the log.
+
+<Snippet id="integrations/nestjs/connections/start-without-database-2" />
+
+## Set up the client before the first model [#configure-before-first-model]
+
+Your app may need a schema extension or an observability subscriber. [`onClientCreate`](../../reference/integrations/nestjs.mdx#on-client-create) is called once with the new client, before the connection and before any model, including with a lazy connection.
+
+<Snippet id="integrations/nestjs/connections/configure-before-first-model" title="app.module.ts" twoslash />
+
+Why here? Extensions ([`client.use`](../../reference/connection/typemo-client.mdx#client.use)) are sealed as soon as the first model compiles, and the `forFeature` providers create models right after the client. Later you can't add an extension anymore. A [`client.instrument`](../../reference/connection/typemo-client.mdx#client.instrument) subscriber attached here sees every operation of the app from the very first one. The [OpenTelemetry](../../observability/opentelemetry.mdx) and [Sentry](../../observability/sentry.mdx) packages plug in the same way, with `TypemoOpenTelemetry.instrument(client)` inside `onClientCreate`.
+
+[`clientFactory`](../../reference/integrations/nestjs.mdx#client-factory) receives the already connected client and returns the one the providers get. [`clientErrorFactory`](../../reference/integrations/nestjs.mdx#client-error-factory) replaces the error startup fails with, for example with your app's own error with a clear message.
+
+## Several clients [#multiple-clients]
+
+Say analytics lives in another cluster. Each `forRoot` with its own `name` is a separate client. `forFeature`, `@InjectModel`, and [`@InjectClient`](../../reference/integrations/nestjs.mdx#inject-client) refer to the client by the same name.
+
+<Snippet id="integrations/nestjs/connections/multiple-clients" title="reports/reports.module.ts" twoslash />
+
+One entity on two clients means two different tokens and two models. An account written through the first model wasn't visible to the second. Two `forRoot` calls with **the same** name are an error at startup, otherwise Nest would silently pick one of them.
+
+<Snippet id="integrations/nestjs/connections/multiple-clients-2" />
+
+## Several databases on one client [#multiple-databases]
+
+The archive lives in another database of the same cluster. You don't need a separate client for that. `forFeature(…, { db })` registers models in the `db` database of the same client and provides its [`Connection`](../../reference/integrations/nestjs.mdx#inject-connection).
+
+<Snippet id="integrations/nestjs/connections/multiple-databases" title="archive/archive.module.ts" twoslash />
+
+The connection pool is shared, and a client transaction covers both databases.
+
+## Check health [#health-check]
+
+Your orchestrator needs a readiness endpoint. The package has no indicator of its own, so you read the client's state directly through [`client.state`](../../reference/connection/typemo-client.mdx#client.state).
+
+<Snippet id="integrations/nestjs/connections/health-check" title="health/health.controller.ts" twoslash />
+
+A connected client answers 200 `{ "database": "connected" }`, and a client with `lazyConnection` and an unreachable database answers 503.
+
+## How to choose whether to wait for the database [#how-to-choose]
+
+Ask yourself what should happen if the database isn't there at startup.
+
+- **The app is useless without a database**, and it's better to fail right away and let the orchestrator restart it. Keep the default behavior. Startup waits for the connection with retries, and an app that came up is definitely connected.
+- **The app must respond even without a database**, with a readiness check or a maintenance page, or you develop without one. Turn on `lazyConnection`. Then each operation waits for the connection itself and fails itself if there isn't one.
+
+## When not to use it [#when-not-to-use]
+
+A single client with a connection string from an environment variable doesn't need `forRootAsync`. It's simpler to write `forRoot(process.env.MONGO_URI ?? "…")`. A separate client for another database in the same cluster isn't needed either, `forFeature(…, { db })` is enough.
+
+## Troubleshooting [#troubleshooting]
+
+**Startup fails after several minutes.** By default there are nine attempts, and each waits up to 30 seconds for server selection. Reduce `retryAttempts` and add `serverSelectionTimeoutMS` to the connection string, for example `?serverSelectionTimeoutMS=2000`.
+
+**An extension isn't applied to models.** `client.use` was called after startup, in a service or in `onModuleInit`, when the models were already compiled. Move the call into `onClientCreate`.
+
+**`forFeature` can't find a client by name.** The name in `forFeature([…], { client })` must match the `name` of `forRoot`. Without a name, the client is called `"default"`.
+
+## Full example [#full-example]
+
+Two clients and two databases. The main client takes its options from configuration, connects with retries, and gets a subscriber right away. The analytics client connects lazily. The archive lives in another database of the main client, and there's a health check.
+
+<Snippet id="integrations/nestjs/connections/full-example" title="app.module.ts" twoslash />
+
+<Callout type="migration" title="Coming from @nestjs/mongoose">
+
+`connectionName` → `name`, `connectionFactory` → `clientFactory`, `connectionErrorFactory` → `clientErrorFactory`, `onConnectionCreate` → `onClientCreate`. There are three differences. `onClientCreate` is called with `lazyConnection` too, while in `@nestjs/mongoose` it isn't. There's one client across all attempts. And `name` in the factory's result is a compile error.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Models in modules" href="./models.mdx">
+  Registering models, discriminators, views, and creating collections on startup.
+</Card>
+<Card title="Transactions and policies per request" href="./transactions-and-policies.mdx">
+  Client transactions in services and the tenant from the request.
+</Card>
+<Card title="Module options in the reference" href="../../reference/integrations/nestjs.mdx#typemo-module-options">
+  Every `forRoot` and `forRootAsync` option with its defaults and errors.
+</Card>
+<Card title="Connect to the database" href="../../connection/connect.mdx">
+  Connecting without Nest: how the client connects, which states it has, and how to wait until it's ready.
+</Card>
+</Cards>

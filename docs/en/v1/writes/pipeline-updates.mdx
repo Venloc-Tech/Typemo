@@ -1,0 +1,183 @@
+---
+title: Pipeline updates
+description: "Write a value computed from other fields of the same document into a field, and see how a pipeline differs from operators"
+icon: Workflow
+---
+
+Update operators write values known in advance. `$set` puts in `"bob"`, `$inc` adds 5. But sometimes the new value has to be computed **from other fields of the same document**: build a note from the owner and the title, double a balance, set a label depending on an amount. For that you write the update as a **pipeline**. Instead of an object of operators, you pass a function that describes how to get the new value from the document's fields. The database runs it in place as one atomic command, so you don't read the document and write it back.
+
+If the value is known in advance, you don't need a pipeline. [Operators](./update-operators.mdx) are simpler, and `$inc`, `$push`, and the rest work with them. What Typemo checks in a pipeline, and what it can't check, is covered below in the sections on checks and limits.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and an account model. The collection holds one account: `Main`, owner `alice`, balance 10, nickname `al`. Every example starts with this data.
+
+<Snippet id="writes/pipeline-updates/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Pass a function instead of an object of operators. It gets the **pipeline builder** `p`, and `p.set(…)` describes the new values through the field proxy `f` and the functions `fn`.
+
+<Snippet id="writes/pipeline-updates/quick-start" twoslash />
+
+Below we'll cover computed values, several stages, conditions, and the pipeline's limits.
+
+## Write a value computed from other fields [#write-computed-value]
+
+The note should hold "owner/title". The value depends on two other fields, and the `$set` operator can't write it. Write it with the `set` stage. `f.owner` means "the value of the `owner` field in the document at the moment of the update".
+
+<Snippet id="writes/pipeline-updates/write-computed-value" title="accounts/accounts.service.ts" twoslash />
+
+The result is `note: "alice/Main"`. `fn.concat` is a string operation of the database, and the proxy `f` put field references into it. Typemo turned all this into the stage `{ $set: { note: { $concat: ["$owner", "/", "$title"] } } }` and sent it to the server. The value is computed there, so it's always built on the document's **current** data, even if something changed between a read and the write.
+
+The `fn` functions are a shared set of expressions, described in the [aggregation](../aggregation/expressions.mdx) section. For now this is enough. `fn.add`, `fn.multiply`, and `fn.concat` compute, `fn.cond` picks a value by a condition, and `fn.now()` gives the server's time.
+
+## A conditional value [#conditional-value]
+
+Let's set the label "rich" or "poor" depending on the balance. The server checks the condition against the value in the document.
+
+<Snippet id="writes/pipeline-updates/conditional-value" twoslash />
+
+Operators can't do this. `$set` can't say "if the balance is more than 5, write one thing, otherwise another". Without a pipeline you'd have to read the document, decide in code, and write, and the document could change between the read and the write.
+
+## Several stages [#multiple-stages]
+
+A pipeline is a chain of stages, and each one sees the result of the previous one. That's how you split a computation into steps. Below, the second stage adds an exclamation mark to what the first one wrote.
+
+<Snippet id="reference/writes/pipeline-updates/multiple-stages" twoslash />
+
+The first stage wrote `alice/Main`, and the second read that value and added the mark. The order of stages matters, like the order of operations in a formula.
+
+There's one limit. If a field with bounds (`min`, `max`) is computed in several stages and a later stage reads the result of an earlier one, Typemo can't check the bound and refuses. See the section on checks for details.
+
+## Remove a field [#remove-field]
+
+The [`unset`](../reference/writes/pipeline-updates.mdx#unset) stage removes a field or a list of fields, usually together with other stages.
+
+<Snippet id="reference/writes/pipeline-updates/unset" twoslash />
+
+## Many documents and getting the document back [#many-and-return]
+
+The same methods that take operators take a pipeline: [`updateOne`](../reference/writes/writes.mdx#update-one), [`updateMany`](../reference/writes/writes.mdx#update-many), and [`findOneAndUpdate`](../reference/writes/writes.mdx#find-one-and-update). The filter rules are the same, so for `updateMany` it's required and non-empty.
+
+<Snippet id="writes/pipeline-updates/many-and-return" twoslash />
+
+The second call sees the balance that the first one doubled: it was 10 and is now 20. And it returns the state **before** its own change.
+
+## What the pipeline checks [#pipeline-checks]
+
+A pipeline writes whatever the server computes, so Typemo can't cast the value to a type as directly as with an operator. But the pipeline isn't left without checks. Values fall into three cases.
+
+**A constant** in a `set` stage is an ordinary value. Typemo casts it to the field's type and checks the bounds before sending, as with `$set`. A wrong type gives a `CastError`, a violated bound gives a `ValidationError`.
+
+<Snippet id="writes/pipeline-updates/pipeline-checks" />
+
+**Removing a required field** with `unset`, or replacing the document with one that lacks the field, gives a `ValidationError` before sending.
+
+<Snippet id="reference/writes/pipeline-updates/required-fields" />
+
+**A computed value** of a field with constraints (`min`, `max`, `enum`, `minLength`, `maxLength`, `match`, `required`) is checked by the database itself. Typemo adds a condition with the same expression and the same constraints to the filter, and an invalid result isn't written. All of this is atomic, in one command. If the condition blocked the write, one extra read tells "document not found" apart from "the value didn't fit" and names the computed value. Here's how the `min: 0` bound on `balance` is protected.
+
+<Snippet id="reference/writes/pipeline-updates/what-is-checked" twoslash />
+
+<Snippet id="reference/writes/pipeline-updates/what-is-checked-2" />
+
+The balance in the database stayed 10, and the error names the computed value, -40. [`findOneAndUpdate`](../reference/writes/writes.mdx#find-one-and-update) and `updateMany` work the same way. For `updateMany`, the documents the condition would block are found before the write, and then **nothing** is written.
+
+## What the pipeline can't check [#pipeline-limits]
+
+The database's condition computes the expression against the stored document. So it's exact only as long as the expression reads fields that no earlier stage changed. Typemo rejects everything else before sending, instead of writing it unchecked.
+
+<Snippet id="writes/pipeline-updates/pipeline-limits" />
+
+The first error: a value reads a field that an earlier stage changed, or `$$ROOT` after a change. The way out is to compute everything in one stage. The second: a computed value of a field with bounds together with `upsert`, the same as `$inc` with a bound and `upsert`.
+
+The same rule rejects a few more cases.
+
+- A computed value after a stage that rewrites the whole document.
+- A field with bounds behind an array or a `Map`.
+- A whole document computed by an expression.
+- Such a pipeline in `bulkWrite`.
+
+What a server expression can't express isn't checked: your `validate` functions, constraints of elements **inside** a computed array, `Map`, or nested document, and the type of a computed value for a field without constraints. Only the types protect such a field. The compiler knows the model's fields and the expression types, so it stops a typo in a field name or an expression of the wrong type. If the result has to stay within bounds and the expression reads an already changed field, use `$inc`. It protects `min` and `max` on the server side.
+
+There are hard rules too. You can't use `arrayFilters` with a pipeline, because a pipeline has no positional paths.
+
+<Snippet id="writes/pipeline-updates/pipeline-limits-2" />
+
+An array of stages instead of a function isn't accepted either. Stages are built with the builder so that the types can check them.
+
+<Snippet id="writes/pipeline-updates/pipeline-limits-3" />
+
+A function with no stages is a query error too.
+
+<Snippet id="reference/writes/pipeline-updates/update-pipelines-errors" />
+
+`upsert` with a pipeline checks the required fields of the new document the same way as with operators. A missing field gives a `ValidationError` before sending.
+
+## Replace the whole document with a stage [#replace-with-stage]
+
+The `project`, `replaceWith`, and `replaceRoot` stages rewrite the whole document. On a model with immutable fields, either `immutable` or the system `createdAt` of `Timestamped`, such a stage could lose or change a field that mustn't be touched. So Typemo lets it through only if the new root carries **every** immutable field over as is.
+
+These are the allowed forms.
+
+- `createdAt: "$createdAt"`, or through the field proxy, `owner: f.owner`.
+- `$$ROOT` as a whole.
+- `$mergeObjects` with `$$ROOT` and an object of other fields.
+- For `project`, an inclusion form with these fields, or an exclusion form that doesn't touch them.
+
+Write the object keys in `replaceWith` with the model's field names. If a field has a `dbName`, Typemo translates them to the stored names itself.
+
+Suppose the model has an immutable `owner` field and the system `createdAt` field. A replacement that carries them along goes through, and the other fields are replaced.
+
+<Snippet id="writes/pipeline-updates/replace-with-stage" twoslash />
+
+If the new root doesn't carry an immutable field over, or takes it from another field, the update is rejected before sending, and the text names the lost fields.
+
+<Snippet id="reference/policies/violations/immutable-4" />
+
+On a model with fields stored under another name (`dbName`), such a stage can't use `$$ROOT` or `$$CURRENT`: `ConfigurationError: Stamped: $$ROOT/$$CURRENT of a model with dbName fields would give stored names to the rows; list the fields instead`. List the fields explicitly.
+
+## How to choose [#how-to-choose]
+
+Ask yourself whether the new value depends on other fields of the document.
+
+- **It doesn't**: use operators, `$set` for a value and `$inc` for a number. They're simpler, and `$inc` protects bounds without any special conditions.
+- **It does, and it has to be computed in place**: use a pipeline.
+- **It depends only on the same numeric field**, as in "add" or "multiply": use an operator here too. `$inc` and `$mul` are atomic and protected, and a pipeline adds nothing.
+
+## When not to use it [#when-not-to-use]
+
+If you compute the value in your app's code from data you already have at hand, write it with the `$set` operator. A constant passes every check before sending. And if you need to compute a value and return it without changing the document, use an [aggregation](../aggregation/first-aggregation.mdx). A pipeline update changes documents.
+
+## Troubleshooting [#troubleshooting]
+
+**A field's bound isn't checked.** You get `ValidationError: … cannot be checked against its constraints: it reads "balance", which an earlier stage of the pipeline changes`. The second stage reads a field with bounds that the first stage changed, and the database can't check the bound against the stored document. Compute the field in one stage, for example `fn.multiply(fn.add(f.balance, 1), 2)`, or pass the intermediate result through a field without bounds.
+
+**An array of stages.** For example, `Accounts.updateOne(filter, [{ $set: { owner: "q" } }])`. Typemo rejects the array with `update: an update pipeline is built with the pipeline builder …`. Pass a function, `(p) => p.set(…)`.
+
+**Replacing the root loses an immutable field.** Say, `p.replaceWith(…)` on a model with `Timestamped`, where the new document doesn't carry `createdAt`. Typemo stops the update and names the lost fields.
+
+<Snippet id="reference/policies/violations/immutable-4" />
+
+Carry every immutable field over as is, for example `createdAt: f.createdAt`, or list the changes with `p.set(…)` and `p.unset(…)`.
+
+## Full example [#full-example]
+
+Everything in one file: a computed note, a label by balance, and doubling every balance of an owner.
+
+<Snippet id="writes/pipeline-updates/full-example" title="accounts/accounts.service.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Pipeline updates" href="../reference/writes/pipeline-updates.mdx">
+  Every stage allowed in an update, with types and limits.
+</Card>
+<Card title="Update operators" href="./update-operators.mdx">
+  When the value is known in advance: `$set`, `$inc`, `$push`, and others.
+</Card>
+<Card title="Update documents" href="./update.mdx">
+  Apply an update to one or many documents.
+</Card>
+</Cards>

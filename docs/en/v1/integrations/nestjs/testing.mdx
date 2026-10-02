@@ -1,0 +1,104 @@
+---
+title: Testing a Nest app
+description: "Unit tests of services with model and client mocks, and integration and e2e tests on a real MongoDB with TypemoTestingModule"
+icon: FlaskConical
+---
+
+There are two ways to test services that use Typemo models. Without a database, the model is replaced with a mock, and you check the service's logic. With a real database, you check everything together: queries, indexes, transactions, and HTTP responses. For the first the package has `provideModelMock` and `provideClientMock`, and for the second, `TypemoTestingModule`. All of it lives in a separate entry point, `@venloc/typemo-nestjs/testing`, so that test helpers don't end up in your app code.
+
+## What you need [#prerequisites]
+
+The accounts service from the [Connect Typemo to NestJS](./setup.mdx) guide and a test framework with `describe` and `test`. The examples are written for `bun:test`, but the code is the same with Jest and Vitest. Tests on a database need MongoDB running as a replica set, otherwise transactions won't work. A replica set is several MongoDB servers holding copies of the same data, and for tests a single node is enough.
+
+<Snippet id="integrations/nestjs/testing/prerequisites" title="accounts/accounts.service.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Here's a unit test with a model mock.
+
+<Snippet id="integrations/nestjs/testing/quick-start" title="accounts/accounts.service.spec.ts" twoslash />
+
+Below we'll cover mocks and tests on a database.
+
+## Replace a model with a mock [#mock-model]
+
+You want to test the service's logic, not the database. [`provideModelMock(Account, mock)`](../../reference/integrations/nestjs.mdx#provide-model-mock) registers a provider under the same token as the real model. So the service gets the mock through its own `@InjectModel(Account)` without any changes.
+
+The compiler checks the mock. Each method keeps the name and the parameters of the model method ([`ModelMock`](../../reference/integrations/nestjs.mdx#model-mock)), and the result can be anything, since the mock doesn't have to build a real query. A typo in a name won't compile.
+
+<Snippet id="integrations/nestjs/testing/mock-model" twoslash />
+
+A method that isn't in the mock is `undefined`. If the service calls a method you forgot, the test fails with a `TypeError` rather than getting a plausible answer. A service that called `deleteOne` with a mock that had only `countDocuments` failed with exactly that `TypeError`.
+
+A mock of a model on another client or database is registered with the same target as in `forFeature`: `provideModelMock(Account, mock, { db: "archive" })`.
+
+## A service with transactions without a replica set [#transactions-without-replica-set]
+
+A service method is marked `@Transactional()`, and the unit test doesn't need a database. [`provideClientMock()`](../../reference/integrations/nestjs.mdx#provide-client-mock) puts in a client whose `transaction(fn)` calls `fn` right away, and binds the decorator to that client.
+
+<Snippet id="integrations/nestjs/testing/transactions-without-replica-set" title="accounts/accounts.service.spec.ts" twoslash />
+
+Don't forget `moduleRef.init()`, since the decorator binds to the client when the module initializes. Without `provideClientMock`, calling a decorated method in a unit test gives the error `called on an object no Nest application with TypemoModule has registered`. There's no silent call without a transaction.
+
+## A test on a real database [#real-database-test]
+
+You need to check that queries, indexes, and transactions work on the server. [`TypemoTestingModule.forRoot(uri)`](../../reference/integrations/nestjs.mdx#typemo-testing-module.for-root) is `TypemoModule.forRoot` for tests. Each call gets its own database, so tests don't see each other's data. Collections and indexes are created on startup, and it tries to connect only once.
+
+<Snippet id="integrations/nestjs/testing/real-database-test" title="accounts/accounts.int-spec.ts" twoslash />
+
+[`TypemoTestingModule.clear`](../../reference/integrations/nestjs.mdx#typemo-testing-module.clear) after each test deletes the documents of every model from `forFeature`, across all tenants and including soft-deleted ones. That way every test starts with empty collections. After `close()` the test database stays on the server. Delete the whole test server or, if the server is shared, the database by name.
+
+Creating collections on startup (`sync: "init"`) matters here for more than indexes. A MongoDB transaction can't create a collection that another operation is creating at the same moment, and the first write in a transaction on an empty database could fail.
+
+## An e2e HTTP test [#e2e-test]
+
+You need to check the app's responses as a whole: statuses, bodies, and errors. Start the app from the test module on a free port and send requests with plain `fetch`.
+
+<Snippet id="integrations/nestjs/testing/e2e-test" title="test/accounts.e2e-spec.ts" twoslash />
+
+Filters, interceptors, and pipes are attached to the test app the same way as in `main.ts`. After all, an e2e test checks what the client will see.
+
+## How to choose between a mock and a database [#how-to-choose]
+
+Ask yourself what can break in the code under test.
+
+- **The service's logic**: a condition, a calculation, the order of calls. Here a mock is faster and more precise.
+- **Talking to the database**: the wrong filter, an unused index, a transaction that doesn't roll back, a tenant that wasn't applied. A mock won't show any of that. You need a test on a real server.
+
+## When not to use it [#when-not-to-use]
+
+The compiler checks the type of the injected model and the shape of the results, so you don't need to repeat that in tests with mocks. A "the module builds" test with no behavior checks doesn't give you much either. An injection error surfaces in the very first e2e test.
+
+## Troubleshooting [#troubleshooting]
+
+**@Transactional in a unit test fails with "no Nest application".** The providers don't include `provideClientMock()`, or `moduleRef.init()` wasn't called.
+
+**Tests see each other's data.** There's one module per test file, the database is shared, and `clear` isn't called. Call `TypemoTestingModule.clear(moduleRef)` in `afterEach`, or create a module for each test.
+
+**The mock didn't replace the model.** The mock is registered with a different target. `provideModelMock(Account, mock)` replaces the model of the default database, while the service injects `@InjectModel(Account, { db: "archive" })`. Pass the same target as the third argument.
+
+## Full example [#full-example]
+
+A unit test of the service with mocks and an integration test on a database, in one file.
+
+<Snippet id="integrations/nestjs/testing/full-example" title="accounts/accounts.spec.ts" twoslash />
+
+<Callout type="migration" title="Coming from @nestjs/mongoose">
+
+`{ provide: getModelToken(Cat.name), useValue: mock }` → `provideModelMock(Cat, mock)`. The token is built from the class, and the mock is checked against the model's methods. Instead of `mongodb-memory-server` and a manual `connection.dropDatabase()` between tests, each module gets its own database and you call `TypemoTestingModule.clear`.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Test your app" href="../../testing/testing-apps.mdx">
+  Testing without Nest: document factories and checking index usage.
+</Card>
+<Card title="The /testing entry point in the reference" href="../../reference/integrations/nestjs.mdx#testing">
+  Every helper of the `/testing` entry point.
+</Card>
+<Card title="A REST API with NestJS" href="../../recipes/nestjs-rest-api.mdx">
+  A complete app with e2e tests.
+</Card>
+</Cards>

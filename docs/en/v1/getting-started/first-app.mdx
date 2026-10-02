@@ -1,0 +1,197 @@
+---
+title: Your first app
+description: "A blog with users, posts, and comments, step by step: models, connecting, services, relations, and errors"
+icon: BookOpenCheck
+---
+
+Let's build a small blog where users write posts and readers comment on them. The other guides build on this project. You'll define three models, connect to MongoDB, write service functions, and run a script that goes all the way from signing up to deleting a comment.
+
+The project is as ordinary as it gets. The files sit side by side, a script calls the service functions, and there's no web framework. You can call the same code from a handler in any framework, and your own classes `__Conflict__` and `__NotFound__` mark the app's boundary, for example the "taken" and "not found" responses. The model grows as the page goes on. First a user with two fields, then a post, then a hidden field and the link between posts and comments.
+
+## What you need [#prerequisites]
+
+The packages installed and `tsconfig.json` set up as in [Installation and setup](./installation.mdx), with legacy decorators and `target` set to `ESNext`. If you haven't run anything yet, start with [Quick start](./quick-start.mdx). And a running MongoDB server on `localhost:27017`.
+
+## Lay out the project [#project-layout]
+
+The project is flat. All files live in `src`, and the file name tells you what's inside. That way the short examples don't need paths.
+
+```tree
+src/
+  user.model.ts       # the user model
+  post.model.ts       # the post model
+  comment.model.ts    # the comment model
+  db.ts               # the client, the connection, the models
+  users.service.ts    # sign-up
+  posts.service.ts    # write, publish, show
+  comments.service.ts # add and delete a comment
+  main.ts             # the script that runs all of it
+```
+
+## Define the user [#define-user]
+
+Let's start with the user model, which has a name and an email. [`trim`](../reference/schemas/prop.mdx#trim) strips spaces from both ends of the name. [`lowercase`](../reference/schemas/prop.mdx#lowercase) lowercases the email, so `Alice@Example.com` and `alice@example.com` count as the same email. And [`unique`](../reference/schemas/prop.mdx#unique) won't let you create two users with the same email. The [Define a model](../schemas/define-model.mdx) guide explains `@Schema` and `@Prop` in detail.
+
+<Snippet id="getting-started/first-app/define-user" title="src/user.model.ts" twoslash />
+
+## Define the post [#define-post]
+
+A post belongs to a user, and the author is stored as a **reference**. The database holds only the user's `_id`, and [`ref`](../reference/schemas/prop.mdx#ref) says which model to look it up in. The [`Ref<User>`](../reference/schemas/field-markers.mdx#ref) type tells the compiler that this field can hold either the identifier or the user itself. More in the [Reference other models](../schemas/references.mdx) guide.
+
+There are three new techniques here.
+
+- [`Timestamped(Entity)`](../reference/schemas/base-classes.mdx#timestamped) gives the post `createdAt` and `updatedAt`, and Typemo fills them in itself. More in [Timestamps and versions](../schemas/timestamps-and-versions.mdx).
+- `tags` is an array. An array without `required` and without `default` always has a value, at least an empty `[]`. So you can leave it out when creating a post, and it's never `undefined`.
+- `published` has a [default value](../schemas/defaults.mdx), and its type is declared as [`Defaulted<boolean>`](../reference/schemas/field-markers.mdx#defaulted). That's how the compiler knows you can skip the field when creating a post. You can't forget `Defaulted`, see [Troubleshooting](#troubleshooting).
+
+<Snippet id="getting-started/first-app/define-post" title="src/post.model.ts" twoslash />
+
+## Define the comment and link it to the post [#define-comment]
+
+A comment stores references to the post and to the author. The post, on the other hand, doesn't store its comments, or the list inside the post would grow without limit. Instead, we add a **virtual field** `comments` to the post model. It writes nothing to the database, and when you query it, it finds the comments whose `post` equals the post's `_id`. More in the [Add computed fields and reverse references](../schemas/virtuals.mdx) guide.
+
+<Snippet id="getting-started/first-app/define-comment" title="src/comment.model.ts" twoslash />
+
+The post gets an import of the comment and the virtual field. [`@Virtual`](../reference/schemas/virtual.mdx#virtual) takes `localField` and `foreignField`. The first is the post field whose value we search by, `_id` here. The second is the comment field that holds that value, `post` here. The [`VirtualRef<Comment>`](../reference/schemas/field-markers.mdx#virtual-ref) type tells the compiler that once the relation is populated, the field holds comments.
+
+<Snippet id="getting-started/first-app/define-comment-2" title="src/post.model.ts" twoslash />
+
+The post and the comment import each other, and that's fine. `ref: () => Comment` and `ref: () => Post` are functions that get called later, when both classes are already loaded.
+
+## Connect and create indexes [#connect-and-create-indexes]
+
+The client and the models are created once, in a separate file. [`TypemoClient.connect`](../reference/connection/typemo-client.mdx#typemo-client.connect) opens the connection, and [`connection.model`](../reference/connection/connection.mdx#connection.model) gives you a model by class. [`connection.init`](../reference/connection/connection.mdx#connection.init) creates whatever the database doesn't have yet, above all the unique index on `email`. Typemo doesn't create indexes on its own, and without `init` the `unique` option would guarantee nothing. The [Connect to the database](../connection/connect.mdx) guide covers the client in detail.
+
+<Snippet id="getting-started/first-app/connect-and-create-indexes" title="src/db.ts" twoslash />
+
+The file has a top-level `await`, which Bun and `module: "Preserve"` allow. The other files import the ready `Users`, `Posts`, and `Comments` from `db.ts`.
+
+## Sign up a user [#register-user]
+
+A user has filled in the sign-up form. You need to store the password hash but never send it out. Let's add a `passwordHash` field to the model with the [`hidden`](../reference/schemas/prop.mdx#hidden) option and the [`Hidden<string>`](../reference/schemas/field-markers.mdx#hidden) type. A hidden field is stored in the database but doesn't end up in the data you send to the client, that is, in the `.plain()` result and in `$toPlain()`. More in the [Hidden and sensitive fields](../schemas/hidden-and-sensitive.mdx) guide.
+
+<Snippet id="getting-started/first-app/register-user" title="src/user.model.ts" twoslash />
+
+`registerUser` creates the user with [`create`](../reference/writes/writes.mdx#create). If the email is already taken, the unique index rejects the write, and Typemo throws [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicate-key-error). The service turns it into its own `__Conflict__` error, which the request handler shows as a 409 response. `create` returns a document, and [`$toPlain`](../reference/documents/document-api.mdx#to-plain) turns it into an ordinary object without hidden fields.
+
+<Snippet id="getting-started/first-app/register-user-2" title="src/users.service.ts" twoslash />
+
+`__hashPassword__` is your hashing function. Typemo doesn't have one. Double underscores mark the reader's code. `registerUser("Alice", "alice@example.com", "s3cret")` returns `{ _id: "…", name: "Alice", email: "alice@example.com" }`. It has no `passwordHash` field, even though the database holds one.
+
+## Write and publish a post [#write-and-publish-post]
+
+The author writes a draft, then publishes it and adds a tag. `writePost` creates the post. The author's identifier arrives as a string, from the session for example, and [`create`](../reference/writes/writes.mdx#create) accepts a string where it expects an `ObjectId`, so you don't convert it yourself. The `published` field isn't passed, so it's `false`.
+
+[`updateOne`](../reference/writes/writes.mdx#update-one) changes a document without reading it first. `$set` writes a new field value, and `$addToSet` adds the tag to the array only if it isn't there yet. Both calls accept `_id` as a string too.
+
+<Snippet id="getting-started/first-app/write-and-publish-post" title="src/posts.service.ts" twoslash />
+
+`updateOne` returns counters, not a document. `matchedCount` is how many documents matched, and `modifiedCount` is how many changed. Along with your fields, Typemo updates `updatedAt` itself. Other ways to change data are covered in the [Update documents](../writes/update.mdx) guide.
+
+## Show the feed [#show-feed]
+
+The home page needs a list of published posts with the author's name, newest first, ten per page. [`find`](../reference/query/reading.mdx#model.find) takes a filter, and then you build the query with a chain of calls.
+
+- [`.sort`](../reference/query/reading.mdx#sort) sets the order. The second key, `_id`, keeps it stable when dates are equal.
+- [`.skip`](../reference/query/reading.mdx#skip) and [`.limit`](../reference/query/reading.mdx#limit) pick the page.
+- [`.select`](../reference/query/reading.mdx#select) keeps only the fields you need.
+
+[`.populate`](../reference/populate/populate.mdx#populate) puts the author in place of the identifier, and the `select` inside it takes only the name. A post must have an author, but the user may have been deleted. Without `required: true` the populated field would have the type `User | null`, and `item.author.name` wouldn't compile. With `required: true` a deleted author becomes a [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#document-not-found-error), and `null` drops out of the type. The chain ends with [`.plain()`](../reference/query/reading.mdx#plain), and the result is ordinary objects ready for the client.
+
+<Snippet id="getting-started/first-app/show-feed" title="src/posts.service.ts" twoslash />
+
+The result type comes from the chain. Hover over `item` in the script below. It has only the selected fields, and `item.author.name` is a string because the relation is populated. The [Reading data](../queries/reading-data.mdx) and [Show related data](../populate/basics.mdx) guides cover these methods in detail.
+
+## Show a post with its comments [#post-with-comments]
+
+The post page needs the author and the comments, and each comment shows its author too. The comments come from the virtual field `comments`, and a nested `populate` fills in their authors. If the post doesn't exist, [`.orFail()`](../reference/query/reading.mdx#or-fail) throws [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#document-not-found-error). Without it, `findById` would return `null`.
+
+<Snippet id="getting-started/first-app/post-with-comments" title="src/posts.service.ts" twoslash />
+
+[`findById`](../reference/query/reading.mdx#model.find-by-id) takes `id` as a string, the way it arrives from the page URL. What exactly the query returns and how many round trips it makes to the database is covered in the [Show related data](../populate/basics.mdx) guide.
+
+## Add and delete a comment [#add-and-delete-comment]
+
+A reader leaves a comment, and the author or a moderator can remove it. `addComment` creates the comment. `removeComment` deletes it with [`deleteOne`](../reference/writes/writes.mdx#delete-one) and uses the `deletedCount` counter to report whether it was found. Deleting it again returns `false`, not an error, because deleting something already deleted is harmless.
+
+<Snippet id="getting-started/first-app/add-and-delete-comment" title="src/comments.service.ts" twoslash />
+
+The [Delete documents](../writes/delete.mdx) guide covers deletion in detail.
+
+## Run the app [#run-app]
+
+The script runs the whole scenario. It signs up two users, tries to take an email a second time, writes and publishes a post, reads the feed and the post page, and leaves and deletes a comment. The results in the `// →` comments come from a real MongoDB.
+
+<Snippet id="getting-started/first-app/run-app" title="src/main.ts" twoslash />
+
+<Snippet id="getting-started/first-app/run-app-2" />
+
+Notice two things. The second sign-up with `Alice@Example.com` is rejected, even though the database stores `alice@example.com`. `lowercase` lowercases the email before the write, and the unique index sees the same email. And the draft didn't make it into the feed. The `published: true` filter cut it out, so the first feed is empty.
+
+If you run the script again, it fails at sign-up. The users already exist, and `registerUser` throws a `__Conflict__` that nobody catches. Drop the `blog` database before the next run.
+
+## How to choose [#how-to-choose]
+
+In an app you'll keep coming back to one question: **what form do you need the data in?**
+
+- **Sending it to a client**, as in `listPublished` and `readPost`: end the query with [`.plain()`](../reference/query/reading.mdx#plain).
+- **Going to change and save it**: read a document, without `.plain()`.
+- **Computing something inside the app**, with no data going out: [`.lean()`](../reference/query/reading.mdx#lean) will do.
+
+The [Reading data](../queries/reading-data.mdx) guide has the full comparison.
+
+## When not to use it [#when-not-to-use]
+
+This is a tutorial example. It has no authorization, no protection against editing other people's comments, no cursor pages, and no transactions. If you need to export thousands of posts, use [keyset pagination](../queries/keyset-pagination.mdx) instead of `skip` and `limit`. And if several writes must change together, use [transactions](../transactions/transactions.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**The compiler asks for `Defaulted<T>`.** A field with `default` is declared with a plain type. The compiler stops you right at the decorator, not where you forgot to pass the field.
+
+<Snippet id="getting-started/first-app/troubleshooting" twoslash />
+
+Typemo infers the input type of `create` from the field type. With `boolean` the field is required, and with `Defaulted<boolean>` it isn't. If you declared `default` but kept `boolean`, `create` would still require the field, and the default would never kick in. That's why the decorator rejects such a model. Declare `Defaulted<boolean>`, as in the post model above.
+
+**The identifier from the URL doesn't fit.** The post page takes `id` from the URL, and a user can type anything there. A string that doesn't look like an `ObjectId` gives a [`CastError`](../reference/errors/data-errors.mdx#cast-error). A valid `id` of a post that doesn't exist gives a [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#document-not-found-error).
+
+<Snippet id="getting-started/first-app/troubleshooting-2" />
+
+At the app's boundary, both errors turn into one "not found" response, and you check the error type with `instanceof`.
+
+<Snippet id="getting-started/first-app/troubleshooting-3" title="src/posts.controller.ts" twoslash />
+
+**A typo in a field name.** If a key with a typo arrives at runtime, for example from data rather than from your code, Typemo stops the write instead of silently creating an extra field. In the example the key is cast to `any`.
+
+<Snippet id="getting-started/first-app/troubleshooting-4" />
+
+A write without a required field behaves the same way: `ValidationError: Validation failed: "body": the field is required [required]`. More in the [Create documents](../writes/create.mdx) and [Strictness](../concepts/strictness.mdx) guides.
+
+## Full example [#full-example]
+
+The full project code is the files above. Three models, `db.ts`, three services, and the `main.ts` script that runs them together and prints the results from the `// →` comments.
+
+<Callout type="migration">
+
+In Mongoose, `mongoose.connect(uri)` creates a global connection, and models bind to it on their own. Typemo has no global connection. You keep the client in `db.ts` and get models from it. A reference is described with the `Ref<T>` type, the result of a query with `populate` has its own type, and the compiler knows where `author` is populated and where it isn't.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Define a model" href="../schemas/define-model.mdx">
+  How `@Schema` and `@Prop` work and where the document type comes from.
+</Card>
+<Card title="Reading data" href="../queries/reading-data.mdx">
+  Documents, `.lean()`, and `.plain()`, and when to use each.
+</Card>
+<Card title="Create documents" href="../writes/create.mdx">
+  Default values, checks, and errors on create.
+</Card>
+<Card title="Show related data" href="../populate/basics.mdx">
+  Everything about `populate`: selecting fields, virtual relations, the number of queries.
+</Card>
+<Card title="Reference" href="../reference/index.mdx">
+  Every model, query, write, and error with exact types.
+</Card>
+</Cards>

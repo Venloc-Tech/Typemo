@@ -1,0 +1,175 @@
+---
+title: Update documents
+description: "Change one or many documents, get the document back, create it when it's missing, and see what Typemo checks along the way"
+icon: Pencil
+---
+
+To change data that's already in the database, call [`updateOne`](../reference/writes/writes.mdx#update-one) or [`updateMany`](../reference/writes/writes.mdx#update-many) and say **what to do** with a field. Add to a number, write a value, push an element into an array. An update isn't a new document but a set of operators. That's why concurrent changes don't overwrite each other, and why Typemo can check every value before it's sent.
+
+If you need the document after the change, there's [`findOneAndUpdate`](../reference/writes/writes.mdx#find-one-and-update) and [`findByIdAndUpdate`](../reference/writes/writes.mdx#find-by-id-and-update). If the document might not exist and should then be created, add [`upsert`](../reference/writes/writes.mdx#upsert) to any of these methods. The operators themselves, `$set`, `$inc`, `$push`, and the rest, are covered in [Update operators](./update-operators.mdx).
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the account model from [Create documents](./create.mdx). Every example starts with the same data.
+
+- Account `Main`: owner `alice`, balance 10, tag `a`.
+- Account `Second`: owner `alice`, balance 5.
+- Account `Other`: owner `bob`.
+
+<Snippet id="writes/delete/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+The three most common cases are changing one document, changing many, and changing with the result returned. After `await` the first two give counters, the third gives a document.
+
+<Snippet id="writes/update/quick-start" twoslash />
+
+Below we'll go through each way on real tasks.
+
+## Change one document [#update-one]
+
+A customer topped up an account, and you know which one. Call `updateOne` with a filter and an update. The filter picks the **first** matching document, and the update says what to do with it.
+
+<Snippet id="writes/update/update-one" title="accounts/accounts.service.ts" twoslash />
+
+The method returned an [`UpdateResult`](../reference/writes/writes.mdx#update-result). `matchedCount` is how many documents matched the filter, and `modifiedCount` is how many of them changed. The numbers differ when the update changed nothing, for example when it wrote the same value.
+
+`updateOne` is a **write builder**. The write goes to the database on `await`, not on the call, and each such object runs once. A second `await` of the same object is an error, otherwise the write would quietly repeat.
+
+<Snippet id="reference/writes/writes/one-run-per-builder" />
+
+### If the document isn't found [#not-found]
+
+If the filter found nothing, `updateOne` doesn't throw and returns `matchedCount: 0`. "Not found" is a normal outcome, not a failure. If it is an error for your task, add [`.orFail()`](../reference/writes/writes.mdx#or-fail).
+
+<Snippet id="writes/update/not-found" twoslash />
+
+<Snippet id="reference/writes/writes/no-match-2" />
+
+## Change many documents [#update-many]
+
+Say every account of an owner needs a mark. `updateMany` changes **all** matching documents in one request.
+
+<Snippet id="writes/update/update-many" twoslash />
+
+As with `updateOne`, the filter of `updateMany` is required and can't be empty. In MongoDB an empty filter `{}` matches every document, and filters are often built from data. One typo, and the update hits the whole collection or, with `updateOne`, a random document. So a `{}` literal doesn't compile, and Typemo rejects an empty object at runtime.
+
+<Snippet id="reference/writes/writes/update-many-empty-filter" />
+
+How to change everything on purpose is covered in [Empty filters in writes](./empty-filters.mdx).
+
+## Change a document and get it back [#update-and-return]
+
+You topped up an account and want to show the customer the new balance. You don't need two requests, "change" and "read". [`findOneAndUpdate`](../reference/writes/writes.mdx#find-one-and-update) changes the document and returns it in one command, and nobody can slip in between the change and the read.
+
+<Snippet id="reference/writes/writes/find-one-and-update" twoslash />
+
+By default you get the document **after** the change. The MongoDB driver and Mongoose return the document before the change by default, but you almost always want the result, so here it's the other way around. If you need the state before, pass `returnDocument: "before"`. The option is described in the [reference](../reference/writes/writes.mdx#return-document).
+
+<Snippet id="reference/writes/writes/document-before-change" twoslash />
+
+You get the same query builder as from [`find`](../reference/query/reading.mdx#model.find). You can add [`.select`](../reference/query/reading.mdx#select), [`.plain`](../reference/query/reading.mdx#plain), [`.lean`](../reference/query/reading.mdx#lean), and [`.orFail`](../reference/query/reading.mdx#or-fail) to it. If nothing is found, you get `null`, and with `.orFail()` a `DocumentNotFoundError` instead.
+
+### A document by id [#find-by-id]
+
+When the `id` came from the request URL, you don't need to build a filter. [`findByIdAndUpdate`](../reference/writes/writes.mdx#find-by-id-and-update) accepts `_id` both as an `ObjectId` and as a string of 24 hex characters.
+
+<Snippet id="writes/update/find-by-id" title="accounts/accounts.service.ts" twoslash />
+
+A string in the wrong format is stopped by a [`CastError`](../reference/errors/data-errors.mdx#cast-error) before it reaches the database.
+
+<Snippet id="reference/writes/input-types/accepted-values" />
+
+## Create the document if it's missing [#upsert]
+
+The task sounds like "top up the account, and if it doesn't exist, open it". The `upsert: true` option inserts a new document when the filter finds nothing. Put starting values that mustn't overwrite existing ones in `$setOnInsert`. It applies only on insert.
+
+<Snippet id="reference/writes/writes/upsert" twoslash />
+
+There was no `Fresh` document, so the database built it from the filter's equalities and the update operators. `upsertedId` holds its `_id`. If the document had existed, `upsertedCount` would be `0`, and `$setOnInsert` would do nothing.
+
+A normal update checks only the fields it writes, because the rest are already in the database. But `upsert` can create a whole document. So before sending, Typemo checks that the new document gets **every** required field: from the filter's equalities, from `$set`, from `$setOnInsert`, or from another operator that writes the field. If a field is missing, like `owner` in `{ $set: { note: "x" } }`, you get a `ValidationError`, and nothing reaches the database.
+
+<Snippet id="reference/writes/writes/upsert-2" />
+
+The check runs on every `upsert`, even if the document exists. Typemo can't know in advance whether the server will insert a new one. There's a second restriction too. You can't use `$inc` or `$mul` on a field with `min` or `max` together with `upsert`, because the condition that protects the bound wouldn't apply on insert. Put the starting value of such a field in `$setOnInsert`.
+
+Upsert works the same way with `findOneAndUpdate`, and the result type takes it into account. With `upsert: true` and `returnDocument: "after"` there's always a document, so `null` drops out of the type.
+
+## What Typemo checks on update [#update-checks]
+
+An update goes through the same checks as creation, but only for what the operator writes. The value is cast to the field's type, the field's validators run, and unknown fields are rejected.
+
+<Snippet id="writes/update/update-checks" />
+
+`$inc` on a field with a bound is a special case. The outcome depends on the value in the database, so Typemo makes the update conditional. If the result would go past the bound, nothing is written, and you get a `ValidationError` with the value from the database and the result.
+
+<Snippet id="writes/update/update-checks-2" twoslash />
+
+<Snippet id="reference/writes/update-operators/min-max-bounds" />
+
+An empty update is an error too. An empty object is too easy to get by accident, and a quiet "change nothing" would hide a bug.
+
+<Snippet id="writes/update/update-checks-3" />
+
+## How to choose [#how-to-choose]
+
+Ask yourself whether you need the document after the change.
+
+- **You don't**: [`updateOne`](../reference/writes/writes.mdx#update-one) or [`updateMany`](../reference/writes/writes.mdx#update-many). They're cheaper, because they don't return the document.
+- **You do**: [`findOneAndUpdate`](../reference/writes/writes.mdx#find-one-and-update), or [`findByIdAndUpdate`](../reference/writes/writes.mdx#find-by-id-and-update) if you know the `_id`.
+
+Then look at how many documents you're changing. One means `updateOne`, many means `updateMany`. `findOneAndUpdate` always changes one.
+
+## When not to use it [#when-not-to-use]
+
+Is the document already in memory, and you changed its fields? Save it with [`$save`](../reference/documents/document-api.mdx#save), which sends only what changed, see [Change and save a document](../documents/change-and-save.mdx). If the document has to be replaced whole rather than have its fields fixed, use [`replaceOne`](../reference/writes/writes.mdx#replace-one), see [Replace a document](./replace.mdx). And if the new value is computed from other fields of the document, you need a [pipeline](./pipeline-updates.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**A second `await` of the same update fails.** You can't do this.
+
+<Snippet id="writes/update/troubleshooting" twoslash />
+
+The second line throws `QueryError: updateOne: this operation was already executed; …`. Each write object runs once, because a repeat is almost always accidental. Build a new update. And if you want the repeat on purpose, call [`query.exec({ force: true })`](../reference/writes/writes.mdx#exec).
+
+**An update without operators.** For example, `Accounts.updateOne({ title: "Main" }, { note: "z" })`. If it does get to run, because the data came from outside and bypassed the types, you get this error.
+
+<Snippet id="writes/update/troubleshooting-2" />
+
+Write `{ $set: { note: "z" } }`. Without an operator the database can't tell what you want: to write a field or to replace the document.
+
+**One path under two operators.** For example, `{ $inc: { balance: 1 }, $set: { balance: 3 } }`. The server rejects such an update, and Typemo notices it earlier.
+
+<Snippet id="reference/writes/update-operators/path-conflict" />
+
+Keep one operator for the path.
+
+## Full example [#full-example]
+
+Everything in one file: a top-up that protects the bound, a document by the id from the URL, and an insert if the document is missing.
+
+<Snippet id="writes/update/full-example" title="accounts/accounts.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, `findOneAndUpdate` returned the document before the change by default (`new: false`), and `updateOne` with an empty update silently sent nothing. Here you get the document after the change by default, and an empty update is an error. Value checks, `runValidators` in Mongoose, always run, and `$inc` protects the `min` and `max` bounds on the server side.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Update operators" href="./update-operators.mdx">
+  Every operator by example: `$set`, `$inc`, `$push`, and the rest, positional paths, and `arrayFilters`.
+</Card>
+<Card title="Empty filters in writes" href="./empty-filters.mdx">
+  Why write methods don't accept `{}` and how to change everything on purpose.
+</Card>
+<Card title="Pipeline updates" href="./pipeline-updates.mdx">
+  When the new value is computed from other fields of the document.
+</Card>
+<Card title="Writing" href="../reference/writes/writes.mdx">
+  Every write method with its options, results, and errors.
+</Card>
+</Cards>

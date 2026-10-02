@@ -1,0 +1,132 @@
+---
+title: Required fields, null, and missing values
+description: "Declare a field as required or nullable, and see how a value, null, and a missing field differ in MongoDB"
+icon: CircleSlash
+---
+
+A field of a MongoDB document has three states. It holds a **value**, it holds **`null`**, or it **isn't there at all**. To the database these are three different cases, and filters, indexes, and checks behave differently in each. Typemo doesn't quietly mix them up.
+
+- The [`required`](../reference/schemas/prop.mdx#required) option says the field must be in the document.
+- The [`nullable`](../reference/schemas/prop.mdx#nullable) option allows `null`.
+- `undefined` is never a value.
+
+Without `nullable`, a required field can't be `null` either. With `nullable`, the key is required, and `null` is allowed.
+
+If MongoDB is new to you, remember that it stores documents as they are. If you didn't write a field, it isn't there. And `null` is a written value that means "empty". The check `user.nickname == null` can't tell one from the other, but the database can.
+
+## What you need [#prerequisites]
+
+A model described as in [Define a model](./define-model.mdx). The examples build a website user profile and add fields to it one at a time.
+
+## Quick start [#quick-start]
+
+Three fields, three states: required, nullable, and optional.
+
+<Snippet id="schemas/required-and-null/quick-start" title="users/profile.ts" twoslash />
+
+`bio` wasn't passed, so it isn't in the document. `nickname` was passed as `null`, and it's written. We'll go through each case below.
+
+## Make a field required [#required-field]
+
+With `required: true` a document without the field won't save, and `null` in place of a value on a regular field won't pass either. You set the option explicitly. It isn't inferred from a `?` in the declaration. A `?` describes the TypeScript type, while being required is a rule for the data, and you decide them separately. So `login!: string` with `required: true` is a required field, and `bio?: string` without `required` is optional. The compiler checks the `create` call, and without a required field the code won't compile.
+
+<Snippet id="schemas/required-and-null/required-field" twoslash />
+
+In untyped code, for example with data from an outside request, the library catches the same thing at runtime. It throws a [`ValidationError`](../reference/errors/data-errors.mdx#validation-error) with the reason `required`.
+
+<Snippet id="schemas/required-and-null/required-field-2" twoslash />
+
+## Allow null [#nullable]
+
+Without `nullable`, a `null` won't get into a field. It's not an empty string and not a missing value but a value of its own, and quietly taking it for something else would mean guessing. `nullable: true` declares `null` a legitimate value of the field. The field type must then include `| null`, and the compiler checks that both ways.
+
+<Snippet id="schemas/required-and-null/nullable" twoslash />
+
+The first document stores `nickname: null`, and the second doesn't have that field. You can see the difference both in the database itself and in query results. [`.lean()`](../reference/query/reading.mdx#lean) returns `null` for the first, and the second has no such key at all. The error on `bio` is a [`CastError`](../reference/errors/data-errors.mdx#cast-error) with the reason `null`.
+
+Forget `| null` in the type, or add it without `nullable: true`, and the compiler tells you. The messages are `@Prop "nickname": "nullable" is set, but the field type has no "| null"` and `@Prop "nickname": the field type has "| null", add nullable: true`.
+
+## Require the key and allow null [#required-nullable]
+
+You can put both options on one field, `required: true` together with `nullable: true`. Then the key must be in the document, and its value can be either a real value or `null`. "We asked and got no answer" is different from "we didn't ask". The field type includes `| null`, and a read returns it without `undefined`.
+
+<Snippet id="schemas/required-and-null/required-nullable" twoslash />
+
+Without the key the document won't save, and `$unset` on such a field is forbidden, because it would remove a required key. To clear the value, write `null`: `$set: { phone: null }` goes through. You can't assign `undefined` on a loaded document either, and you get the same `required` error. On a regular `nullable` field that would mean `$unset`.
+
+## Why `undefined` isn't a value [#why-undefined]
+
+`undefined` is a special JavaScript value, and MongoDB doesn't store it. Depending on its settings, the driver either skips such a field or writes `null`. Typemo relies on neither and rejects `undefined` in data right away. If a field isn't there, **don't pass it**.
+
+<Snippet id="schemas/required-and-null/why-undefined" twoslash />
+
+That way `nickname: user.nick` with a missing `user.nick` won't quietly turn into a written `null` or a lost field.
+
+## Check for null and missing fields in a filter [#filter-null]
+
+In MongoDB the filter `{ nickname: null }` finds documents where the field equals `null` **and** documents where the field is missing. That's how the database works. To find only documents without the field, use `$exists: false`.
+
+<Snippet id="schemas/required-and-null/filter-null" twoslash />
+
+For a field without `nullable`, the filter `{ field: null }` makes no sense, and the library says so outright: `Cast to string failed at path "bio" for null: null is not a value of this path (it is not nullable); an absent field is { $exists: false } [null]`. You won't get an empty result where you expected documents.
+
+## Remove a value in an update [#unset-on-update]
+
+There are three ways to "clear" a field in an update, and they mean different things.
+
+- `$set` with `null` writes `null`. Allowed only for `nullable` fields.
+- `$unset` removes the field from the document. Forbidden for required fields, since the document would no longer match the schema.
+- `$set` with `undefined` is rejected, as in `create`.
+
+<Snippet id="schemas/required-and-null/unset-on-update" twoslash />
+
+On a loaded document, assigning `undefined` to a field means "remove the field". The changes get an `$unset`, not a written `null`. The details are in [Change and save a document](../documents/change-and-save.mdx).
+
+## How to choose [#how-to-choose]
+
+Ask yourself: **what should an empty result mean to whoever reads the data?**
+
+- **The data isn't known yet, so the field can be absent**: leave it optional, without `nullable`.
+- **You know for sure there's no value and want to store that** (for example, the user explicitly declined to give a phone number): `nullable: true`.
+- **Without a value the document makes no sense** (a login, an amount, an owner): `required: true`.
+- **The key must be there, but its value can be "none"** (a phone number the user explicitly left out): both options.
+
+Here's a quick self-check. If you'll need to tell "we didn't ask" from "we asked and got no answer", you need both states, and so you need `nullable`.
+
+## When not to use it [#when-not-to-use]
+
+A value that fills itself in when it isn't passed doesn't need to be required. That's what [`default`](./defaults.mdx) is for. The format and bounds of a value aren't `required`'s job either. There are [`min`, `max`, `match`, and the other options](./validation.mdx) for that. You need the `required: true` and `nullable: true` pair only when a missing key is unacceptable and `null` means something. If you don't need to tell "we didn't ask" from "no answer", one of the options is enough.
+
+## Troubleshooting [#troubleshooting]
+
+**A required field with `nullable` accepts `null` but not a missing value.** The field is declared `required: true, nullable: true`, the document is created without it, and `create` fails. That's by design. `required` demands the key, and `nullable` allows only the value `null`, not a missing field. The error names the field: `Validation failed: "phone": the field is required [required]`. Pass `null` explicitly, or remove `required` if the field may be absent.
+
+**A filter on `null` finds extra documents.** The query `{ nickname: null }` returned both those whose field is empty and those who don't have it. That's how MongoDB works, as described above. If you need only real `null` values, add the condition `$exists: true`.
+
+**An `undefined` came from an optional variable.** `create({ nickname: maybe })` fails with `undefined is never a value`, because `undefined` isn't a value. Build the object without that key: `...(maybe === undefined ? {} : { nickname: maybe })`.
+
+## Full example [#full-example]
+
+One file with the three states of a field and the three ways to change them. Code that isn't part of Typemo is marked `__…__`.
+
+<Snippet id="schemas/required-and-null/full-example" title="users/profiles.service.ts" twoslash />
+
+<Callout type="migration">
+
+Don't bring along the habit of treating `undefined` as a missing value. Typemo keeps the three states strictly apart. `undefined` in data gives a `CastError`, `null` passes only on a `nullable` field, and `required` demands the key and doesn't let `null` through on its own. For that you need the `required` and `nullable` pair. The filter `{ field: null }` on a field without `nullable` is an error, not a quiet search for missing values.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Set default values" href="./defaults.mdx">
+  How to fill in a value when the field isn't passed.
+</Card>
+<Card title="Validate field values" href="./validation.mdx">
+  Bounds, length, shape, and your own checks of a value.
+</Card>
+<Card title="@Prop" href="../reference/schemas/prop.mdx">
+  The `required` and `nullable` options and every error about matching them with the type.
+</Card>
+</Cards>

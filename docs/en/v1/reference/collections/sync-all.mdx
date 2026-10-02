@@ -1,0 +1,184 @@
+---
+title: SyncAll
+description: "SyncAll.run, SyncAll.collections, SyncAllOptions, and the SyncReport, SyncCollectionReport, and SyncViewReport reports"
+icon: RefreshCw
+---
+
+`SyncAll` brings a connection's whole database in line with the model schemas in one call. For each collection it checks the options and indexes, and for each view it checks the definition. Usually you don't call it directly but through [`connection.syncAll`](../connection/connection.mdx#connection.sync-all), and the code is the same. This page describes the report, because the report is what you have to read during a deployment.
+
+If you're setting up a database at startup for the first time, start with the [Sync indexes](../../collections/index-sync.mdx) guide. This page is a reference.
+
+`SyncAll` **doesn't stop at the first error**. One model failing doesn't block the others, for example when an index didn't build on dirty data or a collection in the database is declared differently. Every step of every model runs, and at the end the method throws one [`SyncError`](../errors/configuration-errors.mdx#sync-error) with a list of all the failures and the full report. For a deployment this is the best behavior. In one run you see everything that didn't match, and the deployment can't "succeed" with an index that wasn't built.
+
+The examples use two models: an account with a unique title and a capped transaction journal.
+
+<Snippet id="reference/collections/sync-all/intro" title="accounts/models.ts" twoslash />
+
+The results in the comments come from an empty database unless noted otherwise.
+
+---
+
+## SyncAll.run [#sync-all.run]
+
+`SyncAll.run` syncs all of a connection's models and views and returns a report. Use it when you need all the totals at once: in a deployment script, in an environment check on CI, in a utility command.
+
+For each collection the method takes three steps in turn. It brings the collection options ([`ensureCollection`](./collection-manager.mdx#model.ensure-collection)), the ordinary indexes ([`syncIndexes`](./model-indexes.mdx#model.sync-indexes)), and, if the schema declares search indexes, those too ([`syncSearchIndexes`](./model-indexes.mdx#model.sync-search-indexes)). Then [`TypedView.ensure`](./typed-view.mdx#typed-view.ensure) is called for each view. A failure in any step is remembered, and the other steps carry on.
+
+<Snippet id="reference/collections/sync-all/sync-all-run" twoslash />
+
+Here `inSync` is `false`, though nothing broke. There was something to create in the database, and the `created` list says exactly what was created. Once everything exists, a repeated call returns `inSync: true` and an empty `created`.
+
+<Returns type="Promise<SyncReport>">
+
+A [`SyncReport`](#sync-report) if no step failed. If at least one failed, the method throws a [`SyncError`](../errors/configuration-errors.mdx#sync-error), and the same report with `failed: true` is in its `report` field.
+
+</Returns>
+
+<Params>
+<Param name="connection" type="Connection" required>
+
+The connection whose models and views are synced. Only classes registered through [`connection.model`](../connection/connection.mdx#connection.model) and views from [`TypedView.define`](./typed-view.mdx#typed-view.define) count. The method won't see an unregistered class.
+
+</Param>
+<Param name="options" type="SyncAllOptions">
+
+The sync options, [`SyncAllOptions`](#sync-all-options).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/sync-all/sync-all-run-2" />
+
+</FullType>
+
+For application startup there's another method, [`connection.init`](../connection/connection.mdx#connection.init). It has the same steps, but it only **creates** what's missing, drops and changes nothing, and counts a mismatch as a failure. Its report and error are the same.
+
+### Check without saving [#validate-without-saving]
+
+With `dryRun: true` the method reports what would change and writes nothing: no collections, no indexes, no views. That's a good way to check the database before a deployment, for example in CI. After such a call on an empty database, it still has no collections.
+
+<Snippet id="reference/collections/sync-all/validate-without-saving" twoslash />
+
+With `dryRun`, the `created` list shows what would have been created. If the check finds a failure, for example a collection built differently from the schema, the method throws a `SyncError` even with `dryRun`. A deployment with such a mismatch wouldn't pass anyway.
+
+### One model failed [#one-model-failed]
+
+Say `accounts` has two accounts with the same title, and `ledger` already exists as an ordinary collection with no size limit. Both failures land in one error.
+
+<Snippet id="reference/collections/sync-all/one-model-failed" twoslash />
+
+The failed `accounts` index didn't block the other steps. The `accounts` collection options were checked (`error.report.collections[0].options.result` is `"unchanged"`), the `owner_1` index was built, and only `title_1` wasn't created. In the `ledger` entry, where the collection options didn't match, the `options` field is empty. The message hints at what to do.
+
+<Snippet id="reference/collections/sync-all/one-model-failed-2" />
+
+### Which models are skipped [#skipped-models]
+
+A schema with `autoCreate: false` skips the collection options step. A schema with `autoIndex: false` skips the index steps, and the matching report fields stay empty. Both options apply only here and in [`connection.init`](../connection/connection.mdx#connection.init). Direct calls of `syncIndexes`, `createIndexes`, and `ensureCollection` on a model ignore them.
+
+A schema with `autoCreate: false` and no indexes is skipped entirely, even if the collection doesn't exist yet. If it has indexes and "only at creation" options, a missing collection is an error. For details, see the [`CollectionManager`](./collection-manager.mdx#auto-create-false) page.
+
+Inheriting models ([discriminators](../schemas/discriminator.mdx)) share a collection with the base model. The collection is synced once by the base model's schema, and the indexes of the inheritors are already included in it. View classes (`TypedView`) don't count as collections, and they're handled as views.
+
+---
+
+## SyncAll.collections [#sync-all.collections]
+
+`SyncAll.collections` returns the schemas of a connection's root models, one per collection. `run` goes through the collection steps by this list. It has no views, and inheritors that share a collection aren't listed again. The method is useful for checks like "which collections will the deployment touch".
+
+<Snippet id="reference/collections/sync-all/sync-all-collections" twoslash />
+
+<Returns type="readonly SchemaInfo[]">
+
+Descriptions of the root models' schemas: a [`SchemaInfo`](../schemas/schema-info.mdx) with the fields `collection` (the collection name) and `name` (the class name). While no model is registered, the list is empty.
+
+</Returns>
+
+<Params>
+<Param name="connection" type="Connection" required>
+
+The connection whose models are listed.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/sync-all/sync-all-collections-2" />
+
+</FullType>
+
+---
+
+## SyncAllOptions [#sync-all-options]
+
+The options of [`SyncAll.run`](#sync-all.run) and [`connection.syncAll`](../connection/connection.mdx#connection.sync-all).
+
+<TypeTable
+  type={{
+    dryRun: { type: "boolean", default: "false", description: "Only reports what would change and writes nothing. Applies to collections, indexes, search indexes, and views." },
+    update: { type: "boolean", default: "false", description: "Applies, with the `collMod` command, what the server can change in place: collection options and the view definition. Without it, such a difference becomes a failure (a [`CollectionOptionsError`](../errors/configuration-errors.mdx#collection-options-error) in the report and in the `SyncError`). It doesn't affect indexes, which `syncAll` always brings in line." },
+  }}
+/>
+
+`update` protects a running collection from accidental changes to its options. Say a validator appeared in the schema, and the collection was created without it. Without `update: true`, the method throws a `SyncError` with a `CollectionOptionsError`, and with it the validator is applied.
+
+---
+
+## SyncReport [#sync-report]
+
+The result of [`SyncAll.run`](#sync-all.run) and [`connection.syncAll`](../connection/connection.mdx#connection.sync-all). The object and all its lists are frozen, so you can't change them.
+
+<TypeTable
+  type={{
+    collections: { type: "readonly SyncCollectionReport[]", required: true, description: "One entry for each synced collection, in model registration order." },
+    views: { type: "readonly SyncViewReport[]", required: true, description: "One entry for each of the connection's views, in definition order." },
+    inSync: { type: "boolean", required: true, description: "`true` if nothing failed and the database matches the schemas. For `syncAll` this means there were no differences. If the method created or changed something, `inSync` is `false` even when the difference was fixed, and a repeated call will show `true`. For [`connection.init`](../connection/connection.mdx#connection.init), `inSync` is `true` even after creating what was missing. `init` only creates, and after success the database matches the schemas. A `dryRun` that finds work to do is never `inSync`." },
+    created: { type: "readonly string[]", required: true, description: "What was created or, with `dryRun`, would have been created, in order. For example `\"collection users\"`, `\"index users.email_1\"`, `\"search index users.default\"`, `\"view active_users\"`. Empty if nothing was missing." },
+    failed: { type: "boolean", required: true, description: "`true` if at least one step failed. In a returned report it's always `false`. On a failure the method throws a [`SyncError`](../errors/configuration-errors.mdx#sync-error), and `true` appears only in its `report` field." },
+  }}
+/>
+
+`inSync` and `failed` are different things. `failed: false, inSync: false` means there were changes and all of them were applied (or, with `dryRun`, that changes are needed). `failed: true` means part of the work wasn't done. Such a report arrives only from `SyncError.report`, and the causes are in the `errors` of its entries.
+
+### SyncCollectionReport [#sync-collection-report]
+
+The result for one collection.
+
+<TypeTable
+  type={{
+    collection: { type: "string", required: true, description: "The collection name." },
+    model: { type: "string", required: true, description: "The class name of the collection's root model." },
+    options: { type: "EnsureCollectionReport", description: "What was done with the collection options, an [`EnsureCollectionReport`](./collection-manager.mdx#ensure-collection-report). Empty if the schema declares `autoCreate: false` or the step failed." },
+    indexes: { type: "IndexSyncResult", description: "What was done with the ordinary indexes, an [`IndexSyncResult`](./model-indexes.mdx#index-sync-result). Empty if the schema declares `autoIndex: false` or the step failed." },
+    searchIndexes: { type: "SearchIndexSyncResult", description: "What was done with the search indexes, a [`SearchIndexSyncResult`](./model-indexes.mdx#search-index-sync-result). Empty if the schema declares no search indexes or the step failed." },
+    errors: { type: "readonly TypemoError[]", required: true, description: "All failures of this collection, while the other steps still ran. Any failure makes the call throw a `SyncError`. These are Typemo errors: [`IndexSyncError`](../errors/configuration-errors.mdx#index-sync-error), [`CollectionOptionsError`](../errors/configuration-errors.mdx#collection-options-error), [`ServerError`](../errors/server-errors.mdx#server-error), and others." },
+  }}
+/>
+
+### SyncViewReport [#sync-view-report]
+
+The result for one view.
+
+<TypeTable
+  type={{
+    view: { type: "string", required: true, description: "The view name." },
+    result: { type: "EnsureCollectionReport", description: "What was done with the view, an [`EnsureCollectionReport`](./collection-manager.mdx#ensure-collection-report). Empty if the step failed." },
+    errors: { type: "readonly TypemoError[]", required: true, description: "All failures of this view." },
+  }}
+/>
+
+### How to read a failure [#read-failure]
+
+Catch the `SyncError`, and you can print all the failures as one list and stop the deployment. The original errors are in its `errors`, and the full report is in `report`.
+
+<Snippet id="reference/collections/sync-all/read-failure" twoslash />
+
+---
+
+## When not to use it [#when-not-to-use]
+
+If you only want to create what's missing, dropping and changing nothing, call [`connection.init`](../connection/connection.mdx#connection.init). It also counts a mismatch as a failure and throws a [`SyncError`](../errors/configuration-errors.mdx#sync-error), like `syncAll`. For a single model, call [`syncIndexes`](./model-indexes.mdx#model.sync-indexes) and [`ensureCollection`](./collection-manager.mdx#model.ensure-collection) on it directly. You can also check the state with no write and no `SyncAll`: [`diffIndexes`](./model-indexes.mdx#model.diff-indexes) shows the index mismatch of one model.
+
+The guide with real tasks is [Sync indexes](../../collections/index-sync.mdx).

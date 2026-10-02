@@ -1,0 +1,712 @@
+---
+title: "@venloc/typemo-nestjs"
+description: "Reference for the NestJS package: TypemoModule, model injection, tokens, @Transactional, policies from the request, the error filter, pipes, and testing helpers"
+icon: Boxes
+---
+
+`@venloc/typemo-nestjs` plugs Typemo into a NestJS 12 application. The module creates and closes the client, models are injected by entity class, transactions are declared with a method decorator, the tenant and actor come from the request, and Typemo errors turn into HTTP responses. The package is separate. The core `@venloc/typemo` has no Nest code, and the package itself doesn't depend on `mongoose` or `@nestjs/mongoose`. If you're new here, read the guide [Connect Typemo to NestJS](../../integrations/nestjs/setup.mdx) first. This page is a reference.
+
+The package needs NestJS 12 (`@nestjs/common` and `@nestjs/core` at 12.1.2 or higher), `rxjs` 7, `reflect-metadata`, and the `mongodb` driver as peer dependencies. It works only with the Express HTTP adapter. GraphQL, microservices, and Fastify aren't supported.
+
+```package-install
+@venloc/typemo @venloc/typemo-nestjs mongodb @nestjs/common @nestjs/core @nestjs/platform-express rxjs reflect-metadata
+```
+
+The examples use an account model. We got all the results on a Nest application with MongoDB 9.0 running as a replica set (several MongoDB servers holding copies of the same data, though one server is enough for transactions), here with a single node.
+
+<Snippet id="integrations/nestjs/models/prerequisites" title="accounts/account.ts" twoslash />
+
+<TypeTable
+  type={{
+    "TypemoModule.forRoot": { description: "Creates the client and connects it when the application starts.", type: "(uri, options?) => DynamicModule" },
+    "TypemoModule.forRootAsync": { description: "The same, with options from a factory, a class, or another provider.", type: "(options) => DynamicModule" },
+    "TypemoModule.forFeature": { description: "Registers the entity models of a module.", type: "(features, target?) => DynamicModule" },
+    "TypemoModule.view": { description: "A view for `forFeature`.", type: "(View, definition) => ViewFeature" },
+    "TypemoModule.materialized": { description: "A materialized result for `forFeature`.", type: "(Target, definition) => MaterializedFeature" },
+    "InjectModel": { description: "Injects an entity model.", type: "(Entity, target?) => decorator" },
+    "InjectConnection": { description: "Injects the `Connection` of a database.", type: "(target?) => decorator" },
+    "InjectClient": { description: "Injects a `TypemoClient`.", type: "(name?) => decorator" },
+    "getModelToken": { description: "The model token.", type: "(Entity, target?) => symbol" },
+    "getConnectionToken": { description: "The database connection token.", type: "(target?) => string" },
+    "getClientToken": { description: "The client token.", type: "(name?) => string" },
+    "Transactional": { description: "Runs a method in a transaction.", type: "(options?) => decorator" },
+    "PolicyInterceptor": { description: "Fills the policy context from the request.", type: "class" },
+    "AllTenants": { description: "Cross-tenant access for a handler or a controller.", type: "() => decorator" },
+    "TypemoExceptionFilter": { description: "Typemo and driver errors to HTTP responses.", type: "class" },
+    "ParseIdPipe": { description: "A route parameter to the model's `_id`.", type: "class" },
+    "ValidateBodyPipe": { description: "Validates the request body with the entity schema.", type: "class" },
+    "provideModelMock": { description: "A model mock for unit tests (`/testing`).", type: "(Entity, mock, target?) => MockProvider" },
+    "provideClientMock": { description: "A client mock and the `@Transactional` binding (`/testing`).", type: "(mock?, name?) => providers" },
+    "TypemoTestingModule": { description: "A test module on a real database (`/testing`).", type: "class" },
+  }}
+/>
+
+---
+
+## TypemoModule.forRoot [#typemo-module.for-root]
+
+`TypemoModule.forRoot` creates a [`TypemoClient`](../connection/typemo-client.mdx#new-typemo-client), connects it when the application starts, and closes it when the application stops. The client, the connection to its default database, and the models of all `forFeature` calls are available across the whole application. The client module is global, so you don't have to import it into every module, once in the root module is enough.
+
+<Snippet id="reference/integrations/nestjs/typemo-module-for-root" title="app.module.ts" twoslash />
+
+The application doesn't start until the client is connected. `createNestApplication().init()` and `NestFactory.create` wait for the connection and fail if all attempts failed. At startup the module **writes nothing to the database** until you turn on [`sync`](#sync). Collections and indexes are your explicit decision.
+
+<Returns type="DynamicModule">
+
+A module for `imports` of the root module.
+
+</Returns>
+
+<Params>
+<Param name="uri" type="string" required>
+
+The connection string. An empty string gives a [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error) right at the call.
+
+</Param>
+<Param name="options" type="TypemoModuleOptions" default="{}">
+
+The core client options ([`TypemoClientOptions`](../connection/typemo-client.mdx#client-options): `name`, `dbName`, `readyTimeoutMS`, driver options) and the module options from the section [TypemoModuleOptions](#typemo-module-options). `name` names the client and is part of its tokens.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/integrations/nestjs/typemo-module-for-root-2" />
+
+</FullType>
+
+### Errors [#typemo-module.for-root.errors]
+
+Invalid module options are rejected at the moment `forRoot` is called, before startup.
+
+<Snippet id="reference/integrations/nestjs/typemo-module-for-root-errors" />
+
+Two `forRoot` calls with the same name in one application give an error at startup. Otherwise both modules would provide the token `TypemoClient:default`, and Nest would silently take one of them.
+
+<Snippet id="integrations/nestjs/connections/multiple-clients-2" />
+
+---
+
+## TypemoModule.forRootAsync [#typemo-module.for-root-async]
+
+`TypemoModule.forRootAsync` does the same as [`forRoot`](#typemo-module.for-root), but the options are computed when the application starts. You can read the connection string from configuration, and secrets from a vault. The source of options is one of three: `useFactory` with `inject`, `useClass` (a class the module creates itself and injects dependencies into), or `useExisting` (such a class is already provided by another module).
+
+<Snippet id="reference/integrations/nestjs/typemo-module-for-root-async" title="app.module.ts" twoslash />
+
+The client name `name` stands **next to** the factory, not in its result. That way it's known when Nest builds the module graph, before the factory is called, and the tokens depend on it. Declare the factory parameters with types. The module doesn't know what you listed in `inject`, and without an annotation the parameter gets the type `never`.
+
+<Returns type="DynamicModule">
+
+A module for `imports` of the root module.
+
+</Returns>
+
+<Params>
+<Param name="options.name" type="string" default="&quot;default&quot;">
+
+The client name.
+
+</Param>
+<Param name="options.imports" type="modules" default="[]">
+
+Modules whose providers the factory or the options class needs.
+
+</Param>
+<Param name="options.useFactory" type="(...args) => TypemoModuleFactoryOptions | Promise">
+
+The options factory. It returns [`TypemoModuleFactoryOptions`](#typemo-module-factory-options), that is `uri` and options without `name`.
+
+</Param>
+<Param name="options.inject" type="tokens" default="[]">
+
+The providers `useFactory` will receive, in order. Only together with `useFactory`.
+
+</Param>
+<Param name="options.useClass" type="TypemoOptionsFactory class">
+
+A class with the method `createTypemoOptions()` ([`TypemoOptionsFactory`](#typemo-options-factory)).
+
+</Param>
+<Param name="options.useExisting" type="TypemoOptionsFactory class">
+
+The same kind of class, already provided by a module from `imports`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/integrations/nestjs/typemo-module-for-root-async-2" />
+
+</FullType>
+
+### `name` in the factory result [#factory-name]
+
+`name` inside the result is a compile error, because the result type declares it as `never`.
+
+<Snippet id="reference/integrations/nestjs/factory-name" twoslash />
+
+If you get around the type (the factory returned `any` from foreign configuration), startup fails at once, without connection attempts. The check is the same for all three kinds.
+
+<Snippet id="reference/integrations/nestjs/factory-name-2" />
+
+<Callout type="migration" title="If you're coming from @nestjs/mongoose">
+
+In `@nestjs/mongoose` a `connectionName` in the factory result compiled (the factory is typed through `any[]`), and at startup the driver rejected the unknown option, and the module went into retries. Here the compiler catches the same mistake, and if you get around the type, you get one clear error without retries.
+
+</Callout>
+
+---
+
+## TypemoModuleOptions [#typemo-module-options]
+
+The options of [`forRoot`](#typemo-module.for-root) are all the core [`TypemoClientOptions`](../connection/typemo-client.mdx#client-options) and the module options below ([`TypemoConnectOptions`](#typemo-connect-options)). The module passes the client options to `new TypemoClient` as is, so a typo in a driver option name is rejected by the driver itself when the client is created.
+
+### retryAttempts [#retry-attempts]
+
+`number`, `9` by default. How many times the module tries to connect before startup fails. `0` and `1` mean one attempt. Only errors a retry can fix are retried, that is a missing server or a network failure. A wrong password or a configuration error stops the attempts at once. Between attempts the module writes the client name and the kind of error to the Nest log (`Logger("TypemoModule")`). The connection string isn't there, since it can contain a password and addresses.
+
+<Snippet id="reference/integrations/nestjs/retry-attempts" />
+
+With `retryAttempts: 3`, `retryDelay: 20`, and a dead server, three attempts happened. `onClientCreate` was called once, because there is one client for all attempts. Startup failed with the error from [`clientErrorFactory`](#client-error-factory), and the client is closed.
+
+### retryDelay [#retry-delay]
+
+`number`, `3000` by default. The pause between attempts in milliseconds. If the application is stopped during a pause, the wait ends at once.
+
+### lazyConnection [#lazy-connection]
+
+`boolean`, `false` by default. With `true` the application starts without waiting for the connection, and the client connects in the background with the same retries. Operations called before the connection wait for it for no longer than the client's `readyTimeoutMS`. If the connection failed, they get a [`ConnectionError`](../errors/configuration-errors.mdx#connection-error). When all attempts are exhausted, the module writes to the log.
+
+<Snippet id="reference/integrations/nestjs/lazy-connection" />
+
+[`onClientCreate`](#on-client-create) is called with a lazy connection too.
+
+### sync [#sync]
+
+`false | "init" | "sync"`, `false` by default. What to create in the database at startup, after the models of all `forFeature` calls are registered. `"init"` calls [`connection.init()`](../connection/connection.mdx#connection.init) and creates missing collections, indexes, and views, changing nothing. `"sync"` calls [`connection.syncAll()`](../connection/connection.mdx#connection.sync-all) and brings everything in line with the schemas, including replacing an index declared differently. Synchronization runs in `onApplicationBootstrap` for every database that has `forFeature` models. A [`SyncError`](../errors/configuration-errors.mdx#sync-error) stops startup. By default the module writes nothing, because changing the database on every application launch is a decision, not a default.
+
+### onClientCreate [#on-client-create]
+
+`(client: TypemoClient) => void | Promise<void>`. Called once with the new client, before the connection and before any model is created. This is the place for [`client.use`](../connection/typemo-client.mdx#client.use) (extensions), connection plugins, and [`client.instrument`](../connection/typemo-client.mdx#client.instrument). Extensions are sealed by the first model compilation, and you can't add them later.
+
+### clientFactory [#client-factory]
+
+`(client: TypemoClient) => TypemoClient | Promise<TypemoClient>`. Receives the connected client (a connecting one with `lazyConnection`) and returns the client the providers will get. Usually it returns the same one. If it returns a different one, startup fails.
+
+<Snippet id="reference/integrations/nestjs/client-factory" />
+
+### clientErrorFactory [#client-error-factory]
+
+`(error: unknown) => Error`. Receives the error of the last attempt and returns the error that startup fails with. It isn't called on a successful connection.
+
+<FullType>
+
+<Snippet id="reference/integrations/nestjs/client-error-factory" />
+
+</FullType>
+
+## TypemoConnectOptions [#typemo-connect-options]
+
+The module options without the client options: [`retryAttempts`](#retry-attempts), [`retryDelay`](#retry-delay), [`lazyConnection`](#lazy-connection), [`sync`](#sync), [`onClientCreate`](#on-client-create), [`clientFactory`](#client-factory), [`clientErrorFactory`](#client-error-factory). They're part of both [`TypemoModuleOptions`](#typemo-module-options) and [`TypemoModuleFactoryOptions`](#typemo-module-factory-options).
+
+## TypemoModuleFactoryOptions [#typemo-module-factory-options]
+
+What the factory of [`forRootAsync`](#typemo-module.for-root-async) returns. It's `uri` (required), the client options without `name`, and [`TypemoConnectOptions`](#typemo-connect-options). `name?: never` makes the name in the result a compile error.
+
+## TypemoOptionsFactory [#typemo-options-factory]
+
+The class interface for `useClass` and `useExisting`. It has one method, `createTypemoOptions()`, which returns [`TypemoModuleFactoryOptions`](#typemo-module-factory-options) or a promise of them.
+
+<Snippet id="reference/integrations/nestjs/typemo-options-factory" title="database.config.ts" twoslash />
+
+---
+
+## TypemoModule.forFeature [#typemo-module.for-feature]
+
+`TypemoModule.forFeature` registers entity models in the module that imports it. Each entry of the list becomes a provider under the token [`getModelToken(Entity, target)`](#get-model-token), and you inject it through [`@InjectModel`](#inject-model). The model is the core object [`connection.model(Entity)`](../connection/connection.mdx#connection.model), so one entity in two modules gives **the same** model object, and the core handles discriminators itself.
+
+<Snippet id="reference/integrations/nestjs/typemo-module-for-feature" title="accounts/accounts.module.ts" twoslash />
+
+`forFeature` providers are created when the application starts and only register the model, without touching the database. Collections and indexes are created by [`sync`](#sync) of the root module or by your deploy step.
+
+<Returns type="DynamicModule">
+
+A module for `imports` of the module whose providers use the models. It exports the tokens of all entries, and with `target.db` also the [`Connection`](#get-connection-token) token of that database.
+
+</Returns>
+
+<Params>
+<Param name="features" type="TypemoFeature[]" required>
+
+Entries, one per class.
+- an entity class (`@Schema`)
+- `{ entity, statics }`, a model with plugin statics (see [below](#plugin-statics))
+- [`TypemoModule.view(...)`](#typemo-module.view), a view
+- [`TypemoModule.materialized(...)`](#typemo-module.materialized), a materialized result
+
+</Param>
+<Param name="target" type="FeatureTarget" default="{}">
+
+`client` is the client name (`"default"`), and `db` is a database of this client (by default the default client's database). One entity on two clients or in two databases means two different tokens and two different models.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/integrations/nestjs/typemo-module-for-feature-2" />
+
+</FullType>
+
+### Plugin statics [#plugin-statics]
+
+An `{ entity, statics }` entry injects a model with [`Model.statics(plugin)`](../hooks/plugins.mdx#model.statics) applied for each plugin, so the plugin's statics exist both in the object and in the type. The plugin must be applied to the entity schema (`@Plugin`, a connection plugin, or a global one). Otherwise startup fails, and a model without the promised method isn't injected.
+
+<Snippet id="reference/integrations/nestjs/plugin-statics" />
+
+You write the type of the injected model yourself, `Model<Note> & PluginStatics<typeof countPlugin>` ([`PluginStatics`](../hooks/plugins.mdx#plugin-statics)).
+
+### Discriminators [#discriminators]
+
+A child with [`@Discriminator`](../schemas/discriminator.mdx) shares its base's collection in any order of the list. If the list has only the child, the core compiles the base for it in the same collection, but the base has no provider. To inject the base's model, list it. Three orders, `[Event, Click, SignUp]`, `[Click, SignUp, Event]`, and `[Click, Event, SignUp]`, gave one collection `nt_events` and the key `__t` on the created documents.
+
+### Errors [#typemo-module.for-feature.errors]
+
+<Snippet id="reference/integrations/nestjs/typemo-module-for-feature-errors" />
+
+The first three fire when `forFeature` is called, and the rest at startup. `forFeature` has no collection name. The collection is a property of the entity (`@Schema({ collection })`), and two entries of one entity with different collections would contradict each other. A class registered as a model in one module and as a view in another on the same database would give two different objects for one collection, so startup fails. If a module that needs a model didn't import `forFeature`, Nest reports it with its own error naming the model token.
+
+<Snippet id="integrations/nestjs/setup/troubleshooting" />
+
+## TypemoModule.view [#typemo-module.view]
+
+`TypemoModule.view` describes a MongoDB view for `forFeature`. It's a row class, the source `on`, and a pipeline. The pipeline is checked against the class with the same types as [`TypedView.define`](../collections/typed-view.mdx#typed-view.define), and the definition is applied to the entry's database when the provider is created. What gets injected is the [`TypedView`](../collections/typed-view.mdx) of the class, which has only reads. The view in the database is created by [`sync`](#sync) (`"init"` or `"sync"`). Until it exists, a read throws a [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error) and doesn't return an empty list.
+
+<Snippet id="reference/integrations/nestjs/typemo-module-view" title="accounts/accounts.module.ts" twoslash />
+
+If the pipeline rows don't produce a class field, the definition doesn't compile.
+
+<Snippet id="reference/integrations/nestjs/typemo-module-view-2" twoslash />
+
+<Returns type="ViewFeature">
+
+An entry for `forFeature`. Inject `@InjectModel(OpenAccount)` with the type `TypedView<OpenAccount>`.
+
+</Returns>
+
+<Params>
+<Param name="view" type="class" required>
+
+The view row class (`@Schema({ collection: "<view name>" })`).
+
+</Param>
+<Param name="definition" type="TypedViewDefinition" required>
+
+`on` is the source entity or view, `pipeline` is the pipeline, and `collation` is the optional row sort order.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/integrations/nestjs/typemo-module-view-3" />
+
+</FullType>
+
+## TypemoModule.materialized [#typemo-module.materialized]
+
+`TypemoModule.materialized` describes a materialized result for `forFeature`. It's an ordinary collection of the class `Target`, which a pipeline over the entity `from` fills on every `refresh()`. The definition is checked the same way as [`Materialized.define`](../collections/materialized.mdx#materialized.define). What gets injected is a [`Materialized`](../collections/materialized.mdx) object, whose `model` reads the collection and whose `refresh()` recomputes it.
+
+<Snippet id="reference/integrations/nestjs/typemo-module-materialized" title="reports/reports.module.ts" twoslash />
+
+Two accounts, `Main` with a balance of 5 and `Empty` with 0, then `refresh()` and reading `totals.model.find({}).lean()` gave `[{ _id: "Main", total: 5 }]`.
+
+<Returns type="MaterializedFeature">
+
+An entry for `forFeature`. Inject it with the type `Materialized<TitleTotal>`.
+
+</Returns>
+
+<Params>
+<Param name="target" type="class" required>
+
+The target collection class.
+
+</Param>
+<Param name="definition" type="object" required>
+
+`from`, `pipeline`, and the write settings `mode`, `on`, `whenMatched`, `whenNotMatched`, as in `Materialized.define`.
+
+</Param>
+</Params>
+
+## TypemoCoreModule [#typemo-core-module]
+
+The global module of one client, imported by [`forRoot`](#typemo-module.for-root) and [`forRootAsync`](#typemo-module.for-root-async). It provides the client, the connection to the default database, and the model registry, runs [`sync`](#sync) in `onApplicationBootstrap`, and closes the client in `onApplicationShutdown`. You don't import it directly. It has the same `forRoot(uri, options)` and `forRootAsync(options)` as `TypemoModule`.
+
+---
+
+## InjectModel [#inject-model]
+
+`@InjectModel(Entity, target?)` injects the model of an entity registered in [`forFeature`](#typemo-module.for-feature) with the same `target`, that is `Inject(getModelToken(Entity, target))`. It works on a constructor parameter and on a property. For a view a `TypedView` is injected, and for a materialized result a `Materialized`.
+
+<Snippet id="reference/integrations/nestjs/inject-model" title="accounts/accounts.service.ts" twoslash />
+
+You write the parameter type yourself. The parameter decorator doesn't see it and can't check it, so `@InjectModel(Account) orders: Model<Order>` compiles. Write `Model<Entity>` of the same entity as in the decorator. A class with constructor arguments and a string instead of a class give compile errors.
+
+<Snippet id="reference/integrations/nestjs/inject-model-2" twoslash />
+
+<Params>
+<Param name="entity" type="class" required>
+
+A class listed in `forFeature`.
+
+</Param>
+<Param name="target" type="FeatureTarget" default="{}">
+
+The client and database of that `forFeature` entry.
+
+</Param>
+</Params>
+
+<Returns type="PropertyDecorator & ParameterDecorator">
+
+A decorator.
+
+</Returns>
+
+## InjectConnection [#inject-connection]
+
+`@InjectConnection(target?)` injects a [`Connection`](../connection/connection.mdx), the default client's database or the database `target.db`. `forRoot` provides the connection to the default database, and `forFeature(…, { db })` in the same module provides the one to another database. You need it for what the core has only on a connection, for example [`connection.aggregate`](../connection/connection.mdx#connection.aggregate) over a database or [`connection.init`](../connection/connection.mdx#connection.init) in a deploy script.
+
+<Snippet id="reference/integrations/nestjs/inject-connection" title="reports/reports.service.ts" twoslash />
+
+## InjectClient [#inject-client]
+
+`@InjectClient(name?)` injects the [`TypemoClient`](../connection/typemo-client.mdx#new-typemo-client) with this name (`"default"` without a name). You need the client for [`client.transaction`](../connection/typemo-client.mdx#client.transaction), the connection state, and sessions.
+
+<Snippet id="reference/integrations/nestjs/inject-client" title="health/health.controller.ts" twoslash />
+
+---
+
+## getModelToken [#get-model-token]
+
+`getModelToken(Entity, target?)` returns the model token. It's a **symbol**, created once for a pair of "class plus client and database". A string made from the class name (`"AccountModel"`, as in `@nestjs/mongoose`) doesn't work. Two `Account` classes in two modules would get one token, and the second would silently take the place of the first. You need the token for `Test.createTestingModule(...).overrideProvider(getModelToken(Account))` and for `moduleRef.get`.
+
+<Snippet id="reference/integrations/nestjs/get-model-token" twoslash />
+
+The number after `#` is the ordinal number of the class in the process. It tells apart classes with the same name.
+
+## getConnectionToken [#get-connection-token]
+
+`getConnectionToken(target?)` returns the string `"TypemoConnection:<client>/"` for the default database or `"TypemoConnection:<client>/<database>"`.
+
+## getClientToken [#get-client-token]
+
+`getClientToken(name?)` returns the string `"TypemoClient:<name>"`. The name is a non-empty string without `/`, otherwise you get a [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error).
+
+<FullType>
+
+<Snippet id="reference/integrations/nestjs/get-client-token" />
+
+</FullType>
+
+---
+
+## Transactional <Badge variant="requires">replica set</Badge> [#transactional]
+
+`@Transactional(options?)` runs a method in [`client.transaction`](../connection/typemo-client.mdx#client.transaction). Every Typemo operation inside the method and in the methods it calls joins the transaction on its own, without passing a session. The transaction commits when the method's promise resolved and rolls back when it's rejected. The error reaches the caller. The decorator is for actions that change several documents and must happen entirely or not at all, for example a transfer between accounts or an order that deducts stock.
+
+<Snippet id="reference/integrations/nestjs/transactional" title="transfers/transfers.service.ts" twoslash />
+
+The decorator doesn't see the Nest container, so it only wraps the method, and the application finds the client. At startup it binds to its clients all providers and controllers that have such methods. Singletons are bound on their own, and request-scoped classes through the prototype. After shutdown the binding is removed.
+
+A method may run **several times**. A transient error (`TransientTransactionError`) retries the whole transaction. We made the server refuse the first insert with the label `TransientTransactionError`, the method ran twice, and one pair of documents was committed. So read documents inside the method and change amounts atomically (`$inc`), rather than doing arithmetic on an object loaded outside.
+
+<Params>
+<Param name="options.client" type="string" default="&quot;default&quot;">
+
+The client whose transaction it is.
+
+</Param>
+<Param name="options.join" type="boolean" default="false">
+
+With `true`, a method called inside an already open transaction of the same client runs in it. It has no commit or rollback of its own, and an error goes outward and rolls back the outer transaction. Outside a transaction the method opens its own. Inside a transaction of **another** client you get an error, since silently opening a second transaction would mean the method's write doesn't roll back with the outer one. With `join` the transaction options aren't set (the compiler and the decorator check this), because they belong to the outer transaction. Without `join` a nested call is a strict core error. How a method learns about an open transaction is described in [`client.currentTransaction`](../transactions/transactions.mdx#client.current-transaction).
+
+</Param>
+<Param name="options.readConcern" type="&quot;local&quot; | &quot;majority&quot; | &quot;snapshot&quot;">
+
+The core transaction options ([`TransactionOptions`](../connection/typemo-client.mdx#client.transaction)): `readConcern`, `writeConcern`, `timeoutMS`, `maxCommitTimeMS`.
+
+</Param>
+</Params>
+
+<Returns type="MethodDecorator">
+
+A decorator for a method that returns a promise. A synchronous method gives a compile error, because a transaction is asynchronous.
+
+</Returns>
+
+<FullType>
+
+<Snippet id="reference/integrations/nestjs/transactional-2" />
+
+</FullType>
+
+### On a route handler [#on-route-handler]
+
+You can put the decorator on a controller method too, in any order with `@Post()`, and the route metadata is carried over to the wrapper. `POST /accounts/pair`, where the handler creates an account and fails before the second, returned 500 and left no accounts.
+
+### A nested call: join [#nested-call-join]
+
+Mark a method that's called both on its own and from another transactional method with `join: true`.
+
+<Snippet id="integrations/nestjs/transactions-and-policies/nested-transactional-call" title="ledger/ledger.service.ts" twoslash />
+
+`pair` ran both `entry` calls in one transaction, `client.currentTransaction()` inside them returned the same object, and `pair` itself returned 2. An `entry` called on its own opened its own transaction. An error inside `entry` rolled back both writes of `pair`. A transient server error retried the outer transaction as a whole. When the first insert was refused, `entry` ran three times, once in the failed attempt and twice in the retry, and the database kept two records.
+
+### Errors [#transactional.errors]
+
+<Snippet id="reference/integrations/nestjs/transactional-errors" />
+
+The first error comes from the core. A decorated method called from another decorated one would open a nested transaction, and MongoDB has none. Mark the inner method `@Transactional({ join: true })`, and it runs in the outer transaction, while one called on its own runs in its own. The third protects against silently working without a transaction. An object created with `new`, bypassing Nest, wasn't bound by the application, and the method refuses to run. On a standalone `mongod` without a replica set the core rejects the transaction before any write ([`client.transaction`](../connection/typemo-client.mdx#client.transaction)).
+
+---
+
+## PolicyInterceptor [#policy-interceptor]
+
+`PolicyInterceptor` runs every HTTP handler inside [`PolicyContext.run`](../policies/policy-context.mdx#policy-context.run) with values from the request, that is the tenant and the actor for audit. Everything the handler calls gets the tenant without a parameter being passed, including after `await` and in an `Observable` stream. We sent 20 concurrent requests from two tenants, and every response contained orders of its own tenant only.
+
+<Snippet id="reference/integrations/nestjs/policy-interceptor" title="main.ts" twoslash />
+
+The interceptor is created with `new`. Attach it through `app.useGlobalInterceptors`, `@UseInterceptors(new PolicyInterceptor(...))`, or `{ provide: APP_INTERCEPTOR, useValue: new PolicyInterceptor(...) }`. If a resolver returned `undefined`, the value isn't set. A tenant model then rejects the operation with a [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error) with the reason `tenant`, and the [`TypemoExceptionFilter`](#typemo-exception-filter) answers 400. An empty tenant (`null`, `""`) is rejected by the core itself. "Without a tenant" is written explicitly, through [`@AllTenants()`](#all-tenants).
+
+<Params>
+<Param name="options.tenant" type="(request: R) => unknown">
+
+The tenant of the request.
+
+</Param>
+<Param name="options.actor" type="(request: R) => unknown">
+
+The actor for audit records.
+
+</Param>
+</Params>
+
+The default request type is [`PolicyRequest`](#policy-request), which has only headers. For your own request, give the type, `new PolicyInterceptor<AuthRequest>({ tenant: (request) => request.user.orgId })`.
+
+### Errors [#policy-interceptor.errors]
+
+<Snippet id="reference/integrations/nestjs/policy-interceptor-errors" />
+
+The resolver is synchronous. The context opens before the handler is called, and an asynchronous tenant would have to be awaited outside the context. Get the tenant earlier (a guard, authentication middleware) and put it on the request.
+
+## PolicyRequest [#policy-request]
+
+The part of the request the interceptor reads by default, `headers` (`Readonly<Record<string, string | readonly string[] | undefined>>`).
+
+## AllTenants [#all-tenants]
+
+`@AllTenants()` on a handler or a controller replaces the request's tenant with `allTenants: true`, and operations see the documents of all tenants. You need it for admin routes. `GET /orders/all` with `@AllTenants()` returned the orders of two tenants, and the same route without the decorator and without the header returned 400.
+
+<Snippet id="reference/integrations/nestjs/all-tenants" title="admin/admin.controller.ts" twoslash />
+
+---
+
+## TypemoExceptionFilter [#typemo-exception-filter]
+
+`TypemoExceptionFilter` turns Typemo errors and "raw" driver errors (for example, from [`client.unsafeDriver()`](../connection/typemo-client.mdx#client.unsafe-driver)) into HTTP responses, so handlers don't have to catch them one by one. The kind of error is determined by [`ErrorClassifier.classify`](../errors/hierarchy.mdx#classify). The response has no server text, addresses, or stored values, only fields that are safe to show a client. The filter works only in the Express HTTP context, and in any other context it rethrows the error.
+
+<Snippet id="reference/integrations/nestjs/typemo-exception-filter" title="main.ts" twoslash />
+
+The response body is built like Nest's own errors. It has `statusCode`, `error`, `message`, and the fields of the specific kind. We got every row of the table by querying the application.
+
+| Kind | Status | Body |
+|---|---|---|
+| `duplicate-key` (and a duplicate `_id` from the raw driver) | 409 | `{ message: "Duplicate value", fields: ["email"] }`, the names of the key fields, without values |
+| `validation` | 422 | `{ message: "Validation failed", errors: { age: "must be at most 150" } }` |
+| `server-validation` | 422 | `{ message: "Validation failed" }` |
+| `cast` | 400 | `{ message: "Invalid value", path: "age" }` |
+| `strict` | 400 | `{ message: "Not allowed", reason: "unknown-path", path: "filter.nickname" }` |
+| `not-found` (`orFail`) | 404 | `{ message: "Not found" }` |
+| `version`, `write-conflict` | 409 | `{ message: "The document was changed by someone else" }` |
+| `timeout` | 504 | `{ message: "The database took too long" }` |
+| `connection` | 503 | `{ message: "The database is unavailable" }` |
+| anything else labeled `TransientTransactionError` | 503 | `{ message: "Try again" }` |
+| `bulk-write` with a duplicate | 409 | `{ message: "Duplicate value" }` |
+| anything else, including `post-hook` | 500 | `{ message: "Internal server error" }` |
+
+The values of the duplicate key don't reach the response. The field may be hidden or `sensitive`, and an error from the raw driver has no schema at all. The filter writes 500 responses to the log (`Logger("TypemoExceptionFilter")`) with the error text. A [`PostHookError`](../errors/hierarchy.mdx#post-hook-error) is marked `(the write was applied)`, because the write stayed in the database, and the hook failed after it.
+
+### toResponse [#to-response]
+
+`toResponse(error, classification)` returns `{ status, body }`. Override it in a subclass to change the response for one kind, and call `super.toResponse` for the others.
+
+<Snippet id="reference/integrations/nestjs/to-response" title="errors/api-exception.filter.ts" twoslash />
+
+The filter catches `TypemoError` and `MongoError`. It doesn't touch Nest's own errors (`HttpException`) or your own.
+
+## TypemoHttpResponse [#typemo-http-response]
+
+`{ readonly status: number; readonly body: Readonly<Record<string, unknown>> }` is the response that [`toResponse`](#to-response) returns.
+
+---
+
+## ParseIdPipe [#parse-id-pipe]
+
+`ParseIdPipe` turns a route parameter (always a string) into the model's `_id` of any type: an `ObjectId` (24 hexadecimal characters), a `UUID`, a string, or a number. An invalid id gives a 400 response with a clear text, not a casting error deep inside the request. `ParseIdPipe.for(Entity)` returns a pipe class into which Nest injects the entity model from the `forFeature` of the controller's module.
+
+<Snippet id="reference/integrations/nestjs/parse-id-pipe" title="accounts/accounts.controller.ts" twoslash />
+
+The core casts a string to `ObjectId` and `UUID` itself, but it doesn't accept the string `"5"` for a numeric `_id`, because there's no silent casting. So for a numeric `_id` the pipe first parses the digits strictly. `"42"` gives `42`, and `"42abc"` and `"1e3"` give 400.
+
+<Snippet id="reference/integrations/nestjs/parse-id-pipe-2" />
+
+Instead of `id` the text holds the name of the route parameter. If you already have the model in hand, create the pipe directly, `new ParseIdPipe(model).transform(value)`.
+
+<FullType>
+
+<Snippet id="reference/integrations/nestjs/parse-id-pipe-3" />
+
+</FullType>
+
+## ValidateBodyPipe [#validate-body-pipe]
+
+`ValidateBodyPipe` validates the request body with the entity schema ([`Model.validate`](../documents/model-document-methods.mdx#model.validate)). It checks field types, `required`, `min`/`max`, `enum`, lengths, and validators, and you don't need a separate DTO that has to be kept in sync with the entity. All errors are returned at once, as a 422 response with a message for each field. The result is the submitted fields, cast, without defaults, which `create` adds.
+
+<Snippet id="reference/integrations/nestjs/validate-body-pipe" title="accounts/accounts.controller.ts" twoslash />
+
+An **unknown field** gives 422 by default, so a typo in a name (`balanse`) doesn't silently vanish. A string instead of a number (`"30"` for `age`) is 422 too. The core doesn't cast strings to numbers, and in JSON a number arrives as a number anyway. A body that isn't an object gives 422 with the key `""`.
+
+<Params>
+<Param name="options.pick" type="entity fields">
+
+Only these fields can be submitted, and the rest get `"not allowed here"`.
+
+</Param>
+<Param name="options.omit" type="entity fields">
+
+These fields can't be submitted, for example a role or an owner that the server sets. Together with `pick` it's an error.
+
+</Param>
+<Param name="options.partial" type="boolean" default="false">
+
+For an update. Only the submitted fields are validated, and a required field may be absent. `_id`, immutable fields, and fields the core maintains (`createdAt`, `updatedAt`) are rejected with the text `"cannot be changed"`. The result type for an update is [`UpdateInput<T>`](../writes/input-types.mdx#update-input), which `$set` accepts.
+
+</Param>
+<Param name="options.dropUnknown" type="boolean" default="false">
+
+Drops unknown fields and the fields that `pick`, `omit`, and `partial` exclude, instead of answering 422.
+
+</Param>
+</Params>
+
+A 422 response looks like this (a request with `{ email: "bob@x.io", name: "B", age: 200, role: "root" }`).
+
+<Snippet id="integrations/nestjs/http/validate-body-2" />
+
+The value of a `sensitive` field doesn't reach the response. A number instead of a string in such a field gave 422 without the submitted value.
+
+<FullType>
+
+<Snippet id="reference/integrations/nestjs/validate-body-pipe-2" />
+
+</FullType>
+
+### Errors [#validate-body-pipe.errors]
+
+Invalid options are rejected when the pipe is created.
+
+<Snippet id="reference/integrations/nestjs/validate-body-pipe-errors" />
+
+---
+
+## Testing: `@venloc/typemo-nestjs/testing` [#testing]
+
+This section has helpers for testing your services: mocks for unit tests without a database and a module for tests on a real database. The guide [Testing a Nest app](../../integrations/nestjs/testing.mdx) explains how to use them in real tasks.
+
+### provideModelMock [#provide-model-mock]
+
+`provideModelMock(Entity, mock, target?)` returns a provider under the entity's model token with the value `mock`. The mock keeps the names and parameters of the model methods ([`ModelMock`](#model-mock)), and a typo in a method name or wrong arguments give a compile error. A method missing from the mock is `undefined`, so calling a forgotten method fails with a `TypeError` instead of returning something plausible.
+
+<Snippet id="reference/integrations/nestjs/provide-model-mock" title="accounts/accounts.service.spec.ts" twoslash />
+
+For a view, give the mock type as the second type parameter, `provideModelMock<typeof OpenAccount, TypedView<OpenAccount>>(OpenAccount, { … })`. It returns a [`MockProvider`](#mock-provider).
+
+### provideClientMock [#provide-client-mock]
+
+`provideClientMock(mock?, name?)` returns the providers of a mock client and the [`@Transactional`](#transactional) binding. By default `transaction(fn)` calls `fn` at once and returns its result, so a service with transactions can be tested without a replica set. Spread the result into `providers`, `...provideClientMock()`. For the `@Transactional` binding the module has to be initialized (`await moduleRef.init()`).
+
+### ModelMock [#model-mock]
+
+`ModelMock<M>` is the members of `M` that a mock can provide. Each method comes with its own parameters and any result, and all of them are optional.
+
+### MockProvider [#mock-provider]
+
+`{ provide: string | symbol; useValue: unknown }` is the Nest value provider that `provideModelMock` returns.
+
+### TypemoTestingModule.forRoot [#typemo-testing-module.for-root]
+
+`TypemoTestingModule.forRoot(uri, options?)` is [`TypemoModule.forRoot`](#typemo-module.for-root) for a test. Each call gets its own database (`typemo_test_<time>_<number>` if `dbName` isn't set), [`sync: "init"`](#sync) so the collections are created before the first test and a transaction doesn't collide with creating them, and one connection attempt. You can override any option.
+
+### TypemoTestingModule.clear [#typemo-testing-module.clear]
+
+`TypemoTestingModule.clear(moduleRef, name?)` deletes the documents of all `forFeature` models of the client through the models themselves ([`Filters.all()`](../policies/violations.mdx#filters.all)), in all tenants and including soft-deleted ones. Views are skipped. Call it between tests so each one starts with empty collections.
+
+<Snippet id="reference/integrations/nestjs/typemo-testing-module-clear" title="test/accounts.e2e-spec.ts" twoslash />
+
+<FullType>
+
+<Snippet id="reference/integrations/nestjs/typemo-testing-module-clear-2" />
+
+</FullType>
+
+---
+
+## Other types [#other-types]
+
+<TypeTable
+  type={{
+    "TypemoFeature": { description: "A `forFeature` entry: a class, `ModelFeature`, `ViewFeature`, or `MaterializedFeature`." },
+    "ModelFeature": { description: "`{ entity, statics }`, a model with plugin statics." },
+    "ViewFeature": { description: "The result of [`TypemoModule.view`](#typemo-module.view)." },
+    "MaterializedFeature": { description: "The result of [`TypemoModule.materialized`](#typemo-module.materialized)." },
+    "FeatureKind": { description: "`\"model\" | \"view\" | \"materialized\"`, what the class serves as in the database." },
+    "FeatureTarget": { description: "`{ client?, db? }`, the client and database of an entry." },
+    "TypemoAsyncFactory": { description: "`forRootAsync` with `useFactory` and `inject`." },
+    "TypemoAsyncClass": { description: "`forRootAsync` with `useClass`." },
+    "TypemoAsyncExisting": { description: "`forRootAsync` with `useExisting`." },
+    "TypemoAsyncCommon": { description: "What the three kinds share: `name` and `imports`." },
+    "TransactionalOwnOptions": { description: "The options of a `@Transactional` that opens its own transaction: `client` and the transaction options." },
+    "TransactionalJoinOptions": { description: "`{ join: true, client? }`, join the client's open transaction." },
+    "PolicyInterceptorOptions": { description: "The `tenant` and `actor` resolvers of the interceptor." },
+    "ValidateBodyOptions": { description: "`pick`, `omit`, `partial`, `dropUnknown`." },
+  }}
+/>
+
+## When the package doesn't fit [#when-not-to-use]
+
+- **Not HTTP.** The filter and the interceptor work only in the Express HTTP context. In GraphQL, microservices, and on WebSocket, open the context yourself through [`PolicyContext.run`](../policies/policy-context.mdx#policy-context.run) and translate errors with [`ErrorClassifier.classify`](../errors/hierarchy.mdx#classify).
+- **Fastify.** Not supported, since the filter responds through Express's `response.status().json()`.
+- **Health checks.** There's no indicator of its own. Return [`client.state`](../connection/typemo-client.mdx#client.state) or wait for [`client.ready`](../connection/typemo-client.mdx#client.ready) in your own controller.
+- **Plugins with dependencies from the container** (`forFeatureAsync` in `@nestjs/mongoose`). Not supported. Attach plugins in [`onClientCreate`](#on-client-create) or with the `@Plugin` decorator on the entity.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Connect Typemo to NestJS" href="../../integrations/nestjs/setup.mdx">
+  Installation, the first module, and the first model in an application.
+</Card>
+<Card title="Models in modules" href="../../integrations/nestjs/models.mdx">
+  `forFeature`, several databases, discriminators, views, and synchronization at startup.
+</Card>
+<Card title="Errors, ids, and the request body" href="../../integrations/nestjs/http.mdx">
+  The error filter and the pipes on REST API tasks.
+</Card>
+<Card title="Migrating from @nestjs/mongoose" href="../../integrations/nestjs/migration-from-nestjs-mongoose.mdx">
+  A mapping table and a step-by-step migration.
+</Card>
+</Cards>

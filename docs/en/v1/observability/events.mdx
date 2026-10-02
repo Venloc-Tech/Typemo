@@ -1,0 +1,131 @@
+---
+title: Operation events
+description: "How to subscribe to Typemo operations, find slow and failed queries, and keep user data from leaking out"
+icon: Activity
+---
+
+Every Typemo operation reports on itself with **events**: started, finished, failed. Subscribe to them with a function, and you get a query log, timings, and a list of errors without wrapping every call. While there are no subscribers, this costs nothing. The core doesn't build events nobody is waiting for.
+
+An event is an ordinary object with a `type` field. A subscriber is an object with a `handle` function that the core calls. The ready-made [OpenTelemetry](./opentelemetry.mdx) and [Sentry](./sentry.mdx) packages are built on the same events. If you need another system, read [Custom integration](./custom-integration.mdx).
+
+## What you need [#prerequisites]
+
+The client from the [quick start](../getting-started/quick-start.mdx) and a bank account model. The `accounts` collection holds one account, `{ title: "Main", balance: 100 }`.
+
+<Snippet id="observability/events/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Subscribe on the client and handle the event type you need. TypeScript works out the shape of the event from the `type` field.
+
+<Snippet id="observability/events/quick-start" twoslash />
+
+To listen to every client in the process, call [`Typemo.instrument`](../reference/connection/typemo.mdx#typemo.instrument) instead of `client.instrument`. We'll go through the common tasks below.
+
+## Find slow operations [#slow-operations]
+
+Your app has started responding more slowly, and it's not clear which query is to blame. The [`operation.end`](../reference/observability/events.mdx#operation-end-event) event carries the duration in milliseconds, and the model and the operation name are in the part shared by all events. A database-level operation (more on that below) has no model, so the label uses the database instead.
+
+<Snippet id="observability/events/slow-operations" title="monitoring/slow-operations.ts" twoslash />
+
+`durationMS` is the time from the start of the operation to its end, including type casting, your hooks, and waiting for the database. To see where it went, subscribe to the steps too. [`steps`](../reference/observability/events.mdx#instrumentation-subscriber) are on by default, and the `operation.step` event names the step and its duration. For `find` on a model with `@Pre` and `@Post` hooks, the steps arrived in this order: `cast`, `validate`, `hooksPre`, `populate`, `hooksPost`.
+
+## Log failed operations [#log-failed-operations]
+
+You want to know which operations fail and why, without wrapping every call in `try`. The [`operation.error`](../reference/observability/events.mdx#operation-error-event) event arrives instead of `operation.end` and names the step where the operation failed and the kind of failure.
+
+<Snippet id="observability/events/log-failed-operations" title="monitoring/errors.ts" twoslash />
+
+`find(...).orFail()` on an empty result printed `find: DocumentNotFoundError (not-found), step postProcess, retryable: false`. The classification gives a `kind` (`cast`, `validation`, `duplicate-key`, `timeout`, `connection`…), and `retryable` tells you whether retrying the operation makes sense. The event arrives even if the calling code catches the error itself, so the subscriber sees everything that failed.
+
+This event doesn't replace error handling. The calling code still gets the exception, and the subscriber only watches. [Error handling](../errors/handling.mdx) explains how to handle errors.
+
+## See transactions and cursors [#transactions-and-cursors]
+
+Sometimes you care about a whole transaction or a cursor export, not one operation. A transaction gives a `transaction.start` event, then `transaction.commit` or `transaction.abort`, and on a retry, a `transaction.retry` in between. The operations inside it carry the same number in `transactionId`.
+
+<Snippet id="observability/events/transactions-and-cursors" title="monitoring/transactions.ts" twoslash />
+
+A transaction that failed with an error gave a `transaction.start` and `transaction.abort` pair with the original error and the duration. A cursor sends `cursor.batch` for every batch. For a collection of two documents, one batch `{ batch: 0, size: 2 }` arrived, followed by `operation.end` with `mode: "cursor"` and `documentCount: 2`.
+
+## Database-level operations [#database-operations]
+
+Sometimes an aggregation runs over the whole database rather than a model's collection, through [`connection.aggregate`](../reference/connection/connection.mdx#connection.aggregate) with stages like `$documents`, `$currentOp`, or `$listLocalSessions`. Such an operation has no model. In the event, `model` is `null`, `collection` is `null` too (for `Pipeline.sessions()` it's `"system.sessions"`), `schema` is `null`, and the database is named in `database`. If a subscriber builds a label from `model`, it has to handle `null`, and the compiler will insist on it.
+
+<Snippet id="observability/events/database-operations" title="monitoring/database-level.ts" twoslash />
+
+Otherwise the events of such an operation are the usual ones: `operation.start`, the steps, the driver's `aggregate` command (if you asked for commands), and `operation.end`. More in the [Database-level queries](../aggregation/database-level.mdx) guide.
+
+## See driver commands and the connection pool [#driver-commands-and-pool]
+
+Sometimes operation events aren't enough, and you need to know which server a command went to and how many connections are in use. These events cost more, so they're off by default. Turn them on in the subscriber: `driverCommands` for commands and `poolEvents` for the pool. For driver commands, the client must be created with `monitorCommands: true`.
+
+<Snippet id="observability/events/driver-commands-and-pool" title="monitoring/driver.ts" twoslash />
+
+A single `find` operation gave `driver.pool` events: `connectionCheckOutStarted`, `connectionCheckedOut`, and `connectionCheckedIn`. The `find` command is tied to the operation through `operationId`. If Typemo didn't send the command (the driver's handshake, or your own code using the driver directly), it arrives with `operationId: undefined`.
+
+## Keep user data private [#hide-user-data]
+
+Events go to logs, tracing, and third-party systems, while filters hold names, emails, and account numbers. That's why by default (`sensitive: "mask"`) the core keeps only the shape of the query in the event. Keys and operators stay, and values are replaced with `"?"`.
+
+<Snippet id="observability/events/hide-user-data" title="monitoring/masking.ts" twoslash />
+
+If you need the real values for debugging, choose `sensitive: "show"`, and `balance` arrives as `{"$gt":50}`. But `iban` stays `"?"`. The field is marked `sensitive` in the schema, and a subscriber can't override that mark. This way the values of secret fields don't reach any subscriber, including someone else's. The `"hide"` mode (every unmarked condition becomes `"[hidden]"`) and `{ mask }` (your own function) are described in the [`SubscriberSensitive`](../reference/observability/events.mdx#subscriber-sensitive) reference. The [Hidden and sensitive fields](../schemas/hidden-and-sensitive.mdx) guide explains how to mark fields.
+
+The error in an event is masked too. The `CastError` for `balance: "abc"` reached the calling code with the text `Cast to number failed at path "$set.balance" for "abc" (string): expected a number [type]`, and the subscriber with `for "?"`.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **who should see these events**.
+
+- **The whole app**, including libraries with their own clients: use [`Typemo.instrument`](../reference/connection/typemo.mdx#typemo.instrument), one call at process startup.
+- **One client**, for example a separate analytics database: use [`client.instrument`](../reference/connection/typemo-client.mdx#client.instrument). That way other code doesn't end up in your log.
+
+The [Multiple clients and extensions](../connection/clients-and-extensions.mdx) guide covers choosing the level in detail.
+
+If you need a subscriber only briefly, for a test or a one-off diagnosis, create it with `using`: `using subscription = client.instrument(...)`. The subscription is removed when the block exits. Inside the block `handle` received events, and an operation after the block no longer does.
+
+## When not to use it [#when-not-to-use]
+
+If you need traces rather than a log, don't write a subscriber. Plug in [`@venloc/typemo-opentelemetry`](../reference/observability/opentelemetry.mdx). If you need errors in a tracker, plug in [`@venloc/typemo-sentry`](../reference/observability/sentry.mdx). And if you need to change an operation, add a condition, or reject a write, a subscriber won't help, because it only watches. That's what [hooks](../hooks/operation-hooks.mdx) are for.
+
+## Troubleshooting [#troubleshooting]
+
+**Registration fails because command events are needed.**
+
+<Snippet id="observability/events/troubleshooting" twoslash />
+
+The compiler lets this code through, but a client without `monitorCommands: true` can't produce command events, and at runtime you get `ConfigurationError: TypemoClient "default": driver command events need the client option monitorCommands: true`. Create the client with `monitorCommands: true`, as described in the [client options](../reference/connection/typemo-client.mdx#client-options).
+
+**`handle` threw an exception.** That doesn't break the operation. The core catches the exception and writes the line `[typemo] an instrumentation subscriber threw on "operation.start":` to `console.error` together with the error. Even with a subscriber that always throws, `find` returned the documents. But throwing on every event is expensive, so wrap the body of `handle` in `try` and don't let exceptions out of it.
+
+**The whole event goes into `JSON.stringify`.** Every operation event has `event.schema`, a reference to the model's schema description. It isn't copied and isn't meant to be serialized. Take only the fields you need: `event.operation`, `event.model`, `event.durationMS`, `event.summary`.
+
+**An invalid `sensitive`.** `client.instrument({ handle, sensitive: "x" })` throws `ConfigurationError: the sensitive option of an instrumentation subscriber is "mask", "show", "hide" or { mask: (value, { path }) => json }`. Only these four forms are allowed.
+
+## Full example [#full-example]
+
+<Snippet id="observability/events/full-example" title="monitoring/monitoring.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose you watch queries through `mongoose.set("debug", …)` and global hooks, and query values go into the log as is. In Typemo values are replaced with `"?"` by default, events are typed by the `type` field, and a subscription is removed with its own `unsubscribe()`.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Events" href="../reference/observability/events.mdx">
+  Every field of every event, `sensitive`, `wrap`, and registration errors.
+</Card>
+<Card title="OpenTelemetry" href="./opentelemetry.mdx">
+  Ready-made spans and metrics on top of these events.
+</Card>
+<Card title="Sentry" href="./sentry.mdx">
+  Errors with context and breadcrumbs in Sentry.
+</Card>
+<Card title="Custom integration" href="./custom-integration.mdx">
+  Your own adapter for metrics, a log, or another monitoring system.
+</Card>
+</Cards>

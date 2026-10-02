@@ -1,0 +1,124 @@
+---
+title: Connect Typemo to NestJS
+description: "Installing @venloc/typemo-nestjs, the root module, the first model, and injecting it into a NestJS service"
+icon: Plug
+---
+
+Connecting Typemo to a NestJS app takes three steps. Import `TypemoModule.forRoot` into the root module, list the entities in `TypemoModule.forFeature`, and inject models into services with `@InjectModel`. The module creates the client itself, connects it when the app starts, and closes it when the app stops. The model reaches the service already typed by the entity class, so the compiler checks filters, updates, and results.
+
+If you haven't written Typemo models yet, go through [Quick start](../../getting-started/quick-start.mdx) first. This page assumes you know what an entity and a model are. And if you know NestJS through `@nestjs/mongoose`, the differences are collected in the [Migrating from @nestjs/mongoose](./migration-from-nestjs-mongoose.mdx) guide.
+
+## What you need [#prerequisites]
+
+A NestJS 12 app with the Express HTTP adapter, and MongoDB running as a replica set. A replica set is several MongoDB servers holding copies of the same data, but a single node is enough for transactions. The examples on this page are built around bank accounts.
+
+## Quick start [#quick-start]
+
+Install the packages. `@venloc/typemo-nestjs` doesn't pull in NestJS, since Nest, `rxjs`, and `reflect-metadata` are already in your app.
+
+```package-install
+@venloc/typemo @venloc/typemo-nestjs mongodb
+```
+
+Define an entity, plug in the module, and inject the model.
+
+<Snippet id="integrations/nestjs/setup/quick-start" title="app.module.ts" twoslash />
+
+Below we'll go through each part task by task.
+
+## Configure TypeScript [#configure-typescript]
+
+Your NestJS project already compiles, and you need to make sure Typemo's decorators and Nest's injection get along. Both use TypeScript's legacy decorators. Nest also reads the constructor parameter types that the compiler writes into metadata.
+
+<Snippet id="integrations/nestjs/setup/configure-typescript" title="tsconfig.json" />
+
+`experimentalDecorators` is needed by the `@Schema` and `@Prop` decorators. `emitDecoratorMetadata` is needed by Nest itself. From the metadata it learns that `AccountsController` expects `AccountsService`. Models are injected by an explicit token (`@InjectModel(Account)`), so they don't depend on metadata. The package's module is written in ESM, like Nest 12.
+
+<Callout type="warning">
+
+Don't turn the import of a class injected through the constructor into `import type`. The metadata refers to the class as a value, and after `import type` it isn't there, so Nest can't find the provider: `Nest can't resolve dependencies of the AccountsController (?)`. If your linter suggests `import type` on its own, turn that rule off in your Nest modules.
+
+</Callout>
+
+## Connect to the database [#connect]
+
+The app needs a MongoDB client for as long as it runs. You import [`TypemoModule.forRoot`](../../reference/integrations/nestjs.mdx#typemo-module.for-root) once, into the root module.
+
+<Snippet id="integrations/nestjs/setup/connect" title="app.module.ts" twoslash />
+
+On startup the module creates a [`TypemoClient`](../../reference/connection/typemo-client.mdx#new-typemo-client) and waits for the connection. If the server isn't reachable, the module retries, nine times by default with a 3-second pause, and only then fails the startup. So once the app has started, it's definitely connected.
+
+On `app.close()` the module closes the client. To make that happen when the process is stopped by a signal too, turn on `app.enableShutdownHooks()` in Nest. The client module is global, so models and the client are available in any module of the app without another `forRoot`.
+
+The second argument takes the core client options (`dbName`, `readyTimeoutMS`, driver options like `maxPoolSize`) and the module options. Options from configuration, retries, and several clients are covered in the [Clients, databases, and connections](./connections.mdx) guide.
+
+## Register a module's models [#register-models]
+
+The accounts module needs the account model. [`TypemoModule.forFeature`](../../reference/integrations/nestjs.mdx#typemo-module.for-feature) lists the entities a module works with.
+
+<Snippet id="integrations/nestjs/setup/register-models" title="accounts/accounts.module.ts" twoslash />
+
+A model is registered **by class**, not by a string. The list holds `Account` itself, so a typo in the name is impossible. The model is the core object `connection.model(Account)`, and if `Account` is listed in two modules, both get the same object. Registration doesn't touch the database. Collections and indexes are created only if you ask for it (the `sync` option, see the [Models in modules](./models.mdx) guide).
+
+## Inject a model into a service [#inject-model]
+
+The service needs to read and write accounts. [`@InjectModel`](../../reference/integrations/nestjs.mdx#inject-model) injects the model by the same class.
+
+<Snippet id="integrations/nestjs/setup/inject-model" title="accounts/accounts.service.ts" twoslash />
+
+The parameter type is [`Model<Account>`](../../reference/connection/connection.mdx#connection.model) from the core, the same as for a model outside Nest. Everything described in the reading and writing guides works as is. After `select` and `plain` the type has only `_id`, already a string, and `title`.
+
+You write the parameter type yourself. A parameter decorator can't see it and can't check it, so write the `Model<>` of the same entity as in `@InjectModel`.
+
+## How to choose where to list entities [#how-to-choose]
+
+Ask yourself which module **owns** the data. If the accounts module handles accounts, list `Account` in its `forFeature`. Give other modules the service, not the model. That way the rules for working with accounts live in one place. If several modules need the model directly, for example reports read accounts, list the entity in each one's `forFeature`. They get the same model object, and nothing is duplicated.
+
+## When not to use it [#when-not-to-use]
+
+A migration script or a background job outside the Nest app doesn't need the module. Create the [`TypemoClient`](../../reference/connection/typemo-client.mdx#typemo-client.connect) yourself, as in [Quick start](../../getting-started/quick-start.mdx). If your Nest app doesn't use HTTP, only GraphQL or microservices, the module and `forFeature` still fit. The error filter and the policy interceptor don't, though. They work only in an HTTP context.
+
+## Troubleshooting [#troubleshooting]
+
+**Nest can't resolve dependencies of the AccountsService.** The service's module didn't import `forFeature` with this entity.
+
+<Snippet id="integrations/nestjs/setup/troubleshooting" />
+
+The model token is a symbol named after the class and the client. Add `TypemoModule.forFeature([Account])` to the `imports` of the module where the service is declared.
+
+**Nest can't find `TypemoClient:default`.** There's a `forFeature`, but no `forRoot`, or the `forRoot` has a different client name.
+
+<Snippet id="integrations/nestjs/setup/troubleshooting-2" />
+
+Import `TypemoModule.forRoot(...)` into the root module. If the client has a name (`forRoot(uri, { name: "main" })`), give the name in `forFeature([Account], { client: "main" })` as well.
+
+**The app won't start while there's no database.** That's by design: startup waits for the connection. For development without a database and for fast container startup there's `lazyConnection: true`, covered in the [Clients, databases, and connections](./connections.mdx) guide.
+
+## Full example [#full-example]
+
+The whole accounts app: the model, the service, the controller, and the error filter. `POST /accounts` with the body `{ "title": "Main", "balance": 100 }` returned 201 and the created account, and a repeated request with a negative balance returned 422.
+
+<Snippet id="integrations/nestjs/setup/full-example" title="main.ts" twoslash />
+
+<Callout type="migration" title="Coming from @nestjs/mongoose">
+
+`MongooseModule.forRoot` → `TypemoModule.forRoot`, `MongooseModule.forFeature([{ name: Account.name, schema: AccountSchema }])` → `TypemoModule.forFeature([Account])`, `@InjectModel(Account.name)` → `@InjectModel(Account)`. The schema is the entity class itself, and you don't need `SchemaFactory`. The model type is inferred, so you don't write it by hand as `Model<AccountDocument>`.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Clients, databases, and connections" href="./connections.mdx">
+  Options from configuration, connection retries, lazy startup, and several clients.
+</Card>
+<Card title="Models in modules" href="./models.mdx">
+  Several databases, discriminators, views, and creating collections on startup.
+</Card>
+<Card title="Errors, ids, and the request body" href="./http.mdx">
+  How the filter responds to errors and how to check the id and the request body.
+</Card>
+<Card title="@venloc/typemo-nestjs" href="../../reference/integrations/nestjs.mdx">
+  Every option, decorator, and class of `@venloc/typemo-nestjs`.
+</Card>
+</Cards>

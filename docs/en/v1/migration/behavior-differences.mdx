@@ -1,0 +1,270 @@
+---
+title: Behavior differences
+description: "Where Typemo behaves like Mongoose, where it's stricter and why: casting, empty filters, tenants, bulk writes, discriminators, syncing"
+icon: GitCompare
+---
+
+Where Mongoose silently does its own thing, Typemo answers with an error. Mongoose casts a string to a number, drops an unknown field, turns `undefined` into `null`, and lets an empty update through. All these differences grow from one decision: **strict by default**, with no off switch. Mongoose has a switch for almost every case (`strict`, `strictQuery`, `runValidators`, `sanitizeFilter`), and Typemo has none.
+
+This page helps if you moved your code over and something started behaving differently. Or if you want to know in advance what will break. First we'll cover what Typemo does the same way as Mongoose, even though you might have expected otherwise. Such code moves over without changes. Then where Typemo is stricter, by topic, each with its reason. The table of methods and their counterparts is in [API mapping](../reference/migration/api-mapping.mdx), and what Typemo doesn't have at all is in the [What Typemo doesn't have](./missing-features.mdx) guide.
+
+## What you need [#prerequisites]
+
+The examples are built around a blog, and the post model grows as the page goes on. `Posts` is the Typemo model, and `MPost` is a Mongoose 9.10.2 model over the same data. The results and error texts come from a real MongoDB with both libraries.
+
+## Quick start [#quick-start]
+
+Here are the three differences people trip over first. A numeric string no longer becomes a number, an update without operators doesn't work, and `findOneAndUpdate` returns the already changed document.
+
+<Compare>
+
+<Snippet id="migration/behavior-differences/quick-start" />
+
+<Snippet id="migration/behavior-differences/quick-start-2" twoslash />
+
+</Compare>
+
+Below we'll go through each difference separately.
+
+## What now matches Mongoose [#same-as-mongoose]
+
+There are two behaviors that moved code would trip over for no reason. In Typemo they're the same as in Mongoose, and you don't need to change anything in your code.
+
+**An array is empty by default.** An array field without `default` and without `required` gets `[]` when a document is created. Mongoose does the same, so code that reads `post.tags.length` on a new document keeps working. Typemo also puts in `[]` where you don't see it: in a new subdocument and on an insert through `upsert`. If a document in the database has no key for the array, reading the document also gives `[]`, and the next `$save` writes it. [`lean`](../reference/query/reading.mdx#lean), however, returns the document as it's stored. A field with `required: true` has no default.
+
+<Compare>
+
+<Snippet id="migration/behavior-differences/same-as-mongoose" />
+
+<Snippet id="migration/behavior-differences/same-as-mongoose-2" twoslash />
+
+</Compare>
+
+You don't need to mark the field `Defaulted` for this, and the array is optional in `create`. The field type is plain `string[]`. When you read a document, you get a [`StrictArray`](../reference/documents/typed-collections.mdx#strict-array) rather than a `string[]`, and it changes only through its own methods. The `.lean()` and `.plain()` results give an ordinary array.
+
+**An option changes the name of the discriminator key.** In Mongoose the key is called `__t` by default, and `discriminatorKey` in the schema options sets another name. Typemo does the same: the option is called `discriminatorKey`, and the value is written to the document under that name. There's one difference. The class declares the key with a type so the compiler sees it: `declare readonly kind?: Discriminators<…>`. The whole hierarchy setup is described in the [Inheritance and discriminators](../schemas/discriminators.mdx#base-model-knows-children) guide.
+
+<Compare>
+
+<Snippet id="migration/behavior-differences/same-as-mongoose-3" />
+
+<Snippet id="migration/behavior-differences/same-as-mongoose-4" twoslash />
+
+</Compare>
+
+In everything else Typemo is stricter. That's what the rest of the page is about.
+
+## A string no longer turns into a number [#no-string-to-number]
+
+Say data arrives from a form or from URL parameters, and it has `"42"` instead of `42`. Mongoose casts the value to the field's type and keeps quiet that it was something else. Typemo accepts only a value of the right type.
+
+<Compare>
+
+<Snippet id="migration/behavior-differences/no-string-to-number" />
+
+<Snippet id="migration/behavior-differences/no-string-to-number-2" twoslash />
+
+</Compare>
+
+Casting in Mongoose has many non-obvious rules. `" "` becomes `0`, `"0x10"` becomes `16`, `true` becomes `1`, an empty string in a number field becomes `null`, and dates depend on the server's time zone. Each rule works as long as the data arrives the way you expected. When it arrives differently, the error quietly turns into a wrong value. Typemo accepts a `number` and rejects everything else with a [`CastError`](../reference/errors/data-errors.mdx#cast-error) with the reason `type`.
+
+The rule has three deliberate exceptions, because these types have a canonical string form.
+
+- Typemo accepts a string with an `ObjectId` or `UUID` identifier everywhere: in create, updates, filters, and [`findById`](../reference/query/reading.mdx#model.find-by-id).
+- It accepts a string with an integer for `int64` (`BigInt`), and a string with a decimal number for `Decimal128`.
+- It accepts a calendar date `YYYY-MM-DD` and a full ISO 8601 date with a time zone for `Date`.
+
+Everything else, including `null` in a field without `nullable`, is an error.
+
+<Snippet id="migration/behavior-differences/no-string-to-number-3" twoslash />
+
+Mongoose would write `null` here into any optional field. For a field to be able to hold `null`, declare it [`nullable`](../reference/schemas/prop.mdx#nullable). Then `null` and a missing field become two different states, and the type tells them apart.
+
+## Unknown fields aren't dropped [#unknown-not-dropped]
+
+Take a typo in a field name. Mongoose with default settings (`strict: true`, `strictQuery: false`) reacts to it differently depending on where it is, but never throws an error.
+
+<Compare>
+
+<Snippet id="migration/behavior-differences/unknown-not-dropped" />
+
+<Snippet id="migration/behavior-differences/unknown-not-dropped-2" twoslash />
+
+</Compare>
+
+Silence is dangerous because it looks like success. The `extra` field wasn't saved, and you find out only when you don't see it in the database. The filter with the typo `nope` found nothing, and that also looks like an ordinary "there's nothing there".
+
+In Typemo the compiler stops a typo in a field. And if the value came from untyped JavaScript, the error happens at runtime. An unknown field in a filter gives a [`StrictModeError`](../reference/errors/data-errors.mdx#strict-mode-error) with the reason `unknown-path`, an unknown key in a document being created gives a `CastError` with the reason `unknown-key`, and an unknown path in an update gives a `StrictModeError` before anything is sent to the database.
+
+For data that's already in the database, the rule works the other way round. A field that isn't in the class stays untouched in the document when it's read and saved at the top level. Typemo is stricter with subdocuments. If overwriting a subdocument would erase an unknown field, you get an [`UnknownFieldsError`](../reference/errors/data-errors.mdx#unknown-fields-error) instead of a silent loss. The [Handle fields that aren't in the schema](../documents/unknown-fields.mdx) guide shows how this looks in practice and how to agree to the loss deliberately.
+
+## `undefined` isn't a value [#undefined-not-value]
+
+In JavaScript, `undefined` and "the field is missing" are almost the same thing, and in the database `undefined` is written as `null`. Mongoose turns `undefined` into `null` in a filter, and the query `find({ views: undefined })` looks for documents where `views` is `null` or missing. If the value came from an optional request parameter, you get neither "everything" nor an error, but a different slice from the one you meant.
+
+<Snippet id="migration/behavior-differences/undefined-not-value" twoslash />
+
+Typemo throws a [`QueryError`](../reference/errors/query-errors.mdx#query-error) and suggests what to write instead of `undefined`. For "the field is missing" there's [`$exists: false`](../reference/query/filter-operators.mdx#exists), and to remove a field, [`$unset`](../reference/writes/update-operators.mdx#unset). The same principle holds in updates: `undefined` isn't skipped there and isn't written as `null`.
+
+## A value that can't be cast is always a CastError [#cast-error-always]
+
+Say a field got a value of the wrong type, for example `doc.views = "abc"`. Mongoose stores the cast error in the document and reports it on validation together with all the others, inside a `ValidationError`. For a schema with a required `title`, the constructor `new MPost({ views: "abc" })` without `title` gave one `ValidationError` with two entries: `views` (`CastError`) and `title` (`required`).
+
+Typemo is stricter. A value that can't be cast is always a [`CastError`](../reference/errors/data-errors.mdx#cast-error), one per field, and the field's constraints (`min`, `enum`) aren't checked after it, since there's nothing left to check. When the error arrives depends on how the value got into the document. Methods that take a value (`create`, `Model.new`, `$set`, array methods, update operators) cast it right away. A plain assignment `doc.views = …` is cast on the next [`$validate()`](../reference/documents/document-api.mdx#validate) or `$save()`. The `CastError` comes before any value check, and nothing goes to the database.
+
+<Snippet id="migration/behavior-differences/cast-error-always" twoslash />
+
+If a document has a wrong value and a missing required field at the same time, `$validate()` names only the `CastError`. Value checks start once everything is cast. That's a deliberate difference. Casting answers the question "is the value of the right type", and validation answers "does it fit the rules". The second question makes no sense until the first one is answered.
+
+The exception is the places where you need to collect all the problems at once. These are `Model.validate(input)` and the Standard Schema integration for forms. There, casting is one entry in a shared list with the reason `cast`, and the `CastError` sits in that entry's `cause`: `Validation failed: "title": the field is required [required]; "views": Cast to number failed at path "views" for "abc" (string): expected a number [type] [cast]`.
+
+## Empty and "almost empty" are errors [#empty-is-error]
+
+Sometimes a bug in the code puts an empty condition or an empty change into an update or a delete. Mongoose tolerates all of these, including an empty filter in the `One` forms. `updateOne({}, …)` changes the first document it finds in the collection, `deleteOne({})` deletes it, and `replaceOne({}, …)` replaces it.
+
+<Compare>
+
+<Snippet id="migration/behavior-differences/empty-is-error" />
+
+<Snippet id="migration/behavior-differences/empty-is-error-2" twoslash />
+
+</Compare>
+
+It's all about the cost of a mistake. One typo turns `deleteMany({ author: id })` into `deleteMany({ author: undefined })` or into `deleteMany({})`, and the collection is gone. That's why an empty filter in a write is forbidden in all five methods, including the `One` forms. `updateOne({})` and `deleteOne({})` would touch one document, but the database would decide which one, and that's not what the code's author meant at all.
+
+The `{}` literal doesn't compile in these methods (`an empty filter would change or remove an arbitrary document; pass a filter, or Filters.all() to mean every document on purpose`). A filter built at runtime from a variable or user input is rejected at call time. In a `bulkWrite` batch the same check applies to every operation. If you need every document, say so with a separate word: [`Filters.all`](../reference/policies/violations.mdx#filters.all). Details are in the [Empty filters in writes](../writes/empty-filters.mdx) guide.
+
+Typemo also treats an empty update as an error. It has no sensible result other than "nothing happened", and that shouldn't look like success.
+
+## `findOneAndUpdate` returns the document after the change [#returns-updated]
+
+In Mongoose this method returns the document **before** the change by default (`new: false`), and you have to ask for the new one with `new: true` or `returnDocument: "after"`. This is one of the main reasons to move code carefully. Without a fix the code keeps working, but starts reading a different value.
+
+<Compare>
+
+<Snippet id="migration/behavior-differences/returns-updated" />
+
+<Snippet id="migration/behavior-differences/returns-updated-2" twoslash />
+
+</Compare>
+
+Usually you want to see the result of your write, so in Typemo that's the default. There are no `new` and `returnOriginal` options. `returnDocument` takes `"before"` and `"after"`, and there's no other way to say the same thing. More in the [`findOneAndUpdate`](../reference/writes/writes.mdx#find-one-and-update) reference.
+
+## A query runs once [#single-execution]
+
+Mongoose lets you build a query, but you can't run it a second time. The second `await` throws `Query was already executed: Post.find({ title: 'a' })`. Typemo is gentler and more predictable with reads: awaiting the same builder again returns the same result without a new round trip to the database.
+
+For writes the rule is different and stricter. A write builder runs once, because a repeated write is a repeated side effect. The [`.exec`](../reference/query/reading.mdx#exec) reference and the ["One run per builder"](../reference/writes/writes.mdx#one-run-per-builder) section show how to read and write in a chain.
+
+## Arrays, documents, and relations behave like values [#values-semantics]
+
+Picture code that works with arrays inside a document the way it's usually done in JavaScript.
+
+The first difference is how you change an array. In Mongoose `post.tags[0] = "x"` is tracked, but `post.tags.length = 0` and `delete post.tags[0]` aren't, and the change is lost without a single message. In Typemo a document's array is a [`StrictArray`](../reference/documents/typed-collections.mdx#strict-array). Writing by index and to `length` doesn't compile, and you replace elements with the [`set`](../reference/documents/typed-collections.mdx#strict-array.set), [`clear`](../reference/documents/typed-collections.mdx#strict-array.clear), [`splice`](../reference/documents/typed-collections.mdx#strict-array.splice), and [`replace`](../reference/documents/typed-collections.mdx#strict-array.replace) methods. `set(i, v)` changes only an existing position. You can't write past the end of the array as in Mongoose. That's what `push` is for.
+
+The second is populated relations. In Mongoose you can change a populated array in place, and `push(id)` turns it back into an array of identifiers. In Typemo a populated array and map are read-only, and you change references through the identifiers themselves. After a `push` in Mongoose you can't predict what goes to the database on save, documents or identifiers. More in the [Populate a document you already have](../populate/document-populate.mdx) guide.
+
+## Bulk writes report every error [#bulk-write-errors]
+
+Take `insertMany` with three documents, one of which is invalid.
+
+<Compare>
+
+<Snippet id="migration/behavior-differences/bulk-write-errors" />
+
+<Snippet id="migration/behavior-differences/bulk-write-errors-2" twoslash />
+
+</Compare>
+
+Mongoose inserts the valid documents and silently skips the invalid one. You get an array of two, and the program won't tell you where the third one went. Typemo inserts the same valid documents, but ends the operation with a [`BulkWriteError`](../reference/errors/server-errors.mdx#bulk-write-error). For each failure it has the index in the input array, the code, and the original error, so you know exactly what was inserted and what wasn't. The same error class comes from [`bulkWrite`](../reference/writes/writes.mdx#bulk-write), and the server's message is kept in `cause`.
+
+A separate note on [`create`](../reference/writes/writes.mdx#create) with a list. In Mongoose it saved documents in parallel and required `ordered: true` inside a transaction. Typemo inserts a list with one ordered `insertMany` and never in parallel, so it has no such option.
+
+## A `bulkWrite` batch validates and runs the hooks of every operation [#bulk-write-hooks]
+
+Say an import goes through `bulkWrite` with `upsert`. In Mongoose this method validated only `insertOne` and `replaceOne` against the schema. Values in `updateOne` went to the database unchecked, and the hooks of individual operations weren't called. Only the batch's own `pre("bulkWrite")` and `post("bulkWrite")` ran. A batch with `updateOne`, `upsert: true`, and a price of `-1` with `min: 0` wrote a document with a negative price, and created an insert without a required field with no errors. The `pre("updateOne")` hook wasn't called once.
+
+In Typemo each operation in a batch behaves like its single counterpart. `$set` values are validated, and `upsert` also checks the required fields of the document being inserted. `insertOne` runs the document hooks, and the other operations run the `query.updateOne`, `query.deleteMany`, and similar hooks. A hook learns the operation's number from `this.bulkIndex`.
+
+<Snippet id="migration/behavior-differences/bulk-write-hooks" twoslash />
+
+The first operation wrote a document, the second was rejected, and its number is named in the error. If an operation's hook throws, the whole batch doesn't go to the database. Details and the hook order are in the [Bulk writes](../writes/bulk.mdx#bulk-write-hooks) guide.
+
+## Hooks have a different order and a different `this` [#hook-order-and-this]
+
+Take logic on save. In Mongoose, `save` validates the values first and then calls `pre("save")`. So whatever your hook fixed is no longer validated. In Typemo the order is the reverse: first [`@Pre("document.save")`](../reference/hooks/pre-post.mdx#pre), then validation, then the write. Everything the hook changed is validated as strictly as user input.
+
+The second difference is `this`. In Mongoose query hooks, `this` is the `Query` itself, and a hook can rewrite the condition, swap settings, or mix in a stage. All of that happened after validation and bypassed the policies: tenant, soft delete, sanitization. In Typemo a query hook gets a read-only operation context. You can change the operation with the [`.modify`](../reference/hooks/operation-context.mdx#modify) method, and only in a form the policies check. The [Hook into an operation](../hooks/operation-hooks.mdx) guide shows how this looks in code.
+
+In a document hook, `this` is the document, or a subdocument if the class is embedded in another model. The class's hook fires in both cases. Its type is [`HookThis<"document.save", Post>`](../reference/hooks/pre-post.mdx#hook-this), that is, `HydratedDoc<Post> | Subdocument<Post>`. Both have the `$isNew()` and `$isModified()` methods, and root methods like `$getChanges()` and `$save()` are available after a [`this.$isRoot()`](../reference/documents/document-api.mdx#is-root) check. The compiler won't let you declare `this: HydratedDoc<Post>`, because that type would promise root methods to a subdocument that doesn't have them.
+
+The third: hook events aren't set with strings and regular expressions. In Mongoose `pre("deleteOne")` could mean either the document or the query depending on an option, and `/^find/` caught everything in sight. In Typemo an event always has a scope, `document.save` or `query.find`, and their list is explicit, [`HOOK_EVENTS`](../reference/hooks/pre-post.mdx#hook-events). A document `deleteOne` hook won't fire on a query `deleteOne`, and vice versa.
+
+## The discriminator key can't be changed [#discriminator-key-immutable]
+
+Say you want to "turn" a card document into a transfer by changing the key. In Mongoose the result depends on how you do it, and it's hard to predict. The assignment `doc.kind = "Transfer"` in a saved child document gives a `ValidationError` with a message about casting the key to a string, because the `Card` discriminator doesn't accept someone else's value. The update `updateOne({ _id }, { $set: { kind: "Transfer" } })` silently does nothing: the response is `acknowledged: false`, and the document doesn't change. You can change the key only with the `overwriteDiscriminatorKey: true` option, and then the update goes through.
+
+In Typemo the key value is immutable with no exceptions, and there's no switch. The assignment doesn't compile. An update, and a `$save` after an assignment, are rejected before the database with a `StrictModeError` with the reason `immutable`. A document's kind is chosen once, at creation. To change it, create a document of the right kind and delete the old one. If two children share the same key value, you get a `ConfigurationError` already at the first `model()`. The error texts and examples are in the ["The key value is immutable"](../reference/schemas/discriminator.mdx#key-immutable) reference.
+
+## The tenant is part of the schema [#tenant-in-schema]
+
+In Mongoose you build multi-tenancy yourself: with a plugin, with `pre("find")` hooks, or with a condition in every query. Any path that bypasses the hooks (aggregation, `lean`, the driver) can return another tenant's data. In Typemo the tenant is a schema policy. The `tenant` option turns it on, and the tenant field of type `TenantField<T>` must be marked with the [`@Tenant()`](../reference/schemas/field-markers.mdx#tenant) decorator next to `@Prop`.
+
+<Snippet id="migration/behavior-differences/tenant-in-schema" twoslash />
+
+It's stricter here in several places at once.
+
+- A schema with the `tenant` option and no `@Tenant()` mark won't build: `ConfigurationError: Order: the tenant field "tenantId" must be marked @Tenant() (declare it @Prop(...) @Tenant() tenantId!: TenantField<T>)`. The same happens with a mark and no option, or with marks on two fields.
+- An operation without a tenant doesn't return everything, it fails.
+- An empty string as the tenant is an error too.
+- Working across all organizations at once is written explicitly: `.policy({ allTenants: true })`.
+
+Details are in the [Split data by organization](../policies/tenants.mdx#define-tenant-field) guide and the [A multi-tenant app](../recipes/multi-tenant.mdx) recipe.
+
+## Nothing is created implicitly [#nothing-implicit]
+
+When a model is created, Mongoose creates the collection and indexes on its own (`autoCreate`, `autoIndex`) and queues commands while there's no connection (`bufferCommands`). It also adds an `_id` to every document, and to the model a virtual `id` property, plus timestamps and a version depending on your option. Typemo does none of this on its own.
+
+Your command creates collections and indexes. That's [`connection.init()`](../reference/connection/connection.mdx#connection.init) once when the service starts, or [`syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes) in a deployment step. `syncIndexes` drops indexes that aren't in the class. So before the first run on a collection that Mongoose used to manage, look at the plan: `syncIndexes({ dryRun: true })` writes nothing. An operation before the connection doesn't get queued. It waits for the client to be ready internally and throws an error when the time runs out ([`client.ready`](../reference/connection/typemo-client.mdx#client.ready)).
+
+If syncing can't bring a collection in line with the schema, Typemo tells you. In that situation, `Model.init()` and `createCollection()` in Mongoose silently skip the collection. If the collection already exists without the `capped` option, a schema with `capped` doesn't change it, and there's no error: `isCapped()` returned `false`. And with `autoCreate: false`, a collection with `capped` or `collation` isn't created at all (these are bugs gh-8566 and gh-8814 in the Mongoose tests). The app starts with a collection of the wrong shape and finds out from the consequences.
+
+In Typemo [`connection.init()`](../reference/connection/connection.mdx#connection.init) and `syncAll()` run all the steps and then throw one [`SyncError`](../reference/errors/configuration-errors.mdx#sync-error). It lists every failure in `failures`, and the original errors are in `cause`. On a `logs` collection created without `capped`, with a schema that has `capped: { size: 100_000 }`, you get `SyncError: connection.init() of "app": 1 failure(s) — collection "logs": exists with options MongoDB cannot change (capped): drop the collection and create it again`.
+
+The bookkeeping fields are explicit too. `_id` comes from the [`Entity`](../reference/schemas/base-classes.mdx#entity) base class, timestamps from [`Timestamped`](../reference/schemas/base-classes.mdx#timestamped), and the `__v` version from [`Versioned`](../reference/schemas/base-classes.mdx#versioned). There's no virtual `id`. The identifier is `_id`, and in the `.plain()` result and in JSON it's already a string.
+
+## Reading from the database doesn't validate data [#reads-not-validated]
+
+This difference goes the other way. On writes Typemo is stricter than Mongoose, but on reads it doesn't check what's in the database. Mongoose casts a value it reads to the schema type, and the string `"5"` in the `views` field becomes `5`. Typemo returns what's stored.
+
+If the `views` field holds the string `"5"`, [`findById`](../reference/query/reading.mdx#model.find-by-id) returns `views: "5"`, even though the type promises a number. Typemo reads data as is on purpose, so that turning it into a document doesn't become one more check. As long as Mongoose wrote the collection, the field holds whatever the schema cast the value to on write, and there are no mismatches. They appear when someone writes to the collection without respecting the schema. If that can happen, check the result at runtime with the [`.parse`](../reference/query/contracts.mdx#parse) method, as in the ["Validate data from the database at runtime"](../queries/contracts.mdx#validate-reads) section.
+
+## Troubleshooting [#troubleshooting]
+
+**After the move, tests fail on strings instead of numbers.** Tests and handlers passed `"42"` and got `42`, and now they get a `CastError` with the reason `type`. Cast the value at the app's boundary, not in the model. Parse the request parameter when you read it and pass a number.
+
+**`findOneAndUpdate` returned the new value.** The code computed the difference between the old and new values from the result of `findOneAndUpdate`. Now that result holds the new value. If you really need the old one, add `{ returnDocument: "before" }`.
+
+**A filter with a typo now fails.** It used to silently find zero documents. That's not a regression but a bug found, so fix the field name. If the query is built from untyped JavaScript, the error is a [`StrictModeError`](../reference/errors/data-errors.mdx#strict-mode-error) with the reason `unknown-path`.
+
+**`updateOne({})` and `deleteOne({})` in tests and scripts.** Mongoose scripts and tests often clear a collection with `deleteOne({})` in a loop or update "any document" with `updateOne({}, …)`. Now that's a `StrictModeError`. Name the document with a condition (`{ _id }`, `{ title }`) or, if you really need any document, read it and update it by `_id`. For every document there's [`Filters.all()`](../reference/policies/violations.mdx#filters.all).
+
+**`init()` fails at startup with `SyncError`.** Before, Mongoose silently started on a collection of the wrong shape. `SyncError` names each collection and the reason: a mismatch in options the server doesn't change (for example, `capped`), or an index conflict. Fix the collection by recreating it or bringing the schema in line, rather than catching the error.
+
+**The tenant schema won't build.** You see `ConfigurationError: …must be marked @Tenant()`. Mark the field of type `TenantField<T>` with the decorator, as in the tenant section above.
+
+**An empty `updateOne` no longer "does nothing".** The code updated a document with a change that sometimes arrived empty. Now that's a [`QueryError`](../reference/errors/query-errors.mdx#query-error). Check the change before the call. An empty update means you didn't know yourself what you wanted to change.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="What Typemo doesn't have" href="./missing-features.mdx">
+  What Mongoose can do and Typemo deliberately can't, and what to use instead.
+</Card>
+<Card title="Step-by-step migration" href="./step-by-step.mdx">
+  How to move collection by collection and live with two libraries at once.
+</Card>
+<Card title="API mapping" href="../reference/migration/api-mapping.mdx">
+  Tables of Mongoose methods and their Typemo counterparts, by area.
+</Card>
+</Cards>

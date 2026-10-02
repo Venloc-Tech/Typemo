@@ -1,0 +1,166 @@
+---
+title: "Policy options in the schema"
+description: "The tenant, softDelete, and audit options of @Schema: class fields, defaults, description errors, and the audit entry"
+icon: ShieldCheck
+---
+
+Three data policies are turned on by options of [`@Schema`](../schemas/schema.mdx) with the same names: `tenant`, `softDelete`, and `audit`. All three are off by default. An option accepts `true` (default settings) or an object with settings. Once a policy is on, it applies to **all** operations of the model, and a single query can't turn it off. The values from the environment, such as which tenant and who is acting, come from the [policy context](./policy-context.mdx). If policies are new to you, start with [What data policies are](../../policies/overview.mdx).
+
+The examples are built on a bank. An account has an owner organization, an account can't be erased without a trace, and every write leaves a note in a log.
+
+<TypeTable
+  type={{
+    tenant: { description: "The tenant policy. Every operation works with the data of one tenant.", type: "true | TenantSchemaOptions" },
+    softDelete: { description: "Soft delete. A delete marks the document, and reads hide the marked ones.", type: "true | SoftDeleteSchemaOptions" },
+    audit: { description: "Audit. Every write leaves a row in the log, and it needs a replica set.", type: "true | AuditSchemaOptions" },
+  }}
+/>
+
+## The tenant option [#tenant]
+
+The `tenant` option says that the model's documents belong to different **tenants**. A tenant is an independent owner of data, for example an organization or a customer of the service. The data of tenants lives in one collection and must not see each other. The policy adds a condition on the tenant field to the filter of every operation, stamps the tenant on new documents, and doesn't let a document move to another one. One forgotten `where orgId = …` check in ordinary code would hand out another organization's data. Here you can't forget, because the condition isn't set by the author of the query.
+
+Three things describe the tenant field: an ordinary [`@Prop`](../schemas/prop.mdx), the [`@Tenant()`](../schemas/field-markers.mdx#tenant) decorator, and the [`TenantField`](../schemas/field-markers.mdx#tenant-field) type. The core fills the field in itself, so `create` doesn't require it, and read results always contain it. The type tells the compiler about that, and the decorator tells the library at runtime. TypeScript types disappear at runtime, and without the marker Typemo wouldn't know which field to treat as the tenant.
+
+<Snippet id="reference/policies/schema-options/tenant" title="accounts/account.ts" twoslash />
+
+The second example shows a settings object. The field is called `orgId`, and the tenant type is `ObjectId`. The value from the context is cast by the field type, so a string from the request URL will do.
+
+<Snippet id="reference/policies/schema-options/tenant-2" title="accounts/org-account.ts" twoslash />
+
+The policy covers every path.
+
+- Filters of reads, writes, and "find and modify" get the tenant condition. If you filter by this field yourself, your condition stays, and both must hold, so you can't reach another tenant.
+- Inserts and replaces write the tenant if the field is missing. A foreign value is an error.
+- An update can't change the tenant field. Writing its own value is allowed.
+- In an aggregation the condition goes first. [`$lookup`](../aggregation/stages.mdx#lookup), [`$unionWith`](../aggregation/stages.mdx#union-with), and [`$graphLookup`](../aggregation/stages.mdx#graph-lookup) pull in only documents of the same tenant if the class named in the stage has the policy too. The model of that class isn't needed on the connection.
+- [`$out`](../aggregation/stages.mdx#out) and [`$merge`](../aggregation/stages.mdx#merge) into a collection with a tenant are forbidden, because they would write data around the policy.
+- [`populate`](../populate/populate.mdx) queries are operations of the target model, and they're restricted the same way.
+
+Without a tenant the operation doesn't go to the server. Typemo throws a [`StrictModeError`](./violations.mdx#tenant) with the reason `tenant`.
+
+<Params title="Settings">
+<Param name="field" type="string" default='"tenantId"'>
+
+The name of the tenant field in the class. The field must be declared, otherwise `client.connection.model(Class)` throws `ConfigurationError: NoField: tenant field "tenantId" is not a field of the class`. The `TenantField` type and the `@Tenant()` decorator go on exactly this field. On another field, or on two at once, they give a schema build error, and `@Tenant()` on a field that isn't of type `TenantField<T>` won't compile. For details, see [`TenantField`](../schemas/field-markers.mdx#tenant-field) and [`@Tenant`](../schemas/field-markers.mdx#tenant).
+
+</Param>
+</Params>
+
+The consistency of the option and the marker is checked when the model is built. Any violation is a [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error). The texts below come from a real run.
+
+<Snippet id="reference/policies/schema-options/tenant-3" />
+
+The first error is an option with no marker. The second is a marker with no option. The third is two markers. All the variants are covered in the guide [Split data by organization](../../policies/tenants.mdx#schema-errors). In the `@venloc/typemo-decorators` package the same decorator works the same way.
+
+Three operations behave in a special way.
+
+- `estimatedDocumentCount` reads the collection metadata and can't limit the count by tenant. Instead of quietly counting across all tenants, Typemo throws an error that points to `countDocuments()`.
+- A change stream ([`watch`](../change-streams/watch.mdx)) on a model with a tenant is forbidden without `allTenants: true`. A delete event has no document to filter it by. You can subscribe to all tenants, but you'll have to filter the events yourself.
+- `.policy({ tenant })` for a model without the policy is accepted and changes nothing. That way the same code works with different models.
+
+<FullType>
+
+<Snippet id="reference/policies/schema-options/tenant-4" />
+
+</FullType>
+
+## The softDelete option [#soft-delete]
+
+The `softDelete` option turns on **soft delete**. A delete doesn't erase the document. It writes a timestamp into a field, and the other operations of the model stop seeing the marked documents. A deleted account can be restored, and the history stays. The class field is a `Date` with `null`, where `null` means "alive".
+
+<Snippet id="reference/policies/schema-options/soft-delete" title="accounts/account.ts" twoslash />
+
+The operations `deleteOne`, `deleteMany`, `findOneAndDelete`, deletes in `bulkWrite`, and the document's `$deleteOne` turn into an update of the marker. The result stays a delete result. `deletedCount` equals the number of marked documents, and `findOneAndDelete` returns the document as it was. An already deleted document isn't deleted again, and its marker doesn't change.
+
+All other operations get the condition `deletedAt: null` (the marker is `null` or missing). Your own condition on the marker field stays, and both must hold, so `find({ deletedAt: { $ne: null } })` without a context finds nothing. To see deleted documents, add `includeDeleted` or `onlyDeleted` to the [policy context](./policy-context.mdx#policy-values). An insert writes `deletedAt: null` if the field is missing.
+
+Documents pulled in ([`$lookup`](../aggregation/stages.mdx#lookup), [`$unionWith`](../aggregation/stages.mdx#union-with), [`$graphLookup`](../aggregation/stages.mdx#graph-lookup), `populate`) are never deleted ones. The stage takes the policy from the class named in it, even if that class's model isn't created on the connection.
+
+<Params title="Settings">
+<Param name="field" type="string" default='"deletedAt"'>
+
+The name of the marker field. The field must be a `Date` with `null`, otherwise the model isn't created: `ConfigurationError: S1: softDelete field "deletedAt" must be a nullable Date field (Date | null)`. The same error appears if the field isn't in the class.
+
+</Param>
+</Params>
+
+`estimatedDocumentCount` counts deleted documents too, since it reads collection metadata. Without `includeDeleted: true` Typemo throws a [`StrictModeError`](./violations.mdx#soft-delete) with the reason `soft-delete`.
+
+Soft delete doesn't get along with unique indexes, because a deleted document keeps occupying the value. When a model is created, Typemo hints for every unique index without a partial condition on the marker how to make it partial over the live documents. The condition is `partialFilterExpression: { deletedAt: { $type: "null" } }`. You need exactly `$type: "null"`. A partial index can't express "the field is missing", and an insert always writes `null`.
+
+[`SoftDelete.purge`](./soft-delete-and-untrusted.mdx#soft-delete.purge) and [`SoftDelete.restore`](./soft-delete-and-untrusted.mdx#soft-delete.restore) let you erase documents for good or bring them back.
+
+<FullType>
+
+<Snippet id="reference/policies/schema-options/soft-delete-2" />
+
+</FullType>
+
+## The audit option [#audit]
+
+The `audit` option turns on the **audit**. Every write to the model leaves a row in a separate log collection. The row shows what was written and when, whose tenant it is, and who acted (`actor` from the [policy context](./policy-context.mdx#policy-values)). The log is read for investigations like "who changed the account limit", for reporting, and to rebuild the chain of changes.
+
+<Snippet id="policies/audit/quick-start" title="transfers/transfer.ts" twoslash />
+
+The log is written in the same transaction as the write, right after it. The row names what the operation named. A write by a filter without `_id` leaves the filter, not the ids of the affected documents. To get a document's history, read the ids inside the transaction and write by `_id: { $in }`. The recipe is covered in the guide [Keep an audit log](../../policies/audit.mdx#document-history).
+
+A write and its row are committed together or not at all. If the row wasn't written, the operation fails with an [`AuditError`](../errors/configuration-errors.mdx#audit-error), and the write rolls back. That's why a write to a model with audit outside a transaction opens its own. This needs a **replica set** (several MongoDB servers holding copies of the same data, though one server is enough for transactions) or a sharded cluster. On a standalone `mongod` a write throws a `ConfigurationError` asking you to start a replica set, and a single node will do. Reads don't reach the log.
+
+Secrets in the log are masked by the field option [`sensitive`](../schemas/prop.mdx#sensitive), and `audit` itself has no settings for that. The value is replaced with `?` (`"mask"`) or `[hidden]` (`"hide"`) in the filter, the update, and the documents. A custom function `{ mask: (value) => … }` keeps whatever it returns, for example the last four digits. It's called only with a value of the field's declared type. An operand of another type, say `{ $exists: true }` in a filter on this field, goes into the log as `?` without a call. A hidden field (`Hidden`) without the mark is masked too.
+
+<Params title="Settings">
+<Param name="collection" type="string" default="<collection>_audit">
+
+The name of the log collection. By default `_audit` is appended to the model's collection name, which gives `transfers_audit` for `transfers`.
+
+</Param>
+</Params>
+
+The log has no model, and Typemo only writes to it. Read the rows through the driver, with [`client.unsafeDriver()`](../connection/typemo-client.mdx#client.unsafe-driver). Below is a write in the `Transfer` model on behalf of `user-7` and the row that stayed in the log.
+
+<Snippet id="reference/policies/schema-options/audit" twoslash />
+
+## AuditEntry [#audit-entry]
+
+`AuditEntry` describes a log row. The fields `filter`, `update`, `replacement`, `documents`, and `operations` hold the values after type casting, under the class field names and with secrets masked. A soft delete is recorded as a delete with the flag `softDelete: true`.
+
+<TypeTable
+  type={{
+    at: { description: "When the write was made.", type: "Date" },
+    model: { description: "The model (class) name.", type: "string" },
+    collection: { description: "The model's collection.", type: "string" },
+    operation: { description: "The operation name: `insertOne`, `updateMany`, `deleteMany`, `bulkWrite`, and so on. A document write through `$save` is `insertOne` or `updateOne`.", type: "string" },
+    document: { description: "`true` if the write was made through a document (`$save`, `$deleteOne`, `create`, `bulkSave`).", type: "boolean" },
+    actor: { description: "The `actor` from the policy context, if there was one.", type: "unknown", required: false },
+    tenant: { description: "The `tenant` from the policy context, if there was one.", type: "unknown", required: false },
+    filter: { description: "The filter of the write (masked).", type: "PlanDocument", required: false },
+    update: { description: "The update (masked).", type: "PlanDocument | readonly PlanDocument[]", required: false },
+    replacement: { description: "The replacement document (masked).", type: "PlanDocument", required: false },
+    documents: { description: "The inserted documents (only the ones written).", type: "readonly PlanDocument[]", required: false },
+    operations: { description: "For `bulkWrite`, the operations that were sent (masked).", type: "readonly PlanDocument[]", required: false },
+    result: { description: "The server counters: `insertedCount`, `matchedCount`, `modifiedCount`, `deletedCount`. For \"find and modify\" also `found` and `_id`.", type: "Readonly<Record<string, unknown>>" },
+    outcome: { description: "`\"ok\"` or `\"partial\"`. The second value means an unordered batch insert or `bulkWrite` failed after writing part of the data.", type: '"ok" | "partial"' },
+    softDelete: { description: "`true` if this is a soft delete.", type: "true", required: false },
+  }}
+/>
+
+The type describes the result of reading the log. A row read by the driver also has an `_id`.
+
+<FullType>
+
+<Snippet id="reference/policies/schema-options/audit-entry" />
+
+</FullType>
+
+### What doesn't reach the log [#not-logged]
+
+The log doesn't get reads, aggregations with the `$out` and `$merge` stages (those are reported separately), and writes that a hook canceled before sending. There was nothing to record there.
+
+An unordered batch write that failed inside a transaction leaves neither a write nor a row, because the server rolls back the whole transaction. A `partial` row appears only if part of the documents were rejected before being sent to the server (by casting or validation) and the rest were written.
+
+## When it doesn't fit [#when-not-to-use]
+
+Policies don't replace access rights. They split data and leave traces, but they don't decide who may run an operation. If you need roles, check permissions before calling the model.
+
+The log isn't suitable for auditing every read, since reads aren't written to it. Use the server's access log. If there's no replica set, you can't turn on audit, but you can keep a change history with your own write [hook](../../hooks/operation-hooks.mdx). The guides are [Split data by organization](../../policies/tenants.mdx), [Delete with a way to restore](../../policies/soft-delete.mdx), and [Keep an audit log](../../policies/audit.mdx).

@@ -1,0 +1,224 @@
+---
+title: API mapping
+description: "Each Mongoose method, option, or type next to its Typemo equivalent, or the reason there isn't one."
+icon: ArrowLeftRight
+---
+
+Reference for moving code over from Mongoose 9. On the left is what you write now, and on the right is what to write in Typemo. Where there's no equivalent, the cell says "none" and gives the reason. Still deciding whether to switch? Start with the guide [Why switch](../../migration/why.mdx). The order of work is described in [Step-by-step migration](../../migration/step-by-step.mdx), and every difference in behavior is covered in [Behavior differences](../../migration/behavior-differences.mdx).
+
+The page is made of "name to name" tables, and the explanations in them are short on purpose. If a mapping has a catch, the third column names it and links to the full explanation. A row marked "none" means the element isn't in Typemo's public API. It existed for behavior that Typemo gave up. The Mongoose facts were checked against the sources of version 9.10.2, and the Typemo facts against the code and by running it.
+
+One thing holds for the whole page. Typemo creates nothing implicitly (collections and indexes only on your command), doesn't cast types silently, and doesn't drop what it didn't understand. It throws an error. Most of the "none" rows follow from that.
+
+---
+
+## Schemas [#schemas]
+
+In Mongoose, a schema is a `new Schema({...})` object, and you get a model by calling `mongoose.model`. In Typemo, a schema is a class. The document type, the database schema, and the validator are described in one declaration, so there's nothing for them to drift apart on.
+
+| Mongoose | Typemo | What matters |
+|---|---|---|
+| `new Schema({ … })` | a class with [`@Schema`](../schemas/schema.mdx#schema), fields with [`@Prop`](../schemas/prop.mdx#prop) | Every field's type is explicit, `@Prop(() => String)`. A field without a decorator doesn't enter the schema |
+| `mongoose.model("User", schema)` | [`client.db().model(User)`](../connection/connection.mdx#connection.model) | A model belongs to a connection, and there's no global model |
+| `Schema.Types.ObjectId` with `ref` | [`Types.ObjectId`](../schemas/types-and-spec.mdx#types) and the [`ref`](../schemas/prop.mdx#ref) option, field type [`Ref<User>`](../schemas/field-markers.mdx#ref) | A reference in the model is an ordinary `ObjectId`, and a populated one is a document. The type tells them apart |
+| `Schema.Types.Mixed`, `{}`, `Object`, an untyped array | none | Strictness forbids a field of unknown shape, since there's nothing to validate or type it with. Replacements are a nested class or [`Spec.map`](../schemas/types-and-spec.mdx#spec.map). For more, see [What Typemo doesn't have](../../migration/missing-features.mdx) |
+| `Decimal128`, `Int32`, `Double`, `UUID`, `Buffer` | [`Types.Decimal128`, `Types.Int32`, `Types.Double`, `Types.UUID`, `Types.Binary`](../schemas/types-and-spec.mdx#types) | `Long` is declared as `BigInt`. A `Buffer` isn't created from a string or a number |
+| `Schema.Types.Map` with `of` | [`Spec.map(X)`](../schemas/types-and-spec.mdx#spec.map) | Keys and values are checked, and a `Map` without `of` is an error |
+| `[String]`, `[subSchema]` | `@Prop(() => [String])`, `@Prop(() => [Line])` | An array of subdocuments is a [`SubdocumentArray`](../documents/typed-collections.mdx#subdocument-array). An empty array is filled in by default, as in Mongoose, so you don't need `default` |
+| a nested `new Schema` as a subdocument | a class with [`@Schema({ nested: true })`](../schemas/schema.mdx#nested) | A nested object has no `_id` and no hooks of its own |
+| `required`, `default`, `enum`, `min`, `max`, `minLength`, `maxLength`, `match`, `trim`, `lowercase`, `uppercase`, `immutable` | [`@Prop`](../schemas/prop.mdx#required) options with the same names | `required` is an explicit option, and only [`nullable`](../schemas/prop.mdx#nullable) allows `null` |
+| `validate` | the [`validate`](../schemas/prop.mdx#validate) option | The check context is the second argument, not `this` |
+| `get`, `set` | the [`get`](../schemas/prop.mdx#get) and [`set`](../schemas/prop.mdx#set) options | `get` works only through `$get` and `$toObject({ getters: true })`, not on a property read |
+| `select: false` | [`hidden: true`](../schemas/prop.mdx#hidden) and the type [`Hidden<T>`](../schemas/field-markers.mdx#hidden) | The compiler sees a hidden field. You can bring it back only with an explicit `+field` |
+| `alias` | the [`dbName`](../schemas/prop.mdx#db-name) option | The direction is reversed. The property name is the name in code, and `dbName` is the name in the database |
+| `index`, `unique`, `sparse`, `expires`, `text` on a field | the same-named [`@Prop`](../schemas/prop.mdx#index) options | `expires` is a whole number of seconds, and there are no strings like `"1.5m"` |
+| `schema.index({ a: 1, b: -1 })` | the [`@Index`](../schemas/index-decorators.mdx#index) decorator | The directions are only `1`, `-1`, and `"hashed"` |
+| `schema.index({ x: "text" })`, Atlas Search | [`text`](../schemas/prop.mdx#text), [`@SearchIndex`](../schemas/index-decorators.mdx#search-index) | |
+| `timestamps: true` | the [`Timestamped`](../schemas/base-classes.mdx#timestamped) base class | The `createdAt` and `updatedAt` fields show in the type |
+| `versionKey`, `__v` | the [`Versioned`](../schemas/base-classes.mdx#versioned) base class | Without it there's no version at all |
+| an automatic `_id` and the `id` virtual | the [`Entity`](../schemas/base-classes.mdx#entity) base class, there's no `id` virtual | A model without `_id` throws `ConfigurationError`. A string instead of an `ObjectId` arrives in the `.plain()` result, where `_id` is already a string |
+| `_id: String`, `_id: Number`, `_id: UUID` in a schema | the [`EntityWithId(() => String)`](../schemas/base-classes.mdx#entity-with-id) base class | Don't declare `_id` in the class by hand. Without `default`, the identifier is required in `create`. For details, see the guide [Use your own `_id` type](../../schemas/custom-ids.mdx) |
+| `_id: false` | none for a model, and for a subdocument [`nested: true`](../schemas/schema.mdx#nested) | A collection document without `_id` is impossible |
+| `collection`, `capped`, `timeseries`, `collation`, `shardKey`, `readConcern`, `writeConcern`, `optimisticConcurrency` | the same-named [`@Schema`](../schemas/schema.mdx#collection) options | `optimisticConcurrency` accepts only a list of paths, and `{ exclude }` has no equivalent |
+| `autoIndex`, `autoCreate` | the [`autoIndex` and `autoCreate`](../schemas/schema.mdx#auto-create) options | They act only on an explicit [`connection.init()`](../connection/connection.mdx#connection.init). Creating a model creates nothing by itself |
+| `strict`, `strictQuery`, `useNestedStrict`, `strictRead` | none | Strictness is absolute and can't be turned off. Instead of silent behavior, you get [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error) and `CastError` |
+| `minimize`, `typeKey`, `id`, `bufferCommands`, `bufferTimeoutMS`, `selectPopulatedPaths`, `skipVersioning`, `validateBeforeSave`, `validateModifiedOnly`, a schema's `lean`, `pluginTags`, `collectionOptions` | none | Each of them changes behavior implicitly, and a reader of the code can't see it. Empty objects aren't stripped, waiting for the connection is configured in the client ([`readyTimeoutMS`](../connection/typemo-client.mdx#client-options)), and validation on save can't be turned off |
+| `toJSON`, `toObject` in a schema | none, the options are passed at the call of [`$toObject`, `$toPlain`, `$toJSON`](../documents/document-api.mdx#to-object) | Schema options changed the shape of the result where the caller couldn't see it. The schema option `@Schema({ toJSON })` is an error |
+| `Schema#discriminator`, `discriminatorKey` | [`@Discriminator`](../schemas/discriminator.mdx#discriminator), the [`discriminatorKey`](../schemas/schema.mdx#discriminator-key) option | The discriminator value is a literal. An unknown value in the database gives `CastError`, not a silent base model. The key's value is immutable after creation |
+| `schema.virtual("posts", { ref, … })` | the [`@Virtual`](../schemas/virtual.mdx#virtual) decorator | Virtual properties without `ref` are computed fields, see [`Computed`](../schemas/field-markers.mdx#computed) |
+| `schema.methods`, `schema.loadClass` | ordinary class methods | The class is the schema, so you don't need `loadClass`. An initializer on a field with `@Prop` is an error |
+| `schema.statics`, `schema.query` | none, for shared static functions there's a plugin with [`statics`](../hooks/plugins.mdx#plugin-statics) | Query helper methods are replaced by functions over the builder |
+| `schema.pre`, `schema.post` | [`@Pre`, `@Post`, `@PostError`](../hooks/pre-post.mdx#pre) | Covered in the [Hooks and plugins](#hooks-and-plugins) table |
+| `schema.plugin(fn)` | the [`@Plugin`](../hooks/plugins.mdx#plugin) decorator | A plugin is an object, not a function |
+| `schema.set`, `schema.add`, `schema.path`, `schema.clone` | none | The schema doesn't change after declaration. The read-only description of a schema is [`describe`](../schemas/schema-info.mdx#describe) |
+| `schema.toJSONSchema()` | [`JsonSchemaGenerator.generate`](../schemas/json-and-standard-schema.mdx#json-schema-generator.generate) | There's also [`StandardSchema`](../schemas/json-and-standard-schema.mdx#standard-schema) |
+
+---
+
+## Models and queries [#models-and-queries]
+
+In Mongoose, a query is a `Query` object you can do anything with before it runs. In Typemo, it's a [query builder](../query/reading.mdx#how-builder-works). The chain looks the same, but the filter, projection, and sort are checked by types and at build time.
+
+| Mongoose | Typemo | What matters |
+|---|---|---|
+| `Model.find`, `findOne` | [`Model.find`](../query/reading.mdx#model.find), [`Model.findOne`](../query/reading.mdx#model.find-one) | An unknown field in a filter is a type error and a `StrictModeError`, not an empty result |
+| `Model.findById` | [`Model.findById`](../query/reading.mdx#model.find-by-id) | Accepts a string id, and a malformed string gives `CastError`. An empty id is an error, not a search for `null` |
+| `Model.exists` | [`Model.exists`](../query/reading.mdx#model.exists) | |
+| `Model.countDocuments`, `estimatedDocumentCount` | [`countDocuments`](../query/reading.mdx#model.count-documents), [`estimatedDocumentCount`](../query/reading.mdx#model.estimated-document-count) | On a discriminator, `estimatedDocumentCount` is an error, because it counts the whole collection |
+| `Model.distinct` | [`Model.distinct`](../query/reading.mdx#model.distinct) | |
+| `.lean()` | [`.lean()`](../query/reading.mdx#lean) and [`.plain()`](../query/reading.mdx#plain) | `lean` keeps `ObjectId`, and `plain` turns values into JSON forms (`_id` is a string) |
+| `.select("a -b")`, `.select({ a: 1 })` | [`.select({ a: 1 })`](../query/reading.mdx#select) | Object only. Mixing inclusion and exclusion is an error, and `+field` works only for hidden fields |
+| `.sort("-age name")`, `.sort({ age: -1 })` | [`.sort({ age: -1 })`](../query/reading.mdx#sort) or a list of pairs | There's no string DSL. A path twice is an error |
+| `.limit`, `.skip` | [`.limit`](../query/reading.mdx#limit), [`.skip`](../query/reading.mdx#skip) | `limit("5")` isn't cast. `0` and negative values are an error (in the database, `limit(0)` means "no limit") |
+| `.orFail()` | [`.orFail()`](../query/reading.mdx#or-fail) | On `find` it throws [`DocumentNotFoundError`](../errors/query-errors.mdx#document-not-found-error) for an empty list |
+| `.populate()` | [`.populate()`](../populate/populate.mdx#populate) | See the [Populate](#populate) section |
+| `.cursor()`, `.eachAsync`, `for await` | [`.cursor()`](../query/reading.mdx#cursor), [`.eachAsync`](../query/cursor.mdx#each-async) | A handler error arrives as [`EachAsyncError`](../query/cursor.mdx#each-async-error) |
+| `.exec()`, `await query` | [`.exec()`](../query/reading.mdx#exec), `await` | A repeated `await` of a reader gives the same result without a query. In Mongoose it throws `Query was already executed` |
+| `.where("a").gt(1)`, `.equals`, `.in`, `.nin`, `.exists`, `.regex`, `.mod`, `.size`, `.all`, `.elemMatch`, `.or`, `.and`, `.nor` | [`.where`](../query/conditions.mdx#where) and the chain of conditions on the [Chained conditions](../query/conditions.mdx) page | Values are checked against the field's type |
+| `.merge(query)` | [`.merge`](../query/conditions.mdx#merge) | Only a query of the same model |
+| `.session()` | [`.session()`](../query/options.mdx#session) | Inside `transaction` the session is filled in automatically |
+| `.hint`, `.collation`, `.comment`, `.batchSize`, `.allowDiskUse` | [`.hint`](../query/options.mdx#hint), [`.collation`](../query/options.mdx#collation), [`.comment`](../query/options.mdx#comment), [`.batchSize`](../query/options.mdx#batch-size), [`.allowDiskUse`](../query/options.mdx#allow-disk-use) | |
+| `.maxTimeMS()` | [`.timeoutMS()`](../query/options.mdx#timeout-ms) | The only way to limit time is the driver's client-side timeout |
+| `.read()` | [`.readPreference()`](../query/options.mdx#read-preference) | Inside a transaction, a read preference other than primary is an error |
+| `.explain()` | [`.explain()`](../query/search-and-explain.mdx#explain) | Only for `find` and `findOne` |
+| `.setOptions`, `.getFilter`, `.getUpdate`, `.getOptions`, `.projection`, `.cast`, `.transform`, `.tailable`, `.slice`, `.error`, `.j`, `.w`, `.wtimeout`, `.snapshot`, `.$where` | none | Each method either reads and changes the query's internal state, or hands raw options to the driver around the checks. You can step into an operation with a [hook](../../hooks/operation-hooks.mdx) |
+| `.sanitizeFilter` and the `sanitizeFilter` option | none | The check is always on. An operator in a value that arrived from outside must be explicitly marked as untrusted, see [Behavior differences](../../migration/behavior-differences.mdx) |
+| `Model.aggregate([{ $match: … }])` | `Model.aggregate((p) => p.match(…))` | Stages are typed pipeline methods, and there are no raw stages. See the guide [Your first aggregation](../../aggregation/first-aggregation.mdx) and the reference [Pipeline and Model.aggregate](../aggregation/pipeline.mdx) |
+| `Model.watch()` | [`Model.watch`](../change-streams/watch.mdx#model.watch) | Returns an async iterator, not an `EventEmitter` |
+| `Model.hydrate`, `Model.castObject`, `Model.validate` | [`Model.hydrate`](../documents/model-document-methods.mdx#model.hydrate), [`Model.castObject`](../documents/model-document-methods.mdx#model.cast-object), [`Model.validate`](../documents/model-document-methods.mdx#model.validate) | |
+| `new Model({…})` | [`Model.new`](../documents/model-document-methods.mdx#model.new) | The model class isn't called with `new`, because a model is a connection object |
+| `Model.init`, `createCollection`, `createIndexes`, `ensureIndexes`, `syncIndexes`, `cleanIndexes`, `listIndexes` | [`connection.init`](../connection/connection.mdx#connection.init), [`Model.createCollection`](../collections/collection-manager.mdx#model.create-collection), [`createIndexes`](../collections/model-indexes.mdx#model.create-indexes), [`syncIndexes`](../collections/model-indexes.mdx#model.sync-indexes), [`listIndexes`](../collections/model-indexes.mdx#model.list-indexes), [`diffIndexes`](../collections/model-indexes.mdx#model.diff-indexes) | `ensureIndexes` and `cleanIndexes` don't exist. The first is obsolete, and the second is replaced by `syncIndexes` with `dryRun`. A sync failure isn't skipped, and `init()` and `syncAll()` throw [`SyncError`](../errors/configuration-errors.mdx#sync-error) |
+| `Model.startSession()` | [`client.startSession`](../connection/typemo-client.mdx#client.start-session) | |
+| `Model.populate(docs, paths)`, `Model.translateAliases`, `Model.where`, `Model.$where`, `Model.discriminator(…)`, `Model.collection`, `Model.db` | none | You can populate already loaded documents with [`$populate`](../documents/document-api.mdx#populate) on a document. `dbName` names are translated automatically, a discriminator is a decorator, and the driver is [`client.unsafeDriver()`](../connection/typemo-client.mdx#client.unsafe-driver) |
+
+---
+
+## Writes [#writes]
+
+The main difference is in the defaults. `findOneAndUpdate` returns the document **after** the change, value checks are always on, and an empty or "non-operator" write is an error.
+
+| Mongoose | Typemo | What matters |
+|---|---|---|
+| `Model.create`, `new Model().save()` | [`Model.create`](../writes/writes.mdx#create) | `create([...])` is always one ordered `insertMany`. It has no `ordered` option |
+| `Model.insertMany` | [`insertMany`](../writes/writes.mdx#insert-many) | An unordered insert with invalid documents ends with [`BulkWriteError`](../errors/server-errors.mdx#bulk-write-error), not silence |
+| `Model.updateOne`, `updateMany` | [`updateOne`](../writes/writes.mdx#update-one), [`updateMany`](../writes/writes.mdx#update-many) | Operators only. `{ title: "x" }` without `$set` is an error |
+| `Model.replaceOne` | [`replaceOne`](../writes/writes.mdx#replace-one) | `createdAt` is kept, and an immutable field must be in the replacement |
+| `findOneAndUpdate`, `findByIdAndUpdate` | [`findOneAndUpdate`](../writes/writes.mdx#find-one-and-update), [`findByIdAndUpdate`](../writes/writes.mdx#find-by-id-and-update) | By default the document **after** the change. There's no `new: true` or `returnOriginal`, and the previous document comes from `returnDocument: "before"` |
+| `findOneAndReplace`, `findOneAndDelete`, `findByIdAndDelete` | [`findOneAndReplace`](../writes/writes.mdx#find-one-and-replace), [`findOneAndDelete`](../writes/writes.mdx#find-one-and-delete), [`findByIdAndDelete`](../writes/writes.mdx#find-by-id-and-delete) | |
+| `deleteOne`, `deleteMany` | [`deleteOne`](../writes/writes.mdx#delete-one), [`deleteMany`](../writes/writes.mdx#delete-many) | An empty filter is a `StrictModeError`. To delete everything on purpose, use `Filters.all()` |
+| `bulkWrite`, `bulkSave` | [`bulkWrite`](../writes/writes.mdx#bulk-write), [`bulkSave`](../writes/writes.mdx#bulk-save) | Errors are collected into `BulkWriteError` with the indexes of the input items. Each operation is checked by the schema (in Mongoose, only `insertOne` and `replaceOne`) and runs the hooks of its single-operation counterpart |
+| `{ upsert: true }` | [`upsert`](../writes/writes.mdx#upsert) | With `upsert: true` and `"after"`, the result is never `null` |
+| `{ new: true }` / `{ returnDocument }` | [`returnDocument`](../writes/writes.mdx#return-document) | Only `"before"` and `"after"` |
+| `{ runValidators: true }`, `{ context: "query" }` | none | Checks are always on, for `$set`, `$setOnInsert`, `$min`, `$max`, `$push`, `$addToSet` |
+| `{ setDefaultsOnInsert }`, `{ timestamps: false }`, `{ strict }`, `{ overwriteDiscriminatorKey }`, `{ omitUndefined }` | none | The core handles defaults and timestamps, `strict` can't be turned off, the discriminator key's value is immutable, and `undefined` is an error, not a skip. A write has no `timestamps` option |
+| `{ arrayFilters }` | [`arrayFilters`](../writes/writes.mdx#array-filters) | They must match the `$[id]` identifiers exactly. An extra or missing filter is an error before the request is sent |
+| `{ rawResult: true }` | the `includeResultMetadata` option, see [`findOneAndUpdate`](../writes/writes.mdx#raw-result) | |
+| `{ session }`, `{ writeConcern }`, `{ ordered }`, `{ maxTimeMS }` | [`.session`](../writes/writes.mdx#builder), [`.writeConcern`](../writes/writes.mdx#builder), [`ordered`](../writes/writes.mdx#ordered), `.timeoutMS` | |
+| `updateOne(f, [ { $set } ], { updatePipeline: true })` | `updateOne(f, (p) => p.set(…))` | Update stages are typed, see [`UpdatePipelines`](../writes/pipeline-updates.mdx#update-pipelines) |
+| `$inc`, `$set`, `$push`, `$pull`, `$addToSet`, `$pop`, `$unset`, `$rename`, `$min`, `$max`, `$mul`, `$currentDate`, `$bit` | [update operators](../writes/update-operators.mdx#set) with the same names | A path under two operators at once is an error |
+
+---
+
+## Documents [#documents]
+
+In Mongoose, a document's properties and methods are mixed in with your fields (`doc.isNew`, `doc.save()`). In Typemo, every service member starts with `$`, so a user field with any name gets in nobody's way.
+
+| Mongoose | Typemo | What matters |
+|---|---|---|
+| `doc.save()` | [`doc.$save()`](../documents/document-api.mdx#save) | An empty save sends nothing. The `save` hook is always called |
+| `doc.set(path, value)`, `doc.get(path)` | [`$set`](../documents/document-api.mdx#set), [`$get`](../documents/document-api.mdx#get) | The value is cast right away, and a cast error is thrown, not deferred |
+| `doc.isNew`, `isModified`, `markModified` | [`$isNew()`](../documents/document-api.mdx#is-new), [`$isModified()`](../documents/document-api.mdx#is-modified), [`$markModified()`](../documents/document-api.mdx#mark-modified) | Methods, not properties |
+| `doc.validate()` | [`$validate`](../documents/document-api.mdx#validate) | |
+| `doc.deleteOne()`, `doc.updateOne()` | [`$deleteOne`](../documents/document-api.mdx#delete-one), [`$updateOne`](../documents/document-api.mdx#update-one) | `$deleteOne` doesn't run query hooks |
+| `doc.populate()`, `depopulate`, `populated`, `$assertPopulated` | [`$populate`](../documents/document-api.mdx#populate), [`$depopulate`](../documents/document-api.mdx#depopulate), [`$populated`](../documents/document-api.mdx#populated), [`$assertPopulated`](../documents/document-api.mdx#assert-populated) | A populated array is a read-only view |
+| `doc.toObject()`, `doc.toJSON()` | [`$toObject`](../documents/document-api.mdx#to-object), [`$toPlain`](../documents/document-api.mdx#to-plain), [`$toJSON`](../documents/document-api.mdx#to-json) | `JSON.stringify(doc)` works and gives the same as `$toJSON()` with default settings |
+| `doc.id` | none | The identifier is `_id` of type `ObjectId`. A string arrives in the `.plain()` result and in `$toJSON()` |
+| `doc.$locals`, `doc.$session()` | [`$locals`](../documents/document-api.mdx#locals), [`$session`](../documents/document-api.mdx#session) | |
+| `doc.errors`, `doc.invalidate`, `doc.$isValid`, `doc.directModifiedPaths`, `doc.modifiedPaths()`, `doc.$clone`, `doc.overwrite`, `doc.equals`, `doc.collection` | none, comparison is [`$is`](../documents/document-api.mdx#is) and changes are [`$getChanges`](../documents/document-api.mdx#get-changes) | There's no accumulated error state. A check either passes or throws [`ValidationError`](../errors/data-errors.mdx#validation-error) |
+| `MongooseArray`, `.$pop`, `.nonAtomicPush`, `.$shift`, `$atomics` | [`StrictArray`](../documents/typed-collections.mdx#strict-array) and its methods | Writing `arr[i] = x` and `arr.length = 0` doesn't compile. Use `set`, `clear`, `splice`, `replace` |
+| `DocumentArray.id()`, `.create()`, `.pull()` | [`SubdocumentArray.id`](../documents/typed-collections.mdx#subdocument-array.id), [`create`](../documents/typed-collections.mdx#subdocument-array.create), [`pull`](../documents/typed-collections.mdx#subdocument-array.pull) | `id` with a malformed value gives `CastError`, not `null` |
+| `Map` | [`TypedMap`](../documents/typed-collections.mdx#typed-map) | A value cast error is thrown right away |
+| `subdoc.deleteOne()`, `subdoc.remove()` | none, deletion is `pull(subdoc)` on the array | Until a subdocument is inserted, it doesn't know how to remove itself from its parent |
+| a field that isn't in the schema, in a subdocument | [`unknownFieldsOf`](../documents/unknown-fields.mdx#unknown-fields-of), [`UnknownFieldsError`](../documents/unknown-fields.mdx#unknown-fields-error) | Mongoose would erase such fields when overwriting a subdocument, and Typemo refuses |
+
+---
+
+## Populate [#populate]
+
+| Mongoose | Typemo | What matters |
+|---|---|---|
+| `.populate("author")`, `.populate("a b")` | [`.populate("author")`](../populate/populate.mdx#populate), a list of paths `["a", "b"]` | A string with spaces as a list of paths isn't supported |
+| `.populate({ path, select, match, options, populate })` | [an options object](../populate/populate.mdx#object-options) with `path`, `select`, `match`, `options` | Nested references are set with a dotted path `author.company`, not a nested `populate` |
+| `options.limit`, `options.skip` | [`options.limit`, `options.skip`](../populate/populate.mdx#options) | Counted exactly per document, not "for the whole query" |
+| `justOne`, `retainNullValues`, `perDocumentLimit`, `transform`, `clone` | [`justOne`](../populate/populate.mdx#just-one), [`retainNullValues`](../populate/populate.mdx#retain-null-values), [`perDocumentLimit`](../populate/populate.mdx#per-document-limit), [`transform`](../populate/populate.mdx#transform), [`clone`](../populate/populate.mdx#clone) | `transform` receives a document from `.lean()` |
+| `ref` as a function or a model name | the option [`ref: () => User`](../schemas/prop.mdx#ref) | A reference is only to a class |
+| `refPath` | the options [`refPath`](../schemas/prop.mdx#ref-path) and [`refModel`](../schemas/prop.mdx#ref-model) | `refPath` is a path inside the document with the reference itself, not from the root |
+| virtual `populate` (`localField`, `foreignField`, `count`, `justOne`) | [`@Virtual`](../schemas/virtual.mdx#virtual), its options [`count`](../schemas/virtual.mdx#count), [`justOne`](../schemas/virtual.mdx#just-one) | A virtual reference is part of the model's type |
+| `strictPopulate`, `forceRepopulate`, `populate({ model })`, `options.options` | none | An unknown path is always an error. A repeated `populate` always replaces the previous one, and the model is determined by the field |
+| `Model.populate(docs)` | none, there's `.populate` on a query and [`$populate`](../documents/document-api.mdx#populate) on a document | |
+| `push(id)` into a populated array | none | A populated array is a read-only view. References change through the stored identifiers |
+
+---
+
+## Hooks and plugins [#hooks-and-plugins]
+
+| Mongoose | Typemo | What matters |
+|---|---|---|
+| `schema.pre("save", fn)` | [`@Pre("document.save")`](../hooks/pre-post.mdx#pre) on a class method | Events have a scope: `document.save`, `query.find`, `model.insertMany` |
+| `schema.post("save", fn)` | [`@Post("document.save")`](../hooks/pre-post.mdx#post) | |
+| `schema.post("save", errorFn)` (three arguments) | [`@PostError`](../hooks/pre-post.mdx#post-error) | Per event, either `@Post` or `@PostError` |
+| `next()` in `pre` | none | In Mongoose 9, `next` in `pre` is already gone, and hooks are async functions. In Typemo, a hook is a method and an error is an exception |
+| `this` as a `Query` in query hooks | `this` is the typed [`OperationHookContext`](../hooks/operation-context.mdx#operation-hook-context) | The operation's values are read-only. You can change them with [`.modify`](../hooks/operation-context.mdx#modify) and skip the operation with [`.skip`](../hooks/operation-context.mdx#skip) |
+| `schema.pre(/^find/)`, regular expressions | none | The list of events is explicit, see [`HOOK_EVENTS`](../hooks/pre-post.mdx#hook-events) |
+| `pre("save")`, `pre("validate")` order | `pre(document.save)`, then validation, then the write | In Mongoose, validation runs before `pre("save")` |
+| `schema.plugin(fn, opts)`, `mongoose.plugin(fn)` | [`@Plugin`](../hooks/plugins.mdx#plugin), [`Typemo.plugin`](../connection/typemo.mdx#typemo.plugin), [`SchemaPlugin`](../hooks/plugins.mdx#schema-plugin) | Registration closes with the first successfully compiled model |
+| third-party soft delete, tenant, and audit plugins | built-in policies: [Delete with a way to restore](../../policies/soft-delete.mdx), [Split data by organization](../../policies/tenants.mdx), [Keep an audit log](../../policies/audit.mdx) | They act on all operations and paths, including aggregation. The tenant field is marked with [`@Tenant()`](../schemas/field-markers.mdx#tenant) |
+
+---
+
+## Connection and collections [#connection-and-collections]
+
+| Mongoose | Typemo | What matters |
+|---|---|---|
+| `mongoose.connect(uri, opts)` | [`TypemoClient.connect`](../connection/typemo-client.mdx#typemo-client.connect) | Returns a client instead of changing global state |
+| `mongoose.createConnection()` | [`new TypemoClient`](../connection/typemo-client.mdx#new-typemo-client) and [`client.connect`](../connection/typemo-client.mdx#client.connect) | |
+| `connection.useDb()` | [`connection.useDb`](../connection/connection.mdx#connection.use-db) | |
+| `mongoose.connection.readyState` | [`client.state`](../connection/typemo-client.mdx#client.state), [`client.onStateChange`](../connection/typemo-client.mdx#client.on-state-change) | The states are described on the [`ConnectionState`](../connection/connection-state.mdx) page |
+| `bufferCommands` | none | An operation before the connection waits for readiness inside the pipeline ([`client.ready`](../connection/typemo-client.mdx#client.ready)). There's no queue and no replay |
+| `mongoose.set(…)`, global settings | none, client settings are the [client options](../connection/typemo-client.mdx#client-options) | There are no global mutable settings |
+| `connection.transaction(fn)`, `session.withTransaction` | [`client.transaction`](../connection/typemo-client.mdx#client.transaction), [`connection.transaction`](../connection/connection.mdx#connection.transaction) | The session is filled in automatically and isn't passed to every operation |
+| `connection.db`, `connection.getClient()`, `Model.collection` | [`client.unsafeDriver()`](../connection/typemo-client.mdx#client.unsafe-driver) | The name says outright that you're stepping outside the policies and checks |
+| `Model.createCollection`, `Model.syncIndexes` | [`ensureCollection`](../collections/collection-manager.mdx#model.ensure-collection), [`syncIndexes`](../collections/model-indexes.mdx#model.sync-indexes), [`SyncAll.run`](../collections/sync-all.mdx#sync-all.run) | `syncIndexes` drops indexes that aren't in the class |
+| `connection.createCollection` for a view | [`TypedView.define`](../collections/typed-view.mdx#typed-view.define), [`Materialized.define`](../collections/materialized.mdx#materialized.define) | |
+
+---
+
+## Errors [#errors]
+
+Typemo's errors form one hierarchy under [`TypemoError`](../errors/hierarchy.mdx#typemo-error), and each has a `cause`. Driver errors aren't passed through as they are, and each is classified.
+
+| Mongoose | Typemo | What matters |
+|---|---|---|
+| `mongoose.Error.ValidationError`, `ValidatorError` | [`ValidationError`](../errors/data-errors.mdx#validation-error) | The error's fields are described in the reference |
+| `mongoose.Error.CastError` | [`CastError`](../errors/data-errors.mdx#cast-error) | Has a `reason` field with the cause: `type`, `format`, `range`, `null`, `unknown-key` |
+| `DocumentNotFoundError` | [`DocumentNotFoundError`](../errors/query-errors.mdx#document-not-found-error) | The error doesn't store the filter |
+| `VersionError` | [`VersionError`](../errors/query-errors.mdx#version-error) | |
+| `StrictModeError`, `StrictPopulateError` | [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error) | One error with a `reason` instead of a set |
+| `MongoServerError` with code 11000 | [`DuplicateKeyError`](../errors/server-errors.mdx#duplicate-key-error) | The other server codes are [`ServerError`](../errors/server-errors.mdx#server-error) and its descendants |
+| `MongoBulkWriteError` | [`BulkWriteError`](../errors/server-errors.mdx#bulk-write-error) | The input items' indexes and the codes are kept |
+| `OverwriteModelError` | none, a repeated `model(Post)` on the same connection returns the same model | You can't create a second instance of a model, so there's nothing to overwrite |
+| `MissingSchemaError` | [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error) | A class without `@Schema` or without `_id` doesn't become a model |
+| `err instanceof mongoose.Error` | `err instanceof TypemoError` | All the library's errors descend from one class |
+
+---
+
+## Types [#types]
+
+| Mongoose | Typemo | What matters |
+|---|---|---|
+| `HydratedDocument<T>`, `InferSchemaType`, `InferRawDocType` | [`HydratedDoc`](../values/form-types.mdx#hydrated-doc), the class's own type | There's no separate "inference from the schema", and the class is the type |
+| `FilterQuery<T>`, `UpdateQuery<T>`, `ProjectionType<T>`, `QueryOptions` | [`Filter`](../values/query-types.mdx#filter), [`UpdateInput`](../writes/input-types.mdx#update-input), [`Selected`](../query/contracts.mdx#selected) | The types check keys and values rather than accepting `any` |
+| `LeanDocument<T>`, `Require_id`, `FlattenMaps` | the call determines the result shape: [`.lean()`](../query/reading.mdx#lean), [`.plain()`](../query/reading.mdx#plain). The value forms are [`ValueForms`](../values/value-forms.mdx) | |
+| `PopulatedDoc<T>`, `PopulateOptions` | [`Ref<T>`](../schemas/field-markers.mdx#ref), [`PopulatedField`](../populate/populate-types.mdx#populated-field) | The field type changes after `populate` |
+| `Types.ObjectId`, `Types.Decimal128`, … | [`Types.ObjectId`, `Types.Decimal128`, …](../schemas/types-and-spec.mdx#types) | These are the same `bson` classes the driver uses |
+| `Schema.Types.Mixed`, `Types.Map`, `Types.Array`, `Types.DocumentArray` | none, a document's collections are [`StrictArray`](../documents/typed-collections.mdx#strict-array), [`SubdocumentArray`](../documents/typed-collections.mdx#subdocument-array), [`TypedMap`](../documents/typed-collections.mdx#typed-map) | |

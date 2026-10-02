@@ -1,0 +1,75 @@
+---
+title: Pass the tenant and actor through the whole request
+description: "Open the policy context once where request handling starts, and stop passing the tenant as a parameter to every function"
+icon: Braces
+---
+
+Policies need values from the surroundings: whose tenant this is, who is acting, whether to show deleted documents. You don't have to drag them as a parameter through every function of a service. Open a [`PolicyContext.run`](../reference/policies/policy-context.mdx#policy-context.run) scope once where those values are known, usually where request handling starts. Every model operation **built** inside it gets the values on its own.
+
+If one operation needs special values, use [`.policy()`](../reference/query/options.mdx#policy).
+
+## What you need [#prerequisites]
+
+A model of organization orders with a tenant policy, as in [Split data by organization](./tenants.mdx).
+
+## Quick start [#quick-start]
+
+<Snippet id="policies/policy-context/quick-start" twoslash />
+
+## The scope in async code [#async-scope]
+
+The scope survives the whole call chain inside the function: after `await`, in callbacks, after a timer. Even after a `setTimeout` pause inside the scope, the tenant is still in place. So the service functions don't need a tenant parameter. They call the model, and that's it.
+
+## When the scope is captured [#when-scope-applies]
+
+The values are fixed when the operation is **built**, not when it's awaited. A query built inside `run` stays a query of its tenant, even if you await it outside. And a query built outside doesn't get the tenant, even if you await it inside. That way a query stored in a module variable won't pick up the tenant of someone else's request.
+
+<Snippet id="policies/policy-context/when-scope-applies" twoslash />
+
+## Nested scopes [#nested-scopes]
+
+An inner `run` lays its values over the outer ones. An inner `tenant` overrides the outer one, and `actor` stays. `allTenants: true` removes the inherited `tenant`, and the other way around. Say `run({ tenant: "a", actor: "u1" }, () => run({ tenant: "b" }, current))` returns `{ tenant: "b", actor: "u1" }`. That's how a background task inside a request can explicitly switch to all tenants without losing the actor.
+
+## Values for one operation [#operation-values]
+
+[`.policy()`](../reference/query/options.mdx#policy) is laid over the scope and applies to one operation. `Orders.find().policy({ tenant: "globex" })` reads the data of `globex`, even when called inside an `acme` scope. These values don't show up in [`PolicyContext.current()`](../reference/policies/policy-context.mdx#policy-context.current).
+
+## What the context checks [#context-checks]
+
+An unknown key, a flag with a value other than `true`, and contradictions like `tenant` together with `allTenants`, or `includeDeleted` together with `onlyDeleted`, give a [`QueryError`](../reference/errors/query-errors.mdx#query-error) right away. The error names a typo: `PolicyContext.run: unknown policy value "tenat" (known: tenant, allTenants, actor, includeDeleted, onlyDeleted, hardDelete)`.
+
+An empty tenant is rejected as a [`StrictModeError`](../reference/policies/violations.mdx#tenant) with the reason `tenant`. Empty means an empty string, a string of only spaces, or `null`. The text is `PolicyContext.run: the tenant is empty (null); a tenant is a non-empty value, or allTenants: true for cross-tenant work [tenant]`.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether the value is shared by the whole request handling**.
+
+- **Shared, like the request's tenant and actor**: open `run`.
+- **A special mode for one operation**, like showing deleted documents or reading another tenant: use `.policy()`.
+
+## When not to use it [#when-not-to-use]
+
+If the model has no policies, the context changes nothing. And don't put anything there that policies don't read. The context has six keys, and you can't add your own.
+
+If you write a wrapper or a plugin that builds operations itself, you can get the scope's values with [`PolicyContext.captured`](../reference/policies/policy-context.mdx#policy-context.captured) and [`PolicyContext.merge`](../reference/policies/policy-context.mdx#policy-context.merge). They're public for exactly these cases, and application code doesn't need them.
+
+## Troubleshooting [#troubleshooting]
+
+**`StrictModeError … the operation has no tenant … [tenant]`, even though you await the query inside `run`.** The scope is captured when the query is built, and this query was built outside. Build it inside `run`.
+
+**The scope got lost in a queue or another process.** `run` lives within one process. If the work goes to a queue, pass the values of `PolicyContext.current()` in the message and open `run` again in the handler.
+
+## Full example [#full-example]
+
+<Snippet id="policies/policy-context/full-example" title="http/handler.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="PolicyContext and PolicyValues" href="../reference/policies/policy-context.mdx">
+  Every method, value, and error text.
+</Card>
+<Card title="Split data by organization" href="./tenants.mdx">
+  How the policy uses the tenant.
+</Card>
+</Cards>

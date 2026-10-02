@@ -1,0 +1,211 @@
+---
+title: Projections and the result type
+description: "Return only the fields you need, read a hidden field, and get the exact type of the response"
+icon: ListChecks
+---
+
+A **projection** tells the database which fields of a document to return. You set it with [`.select`](../reference/query/reading.mdx#select), and it pays off twice. First, less data crosses the network, since a list of articles for a menu has no reason to haul texts and comments. Second, the result type narrows along with the selection, and the compiler won't let you touch a field you didn't load.
+
+If you're new to MongoDB, remember the main thing. A projection is either an **inclusion** ("return only these fields") or an **exclusion** ("return everything except these"). The database doesn't allow mixing them, and Typemo reports it as an error before the query is even sent.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and a blog article model. It has a text, a counter, an array of tags, an array of nested comments, and a hidden field.
+
+<Snippet id="queries/projections/prerequisites" title="articles/article.ts" twoslash />
+
+The collection has one article, `Intro`. It has 120 views, the tags `news`, `typemo`, and `mongo`, and three comments: `bob` with 3 likes, `eve` with 0, and `dan` with 9. It also has an editor's note, `check facts`. The `editorNote` field is hidden, as described in [Read a hidden field](#read-hidden-field). The results in the `// →` comments come from this article, with ids shortened to `"…"`.
+
+## Quick start [#quick-start]
+
+A projection has three forms: include fields, exclude fields, and drop `_id`.
+
+<Snippet id="queries/projections/quick-start" twoslash />
+
+We'll go through each form on real tasks below. The full description of the method is in the [Reading](../reference/query/reading.mdx#select) reference.
+
+## Return only the fields you need [#select-fields]
+
+If you know which fields you need, list them with the value `1`. Those fields and `_id` come back, and the database doesn't even send the rest over the network. This is the most common form: a list for a page, a dropdown menu, a card in search results.
+
+<Snippet id="queries/projections/select-fields" title="articles/articles.service.ts" twoslash />
+
+The result type is narrowed to the selected fields. The items have `_id`, `title`, and `views`, but not `body` or `tags`, and you can't reach for those. This works for a document and for `.lean()` and `.plain()` results alike. [`.select`](../reference/query/reading.mdx#select) doesn't depend on the form you get the result in, and the order of calls doesn't matter.
+
+<Snippet id="queries/projections/select-fields-2" twoslash />
+
+`_id` always comes back unless you exclude it. That's handy, because the client later uses `_id` to request a specific record.
+
+## Return everything except a few fields [#exclude-fields]
+
+If you need almost all fields and the extra ones are heavy, list the extra ones with the value `0`. Everything else comes back. That makes it easy to hide the article text and comments in a list without writing out every other field.
+
+<Snippet id="queries/projections/exclude-fields" twoslash />
+
+Exclusion has a downside. A field you add to the model later lands in such a response on its own. So in responses that leave your service, list what you need, and leave exclusion to internal code.
+
+## Drop `_id` [#remove-id]
+
+`_id` is the only field you can exclude inside an inclusion. That comes in handy, for example, for an export to a spreadsheet where the id isn't needed.
+
+<Snippet id="queries/projections/remove-id" twoslash />
+
+## Read a hidden field [#read-hidden-field]
+
+Typemo doesn't read fields with the [`hidden`](../reference/schemas/prop.mdx#hidden) option and the `Hidden<T>` type from the database until you ask for them. An editor's note has no business in the app's memory when nobody needs it. So an ordinary read of the article doesn't return the note.
+
+<Snippet id="queries/projections/read-hidden-field" twoslash />
+
+To read a hidden field, put `+` in front of its name. The `+` doesn't turn the selection into an inclusion. You get all the regular fields plus the hidden one.
+
+<Snippet id="queries/projections/read-hidden-field-2" twoslash />
+
+If you name a hidden field in an ordinary inclusion (`{ title: 1, editorNote: 1 }`), it's read too. But then the response holds only those two fields and `_id`.
+
+Reading a field doesn't mean handing it to the client. A loaded hidden field doesn't get into a `.plain()` result or `$toPlain()` until you separately say `{ hidden: true }`. So an author check, for which someone added `+editorNote` to a shared query, won't turn into a leak. See [Reading data](./reading-data.mdx#hide-secrets).
+
+## Take part of an array [#array-slice]
+
+You can return part of an array instead of the whole thing: the first elements, the last ones, or a range. For that, pass [`$slice`](../reference/query/reading.mdx#select) instead of a flag. The number `n` returns the first `n` elements, `-n` the last `n`, and the pair `[skip, take]` a range.
+
+<Snippet id="queries/projections/array-slice" twoslash />
+
+You need this, for example, for a list where each article shows its two latest comments. The other tens of thousands don't travel over the network.
+
+`$slice` doesn't turn the projection into an inclusion. Write only `select({ comments: { $slice: 1 } })`, and you get **all** the other fields of the article plus one comment, because a slice changes only the array itself. If you need only some fields, list them next to it, as in the examples above.
+
+## Take one matching element of an array [#first-matching-element]
+
+The [`$elemMatch`](../reference/query/reading.mdx#select) projection returns the first array element that matches a condition, instead of the whole array. It helps when you need exactly one nested document.
+
+<Snippet id="queries/projections/first-matching-element" twoslash />
+
+Unlike `$slice`, `$elemMatch` includes the field. The other fields of the article that you didn't name won't come back. If no element matches, the array in the result is empty. Don't confuse this projection with the filter operator of the same name. The projection picks what to return, and the [filter operator](../reference/query/filter-operators.mdx#elem-match) picks which documents to find.
+
+## Select fields of nested documents [#select-nested-fields]
+
+Fields of nested documents are selected with dot notation. In an array of nested documents the projection applies to every element.
+
+<Snippet id="queries/projections/select-nested-fields" twoslash />
+
+## Build a projection piece by piece [#build-projection]
+
+If you call `.select` several times, the selections add up. That helps when a query is assembled in different places in the code. The base query selects the common fields, and the calling code adds its own.
+
+<Snippet id="queries/projections/build-projection" twoslash />
+
+Only selections of the same form add up. Inclusion together with exclusion is an error, covered in [Troubleshooting](#troubleshooting). You also can't select the same key twice. `select({ title: 1 }).select({ title: 1 })` throws a `QueryError` with the text `projection: "title" is selected twice`, so a pointless repeated call doesn't go unnoticed.
+
+## A projection that comes from outside [#external-projection]
+
+So far the projection has been a literal, and the compiler saw each of its keys. But sometimes your code isn't the one picking the fields. A function receives the projection as a parameter, or an API client asks for `?fields=title,views` itself. Then the compiler doesn't know the keys.
+
+[`.select`](../reference/query/reading.mdx#select) accepts such a projection without type casts or workarounds. A value of the declared type [`Projection<Article>`](../reference/values/query-types.mdx#projection) works, and so does a `Record<string, 0 | 1>` dictionary.
+
+<Snippet id="queries/projections/external-projection" title="articles/articles.service.ts" twoslash />
+
+The compiler doesn't know which keys will be in `fields`, so it describes the result in the widest way. That's every field of the model, each one optional. Only top-level fields become optional, and nested documents stay as they are in the model. Your editor shows a document without `.plain()` as `HydratedDoc<Partial<Article>>`, that is the model class with all fields optional.
+
+You get the same wide result even if the projection has the type `any`. The result type keeps the model's fields, not `any`. And what a literal would have been checked for at compile time is checked at runtime, before the database. An unknown path gives a `StrictModeError`, and inclusion together with exclusion gives a `QueryError`, as described in [Troubleshooting](#troubleshooting).
+
+### Fields the client picks [#client-selected-fields]
+
+If the set of fields is built from request data, wrap it in [`untrusted(fields, "projection")`](../reference/policies/soft-delete-and-untrusted.mdx#untrusted). The function returns the same projection but refuses keys that start with `$` or `+`. With `$` a client could turn the projection into a computed expression, and with `+` it could read a hidden field like the editor's note.
+
+<Snippet id="queries/projections/client-selected-fields" title="articles/articles.controller.ts" twoslash />
+
+If the client sent a forbidden key, the query isn't built.
+
+<Snippet id="queries/projections/client-selected-fields-2" />
+
+`untrusted` is only an extra safeguard, not input validation. It doesn't know which fields you're willing to hand out. Check the client's fields against an allowlist and build the projection yourself. In the example above your `__parseFields__` function does that. Without the second argument `untrusted` talks about a filter in its error text, and with `"projection"` about a projection.
+
+## Describe the shape of a response [#define-response-shape]
+
+You can give the result type a name. When a service function returns a selection, you write the type in its signature, so the handler and the client side know the shape of the response. You don't need to copy the fields by hand. The [`Selected`](../reference/query/contracts.mdx#selected) type describes a row of a `.plain()` result from the model and the list of fields.
+
+<Snippet id="queries/projections/define-response-shape" title="articles/articles.service.ts" twoslash />
+
+The function doesn't need `async`. The query builder behaves like a `Promise` itself, and you can return it straight from a function typed as `Promise`. `_id` is part of `Selected` by default, and `"-_id"` among the fields removes it.
+
+If the selection and the declared type drift apart, the compiler tells you right away. Say you removed `views` from the projection but left it in the type.
+
+<Snippet id="queries/projections/define-response-shape-2" twoslash />
+
+To make this check work on real data, not only at compile time, use [`.expect`](../reference/query/contracts.mdx#expect) and [`.parse`](../reference/query/contracts.mdx#parse). They're covered in [Checking the response shape](./contracts.mdx).
+
+## How to choose [#how-to-choose]
+
+Ask yourself **what you need, not what's extra**.
+
+- **You know which fields you need**: list them. The response won't grow when someone adds a field to the model.
+- **You need almost every field, and two or three heavy ones get in the way**: exclude them.
+- **You need a hidden field**: read it with `+`, and only where you can't do without it, such as checking a password.
+- **You need part of an array**: `$slice`, and for one element `$elemMatch`.
+- **The client picks the fields**: accept them as a dictionary and wrap them in `untrusted(fields, "projection")`.
+
+## When not to use it [#when-not-to-use]
+
+If you only need the number of documents or a check that a document exists, you don't need to read fields. That's what [`countDocuments`](../reference/query/reading.mdx#model.count-documents) and [`exists`](../reference/query/reading.mdx#model.exists) are for.
+
+If a field has to be hidden from the client entirely, not merely left unread, declare it hidden in the model. A projection saves you from extra work, not from a leak. And if a value should be shown partially, like a card number with only the last four digits, use [`.mask`](../reference/query/masks.mdx#mask), covered in [Response masks](./response-masks.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**Inclusion and exclusion together.** You selected some fields and excluded others. The compiler won't let that code through.
+
+<Snippet id="queries/projections/troubleshooting" twoslash />
+
+If the projection was built at runtime, [`.select`](../reference/query/reading.mdx#select) throws a [`QueryError`](../reference/errors/query-errors.mdx#query-error) as soon as it's called.
+
+<Snippet id="queries/projections/troubleshooting-2" />
+
+MongoDB won't accept such a projection, because it's unclear what to do with the fields that aren't named. There's one exception, `_id`. Pick one form, either `{ title: 1 }` or `{ body: 0 }`.
+
+**A typo in a field name.** The compiler rejects a field that isn't in the model. Its error is the same on any model and names the field: `unknown field "nope"` in the `"projection error"` property. At runtime Typemo throws a `StrictModeError`.
+
+<Snippet id="queries/projections/troubleshooting-3" twoslash />
+
+<Snippet id="queries/projections/troubleshooting-4" />
+
+A typo shouldn't turn into a response that's quietly missing the field you need. Typemo reports it right away, before contacting the database. The name of a hidden field is checked the same way. `select({ "+nope": true })` doesn't compile, and in untyped code it gives the same error at runtime.
+
+A `+name` key on a field that isn't hidden is an error too, for example `select({ "+title": true })`. It's only for hidden fields and wouldn't change anything here. The query stops with a `StrictModeError` and a separate reason, [`not-hidden`](../reference/policies/violations.mdx#not-hidden): `projection: "+title" adds a Hidden field back, and "title" is not Hidden; select it without the "+" [not-hidden]`. The field does exist, so the reason differs from `unknown-path`, and a handler can explain to the client what's wrong.
+
+**The field isn't in the selection.** You selected `title` and then reached for `body` in code. That's a compile error, not an `undefined` in production, because the result type has no field that wasn't in the projection. There's an example in [Return only the fields you need](#select-fields).
+
+**A hidden field didn't make it into the response.** You added `+editorNote` and called `.plain()`, and the field isn't in the response. That's by design. A hidden field has to be read with `+` and separately allowed out. If you really need it in an internal service, call `.plain({ hidden: true })`.
+
+## Full example [#full-example]
+
+An article service with every scenario from this page.
+
+<Snippet id="queries/projections/full-example" title="articles/articles.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose `select` accepts both a string (`"title -body"`) and an object, and hidden fields (`select: false`) are read with `"+field"`. In Typemo a projection is only an object, the result types follow the selection, and a hidden field is read with a `"+field"` key.
+
+In Mongoose you could write inclusion together with exclusion so that the last word won. In Typemo that's an error. Mongoose's types didn't know about hidden fields, while here such fields aren't in the type until you ask for them.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Reading" href="../reference/query/reading.mdx">
+  `.select`, `.sort`, `.lean`, `.plain`, and the other builder methods with exact types and errors.
+</Card>
+<Card title="Checking the response shape" href="./contracts.mdx">
+  `.expect`, `.parse`, and the `Selected` types: check the shape of a response at compile time and at runtime.
+</Card>
+<Card title="Response masks" href="./response-masks.mdx">
+  Show the client only part of a value.
+</Card>
+<Card title="Hidden and sensitive fields" href="../schemas/hidden-and-sensitive.mdx">
+  `hidden` and `sensitive` in detail.
+</Card>
+<Card title="Show related data" href="../populate/basics.mdx">
+  `populate` and selecting the fields of a related document.
+</Card>
+</Cards>

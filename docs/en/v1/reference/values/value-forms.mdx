@@ -1,0 +1,122 @@
+---
+title: Value forms
+description: "What each MongoDB type looks like in a document, the .lean() result, $toObject, the .plain() result, and JSON, and why there are exactly five forms"
+icon: Table
+---
+
+Typemo returns the same stored value in five forms. The table below shows what each MongoDB type looks like in each of them. There are several forms because MongoDB types have no counterpart in JSON. `ObjectId`, the 64-bit integer, `Decimal128`, binary data, and dates don't fit into JSON without loss or conversion. The driver, the application, and an API client need three different pictures of one document.
+
+If you're choosing a form for your task, start with the [Reading data](../../queries/reading-data.mdx) guide. The TypeScript types that describe the forms are on the [Form types](./form-types.mdx) page.
+
+All results on this page come from running the code on one document. It has one field of each MongoDB type that a schema can store as a field. The exceptions are `MinKey` and `MaxKey`, for which the table describes only the forms.
+
+<Snippet id="reference/values/value-forms/intro" title="sensors/reading.ts" twoslash />
+
+## Five forms [#five-forms]
+
+The form is set by how you read the data, and the schema doesn't affect it.
+
+- **Document**: the result of an ordinary read. A model object with the methods `$save`, `$set` and with typed arrays and maps.
+- **The `.lean()` result**: the driver's rows as they are. `ObjectId`, `bigint`, `Binary`, and a map is a plain object.
+- **`$toObject()`**: the document's data with BSON values as they are and maps as `Map`.
+- **The `.plain()` result**: what `$toPlain()` and `.plain()` return. MongoDB types are turned into strings, and native JavaScript types stay.
+- **JSON**: what `$toJSON()` and `JSON.stringify(doc)` return. Everything that JSON lacks is turned into strings.
+
+Two of the five forms are meant for a response to a client. The `.plain()` result keeps data as JavaScript data, while identifiers and big numbers become strings. And JSON is ready to serialize. The other three are for use inside the application. All the forms are built from one type table, so the result type the compiler infers matches the data. Tests on a real database check this.
+
+## Table by type [#type-table]
+
+<ValueForms />
+
+The table is built from code when the documentation is built, so it can't drift from the behavior. In the container rows (`array`, `subdocument`, `Map`), `T` and `V` are replaced by the element or value type, and the form applies to them recursively. The helper form types are `TimestampJson`, which is `{ t: number; i: number }`, `MinKeyJson`, which is `{ $minKey: 1 }`, and `MaxKeyJson`, which is `{ $maxKey: 1 }`.
+
+Read one document in all forms, and the form of each field becomes visible.
+
+<Snippet id="reference/values/value-forms/type-table" twoslash />
+
+The types in the editor match the data.
+
+<Snippet id="reference/values/value-forms/type-table-2" twoslash />
+
+## Identifiers: ObjectId and UUID [#ids]
+
+In a document, the `.lean()` result, and `$toObject()`, an identifier is an instance of `ObjectId` (or `UUID`). In the `.plain()` result and in JSON it's a string of 24 hexadecimal characters, and for a `UUID` it's the hyphenated form, for example `0f8fad5b-d9cb-469f-a165-70867728950e`. An API client can't work with the `ObjectId` class. It shows the string, puts it in a URL, and sends it back. All the write methods, filters, and `findById` accept it back, so you don't need to wrap the string in an `ObjectId` by hand.
+
+## Numbers: double, int32, and int64 [#numbers]
+
+An ordinary JavaScript number and `Types.Double` are stored as a double, and `Types.Int32` as a 32-bit integer. In all forms they stay a `number`.
+
+The 64-bit `int64` (`BigInt` in a schema) is different. In a document, the `.lean()` result, and `$toObject()` it's a `bigint`, and in the `.plain()` result and JSON it's a **decimal string** of any size. A JavaScript number holds integers exactly only up to 2⁵³. The value `9007199254740993` would turn into `9007199254740992` in a number, with no error. A string keeps all the digits. And `JSON.stringify` never meets a `bigint`, which it chokes on: `TypeError: JSON.stringify cannot serialize BigInt.` That's how serializing a row from `.lean()` fails.
+
+The type of `int64` in the `.plain()` and JSON forms isn't `string` but `` `${bigint}` `` (the [`Int64String`](./form-types.mdx#int64-string) type). Such a string is accepted back by all the write methods with no casts. Only a strictly decimal integer is accepted. `"-42"` and `"9223372036854775807"` work, but `"1.5"`, `"1e3"`, `" 1"`, `"0x10"`, and a number outside the int64 range don't. Everything else is a [`CastError`](../errors/data-errors.mdx#cast-error) with the reason `format`, for example `Cast to Long failed at path "total" for "1.5" (string): a string must be a decimal integer (no sign +, leading zeros, -0, spaces, exponent or prefix) [format]`.
+
+An ordinary JavaScript number in a `BigInt` field is accepted only as a safe integer, no larger than 2⁵³ − 1 in absolute value. A fractional number and a number that has already lost precision give a `CastError` with a hint on how to pass the value correctly.
+
+<Snippet id="reference/values/value-forms/numbers" />
+
+`2 ** 60` in JavaScript is no longer the number you meant. Writing it silently would mean writing a different value. A decimal string works in update operators too: `$inc`, `$mul`, `$min`, and `$max` accept `"9007199254740993"` the same way as a `bigint`.
+
+`NaN` and `Infinity` are ordinary JavaScript numbers. In the `.lean()` and `.plain()` results they stay numbers, and building JSON (`$toJSON()`) fails with the reason `json`, because JSON has neither. For details, see the [Errors](./bson-guards.mdx#errors) section of the `BsonTypeTable` reference.
+
+## Decimal128 [#decimal128]
+
+`Decimal128` is a decimal number with up to 34 digits of precision, and it's what you store money in. In a document, the `.lean()` result, and `$toObject()` it's a `Decimal128` instance, and in the `.plain()` result and JSON it's a string like `"19.99"`. The reason is the same as for `int64`. A JavaScript number is binary and stores decimal fractions inexactly. For the same reason the field accepts a string on input (`create`, updates), and you don't need to wrap `price: "19.99"` in a `Decimal128` by hand. A string that isn't a number gives a `CastError`: `Cast to Decimal128 failed at path "price" for "abc" (string): not a decimal number string [format]`.
+
+## Dates and regular expressions [#dates-and-regex]
+
+A `Date` in the `.plain()` result stays a `Date`, since there's no reason to convert a native JavaScript type, but it's a separate copy. In JSON it's an ISO string (`"2026-01-02T03:04:05.000Z"`). A `RegExp` also stays a `RegExp` in the `.plain()` result and turns into the string `"/a.b/i"` in JSON. Of a regular expression's flags, only `i` and `m` are kept. That's a limit of the format, not a Typemo choice.
+
+## Binary data and vectors [#binary-and-vectors]
+
+A `Binary` in the `.plain()` result is a separate copy as a `Uint8Array` (not a `Buffer` and not a view on the document's memory). In JSON it's a base64 string, `"AQID"` for the bytes 1, 2, 3. So `JSON.stringify` of a `.plain()` result turns a `Uint8Array` into an object with indexes (`{"0":1,"1":2,"2":3}`). For JSON, call `$toJSON()`.
+
+A vector (`Vector`, binary subtype 9) is a `Binary` in a document and an array of numbers in the `.plain()` result and JSON. On input a vector is given as an ordinary array (`vec: [1, 2, 3]`). Declare a vector field with the `Vector` type, and then the type in the `.plain()` form is an array of numbers, not bytes.
+
+## Timestamp, MinKey, and MaxKey [#timestamp-minkey-maxkey]
+
+A `Timestamp` in the `.plain()` result and in JSON turns into an object `{ t, i }` (seconds and an ordinal within the second), for example `{"t":1700000000,"i":7}`. It's a MongoDB service type for replication, not a date. For points in time, use `Date`. `MinKey` and `MaxKey` are service boundary values in sorting. In the `.plain()` result and JSON they turn into `{ $minKey: 1 }` and `{ $maxKey: 1 }`.
+
+## Maps, arrays, and subdocuments [#maps-arrays-subdocuments]
+
+A map (`Spec.map`) is a typed `Map` in a document, a plain object in the `.lean()` result (that's how the driver returns it), a `Map` again in `$toObject()` and the `.plain()` result, and an object in JSON. Map values and array elements go through the same table. A map of `bigint` in the `.plain()` result is a `Map` with string values, and in JSON it's `{ "a": "1" }`. Arrays and subdocuments are typed collections with `$` methods in a document, and ordinary arrays and objects in all the other forms.
+
+## How to choose [#how-to-choose]
+
+Ask yourself what will happen to the data after the read.
+
+- **You'll change and save the data**: read a document.
+- **The data stays in the application and you need the original types**, for example to calculate with a `bigint` or compare `ObjectId` values: read `.lean()`.
+- **The data leaves the process**, in an API response, a queue, or a cache: read `.plain()`. It's safe for `JSON.stringify` as long as the data has no `Uint8Array` and `Map`.
+- **You need ready JSON** where all the values are primitives: use `$toJSON()`.
+
+## When not to use it [#when-not-to-use]
+
+If you write data, forms don't take part. The write methods accept values in a convenient form (a string in place of an `ObjectId`, a string in place of a `bigint`) and cast them themselves. The types of these inputs are [`CreateInput` and `UpdateInput`](./form-types.mdx#create-input-update-input).
+
+## Common mistakes [#common-mistakes]
+
+### Serialization fails on big numbers [#big-numbers-serialization]
+
+`JSON.stringify(lean)` fails with `TypeError: JSON.stringify cannot serialize BigInt.` The `.lean()` result stores `int64` as a `bigint`, and `JSON.stringify` doesn't accept it. Send `.plain()` or JSON outside, where `int64` is a string.
+
+### JSON has an object with indexes instead of bytes [#binary-in-json]
+
+`JSON.stringify(doc.$toPlain())` turns a `Uint8Array` into `{"0":1,"1":2,"2":3}` and a `Map` into `{}`. The `.plain()` result stays JavaScript data, not JSON. For JSON, call `$toJSON()` or `JSON.stringify(doc)`, which does the same.
+
+### Identifiers don't compare equal [#id-not-compared]
+
+Two `ObjectId` values with the same value are different objects, and `===` returns `false`. Compare with `id.equals(other)` or take the strings from the `.plain()` result.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Form types" href="./form-types.mdx">
+  `Lean`, `Plain`, `ObjectForm`, `JsonOf`, and the other types that describe the forms in TypeScript.
+</Card>
+<Card title="BsonGuards and BsonTypeTable" href="./bson-guards.mdx">
+  Runtime value checks and the type table the forms are built from.
+</Card>
+<Card title="Reading data" href="../../queries/reading-data.mdx">
+  How to choose between a document, the `.lean()` result, and the `.plain()` result in a real task.
+</Card>
+</Cards>

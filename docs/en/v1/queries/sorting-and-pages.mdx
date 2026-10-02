@@ -1,0 +1,164 @@
+---
+title: Sorting and paging
+description: "Set the order of documents, take the first few, show a list page by page, and count the total"
+icon: ArrowDownUp
+---
+
+A list a user sees almost always needs an order and pages. There are four tools for that.
+
+- [`.sort`](../reference/query/reading.mdx#sort) sets the order.
+- [`.limit`](../reference/query/reading.mdx#limit) sets the page size.
+- [`.skip`](../reference/query/reading.mdx#skip) says how many records to skip.
+- [`countDocuments`](../reference/query/reading.mdx#model.count-documents) counts the total number of records for "page 2 of 5".
+
+If you're new to MongoDB, remember two rules. Without sorting the database returns documents in any order, and that order can change from one query to the next. And if several documents share the value you sort by, their order among themselves isn't defined either, until you add another key.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and a post model with a title and a view count.
+
+<Snippet id="queries/sorting-and-pages/prerequisites" title="posts/post.ts" twoslash />
+
+The collection has seven posts, created in alphabetical order. `A` has 50 views, `B` and `C` have 40 each, `D` has 30, `E` has 20, and `F` and `G` have 10 each. The `// →` comments list the post titles in the order of the response.
+
+## Quick start [#quick-start]
+
+Let's sort by views in descending order, take three posts, and count them all.
+
+<Snippet id="queries/sorting-and-pages/quick-start" twoslash />
+
+We'll go through each step on real tasks below. If the list is long or the user scrolls it endlessly, you'll need [keyset pagination](./keyset-pagination.mdx) instead of `.skip`.
+
+## Sort a list [#sort-list]
+
+A sort is a "field → direction" object, where `1` means ascending and `-1` descending. There can be several keys, and their order matters. The second key only works within equal values of the first.
+
+<Snippet id="queries/sorting-and-pages/sort-list" twoslash />
+
+You can also write the direction as a word: `"asc"`, `"desc"`, `"ascending"`, `"descending"`. If the order of the keys should be obvious when reading the code, pass a list of pairs, for example `.sort([["views", "desc"], ["title", "asc"]])`. It doesn't affect the result.
+
+Several `.sort` calls append keys at the end instead of replacing the earlier ones. The same key can't appear twice, either in one call or across calls. Typemo throws a [`QueryError`](../reference/errors/query-errors.mdx#query-error) with the text `sort: "views" is sorted twice`, so a second call doesn't turn out quietly useless.
+
+[`findOne`](../reference/query/reading.mdx#model.find-one) has sorting too. There it decides which of the matching documents counts as the first.
+
+<Snippet id="queries/sorting-and-pages/sort-list-2" twoslash />
+
+## Make the order stable [#stable-order]
+
+Posts `B` and `C` have 40 views each. If you sort only by views, MongoDB is free to return them in any order, and that order can change from one query to the next. For a list on a single page that's harmless. But with paging, a post from the end of page 1 can show up again at the start of page 2.
+
+So always make the last key a field whose values differ across all documents. The easiest is `_id`. It's unique, and the order becomes total.
+
+<Snippet id="queries/sorting-and-pages/stable-order" title="posts/posts.service.ts" twoslash />
+
+The direction for `_id` can be either, as long as it doesn't change between queries.
+
+## Take the first records [#take-first]
+
+[`.limit`](../reference/query/reading.mdx#limit) caps the number of documents in the response. Always set it when a user sees the list. The collection has ten records today, and in a year it may have a million, and a query without a limit would bring the app down.
+
+In MongoDB `limit(0)` means "no limit", and a negative number turns on a special mode. Neither rule is obvious, and a zero is easy to get from an empty request parameter and accidentally dump the whole collection. So Typemo accepts only positive integers and throws a `QueryError` right at the call.
+
+<Snippet id="queries/sorting-and-pages/take-first" />
+
+The value is printed along with its type, so a string from a URL parameter is visible right away. `limit("3")` throws `limit must be a positive integer, got "3" (string)`. Convert such a value to a number yourself before passing it to `.limit`.
+
+If you don't need a limit, don't call `.limit`. The method exists only on [`find`](../reference/query/reading.mdx#model.find). On `findOne` it doesn't compile, and in untyped code it gives a `QueryError` with the text `limit applies to find() only, not findOne()`.
+
+## Show a page [#render-page]
+
+Page number `page` with a size of `perPage` means skipping all earlier pages and limiting to one. [`.skip`](../reference/query/reading.mdx#skip) does the skipping.
+
+<Snippet id="queries/sorting-and-pages/render-page" twoslash />
+
+Page 3 holds one post, `G`. A page past the end of the list is an empty array, not an error.
+
+<Snippet id="queries/sorting-and-pages/render-page-2" twoslash />
+
+`.skip` accepts an integer no less than zero. A negative or fractional number gives a `QueryError` with the text `skip must be a non-negative integer, got -1 (number)`. The reason is the same as for `.limit`. The number often comes from outside, and a silent conversion would hide the mistake.
+
+## Count the total [#total-count]
+
+To show "page 2 of 3" you need the total number of records. [`countDocuments`](../reference/query/reading.mdx#model.count-documents) counts it. It takes the same filter as `find` and returns the number of matching documents.
+
+<Snippet id="queries/sorting-and-pages/total-count" title="posts/posts.service.ts" twoslash />
+
+The page and the count are two separate queries, and it's convenient to run them at the same time, as above. The data can change between them, so the count isn't an exact snapshot of the same selection. For a list on screen that's acceptable. If you need a count for a filter, pass the filter to both queries.
+
+<Snippet id="queries/sorting-and-pages/total-count-2" twoslash />
+
+For an approximate count of all documents in the collection there's [`estimatedDocumentCount`](../reference/query/reading.mdx#model.estimated-document-count). It takes the number from metadata and is fast, but it doesn't accept a filter.
+
+## Accept a page number from the URL [#page-number-from-url]
+
+The page number and size arrive from the URL as strings, and you can't trust them. `page=0` gives a negative `skip`, `perPage=0` gives `limit(0)`, and `perPage=100000` makes the database hand over everything. Typemo won't let invalid numbers through, but it's better to check the input earlier and fall back to safe values.
+
+<Snippet id="queries/sorting-and-pages/page-number-from-url" title="posts/posts.service.ts" twoslash />
+
+An upper limit on the page size keeps the user from deciding how many documents your server loads.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether the user needs to jump to an arbitrary page**.
+
+- **Yes**, for example in an admin table with page numbers: use `.skip` and `.limit` together with `countDocuments`.
+- **The user only scrolls forward**, as in a feed: use [keyset pagination](./keyset-pagination.mdx). It costs the same at any depth and doesn't repeat records when the list changes.
+
+## When not to use it [#when-not-to-use]
+
+To skip `n` documents, MongoDB still reads them and then throws them away. On the first pages you won't notice. But on page 1,000 with twenty records per page, the database reads twenty thousand documents to return twenty.
+
+Also, if someone adds a record between page requests, the documents shift. The user sees one record twice or misses another. For long lists and infinite scroll, use [`Model.keysetPage`](../reference/query/keyset.mdx#model.keyset-page).
+
+If you need to export every document rather than show a page, don't page through them with `.skip`. That's what a [cursor](./large-results.mdx) is for.
+
+## Troubleshooting [#troubleshooting]
+
+**`limit(0)` doesn't return everything.** The page size came from a request parameter and turned out to be zero. In MongoDB that would mean "no limit", and in Typemo it's an error.
+
+<Snippet id="queries/sorting-and-pages/troubleshooting" twoslash />
+
+Check and cap the page size before the call, as in [Accept a page number from the URL](#page-number-from-url).
+
+**A record showed up on two pages.** You sorted only by `views`, and posts `B` and `C` had the same value. The order of such documents among themselves isn't defined, and they could swap places between page requests. Add `_id` as the last key, as in [Make the order stable](#stable-order).
+
+**Sorting by a field with a typo.** The compiler rejects a field that doesn't exist in a sort. At runtime Typemo throws a `StrictModeError`.
+
+<Snippet id="queries/sorting-and-pages/troubleshooting-2" twoslash />
+
+<Snippet id="queries/sorting-and-pages/troubleshooting-3" />
+
+Otherwise sorting by a field that doesn't exist would silently leave the documents in arbitrary order.
+
+**`.skip` on `findOne` doesn't compile.** `.skip` and `.limit` exist only on `find`. `findOne` has one result, and there's nothing to skip. If you need "the second one", call `find().skip(1).limit(1)`.
+
+## Full example [#full-example]
+
+A post service that returns a page together with the total count and falls back to safe values instead of raw URL parameters.
+
+<Snippet id="queries/sorting-and-pages/full-example" title="posts/posts.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose `limit(0)` meant "no limit", and `skip` and `limit` accepted any number, even a string or a fraction, and silently converted it. In Typemo `limit` accepts only a positive integer and `skip` an integer no less than zero, and anything else gives a `QueryError`.
+
+A repeated sort key is an error too, and several `.sort` calls add up. Typemo doesn't support the string form `sort("-views title")`. You set the sort with an object or a list of pairs.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Keyset pagination" href="./keyset-pagination.mdx">
+  Page through long lists without `.skip`: a next-page token and infinite scroll.
+</Card>
+<Card title="Reading" href="../reference/query/reading.mdx">
+  `.sort`, `.limit`, `.skip`, and counting documents with exact types and errors.
+</Card>
+<Card title="Large results" href="./large-results.mdx">
+  Export thousands of documents with a cursor without loading them into memory.
+</Card>
+<Card title="Query performance" href="./performance.mdx">
+  Find out whether a query uses an index.
+</Card>
+</Cards>

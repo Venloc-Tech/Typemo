@@ -1,0 +1,869 @@
+---
+title: Reading
+description: "find, findOne, findById, exists, countDocuments, distinct, and the query builder methods: what they accept, what they return, and where they can surprise you"
+icon: Search
+---
+
+This page collects all the model methods that read data, plus the main methods of the **query builder**. That's the object where a query is assembled in parts and goes to the database only on `await`. For each method it describes what it accepts, what it returns, and where it can surprise you.
+
+If you're new to Typemo, read the guide [Reading data](../../queries/reading-data.mdx) first. It explains why there are documents, `.lean()`, and `.plain()`, and how to choose between them. This page is the reference, and you come back to it for a specific detail.
+
+All the examples use one user model. It has a required field, an optional field, an array, and a hidden field, so every method shows how it treats each kind of field.
+
+<Snippet id="reference/query/reading/intro" title="models/user.ts" twoslash />
+
+The collection holds three users. Alice is 30 years old, with the tags `admin` and `dev` and a password hash `$argon2id$…`. Bob is 17, with the tag `dev`. Carol is 30, with no tags. The results in the `// →` comments come from this data. Identifiers in the results are shortened to `"…"`, because the database issues them anew every time the data is loaded.
+
+The builder methods not covered on this page are listed at the end, in the section [Other builder methods](#other-builder-methods).
+
+---
+
+## Model.find [#model.find]
+
+`find` finds all the documents that match the filter and returns them as an array. It's the main read method. Almost any list in an application starts with it: users on an admin page, a customer's orders, records for a report.
+
+By itself `find` doesn't touch the database. It returns a [query builder](#how-builder-works), and you chain sorting, limits, and field selection onto it. The query goes to MongoDB when you write `await`.
+
+<Snippet id="reference/query/reading/model-find" twoslash />
+
+<Returns type="QueryBuilder">
+
+A [query builder](#how-builder-works). After `await` you get an array of documents. If nothing matched the filter, the array is empty, and `find` never returns `null`. If an empty list is an error for you, add [`.orFail()`](#or-fail).
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>">
+
+The search conditions. The keys are model fields, and the values are the field's value itself or [filter operators](./filter-operators.mdx) such as `$gte`, `$in`, `$regex`. The compiler knows the fields and their types, so it suggests the available keys and won't let you compare a number with a string. If you don't pass a filter, all documents match.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/reading/model-find-2" />
+
+</FullType>
+
+### All documents of a collection [#all-documents]
+
+To read the whole collection, call `find` with no argument or with an empty object. For reading, the two are equivalent.
+
+<Snippet id="reference/query/reading/all-documents" twoslash />
+
+An empty filter is allowed only in reading, because reading breaks nothing.
+
+<Callout type="warning">
+
+In [`updateMany`](../writes/writes.mdx#update-many), [`deleteMany`](../writes/writes.mdx#delete-many), and other write methods, Typemo forbids an empty filter. One typo in the code that builds the filter, and you'd change or delete the whole collection. More in the article [Empty filters in writes](../../writes/empty-filters.mdx).
+
+</Callout>
+
+### How Typemo checks the filter [#how-filter-is-checked]
+
+The filter is checked twice. The compiler checks it first, while you write the code. Typemo itself checks it second, before sending the query to the database. The second check is needed because a filter is often built from data the compiler can't see: an HTTP request body, URL parameters, configuration.
+
+Say you mistype a field name. The compiler stops you at once.
+
+<Snippet id="reference/query/reading/how-filter-is-checked" twoslash />
+
+If such a filter arrives while the program is running, Typemo refuses to run it, and the query never reaches the database.
+
+<Snippet id="reference/query/reading/how-filter-is-checked-2" />
+
+The path in the text is named once. The word `filter` says where to look for the error, and `"nope"` says which name didn't fit. MongoDB would return an empty array, because no document has a `nope` field. You'd have to track down the mistake in the name through the application's odd behavior. Typemo reports it at once, through a [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error).
+
+The compiler accepts a filter built at run time, for example of type `Record<string, unknown>` (or `{ [key: string]: unknown }`). It doesn't see the keys of such an object. The same holds for `findOne`, `countDocuments`, and writes with a filter. So a typo in a key of such a filter shows up only when the query runs, with the same `StrictModeError` and `CastError`, and the query still doesn't reach the database.
+
+Value types work the same way. The age in the model is a number, so the string `"30"` passes neither the compiler nor the run-time check.
+
+<Snippet id="reference/query/reading/how-filter-is-checked-3" twoslash />
+
+<Snippet id="reference/query/reading/how-filter-is-checked-4" />
+
+`undefined` is a special case. In JavaScript it's easy to get by accident, for example from an optional query parameter. If Typemo silently turned `{ age: undefined }` into "the field isn't set", you'd get entirely different users than the ones you were looking for. The compiler won't let such a filter through, and if it's built in code without types, `find` throws a [`QueryError`](../errors/query-errors.mdx#query-error) right at the call.
+
+<Snippet id="reference/query/reading/how-filter-is-checked-5" twoslash />
+
+<Snippet id="reference/query/reading/how-filter-is-checked-6" />
+
+If you really want to find documents without the field, say so explicitly: `{ age: { $exists: false } }`.
+
+### When not to use find [#model.find.when-not-to-use]
+
+If you need one document, use [`findOne`](#model.find-one) or [`findById`](#model.find-by-id). They return the document itself or `null`, and you don't have to pull it out of an array.
+
+If you only need to know whether a matching document exists, use [`exists`](#model.exists). It reads one `_id` from the database, not whole documents.
+
+If you need the number of documents, use [`countDocuments`](#model.count-documents). `find` would load all the documents into memory only for the length of an array.
+
+If there are very many documents, tens of thousands or more, add [`.cursor()`](#cursor) at the end. Documents arrive one at a time, and you don't have to hold them all in memory at once.
+
+---
+
+## Model.findOne [#model.find-one]
+
+`findOne` finds the first document that matches the filter. If there's no such document, it returns `null`. Use it when the task by its nature has one result: a user by email, settings by key, a customer's latest order.
+
+<Snippet id="reference/query/reading/model-find-one" twoslash />
+
+<Returns type="QueryBuilder">
+
+A [query builder](#how-builder-works). After `await` you get a document or `null`. TypeScript won't let you reach the result's fields until you check it for `null`. If a missing document is an error for you, add [`.orFail()`](#or-fail). A [`DocumentNotFoundError`](../errors/query-errors.mdx#document-not-found-error) is thrown instead of `null`, and `null` disappears from the type.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>">
+
+The search conditions, the same as in [`find`](#model.find) and checked the same way. Without a filter, `findOne` returns any document of the collection.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/reading/model-find-one-2" />
+
+</FullType>
+
+### Which document counts as first [#first-document]
+
+MongoDB doesn't store documents in a particular order and doesn't promise the order it returns them in. So without a sort, the "first" document is one of the matching ones, any of them, and on the next query it may be a different one.
+
+If it matters which document comes back, set the order with [`.sort`](#sort). That's how you find the youngest user, for example.
+
+<Snippet id="reference/query/reading/first-document" twoslash />
+
+### When not to use findOne [#model.find-one.when-not-to-use]
+
+If you know the document's `_id`, use [`findById`](#model.find-by-id). It does the same thing, is shorter to write, and checks the id right away.
+
+If you need several first documents, for example the five latest orders, use [`find`](#model.find) together with [`.sort`](#sort) and [`.limit`](#limit).
+
+---
+
+## Model.findById [#model.find-by-id]
+
+`findById` finds a document by `_id`. It's the most common way to read one specific record: a profile page, a product card, an order from a link in an email. By meaning it's the same as [`findOne`](#model.find-one) with the filter `{ _id: id }`. The difference is that it accepts the id in two forms and guards against an empty id.
+
+<Snippet id="reference/query/reading/model-find-by-id" twoslash />
+
+<Returns type="QueryBuilder">
+
+A [query builder](#how-builder-works). After `await` you get a document or `null`, as with [`findOne`](#model.find-one).
+
+</Returns>
+
+<Params>
+<Param name="id" type="the type of the _id field, or its string" required>
+
+The document's identifier. For models that extend [`Entity`](../schemas/base-classes.mdx#entity), it's an `ObjectId` or its string of 24 hexadecimal characters. If `_id` in your model has another type, a number for example, `findById` expects that. For a `UUID`, its canonical string works.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/reading/model-find-by-id-2" />
+
+</FullType>
+
+### An id from a URL or a request body [#id-from-request]
+
+Most often the id comes from the client, from an address like `/users/6abcddec50864200b93c7fea` (24 hexadecimal characters) or from JSON in a request body. In both cases it's a string, and `findById` accepts it as is. You don't need to cast the string to an `ObjectId` yourself.
+
+<Snippet id="reference/query/reading/id-from-request" title="users/users.service.ts" twoslash />
+
+Typemo checks the string format itself. If the string doesn't look like an identifier, the query doesn't go to the database, and `await` ends with a [`CastError`](../errors/data-errors.mdx#cast-error).
+
+<Snippet id="queries/reading-data/account-by-id-3" />
+
+That's an error in the client's data, not a server failure. Your code can catch the `CastError` and tell the client the id is wrong. You don't need to parse the string yourself before the call.
+
+<Snippet id="reference/query/reading/id-from-request-2" title="users/users.service.ts" twoslash />
+
+### An empty id [#empty-id]
+
+If you pass `null` or `undefined`, the compiler won't allow it. And if an empty id arrives from code without types, `findById` throws right at the call and doesn't go to the database.
+
+<Snippet id="reference/query/reading/empty-id" twoslash />
+
+<Snippet id="reference/query/reading/empty-id-2" />
+
+This guards against a silent error. A query on `{ _id: undefined }` could turn into a search for `null`, return `null`, and the application would answer "not found". The real problem, an id lost somewhere in your code, would go unnoticed.
+
+### When not to use findById [#model.find-by-id.when-not-to-use]
+
+If you search not by `_id` but by another field, use [`findOne`](#model.find-one). If you need to find several documents at once by a list of ids, use [`find`](#model.find) with the [`$in`](./filter-operators.mdx#in) operator.
+
+---
+
+## Model.exists [#model.exists]
+
+`exists` answers the question "is there at least one matching document". Use it for checks before an action: whether an email is taken at sign-up, whether a customer has an active order, whether a referenced record exists.
+
+<Snippet id="reference/query/reading/model-exists" twoslash />
+
+<Returns type="OptionQuery<{ _id } | null>">
+
+A query that gives, after `await`, an object with the `_id` of the found document, or `null`. In a condition it's convenient to use it as a boolean: `if (await Users.exists(…))`. The query accepts the same [options](./options.mdx) as the other value queries, that is, `.session`, `.policy`, `.hint`, `.collation`, `.comment`, `.timeoutMS`.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+The search conditions, as in [`find`](#model.find). Unlike `find`, the filter is required here. The question "is there anything at all in the collection" almost always means a bug in the code.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/reading/model-exists-2" />
+
+</FullType>
+
+### Why not findOne [#why-not-find-one]
+
+The result would be the same, but [`findOne`](#model.find-one) would read the whole document and build an object from it. `exists` asks the database only for `_id`. For an "is there or isn't there" check the other fields aren't needed, and on large documents the difference is noticeable.
+
+---
+
+## Model.countDocuments [#model.count-documents]
+
+`countDocuments` counts the documents that match the filter. Use it when you need the number itself: the total number of records for paging, a counter of unread messages, the number of orders per day.
+
+<Snippet id="reference/query/reading/model-count-documents" twoslash />
+
+<Returns type="CountQuery">
+
+A query that gives a number after `await`. You can add `.limit(n)` and `.skip(n)` to the query. They work as in [`find`](#model.find) and limit how many documents get counted. The other [options](./options.mdx), `.session`, `.policy`, `.hint`, `.collation`, `.comment`, `.timeoutMS`, are available too.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>">
+
+The search conditions, as in [`find`](#model.find). Without a filter, all documents of the collection are counted.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/reading/model-count-documents-2" />
+
+</FullType>
+
+### Count "up to" [#count-up-to]
+
+Sometimes you don't need the exact number, and it's enough to know whether it exceeds a threshold. For example, to show "99+" instead of the exact number of notifications. `.limit` stops the count as soon as the needed amount is reached, and the database doesn't have to go through all the documents.
+
+<Snippet id="reference/query/reading/count-up-to" twoslash />
+
+On `countDocuments`, `.limit` accepts only a positive integer, and `.skip` an integer of at least zero. Otherwise the query throws a `QueryError` with the text `limit must be a positive integer, got 0 (number)`.
+
+### When not to use countDocuments [#model.count-documents.when-not-to-use]
+
+If you need the size of the whole collection without a filter, and precision doesn't matter, for example for a monitoring dashboard, use [`estimatedDocumentCount`](#model.estimated-document-count). It doesn't walk through the documents and answers instantly even on millions of records.
+
+---
+
+## Model.estimatedDocumentCount [#model.estimated-document-count]
+
+`estimatedDocumentCount` returns the number of documents in the collection without reading the documents themselves. MongoDB takes it from the collection's service data, so the answer comes instantly on a collection of any size.
+
+<Snippet id="reference/query/reading/model-estimated-document-count" twoslash />
+
+<Returns type="OptionQuery<number>">
+
+A query that gives a number after `await`. The query options are the same as in [`exists`](#model.exists).
+
+</Returns>
+
+It takes no arguments. There can't be a filter here, because the service data holds only the total count.
+
+<FullType>
+
+<Snippet id="reference/query/reading/model-estimated-document-count-2" />
+
+</FullType>
+
+### How accurate the number is [#precision]
+
+Usually the number matches the real one. But after an emergency server stop, in a sharded cluster, or during active writing, it can differ for a while. For statistics and monitoring that doesn't matter. If application logic depends on the number, paging for example, use [`countDocuments`](#model.count-documents).
+
+### Soft delete, tenants, and discriminators [#soft-delete-tenants-discriminators]
+
+The collection's service data knows only the total number of documents. It doesn't know which documents are marked deleted, which tenant each document belongs to, or which child model it belongs to. So in three cases `estimatedDocumentCount` would give a number that looks right but counts something other than what you expect. In these cases Typemo doesn't answer with a wrong number. It throws an error and suggests what to use instead.
+
+If the model has [soft delete](../../policies/soft-delete.mdx) turned on, deleted documents would be in the number too.
+
+<Snippet id="reference/query/reading/soft-delete-tenants-discriminators" twoslash />
+
+<Snippet id="reference/query/reading/soft-delete-tenants-discriminators-2" />
+
+If you really need the number of all documents including deleted ones, say so explicitly with [`.policy()`](./options.mdx#policy).
+
+<Snippet id="reference/query/reading/soft-delete-tenants-discriminators-3" twoslash />
+
+If the model has a [tenant field](../../policies/tenants.mdx), documents of all tenants would be in the number, not only the current one. Then `estimatedDocumentCount` also throws an error and recommends `countDocuments`, which takes the tenant into account. The model here is called `Order`.
+
+<Snippet id="reference/query/reading/soft-delete-tenants-discriminators-4" />
+
+If you need the number across all tenants on purpose, pass `.policy({ allTenants: true })`.
+
+If the model is a [discriminator](../../schemas/discriminators.mdx), that is, a child stored in a shared collection with the base model, documents of all children would be in the number. Typemo throws a [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error) and suggests `countDocuments`. The child here is called `CardPayment`.
+
+<Snippet id="reference/query/reading/soft-delete-tenants-discriminators-5" />
+
+---
+
+## Model.distinct [#model.distinct]
+
+`distinct` returns all the different values of one field among the matching documents. Use it to collect options for a filter in an interface, for example all tags or all customer cities.
+
+<Snippet id="reference/query/reading/model-distinct" twoslash />
+
+<Returns type="OptionQuery<Value[]>">
+
+A query that gives an array of values after `await`. The element type matches the field type, which is `number` for `age`. The query options are the same as in [`exists`](#model.exists).
+
+</Returns>
+
+<Params>
+<Param name="path" type="path to a model field" required>
+
+The field whose values you want to collect. The compiler suggests the available paths, including nested ones through a dot. An empty string gives a `QueryError`.
+
+</Param>
+<Param name="filter" type="Filter<T>">
+
+Which documents to take into account. Without a filter, all of them count.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/reading/model-distinct-2" />
+
+</FullType>
+
+### An array field [#array-field]
+
+If the field is an array, `distinct` collects the different values of its elements, not different whole arrays. Alice's tags are `["admin", "dev"]`, Bob's are `["dev"]`, and Carol's are empty. The result is a flat list of tags with no repeats.
+
+<Snippet id="reference/query/reading/array-field" twoslash />
+
+With a filter, only matching documents count. Among users aged 30, only Alice has tags.
+
+<Snippet id="reference/query/reading/array-field-2" twoslash />
+
+---
+
+## How the builder works [#how-builder-works]
+
+[`find`](#model.find), [`findOne`](#model.find-one), and [`findById`](#model.find-by-id) don't touch the database right away. They return a **query builder**, an object where the query is assembled in parts. With a chain of calls you add sorting, limits, and field selection, and say what form you want the result in. The query goes to MongoDB only when you write `await`, call [`.exec()`](#exec), or call [`.cursor()`](#cursor).
+
+<Snippet id="reference/query/reading/how-builder-works" twoslash />
+
+Because of this, you can assemble a query in several places in the code. One function adds a filter for the user's permissions, another adds a sort from URL parameters, and the query runs once, at the end.
+
+The builder is immutable. Each method returns a **new** builder and doesn't touch the previous one. So you can extend a shared query in different places without worrying about spoiling someone else's chain.
+
+<Snippet id="reference/query/reading/how-builder-works-2" twoslash />
+
+Each chain method changes not only the query itself but also the result type. After [`.select({ name: 1 })`](#select), only `_id` and `name` stay in the type, and you can no longer reach `age`. After [`.plain()`](#plain), all values in the type take the shape of a `.plain()` result. After [`.orFail()`](#or-fail), `null` disappears from the type. The order of calls doesn't matter. `.plain().select(…)` and `.select(…).plain()` give the same result and the same type.
+
+Methods that make no sense for the operation don't compile. For example, [`.skip`](#skip) and [`.cursor`](#cursor) exist only on `find`. Skipping documents or handing them out one at a time makes no sense when the result is certain to be single.
+
+<Snippet id="reference/query/reading/how-builder-works-3" twoslash />
+
+The compiler's text names the reason right away: `skip() applies to find()`. If the same thing is built in code without types, the run-time check throws a `QueryError` with the text `skip applies to find() only, not findOne()`.
+
+### The builder as a Promise [#builder-as-promise]
+
+The query builder behaves like a `Promise` of the result. It has `then`, `catch`, and `finally`, and `Object.prototype.toString.call(query)` prints `[object TypemoQuery]`. So you can declare a function as returning a `Promise` and return the query from it directly, without `async` and without `await`.
+
+<Snippet id="reference/query/reading/builder-as-promise" twoslash />
+
+The query doesn't run until someone calls `then` (which `await` does), `catch`, `finally`, [`.exec()`](#exec), or [`.cursor()`](#cursor). Creating the builder sends nothing to the database.
+
+In one place the builder doesn't replace a `Promise`. You can't iterate over it. `for await` over the query itself throws a `QueryError` with a hint that you need a cursor.
+
+<Snippet id="queries/large-results/export-all-3" />
+
+A query is a promise of a result, not a stream, and a loop over it makes no sense. Without this check you'd get the runtime's generic `TypeError` ("not iterable"), as with value queries like `countDocuments`. For `findOne` the text is the same but starts with `findOne():`.
+
+---
+
+## .select [#select]
+
+`.select` chooses which fields of the document to return from the database. That's useful for two reasons. First, less data goes over the network, and a list of users for a drop-down menu doesn't drag tags and settings along. Second, the result type narrows with the selection, and the compiler won't let you reach a field you didn't load.
+
+<Snippet id="reference/query/reading/select" twoslash />
+
+<Returns type="QueryBuilder">
+
+The same builder, but only the selected fields stay in the result type.
+
+</Returns>
+
+<Params>
+<Param name="projection" type="Projection<T>" required>
+
+An object where the keys are model fields and the values say what to do with them. There are three forms, and you can't mix the first two in one call.
+
+- **Inclusion**: `{ name: 1, age: 1 }`. Return only these fields and `_id`.
+- **Exclusion**: `{ tags: 0 }`. Return all fields except these.
+- **Hidden field**: `{ "+passwordHash": true }`. Add a hidden field to the usual set of fields.
+
+For arrays, a projection also accepts `$slice` and `$elemMatch`.
+
+Projections whose shape the compiler can't see are accepted too. That means a value of the declared type [`Projection<T>`](../values/query-types.mdx#projection), a `Record<string, 0 | 1>` dictionary, and outside data wrapped in [`untrusted(fields, "projection")`](../policies/soft-delete-and-untrusted.mdx#untrusted). For them the result is all fields of the model, each one optional, and the paths and the mixing of inclusion with exclusion are checked at run time.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/reading/select-2" />
+
+</FullType>
+
+### Without _id [#without-id]
+
+MongoDB returns `_id` even if you didn't select it. Usually that's handy, because the client later requests a specific record by `_id`. If you don't need `_id`, for an export to a table for example, exclude it explicitly. It's the only field you can exclude inside an inclusion.
+
+<Snippet id="reference/query/reading/without-id" twoslash />
+
+### A hidden field [#hidden-field]
+
+Typemo doesn't read fields with the [`hidden`](../schemas/prop.mdx#hidden) option from the database until you ask for them. That way a password hash doesn't end up in the application's memory when it isn't needed. To read a hidden field, put `+` before its name.
+
+<Snippet id="reference/query/reading/hidden-field" twoslash />
+
+Notice that a `+` selection doesn't turn into an inclusion. You get all the usual fields and the hidden one on top. A `+` on a field that isn't hidden is an error (the text and reason are in the description of [`.select`](#select), at the end of the section on name checks).
+
+Reading a field doesn't mean handing it to the client. In [`.plain()`](#plain) and [`$toPlain()`](../documents/document-api.mdx#to-plain), a loaded hidden field doesn't get in without the `{ hidden: true }` option. More in the section [`.plain`](#plain).
+
+### Several calls [#select.multiple-calls]
+
+If you call `.select` several times, the selections add up. That's handy when a query is assembled in different places in the code.
+
+<Snippet id="reference/query/reading/select-multiple-calls" twoslash />
+
+The same key isn't selected twice, as in `.sort`. A second call with the same key throws a `QueryError` with the text `projection: "name" is selected twice`. A repeated call can neither go unnoticed nor contradict the first.
+
+### A projection built at run time [#runtime-projection]
+
+Usually you write a projection as a literal, and the compiler sees all its keys. But the set of fields can also come from outside. A function takes a projection as a parameter, or an API client picks fields itself with a string like `?fields=name,age`. For such cases `.select` accepts a value of the declared type [`Projection<T>`](../values/query-types.mdx#projection) and a `Record<string, 0 | 1>` dictionary. You don't need to bypass type checking with a cast.
+
+<Snippet id="reference/query/reading/runtime-projection" twoslash />
+
+The compiler doesn't know which keys will end up in `fields`, so the result is described in the broadest way. That's all the model's fields, each one optional (the optionality concerns only the top level, and nested documents stay as in the model). But the paths and the mixing of inclusion with exclusion are checked when the query runs, before the database is contacted.
+
+Wrap a dictionary built from client data in [`untrusted(fields, "projection")`](../policies/soft-delete-and-untrusted.mdx#untrusted). The function returns the same projection but refuses keys that start with `$` or `+`. Through `$` a client would turn the projection into a computed expression, and through `+` it would read a hidden field, a password hash for example.
+
+<Snippet id="reference/query/reading/runtime-projection-2" twoslash />
+
+If a forbidden key ends up in the dictionary, the query isn't built.
+
+<Snippet id="reference/query/reading/runtime-projection-3" />
+
+`untrusted` is only an extra safeguard, not input validation. It doesn't know which fields you're ready to give out. Check the client's fields against a list of allowed ones and build the projection yourself.
+
+If the dictionary has an unknown field, or inclusion is mixed with exclusion, the same error is thrown at run time as for a literal.
+
+<Snippet id="reference/query/reading/runtime-projection-4" />
+
+### Errors [#select.errors]
+
+MongoDB doesn't accept inclusion and exclusion in one projection, because it's unclear what to do with fields that aren't mentioned. Typemo catches this before the query reaches the database. The compiler shows the error right in the editor.
+
+<Snippet id="reference/query/reading/select-errors" twoslash />
+
+The compiler's text has a `"projection error"` property with the explanation `cannot mix inclusion ("name") and exclusion ("tags") in one projection`. If the projection is built while the program runs, `.select` throws a [`QueryError`](../errors/query-errors.mdx#query-error) right at the call.
+
+<Snippet id="reference/query/reading/select-errors-2" />
+
+A field that isn't in the model doesn't compile. The compiler error is the same on any model, with the explanation `unknown field "nope"` in the same `"projection error"` property.
+
+<Snippet id="reference/query/reading/select-errors-3" twoslash />
+
+The compiler also rejects the name of a nonexistent hidden field. `select({ "+nope": true })` doesn't compile, and in code without types it gives an error at run time.
+
+<Snippet id="reference/query/reading/select-errors-4" />
+
+The `+name` key is meant only for hidden fields. For an ordinary field it would change nothing, and all fields would come back, so Typemo doesn't stay silent. The compiler doesn't accept such a key, and in code without types or in a `Record<string, 0 | 1>` dictionary the query stops before the database is contacted. Typemo throws a `StrictModeError` with a separate reason, [`not-hidden`](../policies/violations.mdx#not-hidden): the field exists but isn't hidden.
+
+<Snippet id="reference/policies/violations/not-hidden" />
+
+### When not to use .select [#select.when-not-to-use]
+
+If you need to hide fields not only on read but from the client altogether, or mask a value, use [`hidden`](../schemas/prop.mdx#hidden) in the model and [`.mask`](./masks.mdx#mask). If you need to check that the response has exactly the given shape, add [`.expect`](./contracts.mdx#expect).
+
+---
+
+## .sort [#sort]
+
+`.sort` sets the order in which documents come back. Without it MongoDB returns documents in any order, and that order can change from query to query. So if the order is visible to the user, in a list or a table for example, always set a sort.
+
+<Snippet id="reference/query/reading/sort" twoslash />
+
+Here the users are sorted by descending age. Alice and Carol are the same age, and the second key works between them: the name in alphabetical order.
+
+<Returns type="QueryBuilder">
+
+The same builder with the sort.
+
+</Returns>
+
+<Params>
+<Param name="sort" type="Sort<T>" required>
+
+A "field → direction" object or a list of `[field, direction]` pairs. `1` means ascending and `-1` descending. The words `"asc"`, `"desc"`, `"ascending"`, and `"descending"` are accepted too. The compiler suggests the available fields. After [`.textScore(name)`](./search-and-explain.mdx#text-score), the score field also becomes a sort key, but only with the direction `-1`. `.sort({ score: -1 })` sorts by score, best first.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/reading/sort-2" />
+
+</FullType>
+
+### A list of pairs [#pairs]
+
+When there are several sort keys, their order matters. The second key works only inside equal values of the first. In an object that order is set by the order the keys are written in. If you want it to be obvious when reading the code, use a list of pairs.
+
+<Snippet id="reference/query/reading/pairs" twoslash />
+
+### Several calls [#sort.multiple-calls]
+
+Each next `.sort` call adds keys to the end instead of replacing the previous ones.
+
+<Snippet id="reference/query/reading/sort-multiple-calls" twoslash />
+
+The same path isn't sorted twice, in one call or in different ones. Typemo throws a `QueryError` with the text `sort: "age" is sorted twice`. A second call can't quietly turn out useless, because a key already in the sort can't be overridden.
+
+---
+
+## .limit <Badge>find only</Badge> [#limit]
+
+`.limit` caps how many documents the query returns. Always set it when a list is shown to a user. A collection with ten records today can grow to a million in a year, and a query without a limit would bring the application down. The method exists only on [`find`](#model.find).
+
+<Snippet id="reference/query/reading/limit" twoslash />
+
+<Returns type="QueryBuilder">
+
+The same builder with the limit.
+
+</Returns>
+
+<Params>
+<Param name="n" type="number" required>
+
+The maximum number of documents. An integer greater than zero.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/reading/limit-2" />
+
+</FullType>
+
+### Zero and negative numbers [#zero-and-negative]
+
+In MongoDB, `limit(0)` means "no limit", and a negative number turns on a special mode where the server returns one batch and closes the cursor. Both rules are far from obvious. `limit(0)` is easy to get from an empty query parameter and unexpectedly export the whole collection. So Typemo accepts only positive integers. The compiler doesn't check the number itself, and the error comes at run time, right at the `.limit` call.
+
+<Snippet id="reference/query/reading/zero-and-negative" twoslash />
+
+The value in the error text is printed together with its type, so a string that looks like a number is easy to tell from a number. That happens when the limit comes from a URL parameter. `limit("3")` throws `limit must be a positive integer, got "3" (string)`. Convert such a value yourself before passing it to `.limit`.
+
+If you don't need a limit, don't call `.limit`.
+
+---
+
+## .skip <Badge>find only</Badge> [#skip]
+
+`.skip` skips the first `n` documents. Together with [`.limit`](#limit) it gives simple paging: skip the previous pages and take one. The method exists only on [`find`](#model.find).
+
+<Snippet id="reference/query/reading/skip" twoslash />
+
+Always set a sort together with `.skip`. Without it the order of documents is undefined, and the same records can land on different pages.
+
+<Returns type="QueryBuilder">
+
+The same builder with the skip.
+
+</Returns>
+
+<Params>
+<Param name="n" type="number" required>
+
+How many documents to skip. An integer of at least zero.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/reading/skip-2" />
+
+</FullType>
+
+### When not to use .skip [#skip.when-not-to-use]
+
+To skip `n` documents, MongoDB still reads them and then throws them away. On the first pages you don't notice, but on page one thousand with twenty records, the database reads twenty thousand documents for twenty. On top of that, if someone added a record between page requests, the documents shift. The user will see one record twice or miss another.
+
+For long lists and infinite scroll, use [keyset pagination](../../queries/keyset-pagination.mdx) and the [`Model.keysetPage`](./keyset.mdx#model.keyset-page) method. There the next page starts right after the last document shown, and the database reads nothing extra.
+
+### Errors [#skip.errors]
+
+A negative or fractional number is an error at run time, right at the `.skip` call.
+
+<Snippet id="reference/query/reading/skip-errors" twoslash />
+
+---
+
+## .orFail [#or-fail]
+
+`.orFail` turns "nothing found" into an error. Without it, [`findOne`](#model.find-one) and [`findById`](#model.find-by-id) return `null` and `find` returns an empty array, and you have to check the result before every use. With it you get either a result or an exception, and `null` disappears from the type.
+
+<Snippet id="reference/query/reading/or-fail" twoslash />
+
+Use `.orFail` when a missing document is an error from the point of view of your task. Say a user opened an order page from a link, and there's no such order. That isn't an ordinary situation, it's a reason to answer 404.
+
+<Returns type="QueryBuilder">
+
+The same builder. If no document is found, `await` throws a [`DocumentNotFoundError`](../errors/query-errors.mdx#document-not-found-error) with the fields `operation` and `model`. The filter deliberately stays out of the error, because it may contain personal data.
+
+</Returns>
+
+It takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/query/reading/or-fail-2" />
+
+</FullType>
+
+### Handle "not found" [#handle-not-found]
+
+The error text names the model and the operation, so the logs show right away what exactly wasn't found.
+
+<Snippet id="reference/query/reading/handle-not-found" twoslash />
+
+The text holds the name of the method you called. For `Users.findById(id).orFail()` it's `User.findById`, and for `Users.find(...).orFail()` it's `User.find`.
+
+It's best to build the application boundary, a 404 response for example, in one place. Catch `DocumentNotFoundError` where you turn errors into responses, not in every handler.
+
+<Snippet id="reference/query/reading/handle-not-found-2" title="users/users.service.ts" twoslash />
+
+### With find [#with-find]
+
+For `find` the result is an array, and "nothing found" means "the list is empty". `.orFail()` on `find` also treats an empty list as an error and throws `DocumentNotFoundError`, and returns a non-empty list as usual.
+
+<Snippet id="reference/query/reading/with-find" twoslash />
+
+An empty list can be a perfectly normal answer, say a user has no orders yet. So add `.orFail()` to `find` only where an empty result means a failure, not "nothing yet".
+
+With [`.cursor()`](#cursor), `.orFail()` throws no error. A cursor hands out documents in batches and doesn't know ahead of time that there won't be any, so on an empty selection it ends without a single document.
+
+---
+
+## .lean [#lean]
+
+`.lean` returns the data exactly as the MongoDB driver delivered it, without creating a document. Such a result reads fastest. Typemo doesn't build an object with methods and doesn't remember the original values to track changes.
+
+To show values of different types, let's add one more model, a wallet. It has a 64-bit number, an exact decimal number, a date, and a dictionary field.
+
+<Snippet id="reference/query/reading/lean" title="models/wallet.ts" twoslash />
+
+<Snippet id="reference/query/reading/lean-2" twoslash />
+
+The values stay MongoDB types. `_id` is an `ObjectId` object, 64-bit numbers are `bigint`, and exact decimals are `Decimal128`. `Map` fields come as plain objects, because that's how MongoDB stores them. What each type looks like is shown in the reference [Value forms](../values/value-forms.mdx).
+
+<Returns type="QueryBuilder">
+
+The same builder. After `await` you get the data as the driver delivered it. Their type takes [`.select`](#select) and [`populate`](../populate/populate.mdx) into account, and unselected fields aren't in the type.
+
+</Returns>
+
+It takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/query/reading/lean-3" />
+
+</FullType>
+
+### When to use it [#lean.when-to-use]
+
+`.lean` fits work inside the application where you need exact MongoDB values. For example, adding up points in a `bigint`, comparing identifiers with `ObjectId.equals`, or passing `_id` to the next query.
+
+`.lean` isn't right for a response to a client. `JSON.stringify` can't serialize `bigint` and throws `TypeError: JSON.stringify cannot serialize BigInt.`, and `ObjectId` and `Decimal128` mean nothing to a client. For responses, use [`.plain`](#plain). How to choose between a document, `.lean()`, and `.plain()` is covered in detail in the guide [Reading data](../../queries/reading-data.mdx#how-to-choose).
+
+### Hidden fields [#lean.hidden-fields]
+
+`.lean` hands out everything that was read from the database, including hidden fields you requested with `+`. It's meant for code inside the application, not for a response to a client, so it hides nothing.
+
+<Snippet id="reference/query/reading/lean-hidden-fields" twoslash />
+
+---
+
+## .plain [#plain]
+
+`.plain` returns the data converted to ordinary JavaScript values. These values are meant for everything that leaves the application: API responses, queue messages, cache entries. No document is created, so `.plain` is almost as fast as [`.lean`](#lean).
+
+<Snippet id="reference/query/reading/plain" twoslash />
+
+The values are converted like this.
+- `ObjectId`, `Decimal128`, and UUID become strings.
+- 64-bit integers become strings of type `` `${bigint}` ``, so that precision isn't lost when passed through JSON.
+- `Date` and `RegExp` stay as they are.
+- `Map` fields stay `Map`.
+- Related documents after [`populate`](../populate/populate.mdx) are converted too, each by its own model.
+- Hidden fields are removed.
+
+<ValueForms types={["objectId", "long", "decimal", "date", "map"]} forms={["lean", "plain"]} />
+
+The full table for all MongoDB types is in the reference [Value forms](../values/value-forms.mdx).
+
+<Returns type="QueryBuilder">
+
+The same builder. After `await` you get ordinary data, ready for the client. Its type takes [`.select`](#select), [`populate`](../populate/populate.mdx), and hidden fields into account.
+
+</Returns>
+
+<Params>
+<Param name="options.hidden" type="boolean" default="false">
+
+Keep the hidden fields the query read with `+`. The result type will include them too. Any other key in `options` gives a `QueryError` with the text `plain: "x" is not an option (only "hidden")`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/reading/plain-2" />
+
+</FullType>
+
+### Hidden fields [#plain.hidden-fields]
+
+A hidden field in a `.plain()` result is protected twice. First you have to read it with `+`, and then also allow it to go out with `{ hidden: true }`. Without the second step the field doesn't get into the result, even if it was read.
+
+<Snippet id="reference/query/reading/plain-hidden-fields" twoslash />
+
+That way a password hash won't leak into an API response because someone added `+passwordHash` to a shared query for checking the password.
+
+### Map in JSON [#map-in-json]
+
+In a `.plain()` result, `Map` fields stay real `Map`s. In code that's handy, but `JSON.stringify` turns a `Map` into an empty object without an error. The output is `{"limits":{}}`, and the dictionary values vanished silently. If you give a `Map` field to the client, turn it into an object yourself, for example with `Object.fromEntries(wallet.limits)`. You can also read the document without `.plain()` and call its [`$toJSON()`](../documents/document-api.mdx#to-json), where the `Map` is already turned into an object.
+
+### What you can't do after .plain() [#after-plain-limits]
+
+A `.plain()` result is data, not a document. It has no [`$save()`](../documents/document-api.mdx#save) or other document methods, and the compiler won't let you call them.
+
+<Snippet id="reference/query/reading/after-plain-limits" twoslash />
+
+If you need to change the record, read it without `.plain()` or use the update methods: [`updateOne`](../writes/writes.mdx#update-one), [`findByIdAndUpdate`](../writes/writes.mdx#find-by-id-and-update).
+
+---
+
+## .cursor <Badge>find only</Badge> [#cursor]
+
+`.cursor` runs the query and hands out documents one at a time, as they arrive from the database. An ordinary `await` first collects all the documents into an array and only then gives it to you. A cursor hands out the first document right away and loads the next ones in batches while you process the previous ones. The method exists only on [`find`](#model.find).
+
+<Snippet id="reference/query/reading/cursor" twoslash />
+
+<Returns type="QueryCursor">
+
+A cursor of type [`QueryCursor`](./cursor.mdx#query-cursor), an async iterator with the methods `next`, `toArray`, `map`, `eachAsync`, and `close`. Each element has the form the chain set, that is, a document, a `.lean()` result, or a `.plain()` result. All the cursor methods are described in the reference [Cursor](./cursor.mdx). On `findOne` the method doesn't compile, and in code without types it throws a `QueryError` with the text `cursor applies to find() only, not findOne()`.
+
+</Returns>
+
+It takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/query/reading/cursor-2" />
+
+</FullType>
+
+### When to use it [#cursor.when-to-use]
+
+You need a cursor when there are so many documents that the whole array won't fit in memory or would take too long to build. Typical cases are an export to another system, a data migration, and a nightly rebuild of reports.
+
+For lists on a page you don't need a cursor. They show a limited number of records anyway, and an ordinary `await` with [`.limit`](#limit) is enough.
+
+---
+
+## .exec [#exec]
+
+`.exec` runs the query and returns a `Promise` with the result. `await query` does the same, so in ordinary code you don't need to write `.exec()`. It helps in two cases. The first is when you want to show explicitly that the query goes to the database here. The second is when you need to run an already executed query again.
+
+<Snippet id="reference/query/reading/exec" twoslash />
+
+<Returns type="Promise">
+
+A `Promise` with the query result.
+
+</Returns>
+
+<Params>
+<Param name="options.force" type="boolean" default="false">
+
+Run the query again, even if it has already run. A non-boolean value gives a `QueryError` with the text `find: exec({ force }) takes a boolean`, because Typemo doesn't cast values silently.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/reading/exec-2" />
+
+</FullType>
+
+### A second await [#second-await]
+
+One builder reads the database only once. If you `await` the same query a second time, you get the same result with no new trip to the database.
+
+<Snippet id="reference/query/reading/second-await" twoslash />
+
+That way an accidental second `await`, in two branches of code for example, makes no extra queries. If you need fresh data, call `exec({ force: true })` or create a new query.
+
+---
+
+## Other builder methods [#other-builder-methods]
+
+The query builder has more methods than this page describes. They're grouped by task and described on separate pages of the reference.
+
+<Cards>
+<Card title="Chained conditions" href="./conditions.mdx">
+  `.where`, `.and`, `.or`, `.nor`, and `.merge` add conditions to the filter in parts.
+</Card>
+<Card title=".populate" href="../populate/populate.mdx">
+  `.populate` puts the related document itself in place of a reference.
+</Card>
+<Card title="Contracts" href="./contracts.mdx">
+  `.parse` checks rows against a schema at run time, and `.expect` checks the shape of the result at compile time.
+</Card>
+<Card title="Masks" href="./masks.mdx">
+  `.mask` hides part of the values in the response.
+</Card>
+<Card title="Query options" href="./options.mdx">
+  `.session`, `.policy`, `.hint`, `.collation`, `.comment`, `.timeoutMS`, `.batchSize`, `.readPreference`, `.readConcern`, `.allowDiskUse`.
+</Card>
+<Card title="Search and the query plan" href="./search-and-explain.mdx">
+  `.textScore` for full-text search and `.explain` for the execution plan.
+</Card>
+</Cards>

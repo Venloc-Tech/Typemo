@@ -1,0 +1,116 @@
+---
+title: Save an aggregation result and keep it up to date
+description: "Keep aggregation totals in a separate collection, refresh them on command, and choose between the merge and replace modes"
+icon: DatabaseZap
+---
+
+Some totals take long to compute but are needed often: a summary per customer, daily revenue, a ranking. Recomputing them on every read is expensive. A **materialized view** takes a different approach. The aggregation result is written to an ordinary collection, read from there quickly, and refreshed when you decide.
+
+In Typemo a "source → result" pair like this is described by `Materialized`. The compiler checks the types of the result, and the `refresh` method updates it.
+
+If you haven't worked with aggregation yet, start with [Your first aggregation](../aggregation/first-aggregation.mdx). And if the result must always be fresh and is read moderately, you need a [view](./views.mdx) instead.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and some accounts. You need totals per owner of open accounts. `accounts` has three documents.
+
+- Main: owner alice, balance 120, open.
+- Old: alice, 0, closed.
+- Savings: bob, 500, open.
+
+<Snippet id="collections/materialized-views/prerequisites" title="accounts/models.ts" twoslash />
+
+The result class is an ordinary entity, only with its own `_id` type. [`EntityWithId`](../reference/schemas/base-classes.mdx#entity-with-id) with the `String` type makes `_id` a string. Here it's the owner's name, which identifies a total unambiguously. Ids like this are covered in [Use your own _id type](../schemas/custom-ids.mdx).
+
+## Quick start [#quick-start]
+
+Define the result with [`Materialized.define`](../reference/collections/materialized.mdx#materialized.define), call [`refresh`](../reference/collections/materialized.mdx#materialized.refresh), and read through `model`.
+
+<Snippet id="collections/materialized-views/quick-start" twoslash />
+
+We'll cover the refresh modes and typical tasks below.
+
+## Describe the result [#define-result]
+
+You need totals that are read more often than the data changes. Describe the result class and define the pair. The pipeline is assembled with the same builder as an ordinary aggregation, and the compiler checks it against the class. You don't add the `$merge` and `$out` write stages yourself. `refresh` does that.
+
+`define` doesn't compute or create anything. Until `refresh` is called, the result collection doesn't exist in the database, and after `define` there's still only `accounts`. The definition, though, is available right away. [`definition`](../reference/collections/materialized.mdx#materialized-info) shows the source, the target, the mode, and the stages.
+
+## Refresh the result [#refresh-result]
+
+The data changed, and the totals need recomputing. Call [`refresh`](../reference/collections/materialized.mdx#materialized.refresh) wherever it fits: in a scheduled job, after a bulk load, or in the handler of a button in the admin panel. The result never refreshes by itself.
+
+<Snippet id="collections/materialized-views/refresh-result" title="accounts/totals.job.ts" twoslash />
+
+Until `refresh` is called, the result holds the old value of 120. After the call it's 150. That's the price of materialization. You pay with freshness for fast reads.
+
+## Choose a write mode [#choose-write-mode]
+
+Say an account was closed, and its owner dropped out of the selection. What happens to their old row in the result? The mode decides.
+
+The default mode is `merge`, and the result is **never cleared**. `$merge` inserts new rows and updates matching ones, while rows without fresh data stay. For example, after Savings was closed, bob's total stayed the same, 500.
+
+If the result must match the pipeline exactly, set `mode: "replace"`. Then the whole collection is replaced with the result, and rows that disappeared are gone.
+
+<Snippet id="collections/materialized-views/choose-write-mode" twoslash />
+
+bob's row is gone, because `replace` wrote exactly what the pipeline returned. How to pick a mode is covered below, in "How to choose".
+
+## Merge on another field [#merge-on-field]
+
+Sometimes a result row is identified not by `_id` but by another field, such as the account title. In `merge` mode, name that field in `on`. The target collection then needs a unique index on exactly that field, or the server can't unambiguously find "the same" row.
+
+Typemo checks the index before running. If the index doesn't exist yet, you get a clear error. After [`syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes), `refresh` works.
+
+<Snippet id="collections/materialized-views/merge-on-field" title="accounts/balances.ts" twoslash />
+
+The full error text and the other `whenMatched` values are in the [`refresh`](../reference/collections/materialized.mdx#materialized.refresh) reference.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether a row that disappeared should vanish from the result**.
+
+- **Yes**: use `replace`. The result always equals the pipeline, but every refresh rewrites the whole collection.
+- **Rows should accumulate, and only the changed ones should update**: `merge`, the default. It writes only what the pipeline returned and doesn't delete old rows, so you clean up "dead" rows yourself.
+
+There's an earlier question too: whether to materialize at all. If the selection is fast or rarely read, a [view](./views.mdx) fits better. It stores no data and never goes stale.
+
+## When not to use it [#when-not-to-use]
+
+If a total takes milliseconds to compute, store only the query. Materialization adds a collection whose freshness you have to watch. If you need the result once, an ordinary [aggregation](../aggregation/first-aggregation.mdx) is enough. And if people also edit the result data by hand, `refresh` overwrites those edits in `replace` mode or mixes with them in `merge` mode.
+
+## Troubleshooting [#troubleshooting]
+
+**The result is empty.** `model.find()` returned `[]`. The result collection appears only after the first [`refresh`](../reference/collections/materialized.mdx#materialized.refresh). Call it at startup or on a schedule.
+
+**"Dead" rows stayed in the result.** An owner with no open accounts left is still in the totals. That's how `merge` mode works. It doesn't clear the collection. Set `mode: "replace"`, or delete stale rows yourself.
+
+**`needs a unique index on exactly these fields`.** You merge with `$merge` on a field other than `_id`, and there's no unique index on it. Declare `@Index({ field: 1 }, { unique: true })` on the result class and call [`syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes). Or merge on `_id`.
+
+**The pipeline doesn't compile.** The compiler names the fields of the result class that the pipeline rows don't have. Add them in the `group` or `project` stage, or remove them from the class. There's one exception, `_id`. You don't have to produce it, because `$merge` and `$out` assign it themselves.
+
+## Full example [#full-example]
+
+Here's the result definition and the job that refreshes it.
+
+<Snippet id="collections/materialized-views/full-example" title="accounts/owner-totals.ts" twoslash />
+
+<Callout type="migration">
+
+Mongoose has no materialized view. You build one by hand: add `$merge` or `$out` to an aggregation and run it on a schedule. In Typemo that stage is added for you, and the "source → result" pair is typed. The compiler checks the pipeline rows against the result class, and a `$merge` on a non-unique field is rejected before anything is sent to the server.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Read a predefined selection through a view" href="./views.mdx">
+  An always-fresh selection that stores no data.
+</Card>
+<Card title="Sync indexes" href="./index-sync.mdx">
+  Create the unique index that `$merge` on your own field needs.
+</Card>
+<Card title="Materialized" href="../reference/collections/materialized.mdx">
+  `define`, `refresh`, the write modes, and the exact types.
+</Card>
+</Cards>

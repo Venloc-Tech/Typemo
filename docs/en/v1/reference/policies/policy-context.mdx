@@ -1,0 +1,188 @@
+---
+title: "PolicyContext and PolicyValues"
+description: "How to pass an operation the tenant, the actor, and the soft delete mode through run, current, and .policy"
+icon: Braces
+---
+
+The **policy context** is the set of values that model policies read on every operation. Which tenant the data belongs to, who is acting (for the audit), and whether deleted documents should be shown. The model and the client don't store them. The values come from the scope that [`PolicyContext.run`](#policy-context.run) opens, or from [`.policy()`](../query/options.mdx#policy) on a single operation. If you're new here, read the guide [Pass the tenant and actor through the whole request](../../policies/policy-context.mdx) first.
+
+The context is read **at the moment the operation is built**, not at the moment of `await`. A query created inside `run` remembers the values even if you await it outside. A builder created outside `run` gets no tenant, however long you await it inside. So a query kept in a module variable won't switch the tenant along with an HTTP request that happens to await it.
+
+The examples use an organization's order model. The field `tenantId` is marked with [`@Tenant()`](../schemas/field-markers.mdx#tenant) and the type [`TenantField`](../schemas/field-markers.mdx#tenant-field), and the tenant policy is on ([`tenant`](./schema-options.mdx#tenant)).
+
+<Snippet id="integrations/nestjs/transactions-and-policies/prerequisites" title="orders/order.ts" twoslash />
+
+<TypeTable
+  type={{
+    "PolicyContext.run": { description: "Runs a function in a scope with values. Operations built inside get these values.", type: "(values, work) => R" },
+    "PolicyContext.current": { description: "The values of the current scope, or `undefined` outside `run`.", type: "() => Readonly<PolicyValues> | undefined" },
+    "PolicyContext.captured": { description: "The scope values as `{ policy }` for operation parameters.", type: "() => { policy }" },
+    "PolicyContext.merge": { description: "Validates values and layers them over others.", type: "(base, extra, where) => Readonly<PolicyValues>" },
+    "PolicyContext.EMPTY": { description: "A frozen context with no values.", type: "Readonly<PolicyValues>" },
+    "PolicyValues": { description: "The type of the values object: `tenant`, `allTenants`, `actor`, `includeDeleted`, `onlyDeleted`, `hardDelete`." },
+  }}
+/>
+
+## PolicyContext.run [#policy-context.run]
+
+`run` opens a scope with context values and runs a function in it. The scope lives through the whole chain of asynchronous calls inside the function: after `await`, in callbacks, in timers. Node and Bun store the data of the current HTTP request the same way. You don't have to pass the tenant as a parameter to every service function.
+
+<Snippet id="reference/policies/policy-context/policy-context-run" twoslash />
+
+A nested `run` doesn't replace the scope entirely. It layers its values over the outer one. The inner `tenant` overrides the outer one, and the other values stay. If the inner `run` sets `tenant`, an inherited `allTenants` is canceled. And the other way around, `allTenants: true` cancels an inherited `tenant`. `includeDeleted` and `onlyDeleted` behave the same, since otherwise the context inside would contradict itself.
+
+<Snippet id="reference/policies/policy-context/policy-context-run-2" twoslash />
+
+<Returns type="R">
+
+Whatever `work` returned, unchanged, whether a value or a `Promise`. `run` itself waits for nothing. If you need the scope after `await` as well, declare the function `async` and await inside it, not outside.
+
+</Returns>
+
+<Params>
+<Param name="values" type="PolicyValues" required>
+
+The context values. The keys are described in the section [PolicyValues](#policy-values). Validation happens right away, before `work` is called.
+
+</Param>
+<Param name="work" type="() => R" required>
+
+The function the scope applies in.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/policies/policy-context/policy-context-run-3" />
+
+</FullType>
+
+### Errors [#errors]
+
+[`run`](#policy-context.run) rejects invalid values before it calls the function. A [`QueryError`](../errors/query-errors.mdx#query-error) checks the shape of the values, and a [`StrictModeError`](./violations.mdx#tenant) catches an empty tenant. All the texts below come from a real run.
+
+<Snippet id="reference/policies/policy-context/errors" />
+
+A typo in a key name doesn't turn into a silently missing tenant. The error names `tenat` and the list of valid keys. For the same reason `null`, an empty string, and a whitespace-only string in `tenant` are forbidden. They would look like "no tenant needed", and "not needed" is written explicitly: `allTenants: true`. Without the check, a bug in code that pulls the organization from a token would silently turn into working with documents that have no organization.
+
+## PolicyContext.current [#policy-context.current]
+
+`current` returns the values of the scope you're in. You need it where the values must be read, not applied. For example, to write them to a request log, pass them to a queue job, or show them in a debug response. Outside any `run` you get `undefined`, not an empty object, so a missing scope is visible at once.
+
+<Snippet id="reference/policies/policy-context/policy-context-current" twoslash />
+
+The `.policy()` values of a single operation aren't visible in `current`. `.policy()` applies to one operation and creates no scope.
+
+<Returns type="Readonly<PolicyValues> | undefined">
+
+A frozen object with the scope values (you can't change it), or `undefined` outside `run`.
+
+</Returns>
+
+No arguments.
+
+<FullType>
+
+<Snippet id="reference/policies/policy-context/policy-context-current-2" />
+
+</FullType>
+
+## PolicyContext.captured [#policy-context.captured]
+
+`captured` returns the scope values in the form operation parameters accept: `{ policy }`. The method is open to wrappers and plugins that build an operation themselves, for example for their own query layer. Model operations do the same when they're built. Application code doesn't need it, since the scope is opened through [`run`](#policy-context.run). Outside a scope `policy` is an empty object.
+
+<Snippet id="reference/policies/policy-context/policy-context-captured" twoslash />
+
+<Returns type="{ readonly policy: Readonly<PolicyValues> }">
+
+An object with the single key `policy`. You can spread it into the operation parameters.
+
+</Returns>
+
+No arguments.
+
+<FullType>
+
+<Snippet id="reference/policies/policy-context/policy-context-captured-2" />
+
+</FullType>
+
+## PolicyContext.merge [#policy-context.merge]
+
+`merge` validates values and layers them over others, changing neither. The method is open to wrappers and plugins that combine their own policy values with the scope values. Application code passes operation values directly (`.policy()`, the `policy` parameter of a write). [`run`](#policy-context.run) builds a nested scope the same way, and [`.policy()`](../query/options.mdx#policy) layers the operation values over the scope.
+
+The rules are the same as in `run`. An unknown key, a flag that isn't `true`, and contradictions give a [`QueryError`](../errors/query-errors.mdx#query-error), and an empty tenant (`null`, an empty string) gives a [`StrictModeError`](./violations.mdx#tenant). Both error texts contain the call name from `where`. A value of `undefined` in `extra` is skipped and doesn't erase the value from `base`.
+
+<Snippet id="reference/policies/policy-context/policy-context-merge" twoslash />
+
+An explicit `allTenants` removed the inherited `tenant`, and the result doesn't contradict itself.
+
+<Returns type="Readonly<PolicyValues>">
+
+A new frozen object. The arguments don't change.
+
+</Returns>
+
+<Params>
+<Param name="base" type="Readonly<PolicyValues> | undefined" required>
+
+The values the new ones are layered over. `undefined` means "nothing".
+
+</Param>
+<Param name="extra" type="PolicyValues" required>
+
+The new values. `merge` validates them.
+
+</Param>
+<Param name="where" type="string" required>
+
+The call name. It goes at the start of the error text.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/policies/policy-context/policy-context-merge-2" />
+
+</FullType>
+
+## PolicyContext.EMPTY [#policy-context.empty]
+
+`EMPTY` is a frozen object with no values, the one substituted outside a scope. Compare against it to find out whether the context is empty. You don't need to count keys.
+
+<Snippet id="reference/policies/policy-context/policy-context-empty" twoslash />
+
+<FullType>
+
+<Snippet id="reference/policies/policy-context/policy-context-empty-2" />
+
+</FullType>
+
+## PolicyValues [#policy-values]
+
+`PolicyValues` is the type of the object that [`run`](#policy-context.run), [`merge`](#policy-context.merge), and [`.policy()`](../query/options.mdx#policy) accept. All keys are optional, and an unknown key is an error. Four keys are flags, and they accept only `true` or absence. In the policy context `false` means nothing but confusion, since "turn the policy off" and "don't turn it on" are different things.
+
+<TypeTable
+  type={{
+    tenant: { description: "The tenant of the operation. The value is cast by the type of the model's tenant field (string, number, `ObjectId`, …). Every operation of a model with the [`tenant`](./schema-options.mdx#tenant) policy needs it. The value must be non-empty: `null`, an empty string, and a whitespace-only string are rejected.", type: "unknown" },
+    allTenants: { description: "Work across all tenants at once, for example a background admin task. The tenant policy doesn't restrict the operation. Incompatible with `tenant`.", type: "true" },
+    actor: { description: "Who is acting. It's written into every [audit](./schema-options.mdx#audit) entry.", type: "unknown" },
+    includeDeleted: { description: "The operation sees deleted documents too (the [`softDelete`](./schema-options.mdx#soft-delete) policy). Incompatible with `onlyDeleted`.", type: "true" },
+    onlyDeleted: { description: "The operation sees only deleted documents. That's how [`SoftDelete.restore`](./soft-delete-and-untrusted.mdx#soft-delete.restore) works.", type: "true" },
+    hardDelete: { description: "A delete erases documents for good instead of marking them. That's how [`SoftDelete.purge`](./soft-delete-and-untrusted.mdx#soft-delete.purge) works.", type: "true" },
+  }}
+/>
+
+`tenant` and `actor` have the type `unknown`, because the type of the tenant is set by the model field. For `TenantField<string>` a string fits, and for `TenantField<ObjectId>` an `ObjectId` or its string. The value is cast the same way as a field value, and an unsuitable one raises a [`CastError`](../errors/data-errors.mdx#cast-error). A number for a string field gives `Cast to string failed at path "tenantId" for 5 (number): expected a string [type]`.
+
+<FullType>
+
+<Snippet id="reference/policies/policy-context/policy-values" />
+
+</FullType>
+
+## When it doesn't fit [#when-not-to-use]
+
+The policy context doesn't replace a filter. To restrict a selection by an ordinary field, such as the account owner, use a condition in the filter. Policies take care of what can't be weakened in any query of the model. If one operation needs a different tenant or a different deleted-documents mode, use [`.policy()`](../query/options.mdx#policy), and you don't have to open a scope. To see how the context works in real tasks, read the guides [Pass the tenant and actor through the whole request](../../policies/policy-context.mdx) and [Split data by organization](../../policies/tenants.mdx).

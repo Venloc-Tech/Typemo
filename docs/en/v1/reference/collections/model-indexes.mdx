@@ -1,0 +1,309 @@
+---
+title: Model indexes
+description: "listIndexes, diffIndexes, syncIndexes, createIndexes, diffSearchIndexes, and syncSearchIndexes: what they compare, change, and which errors they return"
+icon: ListTree
+---
+
+This page collects the model methods for working with a collection's **indexes**. An index is a MongoDB service structure. It lets queries skip scanning the whole collection and keeps unique fields unique. The schema describes the indexes you need (`unique`, `index`, [`@Index`](../schemas/index-decorators.mdx#index)), and the methods here compare that description with what's on the server and, if needed, bring the server in line with the schema. A separate group of methods works with **search indexes** ([`@SearchIndex`](../schemas/index-decorators.mdx#search-index)), which need Atlas Search.
+
+If you're setting up indexes for the first time, start with the [Sync indexes](../../collections/index-sync.mdx) guide. This page is a reference, and you come back to it for details.
+
+All examples use the account model. It has a unique field, an ordinary index through `index: true`, and a TTL index through [`@Index`](../schemas/index-decorators.mdx#index). With a TTL index, the server deletes old documents itself.
+
+<Snippet id="reference/collections/model-indexes/intro" title="accounts/account.ts" twoslash />
+
+The schema declares three indexes: `title_1`, `owner_1`, and `opened_ttl`. If `name` isn't set, the name is built from the keys in the pattern `field_direction`. The server creates the `_id_` index itself, and Typemo doesn't touch it. The results in the `// →` comments come from an empty database where the `accounts` collection doesn't exist yet. If an example needs data, it's described next to the example.
+
+The methods work only with the model's collection. All of them first wait for the client to connect (see [`client.ready`](../connection/typemo-client.mdx#client.ready)). To sync all of a connection's models at once, use [`connection.syncAll`](../connection/connection.mdx#connection.sync-all), described on the [`SyncAll`](./sync-all.mdx) page.
+
+The `autoIndex` schema option doesn't affect these methods. Only [`connection.init`](../connection/connection.mdx#connection.init) and `connection.syncAll` use it, to decide whether to build the model's indexes. If you call `syncIndexes` or `createIndexes` yourself on a model with `autoIndex: false`, the indexes are built (on MongoDB 9.0 such a model got `["code_1"]`).
+
+---
+
+## Model.listIndexes [#model.list-indexes]
+
+`listIndexes` returns the indexes that are on the server right now, in the form the driver returns them. It's useful in checks and utility scripts. See which indexes already exist before you change anything, or make sure after a deployment that the index you need was created.
+
+The method compares nothing with the schema and shows the server as is. If the collection doesn't exist yet, you get an empty array, not an error.
+
+<Snippet id="reference/collections/model-indexes/model-list-indexes" twoslash />
+
+<Returns type="Promise<IndexDescriptionInfo[]>">
+
+An array of index descriptions from the `mongodb` driver. Each has `name`, `key` (the keys with directions), and the version `v`, plus the options set on the index: `unique`, `expireAfterSeconds`, `hidden`, `partialFilterExpression`, `collation`. The `_id_` index is always in the list if the collection exists. For a collection that doesn't exist, the array is empty.
+
+</Returns>
+
+It takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/collections/model-indexes/model-list-indexes-2" />
+
+</FullType>
+
+### What the server shows, not the schema [#server-not-schema]
+
+`listIndexes` returns what the server wrote, so descriptions can have fields you never set. For example, MongoDB 9 adds `collation: { locale: "simple" }` to every index. You don't need to compare an index description with the schema by hand. [`diffIndexes`](#model.diff-indexes) does that.
+
+---
+
+## Model.diffIndexes [#model.diff-indexes]
+
+`diffIndexes` compares the schema's indexes with the server's and says what to create, what to drop, and what to change in place. It writes nothing. Use it to see a mismatch before [`syncIndexes`](#model.sync-indexes) fixes it, for example in a check before deployment.
+
+The comparison is strict and symmetric. An index counts as the same if the keys and their order match, along with `unique`, `sparse`, `partialFilterExpression`, the text index settings, and the string collation. An option with its default value equals a missing one, so `unique: false` and `sparse: false` on the server don't count as a difference. Without recreating an index, the server can change only its visibility (`hidden`) and the lifetime of a TTL index. These two differences go into a separate list.
+
+<Snippet id="reference/collections/model-indexes/model-diff-indexes" twoslash />
+
+<Returns type="Promise<IndexDiff>">
+
+An [`IndexDiff`](#index-diff) object with three lists. `toCreate` holds the schema's indexes that are missing on the server or differ. `toDrop` holds the server's indexes that are missing from the schema or differ. `toModify` holds the in-place changes. If everything matches, all three lists are empty.
+
+</Returns>
+
+It takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/collections/model-indexes/model-diff-indexes-2" />
+
+</FullType>
+
+### Text index [#text-index]
+
+The server stores a text index (`@Index({ title: "text", body: "text" })`) together with field weights. If you didn't set them, each field gets a weight of 1. Typemo knows this rule, so right after creation such an index matches the schema, and a repeated call finds no differences. An explicit weight other than one is compared like any other index option.
+
+<Snippet id="reference/collections/model-indexes/text-index" twoslash />
+
+### Extra index [#extra-index]
+
+An index that isn't in the schema shouldn't exist, and it lands in `toDrop`. The schema is the complete description, so Typemo treats an index created by hand as extra. Say the collection has an index `closed_1` that the schema doesn't declare.
+
+<Snippet id="reference/collections/model-indexes/extra-index" twoslash />
+
+`_id_` never lands in `toDrop`, because it's a server index, not a schema one. The index of a clustered collection and the service index of a time series collection, which the server creates itself, aren't counted as extra either.
+
+### The index is declared differently [#index-mismatch]
+
+Sometimes an index with the same name exists in both the schema and on the server, but their keys or options differ. You can't change such an index in place, so its name is **in both `toDrop` and `toCreate`**. The index has to be dropped and created again. In the example, `owner_1` is unique on the server, and the schema doesn't ask for that.
+
+<Snippet id="reference/collections/model-indexes/index-mismatch" twoslash />
+
+### In-place change [#in-place-change]
+
+The server changes the lifetime of a TTL index and the visibility of an index with a command, without recreating it. So such differences sit in `toModify` together with the new value. In the example, someone cut the lifetime of `opened_ttl` to a minute by hand.
+
+<Snippet id="reference/collections/model-indexes/in-place-change" twoslash />
+
+Adding or removing a TTL on an existing index is treated by the code as a rebuild, not an in-place change. That way the meaning of an index doesn't change without recreating it. This case is described from the code and wasn't verified by running it.
+
+---
+
+## Model.syncIndexes [#model.sync-indexes]
+
+`syncIndexes` brings the server's indexes into exact agreement with the schema. It drops the extra ones, changes in place what it can, and creates the missing ones. Use it as a deployment step and in a migration script. Typemo doesn't create indexes by itself. Until you call `syncIndexes` (or [`createIndexes`](#model.create-indexes), or [`connection.init`](../connection/connection.mdx#connection.init)), the uniqueness from the schema isn't guaranteed on the server.
+
+A model can have options that are set only when the collection is created (`capped`, `timeseries`, `clustered`, `collation`). If the collection doesn't exist yet in that case, `syncIndexes` creates nothing and throws a [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error). Otherwise the index would create an ordinary collection, and the options would be lost. First create the collection with [`ensureCollection`](./collection-manager.mdx#model.ensure-collection) or [`connection.init`](../connection/connection.mdx#connection.init). With `dryRun: true` there's no such check, because it writes nothing.
+
+The steps go in this order. First the indexes from `toDrop` are dropped, then the changes from `toModify` are applied, then the indexes from `toCreate` are created. An index being recreated is dropped first and created after. If a step fails, the method doesn't stop. It tries everything else and at the end throws one [`IndexSyncError`](../errors/configuration-errors.mdx#index-sync-error) with all the failures. The indexes that were applied stay.
+
+<Snippet id="reference/collections/model-indexes/model-sync-indexes" twoslash />
+
+<Returns type="Promise<IndexSyncResult>">
+
+An [`IndexSyncResult`](#index-sync-result) object: the same three lists as in [`IndexDiff`](#index-diff), and the `dryRun` field. The lists describe what was applied (with `dryRun`, what would have been applied). A repeated call on a synced collection returns empty lists.
+
+</Returns>
+
+<Params>
+<Param name="options.dryRun" type="boolean" default="false">
+
+Only reports what would change and writes nothing. The result is the same as in [`diffIndexes`](#model.diff-indexes), but with `dryRun: true`. That lets you check a deployment in advance.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/model-indexes/model-sync-indexes-2" />
+
+</FullType>
+
+### Check without saving [#validate-without-saving]
+
+With `dryRun: true` the method returns the plan and doesn't touch the server.
+
+<Snippet id="reference/collections/model-indexes/validate-without-saving" twoslash />
+
+### The data breaks uniqueness [#unique-violation]
+
+Most often the method fails because the collection already holds documents that break the new unique index. Say `accounts` has two accounts titled `Main`, and the schema requires a unique `title`. The method creates the other indexes and throws an error about `title_1`.
+
+<Snippet id="reference/collections/model-indexes/unique-violation" twoslash />
+
+The error text is short. It holds the index, the value, and the `DuplicateKeyError` code. The long server text is in the `serverMessage` of the nested error. It contains index build identifiers, and they depend on the MongoDB version.
+
+<Snippet id="reference/collections/model-indexes/unique-violation-2" />
+
+`owner_1` and `opened_ttl` were created and stayed, because one index failing doesn't roll back the others. Fix the data and call `syncIndexes` again. Only the missing `title_1` is created.
+
+---
+
+## Model.createIndexes [#model.create-indexes]
+
+`createIndexes` creates the schema's indexes without dropping or comparing anything. Use it when there are definitely no extra indexes and you only need to add the missing ones. In other cases choose [`syncIndexes`](#model.sync-indexes), which both drops and changes.
+
+Like `syncIndexes`, the method collects all the failures and throws one [`IndexSyncError`](../errors/configuration-errors.mdx#index-sync-error). For a model with "only at creation" options and no collection, it throws the same [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error). A repeated call is safe, because the server doesn't recreate an index that already exists in exactly the same form.
+
+<Snippet id="reference/collections/model-indexes/model-create-indexes" twoslash />
+
+<Returns type="Promise<readonly string[]>">
+
+The names of **all** the schema's indexes that exist on the server after the call. Names come back even for indexes that were already exactly the same (the second call above returned the same list). So the list doesn't tell you what was created just now. For that, call [`diffIndexes`](#model.diff-indexes) before `createIndexes`, and its `toCreate` shows what will be created.
+
+</Returns>
+
+It takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/collections/model-indexes/model-create-indexes-2" />
+
+</FullType>
+
+### An index with the same name but different options [#index-options-conflict]
+
+`createIndexes` doesn't replace an existing index. Suppose the server has `title_1` without `unique`, and the schema requires a unique one. The server won't create a second index with the same name, and you get an `IndexSyncError`.
+
+<Snippet id="reference/collections/model-indexes/index-options-conflict" />
+
+In that case use [`syncIndexes`](#model.sync-indexes). It sees the difference, drops the old index, and creates the new one.
+
+---
+
+## Model.diffSearchIndexes <Badge variant="requires">Atlas Search</Badge> [#model.diff-search-indexes]
+
+`diffSearchIndexes` compares the schema's **search indexes** with the ones on the server. These are Atlas Search and Atlas Vector Search indexes, described by the [`@SearchIndex`](../schemas/index-decorators.mdx#search-index) decorator. The server builds them in a separate process and stores them apart from ordinary ones. They work only where Atlas Search exists, that is in Atlas or in a local Atlas CLI deployment. The comparison goes by name, and the type and definition of the index must match.
+
+A plain `mongod` without Atlas Search answers such a request with an error. Typemo doesn't turn it into "no indexes", and the error reaches you. That way you don't mistake a server with no search for "everything is synced".
+
+<Returns type="Promise<SearchIndexDiff>">
+
+A [`SearchIndexDiff`](#search-index-diff) object. `toCreate` holds the schema's indexes that are missing on the server. `toUpdate` holds the indexes that exist but whose type or definition differ. `toDrop` holds the server's indexes that aren't in the schema.
+
+</Returns>
+
+It takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/collections/model-indexes/model-diff-search-indexes" />
+
+</FullType>
+
+<Snippet id="collections/search-indexes/view-diff" twoslash />
+
+The result of this example **wasn't verified by running it**, because the test server doesn't support Atlas Search. What the method does on a server without search is verified, though. It throws a [`ServerError`](../errors/server-errors.mdx#server-error) with the code `31082` (`SearchNotEnabled`). The `message` holds the reason and the code, and the full server text with a hint about where to connect is in [`serverMessage`](../errors/server-errors.mdx#server-error).
+
+<Snippet id="collections/search-indexes/without-atlas-search-2" />
+
+---
+
+## Model.syncSearchIndexes <Badge variant="requires">Atlas Search</Badge> [#model.sync-search-indexes]
+
+`syncSearchIndexes` brings the server's search indexes in line with the schema. It creates the missing ones, updates the ones that differ, and drops the extra ones. It works like [`syncIndexes`](#model.sync-indexes) does for ordinary indexes. The method tries every step, collects the failures, and at the end throws an [`IndexSyncError`](../errors/configuration-errors.mdx#index-sync-error). The steps go in order: drop, update, create.
+
+<Returns type="Promise<SearchIndexSyncResult>">
+
+A [`SearchIndexSyncResult`](#search-index-sync-result) object: three lists, as in [`SearchIndexDiff`](#search-index-diff), and `dryRun`.
+
+</Returns>
+
+<Params>
+<Param name="options.dryRun" type="boolean" default="false">
+
+Only reports what would change. But to get the list of search indexes, the check still goes to the server, so on a server without search `dryRun` also throws a `ServerError` with the code `31082`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/model-indexes/model-sync-search-indexes" />
+
+</FullType>
+
+The behavior on a server with Atlas Search **wasn't verified by running it** (there's no environment), and it's described from the code. Something else is verified. On a plain `mongod`, the call, including with `dryRun: true`, throws a `ServerError` with the code `31082`.
+
+---
+
+## IndexDiff [#index-diff]
+
+The result of [`diffIndexes`](#model.diff-indexes) and the basis of [`IndexSyncResult`](#index-sync-result).
+
+<TypeTable
+  type={{
+    toCreate: { type: "readonly string[]", description: "Names of the schema's indexes that are missing on the server or differ there. An index being recreated is both here and in `toDrop`." },
+    toDrop: { type: "readonly string[]", description: "Names of the server's indexes that aren't in the schema or differ. `_id_` never lands here." },
+    toModify: { type: "readonly IndexModification[]", description: "In-place changes: visibility (`hidden`) and TTL lifetime." },
+  }}
+/>
+
+### IndexModification [#index-modification]
+
+One in-place change. The `name` field is always there, and the others are filled in only for what changed.
+
+<TypeTable
+  type={{
+    name: { type: "string", required: true, description: "The index name." },
+    hidden: { type: "boolean", description: "The new visibility value. `true` hides the index from the query planner, but the index keeps being updated." },
+    expireAfterSeconds: { type: "number", description: "The new lifetime of the TTL index, in seconds." },
+  }}
+/>
+
+---
+
+## IndexSyncResult [#index-sync-result]
+
+The result of [`syncIndexes`](#model.sync-indexes). It holds everything in [`IndexDiff`](#index-diff), and the `dryRun` field.
+
+<TypeTable
+  type={{
+    dryRun: { type: "boolean", required: true, description: "`true` if the server wasn't changed, that is `syncIndexes({ dryRun: true })` was called." },
+  }}
+/>
+
+---
+
+## SearchIndexDiff [#search-index-diff]
+
+The result of [`diffSearchIndexes`](#model.diff-search-indexes).
+
+<TypeTable
+  type={{
+    toCreate: { type: "readonly string[]", description: "Names of the schema's search indexes that are missing on the server." },
+    toUpdate: { type: "readonly string[]", description: "Names of indexes that exist on the server but whose type or definition differ. They're updated, not recreated." },
+    toDrop: { type: "readonly string[]", description: "Names of the server's search indexes that aren't in the schema." },
+  }}
+/>
+
+---
+
+## SearchIndexSyncResult [#search-index-sync-result]
+
+The result of [`syncSearchIndexes`](#model.sync-search-indexes). It holds everything in [`SearchIndexDiff`](#search-index-diff), and the `dryRun` field.
+
+<TypeTable
+  type={{
+    dryRun: { type: "boolean", required: true, description: "`true` if the server wasn't changed." },
+  }}
+/>
+
+---
+
+## When not to use these methods [#when-not-to-use]
+
+To bring the whole database in order in one call (collections, indexes, search indexes, and views together), use [`connection.syncAll`](../connection/connection.mdx#connection.sync-all). It goes through all the models, doesn't stop at the first failure, and at the end throws one [`SyncError`](../errors/configuration-errors.mdx#sync-error) with all the failures and the full report. If you only want to create what's missing, change nothing, and get an error on a mismatch, use [`connection.init`](../connection/connection.mdx#connection.init). The index methods don't fit a collection and its options (`capped`, a validator, time series). Those are described in [`CollectionManager`](./collection-manager.mdx) and in the model methods [`ensureCollection`](./collection-manager.mdx#model.ensure-collection) and [`createCollection`](./collection-manager.mdx#model.create-collection).
+
+The guides with real tasks are [Sync indexes](../../collections/index-sync.mdx) and [Define and sync search indexes](../../collections/search-indexes.mdx).

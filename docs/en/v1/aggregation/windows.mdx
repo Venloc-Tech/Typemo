@@ -1,0 +1,112 @@
+---
+title: Window functions
+description: "Compute a running total, a rank, and the previous value without losing rows, and fill gaps in a data series"
+icon: Rows3
+---
+
+`group` folds many rows into one, and the details are lost. But a running total per customer, an order's place in a list, or the difference from the previous order needs both the details and a value that depends on neighboring rows. That's what a **window** is for, a set of rows around the current one. The [`setWindowFields`](../reference/aggregation/stages.mdx#set-window-fields) stage computes a value over the window for each row and **adds** it to the row, removing nothing.
+
+Two more stages repair data series. [`densify`](../reference/aggregation/stages.mdx#densify) adds the missing points of a series, and [`fill`](../reference/aggregation/stages.mdx#fill) fills in empty values.
+
+The types enforce the server's rules. A function that needs an order, such as `fn.rank` or `fn.shift`, won't compile without `sortBy`. A window with bounds requires an order too. And ranks and `fn.linearFill` won't compile if the order is set by several fields.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and running an aggregation from [Your first aggregation](first-aggregation.mdx). The data looks like this.
+
+- `orders` holds five orders. `alice` has 120 (January 5), 80 (February 10), and 30 (March 1), and `bob` has 50 (February 11) and 200 (March 2).
+- `daily_sales` holds sales by day. Day 1 is 10, day 2 has no value, day 4 is 40, day 5 has no value, and day 3 doesn't exist at all.
+
+<Snippet id="aggregation/windows/prerequisites" title="shop/models.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Split the rows into groups (`partitionBy`), order them within the group (`sortBy`), and describe what to compute for each row. A running total is a sum wrapped in [`withWindow`](../reference/aggregation/window-operators.mdx#with-window), and the place in a list comes from [`fn.rank`](../reference/aggregation/window-operators.mdx#fn.rank).
+
+<Snippet id="aggregation/windows/quick-start" twoslash />
+
+Below we'll cover windows, neighboring values, and repairing series.
+
+## A running total [#running-total]
+
+`withWindow(fn.sum(f.total), { documents: ["unbounded", "current"] })` reads as "the sum over the rows from the start of the group to the current one". A window bound is a number, meaning an offset from the current row, `"current"` for the current row, or `"unbounded"` for the edge of the group. A window by the `sortBy` value rather than by position is written as `{ range: [-7, "current"], unit: "day" }`, which is, for example, the sum over the last seven days.
+
+The original rows are in place, with `running` and `rank` added to them. A window with a bound needs an order. Without `sortBy` a running total makes no sense, and the compiler won't let you write one.
+
+## A group total without losing rows [#group-total-per-row]
+
+If no window is given, it covers the whole group. Then each row gets the total of its group. With `group` you can't do that without losing the rows.
+
+<Snippet id="aggregation/windows/group-total-per-row" twoslash />
+
+You don't need `sortBy` here, since order doesn't affect a sum over the whole group.
+
+## Take the previous value [#previous-value]
+
+[`fn.shift`](../reference/aggregation/window-operators.mdx#fn.shift) takes a value at an offset in the order, and `by: -1` is the previous row. The first row has no previous one, so it gets `null`.
+
+<Snippet id="aggregation/windows/previous-value" twoslash />
+
+`fn.subtract(f.total, f.prev)` in the next stage computes the difference from the previous one. Every window operator (`rank`, `denseRank`, `documentNumber`, `derivative`, `integral`, `expMovingAvg`, and others) is listed in the [Window operators](../reference/aggregation/window-operators.mdx) reference.
+
+## Add missing points to a series [#fill-gaps]
+
+`daily_sales` has no day 3, and a sales chart would show a dip. [`densify`](../reference/aggregation/stages.mdx#densify) creates the missing rows with a given step. New rows have only the series field and the grouping fields, so the other fields become optional in the type.
+
+<Snippet id="aggregation/windows/fill-gaps" twoslash />
+
+For dates, add a `unit`, such as `"day"` or `"month"`. `bounds` can be `"full"` (from the minimum to the maximum), `"partition"` (within the group), or an explicit pair of values.
+
+## Fill in empty values [#fill-empty]
+
+Day 2 and day 5 have no amount. [`fill`](../reference/aggregation/stages.mdx#fill) fills them in with a `method` or a value from an expression. The `"locf"` method takes the last known value, `"linear"` interpolates linearly, and both need a `sortBy` order.
+
+<Snippet id="aggregation/windows/fill-empty" twoslash />
+
+To get a continuous series without gaps, put `densify` first and `fill` after it.
+
+## How to choose [#how-to-choose]
+
+Ask yourself whether you need the original rows after the computation.
+
+- **You do, and the value depends on other rows** (the sum up to the current one, a place, the previous value): use a window.
+- **The rows can be folded**: use [`group`](grouping.mdx), which is simpler and faster.
+- **The series has holes**: `densify` if the rows themselves are missing, and `fill` if the row exists but the value doesn't.
+
+## When not to use it [#when-not-to-use]
+
+If you need one total per group rather than per row, use [`group`](grouping.mdx). If you need page numbering rather than a computation over neighbors, see [`sort`, `skip`, and `limit`](../reference/aggregation/stages.mdx#skip) or [keyset pagination](../queries/keyset-pagination.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**Order functions without `sortBy`.** A rank is computed by order, and `fn.rank()` without `sortBy` makes no sense. The compiler rejects it.
+
+<Snippet id="aggregation/windows/troubleshooting" twoslash />
+
+Add `sortBy: { placedAt: 1 }`.
+
+**A rank by several fields.** The server computes `rank`, `denseRank`, `documentNumber`, and `linearFill` only by an order on one field. You can't explain "place by customer and amount together" to it, and Typemo stops such a call at compile time.
+
+<Snippet id="aggregation/windows/troubleshooting-2" twoslash />
+
+The error names the result field and the rule: `$setWindowFields output "place" needs a sortBy with exactly one field (rank, denseRank, documentNumber and linearFill: a server rule)`. Keep one order key, for example `sortBy: { total: -1 }`. If the types were bypassed with a cast, the stage builder names the same reason: `ConfigurationError: $setWindowFields: $rank needs a sortBy with exactly one field (server rule)`.
+
+**An accumulator without a window where a running total is needed.** `fn.sum(f.total)` without `withWindow` computes the sum over the whole group, not a running one. Wrap it in `withWindow` with bounds.
+
+## Full example [#full-example]
+
+<Snippet id="aggregation/windows/full-example" title="reports/customers.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Window operators" href="../reference/aggregation/window-operators.mdx">
+  Every window function, `withWindow`, and `WindowSpec`.
+</Card>
+<Card title="Grouping and reports" href="./grouping.mdx">
+  When rows can be folded instead of computed over a window.
+</Card>
+<Card title="Save the result" href="./output.mdx">
+  Write a computed series to a collection.
+</Card>
+</Cards>

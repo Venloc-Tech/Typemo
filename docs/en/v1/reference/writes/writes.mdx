@@ -1,0 +1,1031 @@
+---
+title: Writing
+description: "Every model write method: create, update, replace, delete, and bulk write, with their options, results, and errors"
+icon: Pencil
+---
+
+This page collects every model method that creates, changes, replaces, and deletes documents, plus the write options and the kinds of results. For each method it says what it accepts, what it returns, and when it throws an error.
+
+If you're just starting out, read the [Create documents](../../writes/create.mdx) or [Update documents](../../writes/update.mdx) guide first. This page is a reference, and you come back to it for details.
+
+Before anything goes to the database, every write passes the same checks. Values are cast to the schema types, unknown fields are rejected, field validators run, and the model's policies (tenant, soft delete, required filter) apply. Unlike the MongoDB driver, Typemo doesn't trust its input. A wrong value stops before the network.
+
+All examples use the same account model. It has required fields, a unique field, a field with a constraint and a default, an array, and an optional field. That way you can see how each method treats them.
+
+<Snippet id="reference/writes/writes/intro" title="accounts/account.ts" twoslash />
+
+The `unique` index on `title` has to be created in the database beforehand (`connection.init()`), or a repeated value won't be an error. You can leave out the `balance` field (`Defaulted`) on create. The `tags` array without `required` and without `default` can be left out too, and the new document gets an empty array `[]`. Identifiers in results are shortened to `"…"`, because the database issues them anew on every run. The examples on this page go in order on one empty collection. The accounts created by the early examples (`Main`, `Salary`, `Savings`, `Second`, `Cash`, `Card`, and others) are needed by the later ones.
+
+There are two kinds of write methods. Some return a **write builder**, an object you chain `.orFail()`, `.session()`, and other options onto. It goes to the database only on `await`. That's how `updateOne`, `updateMany`, `replaceOne`, `deleteOne`, and `deleteMany` work. The `findOneAnd*` and `findByIdAnd*` methods return a query builder, as in [reading](../query/reading.mdx). The rest (`create`, `insertOne`, `insertMany`, `bulkWrite`, `bulkSave`) are ordinary async methods, and you pass them options as the second argument.
+
+Any write error names the method you called. You'll see `Account.create`, not the `insertOne` or `bulkWrite` it turns into inside. The error of `$save` on a deleted document names `Account.save`. The text tells you right away which line of your code caused it.
+
+---
+
+## create [#create]
+
+`create` creates one document or a list of documents and returns them: objects of the model class with defaults and `_id` filled in. It's the main way to create a record. It takes the same path as [`$save`](../documents/document-api.mdx#save), with value checks, validators, save hooks, and service fields.
+
+The input comes in two kinds. One object gives one document. A list gives several documents as **one ordered write**, and they go to the database in one request in the order you passed them. Documents aren't created in parallel. Otherwise, after an error you couldn't say which ones were already written.
+
+<Snippet id="reference/writes/writes/create" twoslash />
+
+<Returns type="Promise<HydratedDoc<Account>> | Promise<HydratedDoc<Account>[]>">
+
+For one object, a document. For a list, an array of documents in input order. Defaults (`balance: 0`) and `_id` are already filled in. The document is marked as saved, and [`$isNew()`](../documents/document-api.mdx#is-new) returns `false`. For a model with `Hidden` fields, the passed values are in the document and the type shows them. That's [`NewDocument<T>`](../values/form-types.mdx#new-document), and the hint reads `HydratedDocWith<User, { passwordHash?: string }>`. The document is built from your data, not read from the database, so nothing is left out. `$toPlain()` and `$toJSON()` still don't include these fields. For a model without `Hidden`, the type is just `HydratedDoc<T>`.
+
+</Returns>
+
+<Params>
+<Param name="doc" type="CreateInput<T> | readonly CreateInput<T>[]" required>
+
+The document data or a list of such data. Fields with `Defaulted`, optional fields, arrays without `required`, and `TenantField` can be left out, and the rest are required. `undefined` can't be a value: a field is either present or absent. Values are cast to the schema types right away, when the document is created. An `ObjectId` can be passed as a string and a `bigint` as a decimal string. A value that can't be cast gives a `CastError`. Field constraints (`min`, `required`) are checked next, with one `ValidationError` for all fields.
+
+</Param>
+<Param name="options" type="WriteOptions">
+
+Session, timeout, comment, write concern, and policy context. The full list is in the [WriteOptions](#write-options) section.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/create-2" />
+
+</FullType>
+
+### Document list [#document-list]
+
+A list is written as one ordered request. If one document in it has a validation error, **nothing** is written, because validation runs before sending.
+
+<Snippet id="reference/writes/writes/document-list" twoslash />
+
+Sometimes a document passes validation but the database rejects it, for example because of a duplicate unique key. Then the documents before it are already written, and the following ones aren't. That's a `BulkWriteError`, covered below.
+
+### Errors [#create.errors]
+
+A document with a wrong value is stopped by a [`ValidationError`](../errors/data-errors.mdx#validation-error) before the database is touched.
+
+<Snippet id="reference/writes/writes/create-errors" />
+
+An unknown field or a value of the wrong type gives a [`CastError`](../errors/data-errors.mdx#cast-error).
+
+<Snippet id="reference/writes/writes/create-errors-2" />
+
+A duplicate of a unique value in one document gives a [`DuplicateKeyError`](../errors/server-errors.mdx#duplicate-key-error). In a list it's a [`BulkWriteError`](../errors/server-errors.mdx#bulk-write-error), where `writeErrors[0].error` is the same `DuplicateKeyError`.
+
+<Snippet id="reference/writes/writes/create-errors-3" />
+
+The text of the `BulkWriteError` says `Account.create`, the method you called. Inside, a list is written by the same mechanism as [`bulkSave`](#bulk-save), but the error doesn't reveal that. An empty list is allowed. It writes nothing and returns an empty array.
+
+### When not to use it [#create.when-not-to-use]
+
+If you don't need save hooks and a document object, and you want a fast insert of data, use [`insertOne`](#insert-one) or [`insertMany`](#insert-many). If documents are already created with [`Model.new`](../documents/model-document-methods.mdx#model.new) and modified, save them with [`bulkSave`](#bulk-save). The guide is [Create documents](../../writes/create.mdx).
+
+---
+
+## insertOne [#insert-one]
+
+`insertOne` inserts one document and returns it. The write is the same as [`create`](#create) with one document. Values are cast and checked, the `document.validate` and `document.save` document hooks run, and a change made in `@Pre` reaches the database. The only difference is the input. `create` also accepts a list, while `insertOne` takes exactly one object and rejects a list or a non-object.
+
+<Snippet id="reference/writes/writes/insert-one" twoslash />
+
+<Returns type="Promise<HydratedDoc<Account>>">
+
+The inserted document with defaults and `_id`. `Hidden` fields are in it, as in [`create`](#create). If you passed `_id` as a string, it's cast to the field type. For an `ObjectId`, a string of 24 hexadecimal characters becomes an `ObjectId`.
+
+</Returns>
+
+<Params>
+<Param name="doc" type="CreateInput<T>" required>
+
+The document data. The rules are the same as in [`create`](#create).
+
+</Param>
+<Param name="options" type="WriteOptions">
+
+Session, timeout, comment, write concern, and policy context. See [WriteOptions](#write-options).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/insert-one-2" />
+
+</FullType>
+
+### Errors [#insert-one.errors]
+
+A duplicate of a unique value gives a [`DuplicateKeyError`](../errors/server-errors.mdx#duplicate-key-error), and a wrong value gives a [`ValidationError`](../errors/data-errors.mdx#validation-error) or a [`CastError`](../errors/data-errors.mdx#cast-error), with the same texts as in [`create`](#create). If `doc` isn't an object, the method throws a [`QueryError`](../errors/query-errors.mdx#query-error).
+
+### When not to use it [#insert-one.when-not-to-use]
+
+If you need a list of documents, use [`create`](#create) with a list or [`insertMany`](#insert-many). The second sends one request and has an unordered mode. The document hooks of `insertOne` are the same as those of `create`, so you don't need to avoid it for the hooks.
+
+---
+
+## insertMany [#insert-many]
+
+`insertMany` inserts a list of documents in one request and returns them. Use it when you need to load a lot of data: an import, initial seeding, a batch of events.
+
+The main choice here is ordering. By default the insert is **ordered**. On the first error the method stops, and the documents after it aren't inserted. With `ordered: false`, every document that passes the checks is inserted, and the errors are collected and arrive at the end.
+
+Each document goes through the same path as in [`create`](#create) before sending. Values are cast and checked, and the `document.validate` and `document.save` hooks run one document after another. The `model.insertMany` event wraps the whole request, and its hooks fire even for an empty list.
+
+<Snippet id="reference/writes/writes/insert-many" twoslash />
+
+<Returns type="Promise<HydratedDoc<Account>[]>">
+
+An array of inserted documents in input order. `Hidden` fields are in them, as in [`create`](#create). An empty list is allowed, no request goes to the database, and the result is an empty array.
+
+</Returns>
+
+<Params>
+<Param name="docs" type="readonly CreateInput<T>[]" required>
+
+A list of documents. If it isn't a list or an element isn't an object, you get a [`QueryError`](../errors/query-errors.mdx#query-error) with the message `insertMany: a list of documents`.
+
+</Param>
+<Param name="options.ordered" type="boolean" default="true">
+
+`true` stops the insert at the first error, and `false` inserts everything it can. The other fields are [WriteOptions](#write-options).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/insert-many-2" />
+
+</FullType>
+
+### Ordered and unordered insert [#ordered-and-unordered]
+
+Say the second document of the list breaks uniqueness. In an ordered insert the first document is written and the third isn't.
+
+<Snippet id="reference/writes/writes/ordered-and-unordered" twoslash />
+
+In an unordered insert all the errors are collected and the other documents are written. A document that fails the Typemo check (`balance: -5`) and a document the server rejects (a duplicate) land in the same `writeErrors` list.
+
+<Snippet id="reference/writes/writes/ordered-and-unordered-2" twoslash />
+
+### Errors [#insert-many.errors]
+
+What you get depends on the mode. In **ordered** mode, a document that fails the Typemo check stops the whole insert before sending. You get a [`ValidationError`](../errors/data-errors.mdx#validation-error) (or a [`CastError`](../errors/data-errors.mdx#cast-error)), and no document of the list appears in the collection. A server rejection, such as a duplicate, arrives as a [`BulkWriteError`](../errors/server-errors.mdx#bulk-write-error), and the documents before it are written.
+
+In **unordered** mode, any failure of the list is a `BulkWriteError`. It gathers both the Typemo check and the server rejection into one list. It has `writeErrors` (the index in the input list, the server code, the classified error), `result` (how many were written and which `_id` values, with failed inserts not included in `insertedIds`), and `ordered`.
+
+<Snippet id="reference/writes/writes/insert-many-errors" />
+
+The first line is an ordered insert with a wrong document, the second is an ordered insert with a duplicate, and the third is an unordered insert with a wrong document. If one unordered list has both a wrong document and a duplicate, the Typemo check passes or fails the document before sending, and the server rejection arrives after. The text still names the failure with the lowest index in the input. "first at index" matches the first element of `writeErrors`, which is sorted by index.
+
+### When not to use it [#insert-many.when-not-to-use]
+
+If the list must be written strictly in order and you don't need the unordered mode, [`create`](#create) with a list is enough. It also runs the document hooks and writes in order. If you need to mix inserts, changes, and deletes in one write, use [`bulkWrite`](#bulk-write).
+
+---
+
+## updateOne [#update-one]
+
+`updateOne` applies an update to the **first** document that matches the filter. Use it when you change exactly one record: top up an account, change a note, add a tag.
+
+An update is an object of MongoDB operators (`$set`, `$inc`, `$push`, and others), not a new document. An operator tells the database **what to do** with a field. `$inc` adds a number rather than writing it, so parallel top-ups don't overwrite each other. There's a second kind of update too, the pipeline `(p) => p.set(…)`. It's described on the [Pipeline updates](./pipeline-updates.mdx) page.
+
+The method returns a **write builder**. Until you write `await`, it sends nothing.
+
+<Snippet id="reference/writes/writes/update-one" twoslash />
+
+<Returns type="WriteBuilder<UpdateResult<ObjectId>>">
+
+A write builder. After `await` you get an [`UpdateResult`](#update-result): how many documents matched and how many changed. If nothing matched, the method **doesn't throw**, and `matchedCount` is `0`. If an empty match is an error for you, add [`.orFail()`](#or-fail). The builder class, [`WriteBuilder`](#write-builder), is exported from the package. You'll need it if you write a function that accepts or returns such a write.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+Search conditions, as in [`find`](../query/reading.mdx#model.find). The filter must be non-empty. With an empty filter, "the first matching document" is an arbitrary document of the collection. The compiler doesn't accept an empty `{}` literal, and an empty object built at runtime is rejected with a `StrictModeError` with the reason `empty-filter`. To change an arbitrary document on purpose, pass `Filters.all()`. `_id` can be passed as a string.
+
+</Param>
+<Param name="update" type="Update<T> | UpdatePipelineFor<T>" required>
+
+An operator object or a pipeline function. An empty update (`{}`, an operator without fields) counts as an error, because "change nothing" is too easy to get from an empty object. All the operators and their operands are described on the [Update operators](./update-operators.mdx) page.
+
+</Param>
+<Param name="options.upsert" type="boolean" default="false">
+
+Inserts a new document if nothing matched. See [upsert](#upsert).
+
+</Param>
+<Param name="options.arrayFilters" type="ArrayFilters<T, U>">
+
+Conditions for array elements in `$[id]` paths. See [arrayFilters](#array-filters). Not allowed with a pipeline.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/update-one-2" />
+
+</FullType>
+
+### Nothing matched [#no-match]
+
+If no document matched the filter, the result holds zeros and there's no error. With `.orFail()` the same case becomes an error.
+
+<Snippet id="reference/writes/writes/no-match" twoslash />
+
+<Snippet id="reference/writes/writes/no-match-2" />
+
+### The update is checked before sending [#update-checked-before-send]
+
+Typemo checks an update twice. The compiler knows the model's fields and which fields an operator applies to, so `$inc` on a string doesn't compile. At runtime, Typemo casts values to the schema types and runs the validators of the fields the update writes. A value that breaks `min` stops before the database.
+
+<Snippet id="reference/writes/writes/update-checked-before-send" />
+
+`$inc` and `$mul` on a field with `min` or `max` are a special case. The result depends on the value in the database, and you can't check it in advance. So Typemo adds a server-side condition to the filter. A result outside the range isn't written, and you get a `ValidationError`.
+
+<Snippet id="reference/writes/update-operators/min-max-bounds" />
+
+For details and exceptions, see the [Update operators](../../writes/update-operators.mdx#min-max-bounds) guide.
+
+### One run per builder [#one-run-per-builder]
+
+A write runs **once** for each builder object. A second `await` of the same object gives an error. It would repeat the write, and that's almost always an accident.
+
+<Snippet id="reference/writes/writes/one-run-per-builder" />
+
+If you need to repeat it on purpose, call [`.exec({ force: true })`](#exec).
+
+### When not to use it [#update-one.when-not-to-use]
+
+To change many documents, use [`updateMany`](#update-many). To get the document back, use [`findOneAndUpdate`](#find-one-and-update). To replace a whole document, use [`replaceOne`](#replace-one). The guide is [Update documents](../../writes/update.mdx).
+
+---
+
+## updateMany [#update-many]
+
+`updateMany` applies an update to **all** documents that match the filter. Use it for mass changes: close all of a client's accounts, set a flag on every record older than a date.
+
+Like [`updateOne`](#update-one), it **requires a non-empty filter**. A filter is often built from data, and one typo would turn an empty object into a change of the whole collection. If you really do need to change everything, say so explicitly with `Filters.all()`.
+
+<Snippet id="reference/writes/writes/update-many" twoslash />
+
+<Returns type="WriteBuilder<UpdateResult<ObjectId>>">
+
+A write builder, as in [`updateOne`](#update-one). After `await` you get an [`UpdateResult`](#update-result) for all the documents together.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+A non-empty filter. `{}` gives an `empty-filter` error.
+
+</Param>
+<Param name="update" type="Update<T> | UpdatePipelineFor<T>" required>
+
+An operator object or a pipeline, as in [`updateOne`](#update-one).
+
+</Param>
+<Param name="options.upsert" type="boolean" default="false">
+
+Inserts one document if nothing matched. See [upsert](#upsert).
+
+</Param>
+<Param name="options.arrayFilters" type="ArrayFilters<T, U>">
+
+Conditions for `$[id]`. See [arrayFilters](#array-filters).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/update-many-2" />
+
+</FullType>
+
+### Empty filter [#update-many.empty-filter]
+
+MongoDB would accept `{}` and change all the documents. Typemo refuses twice. An empty `{}` literal doesn't compile, because [`WriteFilterCheck`](#write-filter-check) turns it into a type error with a hint about `Filters.all()`. And an empty object that appears at runtime (say, the conditions never arrived) is rejected before sending.
+
+<Snippet id="reference/writes/writes/update-many-empty-filter" />
+
+To change everything on purpose, pass `Filters.all()`. It's a real filter, `{ _id: { $exists: true } }`, that matches any document, and the command log shows you meant it. You don't need to give the model type, and the call compiles without it. `Filters.all<Account>()` gives the filter declared for the model.
+
+<Snippet id="reference/writes/writes/update-many-empty-filter-2" twoslash />
+
+The reasons are covered in detail in the [Empty filters in writes](../../writes/empty-filters.mdx) guide.
+
+### The `$inc` bound across several documents [#inc-bounds-many]
+
+If `$inc` breaks `min` for even one document, **nothing** is written. Typemo finds such documents before the write and throws a `ValidationError`. A partial change nobody asked for is worse than an error.
+
+<Snippet id="reference/writes/writes/inc-bounds-many" />
+
+### When not to use it [#update-many.when-not-to-use]
+
+To change one document, use [`updateOne`](#update-one). If the operations differ (inserts, changes, deletes), combine them in [`bulkWrite`](#bulk-write). The guide is [Update documents](../../writes/update.mdx).
+
+---
+
+## replaceOne [#replace-one]
+
+`replaceOne` replaces the **first** matching document as a whole. Everything in the document except `_id` and the service fields disappears, and the new content is written in its place. Use it when the new state of the document is fully known and listing the changes operator by operator isn't needed, for example in an import from an external system or a "save everything" from a form.
+
+A replacement has no operators, and you write ordinary document fields. The replacement has no `_id` and no service fields `createdAt`, `updatedAt`, `__v`. The core keeps `createdAt` and `__v` and updates `updatedAt` itself.
+
+<Snippet id="reference/writes/writes/replace-one" twoslash />
+
+<Returns type="WriteBuilder<UpdateResult<ObjectId>>">
+
+A write builder, and after `await` you get an [`UpdateResult`](#update-result). Without `upsert` and without a match the method doesn't throw, and `matchedCount` is `0`.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+A non-empty filter, as in [`updateOne`](#update-one), because an empty one would pick an arbitrary document. `{}` doesn't compile, and at runtime it gives a `StrictModeError` with the reason `empty-filter`.
+
+</Param>
+<Param name="replacement" type="Replacement<T>" required>
+
+The new document with all the required fields of the model. Fields with `immutable` carry the stored values, and an optional `immutable` field that's missing from the document isn't passed. No `_id` and no service fields. A key that starts with `$` is an error.
+
+</Param>
+<Param name="options.upsert" type="boolean" default="false">
+
+Inserts the replacement if nothing matched. The `_id` of the new document comes from the filter if it's there, and is created otherwise.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/replace-one-2" />
+
+</FullType>
+
+### What is replaced and what stays [#replaced-and-kept]
+
+Fields missing from the replacement are **removed** from the document. That's how a replacement differs from an update. If you forget an optional field, it disappears, and neither the compiler nor the database notices.
+
+The core keeps the service fields of a model with [`Timestamped`](../schemas/base-classes.mdx). `createdAt` and `__v` stay, and `updatedAt` gets the current time. If you do pass a service field, the replacement refuses.
+
+<Snippet id="reference/writes/writes/replaced-and-kept" />
+
+A replacement can't change, lose, or add a field with `immutable`. Only the server knows the stored document, so Typemo adds a condition to the filter. Each such field in the replacement must equal the stored one, and a field missing from the replacement must be missing from the document too. The server checks the condition in the same operation, and a replacement with a mismatch isn't written. If the replacement found nothing, Typemo reads the document once by your filter to tell a missing document from a mismatch, and names the field.
+
+<Snippet id="reference/writes/writes/replaced-and-kept-2" />
+
+If the field is in the document but wasn't passed, the text says `without the immutable field "region" would drop it from the stored document`. If the field was passed but the document doesn't have it, the text says `sets the immutable field "region", which the stored document does not have`. An optional field that's in neither the replacement nor the document doesn't get in the way. With `upsert: true` the server doesn't accept such a condition in the filter, so Typemo checks the document with a read before the write. Outside a transaction, a document written between the read and the replacement is no longer compared. Inside a transaction the read goes in the same session. For details and examples, see the [Replace a document](../../writes/replace.mdx#replace-immutable) guide.
+
+### Errors [#replace-one.errors]
+
+An operator in a replacement is rejected before sending, and so is a non-object.
+
+<Snippet id="reference/writes/writes/replace-one-errors" />
+
+**Any** `_id` in a replacement is forbidden, even one equal to the `_id` of the found document. A replacement keeps the stored `_id`, and you pick the document by `_id` in the filter. The compiler doesn't accept such a field, and if the types are bypassed, the replacement is rejected before sending.
+
+<Snippet id="reference/writes/writes/replace-one-errors-2" />
+
+[`findOneAndReplace`](#find-one-and-replace) and the `replaceOne` operation inside [`bulkWrite`](#bulk-write) throw the same errors.
+
+### When not to use it [#replace-one.when-not-to-use]
+
+If individual fields change, use [`updateOne`](#update-one). It doesn't wipe the rest and is safe under parallel changes. To get the document back, use [`findOneAndReplace`](#find-one-and-replace). The guide is [Replace a document](../../writes/replace.mdx).
+
+---
+
+## findOneAndUpdate [#find-one-and-update]
+
+`findOneAndUpdate` changes one document and **returns it**. Use it when you work with the document after the change: top up an account and show the new balance, take a task from a queue and start processing it right away. The change and the read run as one atomic command, and nobody can get in between them.
+
+By default the document **after** the change is returned. The MongoDB driver and Mongoose return the document before the change by default, and here it's the other way around, because you almost always want the result. To get the state before, pass `returnDocument: "before"`.
+
+The method returns a query builder, like [`find`](../query/reading.mdx#model.find). You chain [`.select`](../query/reading.mdx#select), [`.lean`](../query/reading.mdx#lean), [`.plain`](../query/reading.mdx#plain), [`.orFail`](../query/reading.mdx#or-fail), and the other methods onto it.
+
+<Snippet id="reference/writes/writes/find-one-and-update" twoslash />
+
+<Returns type="QueryBuilder">
+
+A query builder. After `await` you get a document, or `null` if nothing matched. With [`.orFail()`](../query/reading.mdx#or-fail), `null` is replaced by a `DocumentNotFoundError`, and `null` drops out of the type. With `upsert: true` and `returnDocument: "after"` (the default) there's always a document, so `null` is removed from the type right away.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+A non-empty filter. The method picks the document to change, and an empty filter would pick an arbitrary one. `{}` gives a `StrictModeError` with the reason `empty-filter`, but only at runtime, and the compiler lets an empty literal through here. "Any document" is written `Filters.all()`.
+
+</Param>
+<Param name="update" type="Update<T> | UpdatePipelineFor<T>" required>
+
+An operator object or a pipeline.
+
+</Param>
+<Param name="options.returnDocument" type={'"before" | "after"'} default={'"after"'}>
+
+Which version of the document to return. See [returnDocument](#return-document).
+
+</Param>
+<Param name="options.upsert" type="boolean" default="false">
+
+Inserts a document if nothing matched. See [upsert](#upsert).
+
+</Param>
+<Param name="options.arrayFilters" type="ArrayFilters<T, U>">
+
+Conditions for `$[id]`. Not allowed with a pipeline.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/find-one-and-update-2" />
+
+</FullType>
+
+### The document before the change [#document-before-change]
+
+<Snippet id="reference/writes/writes/document-before-change" twoslash />
+
+### Only the fields you need [#needed-fields]
+
+A projection applies to the returned document, not to the update.
+
+<Snippet id="reference/writes/writes/needed-fields" twoslash />
+
+### Raw result [#raw-result]
+
+To find out whether an existing document was updated or a new one was inserted, add `.includeResultMetadata()`. You get a [`ModifyResult`](#modify-result). The document itself is in `value`, and the details are in `lastErrorObject`.
+
+<Snippet id="reference/writes/writes/raw-result" twoslash />
+
+### Errors [#find-one-and-update.errors]
+
+An empty filter.
+
+<Snippet id="reference/writes/writes/find-one-and-update-errors" />
+
+`.orFail()` without a match.
+
+<Snippet id="reference/writes/writes/find-one-and-update-errors-2" />
+
+The other update errors are the same as in [`updateOne`](#update-one).
+
+### When not to use it [#find-one-and-update.when-not-to-use]
+
+If you don't need the document back, [`updateOne`](#update-one) is cheaper. If you know the document by `_id`, there's [`findByIdAndUpdate`](#find-by-id-and-update). The guide is [Update documents](../../writes/update.mdx).
+
+---
+
+## findByIdAndUpdate [#find-by-id-and-update]
+
+`findByIdAndUpdate(id, update, options)` is the same as `findOneAndUpdate({ _id: id }, update, options)`. It saves you building a filter when the `_id` comes from outside, for example from a request URL.
+
+You can pass `id` in its natural form (`ObjectId`) or as a string: 24 hexadecimal characters for an `ObjectId`, the canonical string for a `UUID`. You can't pass `null` or `undefined`.
+
+<Snippet id="reference/writes/writes/find-by-id-and-update" twoslash />
+
+<Returns type="QueryBuilder">
+
+A query builder, as in [`findOneAndUpdate`](#find-one-and-update). You get the document after the change (the default) or `null`.
+
+</Returns>
+
+<Params>
+<Param name="id" type="IdInputOf<T>" required>
+
+The document's `_id` or its string form. A string in the wrong format gives a `CastError`.
+
+</Param>
+<Param name="update" type="Update<T>" required>
+
+An operator object. A pipeline isn't accepted here, so for one use [`findOneAndUpdate`](#find-one-and-update) with the filter `{ _id }`.
+
+</Param>
+<Param name="options" type="FindOneAndUpdateOptions<T, U>">
+
+`upsert`, `returnDocument`, `arrayFilters`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/find-by-id-and-update-2" />
+
+</FullType>
+
+### Errors [#find-by-id-and-update.errors]
+
+<Snippet id="reference/writes/writes/find-by-id-and-update-errors" />
+
+### When not to use it [#find-by-id-and-update.when-not-to-use]
+
+If you look the document up by another field, use [`findOneAndUpdate`](#find-one-and-update). To skip getting the document back, use [`updateOne`](#update-one) with `{ _id: id }`. The guide is [Update documents](../../writes/update.mdx).
+
+---
+
+## findOneAndReplace [#find-one-and-replace]
+
+`findOneAndReplace` replaces one document as a whole and returns it. It relates to [`replaceOne`](#replace-one) the way [`findOneAndUpdate`](#find-one-and-update) relates to [`updateOne`](#update-one). The replacement is the same, but the document comes back. By default the document **after** the replacement is returned.
+
+<Snippet id="reference/writes/writes/find-one-and-replace" twoslash />
+
+<Returns type="QueryBuilder">
+
+A query builder. You get a document (by default after the replacement) or `null`. With `upsert: true` and `"after"` there's always a document.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+A non-empty filter, as in [`findOneAndUpdate`](#find-one-and-update).
+
+</Param>
+<Param name="replacement" type="Replacement<T>" required>
+
+The new document, with the same rules as in [`replaceOne`](#replace-one).
+
+</Param>
+<Param name="options.upsert" type="boolean" default="false">
+
+Inserts the replacement if nothing matched.
+
+</Param>
+<Param name="options.returnDocument" type={'"before" | "after"'} default={'"after"'}>
+
+Which version to return.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/find-one-and-replace-2" />
+
+</FullType>
+
+### Errors [#find-one-and-replace.errors]
+
+An empty filter gives a `StrictModeError` with the reason `empty-filter`. An operator or a service field in the replacement gives the same errors as in [`replaceOne`](#replace-one).
+
+### When not to use it [#find-one-and-replace.when-not-to-use]
+
+If individual fields change, use [`findOneAndUpdate`](#find-one-and-update). If you don't need the document back, use [`replaceOne`](#replace-one). The guide is [Replace a document](../../writes/replace.mdx).
+
+---
+
+## deleteOne [#delete-one]
+
+`deleteOne` deletes the **first** document that matches the filter. Use it when you know the record and need to remove it: close an account, revoke a token.
+
+If the model has soft delete turned on (`softDelete`), the document isn't erased. It gets a mark and drops out of selections. To delete physically, pass `.policy({ hardDelete: true })`.
+
+<Snippet id="reference/writes/writes/delete-one" twoslash />
+
+<Returns type="WriteBuilder<DeleteResult>">
+
+A write builder. After `await` you get a [`DeleteResult`](#delete-result). If nothing matched, `deletedCount` is `0` and there's no error. With [`.orFail()`](#or-fail), an empty match gives a `DocumentNotFoundError`.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+A non-empty filter, because an empty one would pick an arbitrary document. An empty `{}` literal doesn't compile, and an empty object at runtime gives a `StrictModeError` with the reason `empty-filter`. To delete an arbitrary document on purpose, pass `Filters.all()`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/delete-one-2" />
+
+</FullType>
+
+### Empty filter [#delete-one.empty-filter]
+
+<Snippet id="reference/policies/violations/empty-filter-2" />
+
+The text depends on the form of the method. For the `One` forms it names "an arbitrary document", because one document is deleted and the database doesn't promise which one. For `deleteMany` it names "every document". The rule is the same: the filter has to say what you mean.
+
+### Nothing deleted [#nothing-deleted]
+
+<Snippet id="reference/writes/writes/nothing-deleted" />
+
+### When not to use it [#delete-one.when-not-to-use]
+
+To delete many documents, use [`deleteMany`](#delete-many), and to delete a document and get it back, use [`findOneAndDelete`](#find-one-and-delete). For soft delete, see [Delete with a way to restore](../../policies/soft-delete.mdx). The guide is [Delete documents](../../writes/delete.mdx).
+
+---
+
+## deleteMany [#delete-many]
+
+`deleteMany` deletes **all** documents that match the filter. Like [`updateMany`](#update-many), it requires a non-empty filter. An empty object from a typo would wipe the collection.
+
+<Snippet id="reference/writes/writes/delete-many" twoslash />
+
+<Returns type="WriteBuilder<DeleteResult>">
+
+A write builder. After `await` you get a [`DeleteResult`](#delete-result) with the number of deleted documents.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+A non-empty filter. The compiler doesn't accept an empty `{}` literal. To delete everything on purpose, pass `Filters.all()`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/delete-many-2" />
+
+</FullType>
+
+### Empty filter [#delete-many.empty-filter]
+
+<Snippet id="reference/policies/violations/empty-filter" />
+
+To delete everything on purpose, write it like this.
+
+<Snippet id="reference/writes/writes/delete-many-empty-filter" twoslash />
+
+### When not to use it [#delete-many.when-not-to-use]
+
+To delete one document, use [`deleteOne`](#delete-one). The guides are [Delete documents](../../writes/delete.mdx) and [Empty filters in writes](../../writes/empty-filters.mdx).
+
+---
+
+## findOneAndDelete [#find-one-and-delete]
+
+`findOneAndDelete` deletes one document and **returns it** as it was before the deletion. Use it when you still need the deleted data: show "record deleted", put a copy in an archive, take a task from a queue and delete it right away.
+
+A filter is required and must be non-empty, because the method picks the document to delete.
+
+<Snippet id="reference/writes/writes/find-one-and-delete" twoslash />
+
+<Returns type="QueryBuilder">
+
+A query builder. After `await` you get the deleted document, or `null` if nothing matched. With [`.orFail()`](../query/reading.mdx#or-fail), `null` is replaced by a `DocumentNotFoundError`.
+
+</Returns>
+
+<Params>
+<Param name="filter" type="Filter<T>" required>
+
+A non-empty filter. An empty one gives a `StrictModeError` with the reason `empty-filter`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/find-one-and-delete-2" />
+
+</FullType>
+
+### When not to use it [#find-one-and-delete.when-not-to-use]
+
+If you don't need the document back, use [`deleteOne`](#delete-one). If you know the `_id`, use [`findByIdAndDelete`](#find-by-id-and-delete). The guide is [Delete documents](../../writes/delete.mdx).
+
+---
+
+## findByIdAndDelete [#find-by-id-and-delete]
+
+`findByIdAndDelete(id)` is the same as `findOneAndDelete({ _id: id })`. `id` accepts the same forms as in [`findByIdAndUpdate`](#find-by-id-and-update): the natural type of `_id` or its string form.
+
+<Snippet id="reference/writes/writes/find-by-id-and-delete" twoslash />
+
+<Returns type="QueryBuilder">
+
+A query builder. You get the deleted document, or `null` if there's no document with that `_id`.
+
+</Returns>
+
+<Params>
+<Param name="id" type="IdInputOf<T>" required>
+
+The `_id` or its string. `null` and `undefined` give `QueryError: findByIdAndDelete: an id is required`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/find-by-id-and-delete-2" />
+
+</FullType>
+
+### When not to use it [#find-by-id-and-delete.when-not-to-use]
+
+If you look the document up by another field, use [`findOneAndDelete`](#find-one-and-delete). The guide is [Delete documents](../../writes/delete.mdx).
+
+---
+
+## bulkWrite [#bulk-write]
+
+`bulkWrite` sends **several different operations to the database in one request**: inserts, changes, replacements, and deletes mixed together. Use it when you need to fit many writes into one exchange with the server, for example when syncing with an external source or processing a batch.
+
+Each operation is an object with **one** key that names it. The name is `insertOne`, `updateOne`, `updateMany`, `replaceOne`, `deleteOne`, or `deleteMany`. Operations are typed by the model, and the input isn't changed, because Typemo copies it before sending.
+
+<Snippet id="reference/writes/writes/bulk-write" twoslash />
+
+<Returns type="Promise<BulkWriteResult<ObjectId>>">
+
+A [`BulkWriteResult`](#bulk-write-result) with the numbers of inserted, matched, modified, deleted, and `upsert`-inserted documents, and with the `insertedIds` and `upsertedIds` maps, where the key is the index of the operation in the input list. An empty list is allowed, no request is sent, and the result is all zeros.
+
+</Returns>
+
+<Params>
+<Param name="operations" type="readonly BulkWriteOperation<T>[]" required>
+
+The operations. Each has exactly one key out of six names. The forms are as follows.
+
+- `insertOne` takes `{ document }`.
+- `updateOne` and `updateMany` take `{ filter, update, upsert?, arrayFilters?, hint? }`.
+- `replaceOne` takes `{ filter, replacement, upsert?, hint? }`.
+- `deleteOne` and `deleteMany` take `{ filter, hint? }`.
+
+Filters and updates are checked the same way as in the individual methods, including the empty filter. It's rejected in `updateOne`, `updateMany`, `replaceOne`, `deleteOne`, and `deleteMany`. A replacement with `_id` is rejected the same way as in `replaceOne`, and `upsert` checks the required fields of the inserted document. The `immutable` fields in `replaceOne` are compared with the stored document by a read before the batch is sent, because the batch result doesn't say which operation matched what.
+
+The update in `updateOne` and `updateMany` is an operator object or a pipeline update (a function `(p) => p.set(…)`), as in the individual methods. Both kinds are accepted by the types and at runtime. An array of stages is rejected: `update: an update pipeline is built with the pipeline builder …`.
+
+</Param>
+<Param name="options.ordered" type="boolean" default="true">
+
+`true` stops the batch at the first error, and `false` runs every operation it can. The other fields are [WriteOptions](#write-options).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/bulk-write-2" />
+
+</FullType>
+
+### Ordered write and errors [#ordered-writes]
+
+On a server error the method throws a [`BulkWriteError`](../errors/server-errors.mdx#bulk-write-error). `writeErrors` names the index and the reason of each failure, `result` says what is already written, and `ordered` gives the mode. `result.insertedIds` holds only the inserts that were actually written. Failed inserts, and in ordered mode the ones not run after them, aren't there.
+
+In ordered mode, operations after the first error don't run, but everything before it **stays written**. Only a transaction can roll that back.
+
+When the Typemo check rejects an operation (a wrong value, an empty filter), the batch mode treats it differently.
+
+- **Ordered mode.** The operation stops the whole batch before sending. You get the check error itself (`ValidationError`, `CastError`, `StrictModeError`), and nothing is written.
+- **Unordered mode, wrong value.** A wrong value in an insert or an update (`ValidationError`, `CastError`) lands in `writeErrors` together with the server rejections, and the other operations run.
+- **Unordered mode, policy violation.** An empty filter and the like stop the batch here too. You get a `StrictModeError`, and nothing is written.
+
+There's one exception. A `replaceOne` mismatch with an `immutable` field depends on the stored document, like a server rejection. So in unordered mode it lands in `writeErrors` (a `StrictModeError` with the reason `immutable`), and the other operations are written.
+
+An exception thrown by the `@Pre` hook of one operation also lands in `writeErrors` at its index in unordered mode (a `TypemoError` with the original exception in `cause`). The other operations are written. In ordered mode the batch stops, and the hook's exception arrives.
+
+<Snippet id="reference/writes/writes/ordered-writes" twoslash />
+
+### When an operation is invalid [#invalid-operation]
+
+Typemo rejects a malformed operation by its index, before sending.
+
+<Snippet id="reference/writes/writes/invalid-operation" />
+
+### Hooks of batch operations [#bulk-operation-hooks]
+
+Each operation in a batch runs the hooks of its standalone counterpart. `insertOne` runs the `document.validate` and `document.save` document hooks, and a change made in `@Pre` reaches the database. `updateOne`, `updateMany`, `replaceOne`, `deleteOne`, and `deleteMany` run the `query.updateOne`, `query.updateMany` hooks, and so on.
+
+In the hook of a batch operation, `this.bulkIndex` equals the position of the operation in the list. `@Post` receives a [`BulkOperationResult`](#bulk-operation-result). For a single operation the server names only the identifier of a document inserted by `upsert`, so the counters there are `null`. `upsert` doesn't run document hooks, because there's no document before the server answers.
+
+The order is as follows.
+
+- First the `@Pre` document hooks of the inserts, together with validation.
+- Then the `@Pre` hooks of the operations in list order.
+- Then the `@Pre` hooks of `model.bulkWrite`.
+- Then the request runs.
+- After the request, first the `@Post` of the `model.bulkWrite` hook, then the `@Post` hooks of the operations and of the insert documents in list order.
+
+If the batch fails, the operations the server applied end with `@Post`, and the rest with `@PostError`. The applied operations are all those before the first error in an ordered write, and all those without a write error in an unordered one. For details, examples, and errors, see the [Bulk writes](../../writes/bulk.mdx#bulk-write-hooks) guide, and for the types themselves, the [Operation context](../hooks/operation-context.mdx#bulk-operation-result) page.
+
+### Limit: `$inc` on a field with bounds [#inc-with-bounds]
+
+`$inc` and `$mul` on a field with `min` or `max` are **not accepted** in `bulkWrite`. The result of each operation doesn't say how many documents it matched, and without that you can't tell a protection that fired from a missing document. Use `updateOne` or `updateMany`.
+
+<Snippet id="reference/writes/writes/inc-with-bounds" />
+
+### When not to use it [#bulk-write.when-not-to-use]
+
+If the operations are all of one kind, [`insertMany`](#insert-many), [`updateMany`](#update-many), or [`deleteMany`](#delete-many) is simpler. For documents you've already loaded and changed in memory, there's [`bulkSave`](#bulk-save). The guide is [Bulk writes](../../writes/bulk.mdx).
+
+---
+
+## bulkSave [#bulk-save]
+
+`bulkSave` saves **documents** loaded or created in memory as one ordered write. Each document goes through the same preparation as [`$save`](../documents/document-api.mdx#save): hooks, validators (including async ones), the version. New documents are inserted, changed ones are updated, and unchanged ones are skipped.
+
+You need the method when you've changed many documents in memory and want to save them in one exchange with the server instead of a loop of `$save`.
+
+<Snippet id="reference/writes/writes/bulk-save" twoslash />
+
+<Returns type="Promise<BulkWriteResult<ObjectId> | undefined>">
+
+A [`BulkWriteResult`](#bulk-write-result), or `undefined` if there was nothing to write: the list is empty or no document changed. Then no request goes to the database.
+
+</Returns>
+
+<Params>
+<Param name="documents" type="readonly SavableDocument[]" required>
+
+Documents of the model. If it isn't a list, you get `QueryError: bulkSave: a list of documents`.
+
+</Param>
+<Param name="options" type="SaveOptions">
+
+Session, timeout, policy context, and `dropUnknownFields`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/writes/bulk-save-2" />
+
+</FullType>
+
+### Errors [#bulk-save.errors]
+
+A document that fails validation stops the whole write before sending, and no document of the list is written. Server-side write errors arrive as a `BulkWriteError`.
+
+### When not to use it [#bulk-save.when-not-to-use]
+
+If the documents aren't loaded and the data came from outside, use [`insertMany`](#insert-many) or [`bulkWrite`](#bulk-write). The guide is [Bulk writes](../../writes/bulk.mdx).
+
+---
+
+## Write builder [#builder]
+
+[`updateOne`](#update-one), [`updateMany`](#update-many), [`replaceOne`](#replace-one), [`deleteOne`](#delete-one), and [`deleteMany`](#delete-many) return a **write builder**. It's immutable. Each method returns a new object, and the request goes to the database on `await`. The class is called [`WriteBuilder`](#write-builder), and its methods are described below.
+
+### WriteBuilder [#write-builder]
+
+`WriteBuilder<R>` is the write builder class, where `R` is the result after `await`, that is an [`UpdateResult`](#update-result) or a [`DeleteResult`](#delete-result). It's exported from the package so you can name it in types. A function that assembles a write but doesn't run it returns `WriteBuilder<UpdateResult<ObjectId>>`, and the calling code decides whether to add `.orFail()` or `.session(…)`. It has two methods of its own: [`.orFail`](#or-fail) and [`.writeConcern`](#write-concern). The rest it inherits from the shared query options: `.session`, `.policy`, `.hint`, `.collation`, `.comment`, `.timeoutMS`, and `.exec`.
+
+<Snippet id="reference/writes/writes/write-builder" twoslash />
+
+### .orFail [#or-fail]
+
+`.orFail()` turns "nothing matched" into a [`DocumentNotFoundError`](../errors/query-errors.mdx#document-not-found-error). The result type doesn't change, because write results are never `null`. An insert through `upsert` counts as a match.
+
+<Snippet id="reference/writes/writes/or-fail" twoslash />
+
+### .writeConcern [#write-concern]
+
+`.writeConcern({ w, journal })` sets the write concern for this operation. Inside a transaction the transaction's level applies, and a different level on a single operation gives an error.
+
+### .session, .policy, .hint, .collation, .comment, .timeoutMS [#other-options]
+
+These are the shared options of an immutable query.
+
+- `.session(session)` runs the write in a session, and `null` takes it out of an outer transaction.
+- `.policy(values)` sets the policy context (tenant, soft delete).
+- `.hint(index)` suggests an index.
+- `.collation(options)` sets the string comparison rules.
+- `.comment(text)` adds a comment for the profiler.
+- `.timeoutMS(ms)` limits the operation in time.
+
+They're described in detail in the [Query options](../query/options.mdx) reference.
+
+### .exec [#exec]
+
+`.exec()` runs the write, like `await`. `.exec({ force: true })` runs it again on purpose. Without `force`, a second run of the same object gives an error.
+
+<Snippet id="reference/writes/writes/exec" twoslash />
+
+---
+
+## Write options [#options]
+
+Options come in two kinds. Some go in an object as the second or third argument of a method, and others are chained onto the builder.
+
+### upsert [#upsert]
+
+`upsert: true` inserts a new document if the filter found nothing. The new document is built from the equalities in the filter, the `$set` operator, and the `$setOnInsert` operator. `$setOnInsert` fires **only** on insert, and it's the only one that accepts fields with `Immutable`. Defaults, service fields, and the version are filled in.
+
+<Snippet id="reference/writes/writes/upsert" twoslash />
+
+In an ordinary update, `required` is checked only for the fields the update writes. The rest are already in the database and already checked. But `upsert` can insert a new document, and then the whole document would stay unchecked. So before sending, Typemo assembles the document that would be inserted and requires every required field in it. The field can come from the equalities in the filter, from `$set`, from `$setOnInsert`, or from any other operator that writes this path. The result doesn't depend on whether the server actually inserts the document, and the check applies to every `upsert`. A missing field gives a `ValidationError` before the database is touched.
+
+<Snippet id="reference/writes/writes/upsert-2" />
+
+The same rules apply to a pipeline `upsert` and to an `updateOne` operation with `upsert: true` inside [`bulkWrite`](#bulk-write).
+
+`upsert` doesn't work with `$inc` and `$mul` on fields with `min` or `max`. If the protection condition fails, the server would insert a new document.
+
+<Snippet id="reference/writes/writes/upsert-3" />
+
+### returnDocument [#return-document]
+
+`returnDocument: "after"` (the default) returns the document after the change, and `"before"` returns it before. The option exists on [`findOneAndUpdate`](#find-one-and-update), [`findByIdAndUpdate`](#find-by-id-and-update), and [`findOneAndReplace`](#find-one-and-replace). If there was no document before the change (an insert with `upsert`), `"before"` returns `null`.
+
+### arrayFilters [#array-filters]
+
+`arrayFilters` is a list of conditions for array elements in paths with `$[id]`. Each identifier in the update needs its own filter, and each filter must be used. The server rejects both extras and missing ones, and Typemo reports it earlier.
+
+<Snippet id="reference/writes/writes/array-filters" />
+
+For details, see the [Update operators](../../writes/update-operators.mdx#array-filters) guide.
+
+### ordered [#ordered]
+
+`ordered` exists on [`insertMany`](#insert-many) and [`bulkWrite`](#bulk-write). `true` (the default) stops the write at the first error, and `false` does everything it can.
+
+### WriteOptions [#write-options]
+
+The methods without a builder ([`create`](#create), [`insertOne`](#insert-one), [`insertMany`](#insert-many), [`bulkWrite`](#bulk-write)) accept a `WriteOptions` object.
+
+<TypeTable
+  type={{
+    session: { description: "An explicit transaction session. `null` runs the write outside an outer transaction, and without the field the current outer transaction is used. See [Manual sessions](../../transactions/sessions.mdx).", type: "ClientSession | null" },
+    timeoutMS: { description: "A client-side timeout for the operation.", type: "number" },
+    comment: { description: "A comment for the profiler and logs.", type: "string" },
+    writeConcern: { description: "The write concern. Inside a transaction the transaction's level applies, and a different one gives an error.", type: "{ w?: W; journal?: boolean }" },
+    policy: { description: "The policy context of this write (tenant, actor, soft delete) on top of the current one.", type: "PolicyValues" },
+  }}
+/>
+
+A write has no `timestamps` option. `createdAt` and `updatedAt` are maintained by the [`Timestamped`](../schemas/base-classes.mdx) base class, and it updates `updatedAt` on every write itself.
+
+---
+
+## Results [#results]
+
+### UpdateResult [#update-result]
+
+The result of `updateOne`, `updateMany`, and `replaceOne`.
+
+- `acknowledged`: whether the server acknowledged the write.
+- `matchedCount`: how many documents matched.
+- `modifiedCount`: how many changed. If an update changed nothing, it's less than `matchedCount`.
+- `upsertedCount`: how many were inserted through `upsert`.
+- `upsertedId`: the `_id` of the inserted document, of the same type as the model's `_id`, or `null`.
+
+<Snippet id="reference/writes/writes/update-result" twoslash />
+
+### DeleteResult [#delete-result]
+
+The result of `deleteOne` and `deleteMany` consists of `acknowledged` and `deletedCount`. With soft delete, `deletedCount` counts the documents that got the mark.
+
+### ModifyResult [#modify-result]
+
+The raw result of `findOneAnd*` with [`.includeResultMetadata()`](#find-one-and-update). It holds `value` (a document or `null`), `lastErrorObject` (`n`, `updatedExisting`, `upserted`), `ok`, and on replica sets also `operationTime` and `$clusterTime`.
+
+### BulkWriteResult [#bulk-write-result]
+
+The result of `bulkWrite` and `bulkSave` holds `insertedCount`, `matchedCount`, `modifiedCount`, `deletedCount`, `upsertedCount`, and also `insertedIds` and `upsertedIds`. The map key is the index of the operation in the input list, and the value is the `_id`.
+
+<Snippet id="reference/writes/writes/bulk-write-result" twoslash />
+
+### BulkOperationResult [#bulk-operation-result]
+
+The result received by the `@Post` hook of one operation inside `bulkWrite`. For a single operation of the batch, the server reports only the `_id` of a document inserted through `upsert`. So `matchedCount`, `modifiedCount`, and `deletedCount` in it are `null`, while `upsertedCount` and `upsertedId` are known. The totals of the whole batch are in the [`BulkWriteResult`](#bulk-write-result). For the fields and examples, see the [Operation context](../hooks/operation-context.mdx#bulk-operation-result) page.
+
+---
+
+## WriteFilterCheck [#write-filter-check]
+
+`WriteFilterCheck<T, F, Form>` stands behind the `filter` argument of [`updateOne`](#update-one), [`updateMany`](#update-many), [`replaceOne`](#replace-one), [`deleteOne`](#delete-one), [`deleteMany`](#delete-many), [`findOneAndUpdate`](#find-one-and-update), [`findOneAndReplace`](#find-one-and-replace), and [`findOneAndDelete`](#find-one-and-delete). The third parameter `Form` is the form of the method (`WriteForm`): `"one"` for methods that touch one document, and `"many"` for `updateMany` and `deleteMany`.
+
+The type does the same as the filter check in reads. An unknown field or a condition of the wrong type is a compile error. On top of that, it adds a write rule that doesn't accept an empty object literal `{}`. In these methods an empty filter means "any document", and an accidentally empty filter must not change or delete an arbitrary record. You need this type if you write a wrapper around a write method and want to pass the same restriction on.
+
+<Snippet id="reference/writes/writes/write-filter-check" twoslash />
+
+The compiler answers with an error about the `"filter error"` property with the text `an empty filter would change or remove an arbitrary document; pass a filter, or Filters.all() to mean every document on purpose`. `updateMany` and `deleteMany` have a different text, as does the runtime error: `an empty filter would affect every document; …`. The rule applies only to a literal. A filter declared as `Filter<Account>` and `Record<string, unknown>` compile, and for them the runtime check remains (a `StrictModeError` with the reason `empty-filter`).
+
+<FullType>
+
+<Snippet id="reference/writes/writes/write-filter-check-2" />
+
+</FullType>
+
+---
+
+## Other methods [#other-methods]
+
+Write methods that aren't on this page are described on other reference pages.
+
+- Update operators (`$set`, `$inc`, `$push`, and others): [Update operators](./update-operators.mdx).
+- Pipeline updates: [Pipeline updates](./pipeline-updates.mdx).
+- Input types (`CreateInput`, `UpdateInput`, `Update`, `Replacement`, `WriteValue`): [Input types](./input-types.mdx).
+- The document methods `$save`, `$deleteOne`, `$updateOne`, and `Model.new`: the [Document API](../documents/document-api.mdx) reference.
+- Soft delete and `SoftDelete.restore`: [SoftDelete and untrusted](../policies/soft-delete-and-untrusted.mdx).

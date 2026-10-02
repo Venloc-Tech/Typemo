@@ -1,0 +1,289 @@
+---
+title: Pipeline updates
+description: "UpdatePipelines and the stages an update allows: set, addFields, unset, project, replaceWith, and replaceRoot"
+icon: Workflow
+---
+
+This page covers updates where the new value of a field is computed **from other fields of the same document**. It describes the `UpdatePipelineFor` type, the `UpdatePipelines` class, and the six stages such an update allows. If you're just starting out, read the [Pipeline updates](../../writes/pipeline-updates.mdx) guide first.
+
+A **pipeline update** is an update written not as an operator object (`$set`, `$inc`) but as a list of aggregation stages. It helps where operators are powerless. With operators the value is known in advance, while a pipeline takes it from the document itself. Operators can't write a string built from `owner` and `title` into `note`, or double a balance above a threshold. The server runs the pipeline as one atomic command.
+
+You don't write the stages by hand. [`updateOne`](./writes.mdx#update-one), [`updateMany`](./writes.mdx#update-many), and [`findOneAndUpdate`](./writes.mdx#find-one-and-update) accept a function in place of an operator object, and that function receives a pipeline builder in "update mode". You can't pass an array of stages.
+
+<Snippet id="reference/writes/pipeline-updates/intro" title="accounts/account.ts" twoslash />
+
+In all examples the source document is `title: "Main"`, `owner: "alice"`, `balance: 10`, `nickname: "al"`. The result in the `// →` comment is what sits in the database after the update.
+
+---
+
+## UpdatePipelines [#update-pipelines]
+
+`UpdatePipelines` is a class with a static method `compile`. It turns a pipeline function into a list of stages and makes sure there is at least one stage. `updateOne` and the other methods do the same inside. You need `compile` only to see which stages go to the server.
+
+<Snippet id="reference/writes/pipeline-updates/update-pipelines" twoslash />
+
+<Returns type="readonly PipelineStage[]">
+
+The list of serialized stages. It's never empty.
+
+</Returns>
+
+<Params>
+<Param name="build" type="UpdatePipelineFor<T>" required>
+
+A function that receives the builder and returns it after adding stages.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/pipeline-updates/update-pipelines-2" />
+
+</FullType>
+
+### Errors [#update-pipelines.errors]
+
+A function without a single stage is rejected as a query error. An empty pipeline is a mistake in one call, not in the application setup.
+
+<Snippet id="reference/writes/pipeline-updates/update-pipelines-errors" />
+
+### When not to use it [#update-pipelines.when-not-to-use]
+
+If the new values are known in advance, use an operator object: [`$set`](./update-operators.mdx#set), [`$inc`](./update-operators.mdx#inc). It's simpler and is checked in full before sending. What is checked in a pipeline is described below in the "What is checked" section.
+
+---
+
+## UpdatePipelineFor [#update-pipeline-for]
+
+`UpdatePipelineFor<T>` is the type of the function the update methods accept. It receives a builder typed with the model's document and returns a chain of stages. You need the type when you move a pipeline into a separate function.
+
+<Snippet id="reference/writes/pipeline-updates/update-pipeline-for" title="accounts/pipelines.ts" twoslash />
+
+<FullType>
+
+<Snippet id="reference/writes/pipeline-updates/update-pipeline-for-2" />
+
+</FullType>
+
+The builder in `update` mode knows only six stages: `set`, `addFields`, `unset`, `project`, `replaceWith`, and `replaceRoot`. The other aggregation stages (`match`, `group`, `unwind`) aren't allowed in an update, and the types don't show them.
+
+An update pipeline goes through a guard. Constants in stages are cast to types and checked before sending. Removing a required field is rejected. The server checks a computed value of a field with constraints (`min`, `max`, `enum`, `minLength`, `maxLength`, `match`, `required`), after receiving the same expression in the filter condition. For details and limits, see [What is checked](#what-is-checked) below.
+
+---
+
+## .set [#set]
+
+`.set(builder)` writes computed values into fields. `builder` receives a **field proxy** `f`. Reading `f.balance` means "the value of the `balance` field in the document at the moment of the update". Values are built with the `fn.*` functions: `fn.add`, `fn.concat`, `fn.cond`, and the others from the aggregation reference.
+
+<Snippet id="reference/writes/pipeline-updates/set" twoslash />
+
+<Returns type="PipelineBuilder">
+
+The builder for the next stage. Stages run in order, and each one sees the result of the previous one.
+
+</Returns>
+
+<Params>
+<Param name="builder" type="(f: FieldProxy<T>) => Record<string, unknown>" required>
+
+A function that returns a "path and expression" object. A key can be nested with a dot. The compiler rejects a key that isn't in the model.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/pipeline-updates/set-2" />
+
+</FullType>
+
+### Several stages [#multiple-stages]
+
+Stages run in order. In the second `.set`, the note is already what the first one made it.
+
+<Snippet id="reference/writes/pipeline-updates/multiple-stages" twoslash />
+
+### Errors [#set.errors]
+
+`arrayFilters` can't be used with a pipeline, because a pipeline has no positional paths.
+
+<Snippet id="reference/writes/pipeline-updates/set-errors" />
+
+You get the second message when you pass an array of stages instead of a function.
+
+### What is checked [#what-is-checked]
+
+An operator object goes through type casting and the field validators before sending. In a pipeline the values are server expressions, so the check depends on what exactly you write.
+
+A **constant** (`balance: -1`, `note: "x"`) is cast to the field type and checked before sending, as with `$set`. The error is a `CastError` or a `ValidationError`.
+
+The server checks a **computed value** of a field with constraints. Typemo adds a condition with the same expression and the same constraints to the filter, so a wrong result isn't written, and this is atomic. In the example, the balance would drop below zero, and the update is rejected.
+
+<Snippet id="reference/writes/pipeline-updates/what-is-checked" twoslash />
+
+<Snippet id="reference/writes/pipeline-updates/what-is-checked-2" />
+
+The server condition evaluates the expression over the stored document. So it's exact as long as the expression doesn't read fields changed by an earlier stage. Typemo rejects the other cases before sending (`ValidationError`).
+
+- A computed value reads a field changed earlier, or `$$ROOT` after a change.
+- A computed value comes after a stage that rewrites the document.
+- A field with constraints sits behind an array or a `Map`.
+- A whole document is computed by an expression on a schema with required fields.
+- `upsert` and [`bulkWrite`](./writes.mdx#bulk-write) work with a computed value of such a field.
+
+<Snippet id="reference/writes/pipeline-updates/what-is-checked-3" />
+
+The server can't express several checks, so they don't run. These are your `validate` functions, the constraints of elements inside a computed array, `Map`, or subdocument, and the type of a computed value for a field without constraints. For `maxLength` and `minLength` the server counts code points, while JavaScript counts UTF-16 units. For strings with characters outside the basic plane, the lengths can differ.
+
+### When not to use it [#set.when-not-to-use]
+
+If the value is known in advance, [`$set`](./update-operators.mdx#set) checks it more strictly. To add a number, use [`$inc`](./update-operators.mdx#inc), which protects the `min` and `max` bounds.
+
+---
+
+## .addFields [#add-fields]
+
+`.addFields(builder)` does the same as `.set`. In aggregation `$set` is a synonym of `$addFields`, so use whichever name you're used to.
+
+<Snippet id="reference/writes/pipeline-updates/add-fields" twoslash />
+
+<Params>
+<Param name="builder" type="(f: FieldProxy<T>) => Record<string, unknown>" required>
+
+Same as [`.set`](#set).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/pipeline-updates/add-fields-2" />
+
+</FullType>
+
+---
+
+## .unset [#unset]
+
+`.unset(path)` removes a field or a list of fields. For fields known in advance, the [`$unset`](./update-operators.mdx#unset) operator does the same. You need `.unset` when other pipeline stages follow it.
+
+<Snippet id="reference/writes/pipeline-updates/unset" twoslash />
+
+<Params>
+<Param name="fields" type="Path | [Path, ...Path[]]" required>
+
+A field path or a non-empty list of paths.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/pipeline-updates/unset-2" />
+
+</FullType>
+
+### Required fields [#required-fields]
+
+`.unset` of a required field is rejected before sending, like `$unset` in an operator object.
+
+<Snippet id="reference/writes/pipeline-updates/required-fields" />
+
+---
+
+## .project [#project]
+
+`.project(spec)` keeps only the listed fields in the document (`1`) or removes the listed ones (`0`). `_id` always stays. This is the most radical stage, because everything you don't name **disappears** from the document.
+
+<Snippet id="reference/writes/pipeline-updates/project" twoslash />
+
+<Params>
+<Param name="spec" type="{ [path]: 0 | 1 | boolean }" required>
+
+Paths with `1` (keep) or `0` (remove). You can't mix them, except for `_id`. Instead of an object you can pass a function with a field proxy and compute values.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/pipeline-updates/project-2" />
+
+</FullType>
+
+### Models with immutable fields [#immutable-models]
+
+If a model has `immutable` fields or the service field `createdAt` (on `Timestamped`), the `.project`, `.replaceWith`, and `.replaceRoot` stages pass only when the new document carries over **every** immutable field as is. These variants are allowed.
+
+- A field taken from itself (`createdAt: f.createdAt`, `"$createdAt"`).
+- `"$$ROOT"` as a whole.
+- `$mergeObjects` with `"$$ROOT"` and an object of fields that has no immutable ones.
+- An including `.project` that lists these fields.
+- An excluding `.project` that doesn't touch them.
+
+Everything else is rejected before sending. That includes a field moved from another field and an immutable field overwritten with a constant. The error text names the lost fields and gives a hint.
+
+<Snippet id="reference/writes/pipeline-updates/immutable-models" />
+
+You write the object keys in `.replaceWith` and `.replaceRoot` as model field names. If a field has `dbName`, Typemo translates them to database names itself. But `$$ROOT` and `$$CURRENT` aren't allowed on a model with such fields: `ConfigurationError: Stamped: $$ROOT/$$CURRENT of a model with dbName fields would give stored names to the rows; list the fields instead`. List the fields explicitly.
+
+### When not to use it [#project.when-not-to-use]
+
+To remove one field, use [`.unset`](#unset). To change several, use [`.set`](#set).
+
+---
+
+## .replaceWith [#replace-with]
+
+`.replaceWith(builder)` replaces the whole document with a computed one. It's a replacement like [`replaceOne`](./writes.mdx#replace-one), except the new content is built from the fields of the old document. The `_id` stays the same.
+
+<Snippet id="reference/writes/pipeline-updates/replace-with" twoslash />
+
+<Params>
+<Param name="builder" type="(f: FieldProxy<T>) => object" required>
+
+A function that returns the new document. It must be a document. The server rejects `null` and a missing value, so the type has no `null`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/pipeline-updates/replace-with-2" />
+
+</FullType>
+
+### Errors [#replace-with.errors]
+
+Models with immutable fields have the same limits as in [`.project`](#project).
+
+### When not to use it [#replace-with.when-not-to-use]
+
+If the whole replacement is known in advance, use [`replaceOne`](./writes.mdx#replace-one). It checks the values.
+
+---
+
+## .replaceRoot [#replace-root]
+
+`.replaceRoot(builder)` does the same as `.replaceWith`: it replaces the whole document with a computed one. They're two spellings of one server stage, and the result is the same.
+
+<Snippet id="reference/writes/pipeline-updates/replace-root" twoslash />
+
+<Params>
+<Param name="builder" type="(f: FieldProxy<T>) => object" required>
+
+A function that returns the new root of the document.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/writes/pipeline-updates/replace-root-2" />
+
+</FullType>
+
+### When not to use it [#replace-root.when-not-to-use]
+
+Use [`.replaceWith`](#replace-with). It's shorter, and the result is the same.

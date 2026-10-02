@@ -1,0 +1,108 @@
+---
+title: Special collections
+description: "Describe a capped collection, a time series, a validator, and other collection properties in the schema"
+icon: Database
+---
+
+A regular collection is almost always enough. But MongoDB has collections with special properties.
+
+- A **capped** collection keeps only the latest records.
+- A **time series** collection stores measurements compactly.
+- Any collection can have a **validator**, a set of rules the server checks every document against.
+
+Typemo describes all of this right in [`@Schema`](../reference/schemas/schema.mdx#schema). The option declares the property, and the collection itself is created with these settings on [`connection.init()`](../reference/connection/connection.mdx#connection.init). That has an important consequence. The settings apply only at creation, and you can't change them on an existing collection this way.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx). [Create collections with options](../collections/create.mdx) covers how to create collections and work with existing ones. This page is about what to choose and what you get.
+
+## Quick start [#quick-start]
+
+A capped log collection that holds five records.
+
+<Snippet id="schemas/special-collections/quick-start" title="logs/log.ts" twoslash />
+
+Below we'll go through the other kinds.
+
+## A capped collection [#capped-collection]
+
+[`capped`](../reference/schemas/schema.mdx#capped) makes a collection capped. `size` sets the size limit in bytes and is required, and `max` sets the limit on the number of documents. Once the limit is reached, the server pushes out the oldest documents. That's how you keep logs you only need for the recent past, or ring buffers of events. In the example above, five of the seven records remained, the latest ones.
+
+## Time series [#time-series]
+
+A time series collection stores sensor readings, exchange rates, metrics. The server groups them into buckets by time and metadata, so they take less space and time-range queries run faster. [`timeseries`](../reference/schemas/schema.mdx#timeseries) requires `timeField`, a required field of type `Date`. It also takes `metaField` (what is being measured), `granularity` (`seconds`, `minutes`, `hours`), and `expireAfterSeconds` (automatic deletion).
+
+<Snippet id="schemas/special-collections/time-series" title="sensors/reading.ts" twoslash />
+
+The constraints are checked when you describe the model. `timeField` must be required (`timeseries: timeField "at" must be required (every measurement has it)`). A time series collection doesn't combine with `capped` or `clustered` and doesn't allow unique indexes.
+
+## A clustered collection [#clustered-collection]
+
+[`clustered`](../reference/schemas/schema.mdx#clustered) stores documents in `_id` order, and the `_id` index is the collection itself. That saves space and speeds up range queries on `_id`. The object takes `name` and `expireAfterSeconds` (for an `_id` of type `Date`). A clustered collection doesn't combine with `capped` or `timeseries`, and a time series collection is clustered already.
+
+## Default string ordering [#default-collation]
+
+[`collation`](../reference/schemas/schema.mdx#collation) sets the string comparison rules for the whole collection: the language and sensitivity to case and accents. With `strength: 2`, searches ignore case.
+
+<Snippet id="schemas/special-collections/default-collation" title="accounts/named.ts" twoslash />
+
+Text indexes and `2d` indexes don't support collation. On such a collection, declare them with `collation: { locale: "simple" }`, or you get a `ConfigurationError`.
+
+## A validator on the server [#server-validator]
+
+Typemo checks data before a write, but other programs can write to the database too. [`validator`](../reference/schemas/schema.mdx#validator) builds `$jsonSchema` rules from the schema and sets them up on the server. The collection then rejects documents with wrong types, missing required fields, or values outside `enum` and bounds. The value `true` gives the `strict` level and the `error` action, and an object fine-tunes [`validationLevel`](../reference/schemas/schema.mdx#validation-level) and [`validationAction`](../reference/schemas/schema.mdx#validation-action).
+
+<Snippet id="schemas/special-collections/server-validator" title="accounts/checked.ts" twoslash />
+
+Here a document with a number in a string field was written around Typemo, through the driver, and the server rejected it. Your `validate` functions and Map key rules can't be expressed on the server, so only Typemo checks them. The rules are built by the [`JsonSchemaGenerator`](./json-and-standard-schema.mdx).
+
+## Other options [#other-options]
+
+There are three more collection options.
+
+- [`changeStreamPreAndPostImages`](../reference/schemas/schema.mdx#change-stream-pre-and-post-images) turns on recording the document's state before and after a change. Change streams that ask for `fullDocumentBeforeChange` need it.
+- [`shardKey`](../reference/schemas/schema.mdx#shard-key) tells Typemo the shard key, so `$save` finds the document by the key's original values.
+- [`autoCreate: false`](../reference/schemas/schema.mdx#auto-create) excludes the collection from `init()` and `syncAll()` if you manage the collection yourself.
+
+The [`readConcern`](../reference/schemas/schema.mdx#read-concern) and [`writeConcern`](../reference/schemas/schema.mdx#write-concern) options set defaults for the model's operations. They go to the server with every read and write, but a level set on the operation itself wins. Inside a transaction the schema's levels aren't sent, and the transaction's settings apply.
+
+## How to choose [#how-to-choose]
+
+Ask yourself: **what must the collection guarantee?**
+
+- **Keep only the latest records**: `capped`.
+- **Store measurements over time**: `timeseries`.
+- **Protect itself from other programs that write to it too**: `validator`.
+- **Search without regard to case**: `collation`.
+
+For everything else, a regular collection will do.
+
+## When not to use it [#when-not-to-use]
+
+Don't make a collection capped if you need to keep old documents. The server pushes them out without warning. Don't use time series for ordinary entities with fields that change. And don't turn on a validator if the schema changes often. The server will start rejecting documents until you update the collection ([Create collections with options](../collections/create.mdx) describes how).
+
+## Troubleshooting [#troubleshooting]
+
+**The options didn't apply to an existing collection.** You added `capped` or `validator` to a collection that's already in the database. `init()` compares the settings and doesn't change them quietly. It throws a [`SyncError`](../reference/errors/configuration-errors.mdx#sync-error).
+
+Some properties MongoDB can't change on an existing collection: making a regular collection capped, turning it into a time series or a clustered collection, changing the collation. For those the error is `collection "legacy_logs": exists with options MongoDB cannot change (capped): drop the collection and create it again`. For changeable ones, such as the validator, it's `collection "legacy_checked": exists with other options (validator); run ensureCollection({ update: true }) to change them with collMod`. Create a new collection with the settings you need, or change the existing one as described in [Create collections with options](../collections/create.mdx#change-collection-options).
+
+**Time series doesn't accept an option.** A unique index, `capped`, and `clustered` together with `timeseries` are rejected, because the server doesn't support them. Typemo tells you when you describe the model, before the database is ever contacted.
+
+## Full example [#full-example]
+
+<Snippet id="schemas/special-collections/full-example" title="sensors/sensors.service.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Create collections with options" href="../collections/create.mdx">
+  How to create collections at startup and what to do with existing ones.
+</Card>
+<Card title="@Schema" href="../reference/schemas/schema.mdx">
+  Every schema option with its exact types and errors.
+</Card>
+<Card title="The schema at runtime" href="./runtime-schema.mdx">
+  How to read these options from a model.
+</Card>
+</Cards>

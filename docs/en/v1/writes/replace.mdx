@@ -1,0 +1,124 @@
+---
+title: Replace a document
+description: "Replace a whole document with replaceOne and findOneAndReplace, and don't mix up a replacement with an update"
+icon: Replace
+---
+
+To replace a document whole, call [`replaceOne`](../reference/writes/writes.mdx#replace-one). You pass the new content, and everything that isn't in it disappears from the document. The `_id` stays the same. A replacement fits when you know the new state completely. For example, a record came from an external system, a form saves everything as is, or you sync with a source and don't know which fields changed.
+
+If you need to fix a couple of fields and keep the rest, a replacement won't do. Use an [update](./update.mdx). A replacement **removes** the fields you didn't pass, while an update touches only the ones you name.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx). The account model extends `Timestamped(Entity)`. This base class adds the system fields `createdAt` and `updatedAt`, and the core maintains them itself. The collection holds the account `Main`: owner `alice`, balance 10, tags `a` and `b`, nickname `al`.
+
+<Snippet id="writes/replace/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+To replace without getting a result, use `replaceOne`. To replace and get the document, use `findOneAndReplace`.
+
+<Snippet id="writes/replace/quick-start" twoslash />
+
+Below we'll cover what exactly gets replaced, how system fields behave, and when a replacement does harm.
+
+## Replace a whole document [#replace-document]
+
+An external system sent the current state of an account. You write it whole, and everything outdated should disappear.
+
+<Snippet id="writes/replace/replace-document" title="accounts/accounts.service.ts" twoslash />
+
+Now the `Main` document has only `title`, `owner`, and the default values, which means `balance: 0`. The `tags` and `nickname` fields that were there are **gone**. A replacement doesn't add to the old content, it writes the new content over it. That's the main thing to remember. Forget an optional field in a replacement, and it disappears, and neither the compiler nor the database notices.
+
+A replacement has no operators, only the document's fields. You don't pass `_id`. The compiler won't accept it, and the identifier stays the same anyway. The filter of `replaceOne` is required and can't be empty, otherwise the replacement would pick a random document. So `{}` doesn't compile, and an empty object at runtime gives a `StrictModeError` with the reason `empty-filter`. See [Empty filters in writes](./empty-filters.mdx) for details.
+
+If nothing matches the filter, the method doesn't throw and returns `matchedCount: 0`. If you need an error, add [`.orFail()`](../reference/writes/writes.mdx#or-fail).
+
+## System fields [#system-fields]
+
+The core maintains the system fields `createdAt`, `updatedAt`, and `__v`. On a replacement, `createdAt` and `__v` are kept, and `updatedAt` gets the time of the replacement. You don't need to pass them, and you don't need to worry that a replacement will wipe the document's history.
+
+<Snippet id="writes/replace/system-fields" twoslash />
+
+If you pass a system field yourself, the replacement refuses. The core decides these fields, and you shouldn't substitute them.
+
+<Snippet id="reference/writes/writes/replaced-and-kept" />
+
+## Replace a document and get it back [#replace-and-return]
+
+You replaced a document and want to return it to the client. [`findOneAndReplace`](../reference/writes/writes.mdx#find-one-and-replace) replaces and reads in one command. By default it returns the document **after** the replacement, and `returnDocument: "before"` gives you the old state.
+
+<Snippet id="writes/replace/replace-and-return" twoslash />
+
+Like [`findOneAndUpdate`](../reference/writes/writes.mdx#find-one-and-update), the method accepts `upsert`, and if there's no document, the replacement is inserted as a new one. The filter of `findOneAndReplace` is also required and can't be empty. The method picks a document to replace, and an empty filter would pick a random one.
+
+<Snippet id="writes/replace/replace-and-return-2" />
+
+## How to choose [#how-to-choose]
+
+Ask yourself what you know about the document's new state.
+
+- **You know it completely, and everything else should disappear**: use a replacement.
+- **You know only what changed**: use an [update](./update.mdx). It won't overwrite fields that other code added, and it handles concurrent changes well, since operators like `$inc` don't lose other writers' increments.
+
+## When not to use it [#when-not-to-use]
+
+If you changed one or two fields, a replacement only complicates the code and risks wiping the rest. Use [`updateOne`](../reference/writes/writes.mdx#update-one) with [`$set`](../reference/writes/update-operators.mdx#set). And if the document is already loaded and changed in memory, save it with [`$save`](../reference/documents/document-api.mdx#save), which sends only the changes.
+
+## Troubleshooting [#troubleshooting]
+
+**Fields are gone after a replacement.** The document has no `nickname`, `tags`, or other fields you didn't touch. A replacement writes exactly what you passed. Pass every field that should stay, or use an update with `$set` on the changed fields only.
+
+**An operator in a replacement.** For example, `replaceOne({ title: "Main" }, { $set: { owner: "h" } })`. A replacement doesn't understand operators, and Typemo stops it.
+
+<Snippet id="reference/writes/writes/replace-one-errors" />
+
+If you need an operator, it's an update, [`updateOne`](../reference/writes/writes.mdx#update-one). If you need a replacement, pass plain fields.
+
+**An identifier in a replacement.** You can't pass `_id` in a replacement, not even the same one. The compiler won't accept the `_id` field, and if the types are bypassed, Typemo rejects the replacement before sending.
+
+<Snippet id="reference/writes/writes/replace-one-errors-2" />
+
+Leave `_id` out, and it stays the same on its own. Pick the document you need by `_id` in the filter.
+
+### A replacement that conflicts with an `immutable` field [#replace-immutable]
+
+Suppose another model, `Pinned`, has a required `region` field and an optional `code` field, both `immutable`. A replacement rewrites the whole document, so for such fields it has to say the same thing that's already stored. The same value if the field is in the document, and nothing if it isn't. Only the server knows what's stored. So Typemo adds this condition to the replacement's filter, and the server compares the values itself, in the same operation. A mismatch isn't written, and Typemo names the field.
+
+You can't pass a different value in a replacement.
+
+<Snippet id="writes/replace/replace-immutable" />
+
+You can't leave out a field that's in the document, because the replacement would lose it.
+
+<Snippet id="writes/replace/replace-immutable-2" />
+
+And you can't pass a field that isn't in the document. An immutable field gets its value only when the document is created.
+
+<Snippet id="writes/replace/replace-immutable-3" />
+
+Pass the stored value, and don't pass an optional field that isn't in the document at all. Such a replacement goes through without an extra round trip to the server. If the filter didn't find a document, the result is the usual one: `matchedCount: 0` or `null`. Only in that case does Typemo read the document once by your filter, to tell "no document" apart from "a different value". Inside a [transaction](../transactions/transactions.mdx) that read runs in the same session.
+
+Typemo checks a replacement with `upsert: true` by reading before the write. The server doesn't accept such a condition in an `upsert` filter, and without the check a mismatch would turn into an insert of a new document. Outside a transaction, a document that appears between the read and the write isn't compared anymore, so protect against races with a transaction.
+
+`replaceOne` in [`bulkWrite`](../reference/writes/writes.mdx#bulk-write) is checked the same way, by reading before sending. In an unordered batch the rejected operation lands in `writeErrors`, and the rest are written. An ordered batch with a mismatch isn't sent at all.
+
+## Full example [#full-example]
+
+Everything in one file: syncing a record from an external source and getting the previous state.
+
+<Snippet id="writes/replace/full-example" title="accounts/accounts.service.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Update documents" href="./update.mdx">
+  Change single fields without wiping the rest.
+</Card>
+<Card title="Update operators" href="./update-operators.mdx">
+  `$set`, `$inc`, `$push`, and the other operators on real tasks.
+</Card>
+<Card title="Writing" href="../reference/writes/writes.mdx#replace-one">
+  The exact description of `replaceOne` and `findOneAndReplace`, with errors.
+</Card>
+</Cards>

@@ -1,0 +1,208 @@
+---
+title: Extensions
+description: "Reference for TypemoExtension, PropExtensions, and SchemaExtensions: what they accept, how values are validated, and which errors they throw"
+icon: Blocks
+---
+
+An **extension** adds your own key inside `ext` on `@Prop` and `@Schema`. Typemo validates its values when the schema compiles. That's how libraries and your own code keep settings right next to a field: a label for the UI, export rules, search flags. An extension is only metadata. It does nothing during operations and doesn't bypass policies (tenant, soft delete, hidden fields).
+
+Adding your own key for the first time? Start with the guide [Add your own field and schema options](../../extensions/custom-options.mdx) and the example [An extension from start to finish](../../extensions/example.mdx). Registration for all clients is described in the reference for [`Typemo.use`](../connection/typemo.mdx#typemo.use), and for a single client in [`client.use`](../connection/typemo-client.mdx#client.use).
+
+An extension has three parts. You declare the key's type for the compiler in `PropExtensions` or `SchemaExtensions`, register the value check through `TypemoExtension`, and read the values from the schema description ([`SchemaInfo`](../schemas/schema-info.mdx)). The examples use a `label` extension that stores a field's label for the UI.
+
+---
+
+## TypemoExtension [#typemo-extension]
+
+`TypemoExtension<N>` is the extension object. It holds the key name and the validation functions, so a bad value is found when the schema compiles, not when an integration reads it. A check receives the value as written and **throws an error** if it's wrong.
+
+<Snippet id="reference/extensions/extensions/typemo-extension" twoslash />
+
+The value arrives as `unknown`. The compiler checks calls written in TypeScript, but it can't see values that come from JavaScript code or configuration, so the check protects itself. As the second argument it receives a description of the declaration site, either [`ExtensionFieldInfo`](#extension-field-info) or [`ExtensionSchemaInfo`](#extension-schema-info). Use it to take the field kind or path into account. Typemo adds the field address to the error text itself, so don't repeat it in your message.
+
+<Params>
+<Param name="name" type="N extends ExtensionName" required>
+
+The extension name, that is, the key under `ext`. It must be a key of `PropExtensions` or `SchemaExtensions` already declared in the types. It's a non-empty string that doesn't start with `$`.
+
+</Param>
+<Param name="validateProp" type="(value: unknown, field: ExtensionFieldInfo) => void">
+
+Checks the value on a field and throws an error if it's wrong. Without this function, the key can't be set in `ext` on `@Prop`.
+
+</Param>
+<Param name="validateSchema" type="(value: unknown, schema: ExtensionSchemaInfo) => void">
+
+Checks the value on a schema and throws an error if it's wrong. Without this function, the key can't be set in `ext` on `@Schema`.
+
+</Param>
+</Params>
+
+You need at least one of the two functions. An extension with neither is useless, and registration rejects it.
+
+<FullType>
+
+<Snippet id="reference/extensions/extensions/typemo-extension-2" />
+
+</FullType>
+
+### What Typemo does with the value [#value-handling]
+
+Before the check runs, Typemo copies the value into a frozen copy. Your input doesn't change, and neither the check nor readers can corrupt what's stored. Plain objects and arrays are copied deeply, while functions and BSON values stay as they are. `Object.isFrozen` returned `true` for both the field description and the extension value inside it, and the `format` function stayed callable.
+
+Typemo puts an error thrown by a check into the `cause` of a `ConfigurationError` and prepends the field address to its text. Here is the result for `ext: { label: { text: "" } }` and a check that throws `TypeError("text must be a non-empty string")`.
+
+<Snippet id="reference/extensions/extensions/value-handling" />
+
+A key with no check for that place also gives a `ConfigurationError`. That's what happened with an extension that has only `validateProp`, used on a schema.
+
+<Snippet id="extensions/custom-options/troubleshooting" />
+
+Here is what the client returned for a key that isn't registered, without `client.use`.
+
+<Snippet id="extensions/custom-options/per-client-or-global" />
+
+The text is the same for a client and for global registration. It names both ways, because the key could have been registered either way. If `ext` isn't an object, Typemo throws a `ConfigurationError` with the text `Bad3.a: option "ext" is an object { [extension name]: options }`.
+
+### Registration errors [#registration-errors]
+
+The name is repeated, whether it's taken globally or on the client.
+
+<Snippet id="connection/clients-and-extensions/register-global-2" />
+
+The extension has no checks at all.
+
+<Snippet id="reference/extensions/extensions/registration-errors" />
+
+The name is empty or starts with `$`.
+
+<Snippet id="reference/extensions/extensions/registration-errors-2" />
+
+Registration came after the client's first schema was compiled.
+
+<Snippet id="connection/clients-and-extensions/register-before-first-model" />
+
+The **first successful schema compilation** closes the registry. An extension registered later wouldn't have checked the schemas that are already built. A failed compilation doesn't close the registry. After a `ConfigurationError` caused by an unregistered key, `client.use` on the same client still accepts extensions, so register the named extension and call `model` again. A client's registry closes with its first model. The [`Typemo.use`](../connection/typemo.mdx#typemo.use) registry closes with the first schema built successfully on any client, and then the text says `call Typemo.use() before the first model`. Plans close the same way: plugins registered after the first successful schema give a `ConfigurationError`. For more, see the guide [Multiple clients and extensions](../../connection/clients-and-extensions.mdx#register-before-first-model).
+
+### When not to use `TypemoExtension` [#when-not-to-use]
+
+An extension can't affect operations, because it has no access to operations or policies. For that, use [hooks](../../hooks/operation-hooks.mdx), and `modify` passes through all policies. To observe operations, subscribe to [events](../observability/events.mdx). To change the schemas of many models by one rule, write a [plugin](../hooks/plugins.mdx#schema-plugin).
+
+---
+
+## PropExtensions [#prop-extensions]
+
+`PropExtensions<V>` is the interface of extension options on a field, that is, `ext` in `@Prop`. In the core it's empty. Each extension adds its own key to it through a module declaration (declaration merging). After that the key is valid on `@Prop`, and the compiler knows the type of its value. `V` is the field's value type, so you can use it to type an option, for example `format?: (value: V) => string`.
+
+<Snippet id="reference/extensions/extensions/prop-extensions" twoslash />
+
+Here `value` in `format` is a number, which the compiler inferred from the field type.
+
+The parameter in every declaration must be named `V`, because TypeScript requires that when it merges interfaces with type parameters. Keys are unique: one extension, one key.
+
+### Compile errors [#compile-errors]
+
+The compiler rejects a key that isn't declared.
+
+<Snippet id="reference/extensions/extensions/compile-errors" twoslash />
+
+It also rejects a value of the wrong type. If `label.text` is declared as a string, a number won't fit. At run time, `validateProp` checks the same thing.
+
+<FullType>
+
+<Snippet id="reference/extensions/extensions/compile-errors-2" />
+
+</FullType>
+
+---
+
+## SchemaExtensions [#schema-extensions]
+
+`SchemaExtensions` is the same thing for a schema, that is, `ext` in `@Schema`. Keys are added the same way, with a module declaration. It has no type parameter.
+
+<Snippet id="reference/extensions/extensions/schema-extensions" twoslash />
+
+A discriminator takes the schema options of its root, so the root's `ext` applies to it too.
+
+<FullType>
+
+<Snippet id="reference/extensions/extensions/schema-extensions-2" />
+
+</FullType>
+
+---
+
+## ExtensionName [#extension-name]
+
+`ExtensionName` is the name of an extension, that is, a key of either interface, `PropExtensions` or `SchemaExtensions`. While no extension is declared, it's `never`. After you declare `label`, it becomes `"label"`. You need this type for the `N` parameter of [`TypemoExtension`](#typemo-extension).
+
+<FullType>
+
+<Snippet id="reference/extensions/extensions/extension-name" />
+
+</FullType>
+
+---
+
+## ExtensionFieldInfo [#extension-field-info]
+
+`ExtensionFieldInfo` describes a field that has `ext` declared. `validateProp` receives it as the second argument. A check can use it to take the field kind or path into account, for example to allow a key only on scalar fields. Typemo adds the `Class.field` address to the error message itself.
+
+<TypeTable
+  type={{
+    "where": { description: "`Class.field` for messages, for example `Account.balance`.", type: "string" },
+    "path": { description: "The field's path in the schema in code names (`name.first` for a field of a nested object).", type: "string" },
+    "dbPath": { description: "The field's path in the database.", type: "string" },
+    "kind": { description: "The field node kind: `scalar`, `array`, `map`, `subdocument`, and others.", type: "string" },
+  }}
+/>
+
+<FullType>
+
+<Snippet id="reference/extensions/extensions/extension-field-info" />
+
+</FullType>
+
+---
+
+## ExtensionSchemaInfo [#extension-schema-info]
+
+`ExtensionSchemaInfo` describes a schema that has `ext` declared. `validateSchema` receives it as the second argument.
+
+<TypeTable
+  type={{
+    "name": { description: "The class name.", type: "string" },
+    "kind": { description: "A document or a nested object.", type: "\"document\" | \"nested\"" },
+    "discriminator": { description: "The discriminator value if the schema is a discriminator (it has the same options as its root), otherwise `undefined`.", type: "string | undefined" },
+  }}
+/>
+
+<FullType>
+
+<Snippet id="reference/extensions/extensions/extension-schema-info" />
+
+</FullType>
+
+---
+
+## Reading values [#reading-values]
+
+You read extension values from the schema description, [`SchemaInfo`](../schemas/schema-info.mdx). For a schema that's `model.schema.ext`, and for a field it's `model.schema.extOf(path)`. The same `SchemaInfo` sits in the `schema` field of operation events and in [`OperationInfo`](../hooks/operation-context.mdx#operation-info), so an integration reads its options right from the event.
+
+`extOf` accepts a path in any positional form (`lines.0.note`). If there's no such path, it returns `undefined`, and for a field without options it returns an empty object. The `describe()` method includes `ext` for paths and the schema, but only as data, and functions drop out of the JSON.
+
+In the example, `model.schema.ext` returned `{ label: { title: "Accounts" } }` and `extOf("title")` returned `{ label: { text: "Title" } }`. For a field without options, `extOf("note")` returned `{}`, and `extOf("nope")` returned `undefined`.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Add your own field and schema options" href="../../extensions/custom-options.mdx">
+  How to introduce your own key in `ext`, validate it, and read it from the schema.
+</Card>
+<Card title="An extension from start to finish" href="../../extensions/example.mdx">
+  An extension from the type declaration to reading it in the UI.
+</Card>
+<Card title="Typemo" href="../connection/typemo.mdx">
+  Global registration of extensions, plugins, and subscribers.
+</Card>
+</Cards>

@@ -1,0 +1,254 @@
+---
+title: ".populate"
+description: "Every call form and option of populate, from path and select to required, clone, and transform"
+icon: Link
+---
+
+**Populate** puts the related documents themselves into a read result instead of their identifiers. A post stores `author` as the user's `ObjectId`, and after `.populate("author")` that field holds the user. `.populate` is a query builder method. You call it after [`find`](../query/reading.mdx#model.find), [`findOne`](../query/reading.mdx#model.find-one), and other read methods, and the query goes to the database on `await`.
+
+If you're new to related data, start with the [Show related data](../../populate/basics.mdx) guide. This page collects every call form, every option, and every error. The result types are described on the [Populate types](./populate-types.mdx) page, and the document methods in the [Document API](../documents/document-api.mdx#populate).
+
+All the examples use one blog model. The author lives in `Post.author`, tags are an array in `Post.tags`, and reviewers are a map in `Post.reviewers`. Comments aren't stored in the post. They are a **virtual field** `comments` that finds them by the `post` field (virtual fields are described in the [`@Virtual`](../schemas/virtual.mdx) section).
+
+<Snippet id="reference/populate/populate/intro" title="blog/models.ts" twoslash />
+
+The database has two users (Alice with the email `a@example.com`, and Bob), two tags (`db` and `ts`), and three posts.
+
+- "Hello" was written by Alice. Tags `db` and `ts`, 10 views.
+- "Second" was written by Alice. Editor Bob, tag `ts`, 50 views.
+- "Bob's" was written by Bob. No tags, 5 views.
+
+There are three comments. `c1` (author Bob) and `c2` (author Alice) belong to "Hello", and `c3` (author Bob) belongs to "Second". Identifiers in the results are shortened to `"…"`, because the database issues new ones on every data load.
+
+The elements on this page are [`.populate`](#populate) and its [options](#object-options) [`path`](#path), [`select`](#select), [`match`](#match), [`options`](#options), [`populate`](#object-options.populate), [`justOne`](#just-one), [`retainNullValues`](#retain-null-values), [`perDocumentLimit`](#per-document-limit), [`required`](#required), [`clone`](#clone), and [`transform`](#transform).
+
+---
+
+## .populate [#populate]
+
+`.populate` tells the query builder to replace, after reading, the references in the given fields with the documents they lead to. You need it when you must show data from another record next to a record: a post with the author's name, an order with its products, a comment with its post. Without it you'd read the related documents with separate queries and glue them together by hand.
+
+The method accepts a path string, a list of paths and objects, or one object with options. Whichever form you choose, Typemo doesn't join documents on the database side. For each path it takes the identifiers from the documents it read, finds the documents of the target model with one query, and puts them in their places. These are ordinary operations of the target model, so its policies (soft delete, tenant, hidden fields) apply here too.
+
+<Snippet id="reference/populate/populate/populate" twoslash />
+
+The `?.` sign isn't there for show. The author may have been deleted, and then `author` holds `null`. Why that happens and how to turn it off is covered in the [Reference without a document](#dangling-ref) section.
+
+<Returns type="QueryBuilder">
+
+A new query builder whose type marks the path as loaded. The builder is immutable, and each call returns a new one. What the field holds depends on the kind of result. For a document it's documents of the target model (a read-only array), and for [`.lean()`](../query/reading.mdx#lean) and [`.plain()`](../query/reading.mdx#plain) it's plain objects. If no document was found for a reference, a single reference becomes `null` (the field type allows that), and an element disappears from an array. See the [Reference without a document](#dangling-ref) section for details.
+
+</Returns>
+
+<Params>
+<Param name="path" type="string" required>
+
+The path of a reference field or a virtual field. Nested fields and fields of documents inside arrays are written with dots (`lines.product`), and the values of a reference map with `$*` (`reviewers.$*`). The path can continue into the related model (`post.author`), which is a nested populate. The compiler checks the path segment by segment. It suggests paths up to three segments and checks up to seven.
+
+</Param>
+<Param name="list" type="(string | PopulateObject)[]" required>
+
+A list of paths and objects with options instead of one path, for example `["author", { path: "tags", select: { label: 1 } }]`. An empty list and a repeat of one path are forbidden. The compiler notices a repeat, while an empty list is caught only by the runtime check.
+
+</Param>
+<Param name="spec" type="PopulateObject" required>
+
+An object with a `path` field and the [options](#object-options). The path is inferred first, and the other options are typed by the target model of that path. `select` suggests the target model's fields, and `match` its filter.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/populate/populate/populate-2" />
+
+</FullType>
+
+### A single reference [#single-ref]
+
+Most often you pass the path of one reference. In the document, a document of the target model with all its methods takes its place. You can change it and save it.
+
+<Snippet id="reference/populate/populate/single-ref" twoslash />
+
+The field type changed too. Instead of `Ref<User>` the compiler sees the user document. The same result as `.plain()` and `.lean()` differs in the type of `_id`.
+
+<Snippet id="reference/populate/populate/single-ref-2" twoslash />
+
+A single reference with no value stays with no value. "Hello" has no `editor` field, and the `editor` key doesn't appear in the result, because populate invents nothing.
+
+### Several paths as a list [#multiple-paths]
+
+To load several paths in one call, pass a list. You can mix strings and objects with options in it. Each path is a separate query to its target model.
+
+<Snippet id="populate/basics/multiple-populate" twoslash />
+
+### A dotted path [#dot-path]
+
+A path can continue into the model the reference leads to. `post.author` means "load the comment's post and the author of that post". This is a nested populate. Typemo finds the posts, then their authors. The [`populate` option](#object-options.populate) writes the same thing. A dotted path is shorter, and the option is needed when the nested path has options of its own.
+
+<Snippet id="reference/populate/populate/dot-path" twoslash />
+
+Every link of the chain is a single reference, so `post` and `author` allow `null`. A dotted path goes through arrays of subdocuments (`lines.product`), nested objects, and maps (`reviewers.$*`, `notes.$*.author`). Examples of such relations are in the [Relations inside nested data](../../populate/complex-relations.mdx) guide.
+
+### A repeated call replaces [#repeat-call-replaces]
+
+Options don't add up when you populate the same path again. The last call replaces the previous one entirely. Load the author in full, then with `select: { name: 1 }`, and the result has only the name. Paths the second call doesn't touch stay as they were.
+
+<Snippet id="reference/populate/populate/repeat-call-replaces" twoslash />
+
+One path twice in one list is an error, because you'd have to guess the winner. The compiler stops such a list (`"populate error": populate "author": the path is given twice`). For a path built from data, [`QueryError`](../errors/query-errors.mdx#query-error) says the same at runtime. Its text is in the [Errors](#errors) section.
+
+### Reference without a document [#dangling-ref]
+
+A reference may lead to a document that doesn't exist. It was deleted, hidden by soft delete, or filtered out by the [`match`](#match) option. Populate doesn't throw (unless you asked for [`required`](#required)) and looks at the shape of the field.
+
+- A single reference becomes `null`, and the field type allows that. For a document that's `HydratedDoc<User> | null`, and for `.lean()` and `.plain()` it's `{ … } | null`.
+- An element disappears from an array of references, and the rest keep their order ([`retainNullValues`](#retain-null-values) keeps the position).
+- A map value without a document stays in the map as `null`, and the key isn't lost.
+- A field that wasn't in the document stays with no value.
+
+<Snippet id="populate/basics/result-and-type" twoslash />
+
+Here `match` filtered out the tag `db`, and one reference disappeared from the array of the "Hello" post. The "Bob's" post had no tags, so its array is empty.
+
+The type of a single reference after populate always includes `null`, even with `required: true` in `@Prop`. `required` in the schema demands that the document holds an identifier. It doesn't guarantee the document still exists. The database doesn't care whether you deleted the author after writing the post. So access the field with `?.` or narrow it with the [`isPresent`](./populate-types.mdx#is-present) check. If a missing reference is a data error for you, pass populate [`required: true`](#required). Then Typemo throws an error, and `null` leaves the type.
+
+<Snippet id="reference/populate/populate/dangling-ref" twoslash />
+
+The author of the "Bob's" post is deleted, and `author` is `null`. "Hello" has an author, and with `required: true` the type has no `null`, so `strict.author.name` compiles without `?.`.
+
+Populate won't find a soft-deleted document of the target model either. The load runs as an ordinary read of the target model and gets the same condition as any read.
+
+### Hidden fields of the target model [#target-hidden-fields]
+
+Populate reads the target model by its rules, so its hidden fields (`hidden`) don't make it into the loaded documents in a `.plain()` result. To get a hidden field, add it to [`select`](#select) with the `+` prefix. For `.plain()` you also need to request the field with the `hidden` option.
+
+### How many queries go to the database [#query-count]
+
+One `.populate` with one path is one extra query to the target model, however many documents you read. The identifiers of all documents are collected into one `$in`. Queries to different target models run in parallel, and inside a transaction one after another. The exact number of queries is visible in the [operation events](../observability/events.mdx). Populate subqueries are nested in the parent operation, and each has `populatePath` filled in.
+
+<Snippet id="reference/populate/populate/query-count" />
+
+These are the events for `Posts.find().populate(["author", "tags", "editor"])`. One query for posts and one for each path. A virtual field with `perDocumentLimit` (or `options.limit`) on several documents turns into one aggregation query with `$lookup`. A counter (`count: true`) becomes an aggregation that counts documents on the database side and loads nothing.
+
+### Where populate works [#where-populate-works]
+
+The method works with `find`, `findOne`, `findById`, a cursor (`cursor`), and `findOneAndUpdate`. The result of a change comes back right away with the relations loaded. Aggregations have no `populate`, and there the [`$lookup`](../aggregation/stages.mdx#lookup) stage pulls in relations. A loaded document has its own methods: [`$populate`](../documents/document-api.mdx#populate), [`$depopulate`](../documents/document-api.mdx#depopulate), and [`$populated`](../documents/document-api.mdx#populated). The [Populate a document you already have](../../populate/document-populate.mdx) guide covers them.
+
+### Errors [#errors]
+
+The path and options are checked twice. The compiler catches a wrong path, an unknown option, and `select` and `match` with fields the target model lacks. It doesn't catch only what is visible at runtime, for example a path built from data.
+
+<Snippet id="populate/basics/troubleshooting" twoslash />
+
+The compiler answers with one `TS2345` message. The method has one signature, and the reason sits right in the parameter type, `Argument of type '"title"' is not assignable to parameter of type 'PopulateObject | "Invalid populate path \"title\": \"title\" is not a reference"'`. For an object with options the reason text arrives in the `"populate error"` property. For example `select of "author": unknown field "nope"`, `match of "author" is not a valid filter of the populated model`, `retainNullValues of "comments": a virtual has no positions to keep`, or `populate "author": the path is given twice` for a repeated path in a list. The compiler names an unknown option itself (`TS2353`, `'foo' does not exist in type …`). Some checks are possible only at runtime. Those are an empty list, `sort`, `limit`, and `skip` on a single reference, `justOne` on map values, and both forms of the limit at once.
+
+At runtime the same checks throw [`QueryError`](../errors/query-errors.mdx#query-error). The texts were obtained by running the code.
+
+<Snippet id="reference/populate/populate/errors" />
+
+Populate doesn't guess your intent. A typo in a path or a conflict of two options would give a plausible but wrong result, so Typemo stops right away.
+
+### When not to use it [#when-not-to-use]
+
+If you need the related data for a calculation on the database side (a sum over comments, grouping by author), use an aggregation with the [`$lookup`](../aggregation/stages.mdx#lookup) stage. Populate loads documents into the application, and you'd have to calculate there. Need only the number of related documents? Add a virtual field with a counter (`count: true`, see [`@Virtual`](../schemas/virtual.mdx)) and request it through populate. Need the relation once, for a document you already hold? Call [`$populate`](../documents/document-api.mdx#populate) on it.
+
+---
+
+## Object options [#object-options]
+
+An object accepts the options below. All except `path` are optional. An unknown option name is an error both at compile time and at runtime, `QueryError: populate "author": unknown option "foo"`.
+
+### path [#path]
+
+A required string. It's the path of a reference field or a virtual field, by the same rules as in the string form. The path `title` (an ordinary field) and a path to an embedded document without a reference are errors.
+
+### select [#select]
+
+The projection of the loaded documents. `{ name: 1 }` keeps only the name, and `{ email: 0 }` removes the email. Inclusion and exclusion can't be mixed, and `_id` can be excluded in either mode. Field selection in the parent query doesn't affect selection in populate, because they are independent.
+
+<Snippet id="reference/populate/populate/select" twoslash />
+
+The projection is typed by the target model, so the type of the loaded field narrows the same way as with the ordinary [`.select`](../query/reading.mdx#select). If you didn't select `email`, you can't read it. `select` is forbidden for a counter (`count: true`), because the result there is a number.
+
+### match [#match]
+
+An extra condition for the loaded documents. A document that doesn't fit it counts as not found. A single reference becomes `null`, and an element disappears from an array. That's why the type of a single reference with `match` includes `null`.
+
+<Snippet id="reference/populate/populate/match" twoslash />
+
+`match` can be a function. It receives the source document and returns a condition. The condition is then different for each document, and each document sends its own query to the database. The function receives the document in `.lean()` form and before this path is loaded, so references in it are still identifiers. It must return a filter object, or you get `QueryError: populate "author": the match function must return a filter object`.
+
+<Snippet id="reference/populate/populate/match-2" twoslash />
+
+The `match` condition is a filter of the target model and is checked as an ordinary filter. A typo in a field gives the compile error `match of "author" is not a valid filter of the populated model`.
+
+### options [#options]
+
+An object with the keys `sort`, `limit`, and `skip`. Any other key gives `QueryError: populate "tags": unknown option "foo"`. `sort` orders the loaded documents. `limit` and `skip` apply **to each source document separately**. `limit: 2` means "at most two comments per post", not "two comments in total".
+
+<Snippet id="reference/populate/populate/options" twoslash />
+
+A single reference has no order, so `sort`, `limit`, and `skip` are pointless for it. Typemo answers with an error instead of silently ignoring the options: `QueryError: populate "author": a single reference holds one document; options sort apply to reference arrays only` (the same for `limit`, `skip`, and `perDocumentLimit`). For reference arrays and virtual fields the options work. `sort` doesn't combine with `retainNullValues`. One option keeps positions, the other changes them.
+
+### The populate option [#object-options.populate]
+
+A nested populate: paths for the documents this path loaded. The value is the same as for `.populate`, that is, a string, an object, or a list. The path is written relative to the target model.
+
+<Snippet id="reference/populate/populate/object-options-populate" twoslash />
+
+The nested populate runs on the found documents before they take their places. That's why [`transform`](#transform) sees the document with the nested relations already loaded. The call `populate("post.author")` gives the same result if `author` needs no options.
+
+### justOne [#just-one]
+
+Forces one document (`true`) or a list (`false`), whatever the field type suggests. For an array of references, `justOne: true` keeps the first document found. For a single reference, `justOne: false` turns the result into an array. For a virtual field it's a way to get one document instead of a list. The option is forbidden for the values of a reference map (`QueryError: populate "reviewers.$*": justOne does not apply to the values of a Map`), and for a counter too.
+
+<Snippet id="reference/populate/populate/just-one" twoslash />
+
+If a virtual field is declared with `justOne: true` in [`@Virtual`](../schemas/virtual.mdx), it returns one document anyway. You don't need to repeat the option.
+
+### retainNullValues [#retain-null-values]
+
+For an array of references, keeps the position of every reference for which no document was found. A `null` stands in its place. Without the option such elements disappear, and the result indexes stop matching the indexes of the source array. You need the option when position matters, for example when a user set the order of tags.
+
+<Snippet id="reference/populate/populate/retain-null-values" twoslash />
+
+Virtual fields have no source positions, so the option doesn't suit them. The compiler answers `retainNullValues of "comments": a virtual has no positions to keep`, and at runtime `QueryError` says `retainNullValues keeps the positions of a reference array; a virtual has none`. The option is incompatible with `sort` too: `QueryError: populate "tags": retainNullValues keeps positions, sort reorders: they cannot be combined`.
+
+### perDocumentLimit [#per-document-limit]
+
+No more than this many documents per source document. The limit is counted for each post separately. It's the same as `options.limit`, and you can set only one of the two options. Both at once give the error `"options.limit" and "perDocumentLimit" are the same per-document limit; give one`. For a virtual field on several documents the limit turns into one aggregation query with `$lookup` and a `$limit` per owner. If there is one owner, the query is ordinary: a `find` with a limit. In `@Virtual` the same option sets the default limit.
+
+<Snippet id="reference/populate/populate/per-document-limit" twoslash />
+
+### required [#required]
+
+A reference without a document becomes an error, not `null`. [`DocumentNotFoundError`](../errors/query-errors.mdx#document-not-found-error) is thrown on the first reference that found nothing. The `| null` leaves the result type, as after the query's [`.orFail()`](../query/reading.mdx#or-fail). You need the option when a dangling reference means corrupted data and you can't go on. It's an option of populate itself. The parameter of the same name, `required` in `@Prop`, doesn't change the type of the loaded field. If the field is absent from the document entirely ("Hello" has no `editor`), the option requires nothing. There is no reference, so there is nothing to look for.
+
+<Snippet id="reference/populate/populate/required" />
+
+### clone [#clone]
+
+Gives each source document its own copy of the loaded document. Without it, a document found for several owners is one shared object. Two posts by one author get the same object in `author`. A change through one post is visible through the other, and `$save()` of that document saves everything changed through any owner. `clone: true` separates the copies at the cost of memory and time.
+
+<Snippet id="reference/populate/populate/clone" twoslash />
+
+### transform [#transform]
+
+A function `(doc, id) => value` that replaces each loaded value with its result. `doc` is the loaded document in `.lean()` form (or `null` if there is no document), and `id` is the original value of the reference. The field stores what the function returned, and the result type records exactly that. It's useful when the client needs not the whole related record but one value.
+
+<Snippet id="reference/populate/populate/transform" twoslash />
+
+For an array of references the function is called on each element, and the result is an array of its results. The type of `doc` follows [`select`](#select). If only the name is selected, `doc` is `{ _id, name } | null`.
+
+---
+
+## Limits and path depth [#limits-and-path-depth]
+
+The compiler checks a path segment by segment and doesn't enumerate all possible paths. On dense models there are tens of thousands of them, and the compiler wouldn't cope. So editor suggestions are limited to three segments, while the check goes up to seven. A path of eight segments is a compile error with the text `populate path is deeper than the 7-level ceiling`. At runtime there is no separate depth limit. A path built from a string is checked against the schema, not against a counter.
+
+There is nothing to populate below a polymorphic reference (`refPath`, `refModel`), because the target there isn't one model. An attempt is an error, `QueryError: populate "target.author": "target" is a polymorphic reference (refPath/refModel); nothing below it can be populated`. A path to a map without `$*` is an error too, `QueryError: populate "reviewers": "reviewers" is a Map: its values are "reviewers.$*"`.
+
+## Other methods [#other-methods]
+
+The document method [`$populate`](../documents/document-api.mdx#populate) is described on the [Document API](../documents/document-api.mdx) page. The result types and helper types are on the [Populate types](./populate-types.mdx) page. The schema options that define relations (`ref`, `refPath`, `refModel`, `@Virtual`) are in the [schemas](../schemas/prop.mdx) reference.

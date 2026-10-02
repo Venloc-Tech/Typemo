@@ -1,0 +1,151 @@
+---
+title: Send a document to the client
+description: "Turn a document into plain data with $toObject, $toPlain, or $toJSON, and hide or mask what shouldn't go out"
+icon: Send
+---
+
+To send a document to the client or put it in a cache, turn it into plain data. There are three ways.
+
+- [`$toPlain()`](../reference/documents/document-api.mdx#to-plain): for an API response.
+- [`$toJSON()`](../reference/documents/document-api.mdx#to-json): for strict JSON.
+- [`$toObject()`](../reference/documents/document-api.mdx#to-object): for working with the data inside the app.
+
+All three return a copy that's no longer tied to the document.
+
+You can't send the document itself, and not only because of its service methods. It holds MongoDB values that JSON doesn't have: `ObjectId` ids, int64 integers (`bigint`), `Decimal128`, bytes. Sent as is, a `bigint` breaks `JSON.stringify`, and an `ObjectId` turns into something unexpected. The three methods solve this in different ways, and each one decides which types become strings and which stay as they are.
+
+## What you need [#prerequisites]
+
+The connection from [Connect to the database](../connection/connect.mdx) and an `Invoice`. An invoice has a customer, an issue date, points in int64, tags, a `Map` of fees, a hidden note, a discount with a `get` function, and a computed `label` field.
+
+<Snippet id="documents/serialization/prerequisites" title="models/invoice.ts" twoslash />
+
+The database has one invoice.
+
+- Customer `alice`, issued `2026-01-02T03:04:05Z`.
+- 9007199254740993 points, one more than the limit of exact JavaScript numbers.
+- The tag `gift` and a `delivery` fee of 5.
+- The note `call first` and a discount of 2.6.
+
+## Quick start [#quick-start]
+
+<Snippet id="documents/serialization/quick-start" twoslash />
+
+`JSON.stringify(invoice)` calls [`$toJSON`](../reference/documents/document-api.mdx#to-json) on its own, so you can send the document directly too. Below we cover how the forms differ and how to use them.
+
+## Send data in an API response [#api-response]
+
+For a response to the client, use [`$toPlain`](../reference/documents/document-api.mdx#to-plain). Ids, int64, `Decimal128`, and UUID become strings, while native JavaScript types like `Date` and `Map` stay. You can safely pass this result to `JSON.stringify`. There's no `bigint` in it, and the points don't lose precision.
+
+<Snippet id="documents/serialization/api-response" twoslash />
+
+Notice that `points` became the string `"9007199254740993"`, not a number. JavaScript stores a number above 2⁵³ imprecisely, and the client would get a different value without any error. A string keeps the value exact, and Typemo accepts it back in `create`, `update`, and filters.
+
+If you need real JSON, with no `Date` and no `Map`, use [`$toJSON`](../reference/documents/document-api.mdx#to-json). The date becomes an ISO string, and the `Map` becomes a plain object.
+
+<Snippet id="documents/serialization/api-response-2" twoslash />
+
+The table shows the type of each value in each form. It's built straight from the library's code.
+
+<ValueForms types={["objectId", "long", "decimal128", "date", "map"]} forms={["hydrated", "object", "plain", "json"]} />
+
+## Work with the data inside the app [#work-in-app]
+
+[`$toObject`](../reference/documents/document-api.mdx#to-object) returns MongoDB values as they are. An `ObjectId` stays an `ObjectId`, int64 stays a `bigint`, and a `Map` stays a `Map`. That's what you want when the data doesn't leave the app, for example to compare values or pass them to another database operation. But you can't pass this result to `JSON.stringify`.
+
+<Snippet id="documents/serialization/work-in-app" />
+
+For that, use [`$toPlain`](../reference/documents/document-api.mdx#to-plain) or [`$toJSON`](../reference/documents/document-api.mdx#to-json).
+
+### Print a document to the console [#log-document]
+
+`console.log` and `util.inspect` show a document and a subdocument in a readable form. You see the class name and the data as `$toObject` would return it, without service internals like the parent and the change log. Hidden fields (`hidden`) don't appear in this output even when they're loaded, so you can safely print a document to a log. All of this works only on output and doesn't slow down creating, reading, or saving.
+
+<Snippet id="documents/serialization/log-document" twoslash />
+
+The output has no `note` field, even though the document holds it. Hidden fields are covered in [Don't send hidden fields](#hide-hidden-fields).
+
+## Don't send hidden fields [#hide-hidden-fields]
+
+Fields with `hidden`, like the note in the example, must not reach the client. So [`$toPlain`](../reference/documents/document-api.mdx#to-plain) and [`$toJSON`](../reference/documents/document-api.mdx#to-json) leave them out by default. [`$toObject`](../reference/documents/document-api.mdx#to-object) includes them, since it's for internal work. Besides, a hidden field is often not loaded at all. By default a query doesn't read it, and you add it to the projection explicitly.
+
+<Snippet id="documents/serialization/hide-hidden-fields" twoslash />
+
+`hidden` works at any depth: in subdocuments, arrays, and `Map`s of subdocuments.
+
+## Add computed fields and apply get [#add-fields-and-get]
+
+The class's computed fields (`Computed` getters) get into the result only if you ask with `virtuals: true`. The `get` functions of fields apply only with `getters: true`.
+
+<Snippet id="documents/serialization/add-fields-and-get" twoslash />
+
+## Mask values [#mask-values]
+
+If you need to send part of a value rather than remove the whole field, use the `mask` option. Its keys are paths of the result, and its values are `"mask"` (which puts `"?"` in place) or a ready mask from [`Mask`](../reference/query/masks.mdx#mask). The mask applies to the copy, so it doesn't touch the document or the next `$save`.
+
+<Snippet id="documents/serialization/mask-values" twoslash />
+
+The compiler rejects a mask with a wrong path. In code without types, a path that isn't in the result won't pass either. The method throws instead of leaving the value unmasked.
+
+## Turn the result into something of your own [#transform-result]
+
+The `transform` option takes a function, and that function's result becomes the method's result. It's applied after the mask.
+
+<Snippet id="documents/serialization/transform-result" twoslash />
+
+## How to choose [#how-to-choose]
+
+Ask yourself **where the data goes after the method**.
+
+- **Outside the app** (an API response, a message queue, a cache): use `$toPlain` or `$toJSON`. They have no `bigint`, and hidden fields are off. `$toPlain` keeps dates and `Map`s, and `$toJSON` follows the JSON rules strictly.
+- **It stays in the app, and you'll work with it** (compare `ObjectId`s, compute in `bigint`): use `$toObject`.
+
+## When not to use it [#when-not-to-use]
+
+If you need the document only for the response and won't change it, don't load it at all. [`.plain()`](../reference/query/reading.mdx#plain) on a query returns ordinary objects ready for the client right away, without creating a document. And [`.lean()`](../reference/query/reading.mdx#lean) returns the data as the driver returned it. That's faster, and hidden fields aren't even read from the database.
+
+## Troubleshooting [#troubleshooting]
+
+**`JSON.stringify` fails on large numbers.** You passed the result of `$toObject` to `JSON.stringify`, and it has a `bigint`.
+
+<Snippet id="documents/serialization/work-in-app" />
+
+Use [`$toPlain`](../reference/documents/document-api.mdx#to-plain) or [`$toJSON`](../reference/documents/document-api.mdx#to-json), or `JSON.stringify(document)`.
+
+**The response lacks a hidden field you need.** `$toPlain` and `$toJSON` don't include `hidden` fields. If you need the note, pass `{ hidden: true }` and make sure the field is loaded with `select({ "+note": true })`. A field that isn't loaded is missing from every form.
+
+**`$toJSON` refuses on `NaN`.** Typemo itself won't write `NaN` or `Infinity` into a field and answers `CastError: Cast to number failed at path "ratio" for NaN (number): NaN and Infinity are not allowed [finite]`. But another program could have written them to the database. After a read they stay numbers in the results of `.lean()` and `.plain()` and in `$toPlain`. JSON has no such numbers, so `$toJSON()` and `JSON.stringify(document)` answer with an error instead of a silent `null`.
+
+<Snippet id="documents/serialization/troubleshooting" />
+
+A stored `NaN` on its own doesn't make the document "modified". When compared with the read value, `NaN` counts as equal to `NaN`, so `$isModified()` stays `false`, and `$getChanges()` is empty. There's more in [Change and save a document](./change-and-save.mdx).
+
+There's a flip side. `JSON.stringify(document.$toPlain())` won't refuse. It silently turns `NaN` into `null`. If such data is possible, check the field before serializing, or fix the data with a migration.
+
+**A mask is rejected because the path doesn't exist.** `mask: { nope: "mask" }` in code without types masks nothing. So the method answers with an error instead of sending the value as is: `StrictModeError: mask: "nope" is not a path of Invoice's rows, so it would mask nothing; name a field of the rows [unknown-path]`. In type-checked code the compiler rejects such a path earlier.
+
+## Full example [#full-example]
+
+<Snippet id="documents/serialization/full-example" title="invoices/invoices.service.ts" twoslash />
+
+## Coming from Mongoose [#from-mongoose]
+
+<Callout type="migration">
+
+`doc.toObject()` and `doc.toJSON()` are called `$toObject()` and `$toJSON()` here. There's also `$toPlain()`, a form where MongoDB values became strings while `Date` and `Map` stayed. There are no schema-level serialization settings like `toJSON: { virtuals: true }`. You pass options on every call. Hidden fields are excluded from `$toJSON` and `$toPlain` by default.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Value forms" href="../reference/values/value-forms.mdx">
+  How each MongoDB type looks in a document, in `.lean()`, in `.plain()`, and in JSON.
+</Card>
+<Card title="Response masks" href="../queries/response-masks.mdx">
+  Every ready-made mask and how to apply it to queries.
+</Card>
+<Card title="Document API" href="../reference/documents/document-api.mdx">
+  Every serialization option and its types.
+</Card>
+</Cards>

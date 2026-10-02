@@ -1,0 +1,115 @@
+---
+title: Accept a filter from a client request
+description: "Stop a client from replacing a value with a query operator or opening a hidden field through a projection"
+icon: ShieldAlert
+---
+
+The data for a filter often comes from the client, from the request body or the query string. Instead of a string, the client can send an object with an operator and change the meaning of the query. The [`untrusted`](../reference/policies/soft-delete-and-untrusted.mdx#untrusted) function marks such data. If a key with `$` or `+` turns up inside it at any depth, it throws a [`StrictModeError`](../reference/policies/violations.mdx#sanitize) with the reason `sanitize`.
+
+With the second argument, [`UntrustedPlace`](../reference/policies/soft-delete-and-untrusted.mdx#untrusted-place), you say where the data goes: a filter, an update, or a projection. The check itself doesn't change, but the error text explains the danger for that particular place. This is an **extra** layer of protection. The main one is to validate the input against a schema and build the filter yourself.
+
+<Callout type="warning" title="The filter { name: body.name } isn't safe on its own">
+
+If a filter field is taken from the request body as is, `find({ name: body.name })`, the client can send an object with an operator instead of a string, for example `{"name": {"$gt": ""}}`. For the string field `name`, the condition `{ $gt: "" }` is valid and correctly typed. Typemo runs it, and instead of one user the query returns all of them. The compiler won't notice, because you declared the type of `body.name` yourself. Wrap the client's data in [`untrusted`](../reference/policies/soft-delete-and-untrusted.mdx#untrusted) or check that a string came in. The details are in [An operator instead of a value](#operator-instead-of-value).
+
+</Callout>
+
+## What you need [#prerequisites]
+
+A client connected as in [Connect to the database](../connection/connect.mdx), and a blog user model.
+
+<Snippet id="getting-started/installation/choose-decorators" title="users/user.ts" twoslash />
+
+## Quick start [#quick-start]
+
+Wrap the client's data in `untrusted` where you put it into the filter.
+
+<Snippet id="policies/untrusted-input/quick-start" twoslash />
+
+Client data usually arrives as a `Record<string, unknown>` dictionary. Such a filter compiles without type casts, and the key names are checked at runtime, right after the `untrusted` check. A key that isn't in the schema stops the query before it reaches the database.
+
+<Snippet id="policies/untrusted-input/quick-start-2" twoslash />
+
+## An operator instead of a value [#operator-instead-of-value]
+
+The app looks up a user by the name from the request body: `find({ name: body.name })`. The client sends `{"name": {"$gt": ""}}`. The condition "the name equals" turns into "the name is greater than an empty string", and every user matches. The collection has three of them: `ann`, `bob`, and `cy`.
+
+<Snippet id="policies/untrusted-input/operator-instead-of-value" title="users/users.service.ts" twoslash />
+
+Why does Typemo let it through? A filter allows field operators as a normal condition, and `{ $gt: "" }` on a string field is a valid condition of the right type. The strict checks compare the path, the operator, and the operand's type, but they don't know where the value came from. Casting would stop only an operator whose operand has a different type.
+
+The compiler is silent too. `JSON.parse` returns whatever you declared, and the `string` type of `body.name` is your promise, not a check. Typemo can't tell a condition written by a programmer from one sent by a client. That's why client data has to be marked.
+
+`untrusted` stops such input before it reaches the database and names the path to the operator.
+
+<Snippet id="policies/untrusted-input/operator-instead-of-value-2" title="users/users.service.ts" twoslash />
+
+You can also wrap a single value, `{ name: untrusted(body.name) }`. Then the path in the error starts with the operator (`$gt`). The most reliable way is to validate the input first, with `typeof body.name === "string"` or a request validator, then build the filter, and keep `untrusted` as a safety net.
+
+The check goes to any depth, including arrays and `Map`. For `untrusted({ a: [{ b: { $gt: 1 } }] })` the path is `a.0.b.$gt`. Dates, regular expressions, and BSON values count as data, and the check doesn't look inside them.
+
+## Don't expose a hidden field through a projection [#hidden-via-projection]
+
+In a projection, a `+path` key adds a [hidden field](../reference/schemas/field-markers.mdx#hidden). If the client picks the fields itself through `?fields=…`, it can send `{"+passwordHash": true}`. For a projection, pass `"projection"` as the second argument. Such a projection is rejected, and the text names exactly this threat: `untrusted value: "+passwordHash" at "+passwordHash" — a "+path" key inside data from outside would select a Hidden field; validate the input and build the projection yourself [sanitize]`.
+
+A key with `$` in a projection is rejected too, because it would turn the projection into a computed expression. The text is `untrusted value: "$slice" at "a.$slice" — an operator inside data from outside would turn the projection into a computed expression; validate the input and build the projection yourself [sanitize]`.
+
+<Snippet id="policies/untrusted-input/hidden-via-projection" twoslash />
+
+## Client data in an update [#client-data-in-update]
+
+An update carries the same risk. The client sends the fields to change, and among them is an operator key. Pass `"update"`, and the error tells you what exactly such a value would change.
+
+<Snippet id="policies/untrusted-input/client-data-in-update" twoslash />
+
+A `+` key in a filter or an update is rejected too. It isn't a field name but projection syntax, and it has no business in client data. If you pass anything other than the three allowed places, which is only possible without types, you get a [`QueryError`](../reference/errors/query-errors.mdx#query-error) with the text `untrusted(value, place): place must be "filter", "update" or "projection", got string "nope"`.
+
+## Check a whole object separately [#validate-whole-object]
+
+If you need to check a value but not pass it through the function, call [`Untrusted.check`](../reference/policies/soft-delete-and-untrusted.mdx#untrusted.check). The check is the same, but the function returns nothing.
+
+## What Typemo does even without untrusted [#without-untrusted]
+
+The strict filter checks always work. They reject, with the reason `sanitize`, an unknown operator, an operator at the top level, a mix of operators and fields, `$where`, and other server-side computations. For example, `filter.$where` gives this text:
+
+`"$where" runs JavaScript on the server and is not supported (at "filter.$where"): JavaScript code in a query runs with the rights of the database, cannot be checked against the schema, and turns injected input into executed code (Mongoose CVE-2025-23061, $where in populate); write the condition with query or aggregation operators ($expr) instead [sanitize]`
+
+The reason is in the text itself. JavaScript in a query runs with the database's rights, and a replaced value in it turns into running someone else's code. Write the condition you wanted in JavaScript with query or aggregation operators instead. The full list is in [Policy violations](../reference/policies/violations.mdx#sanitize).
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether the value came from a person or from another system**.
+
+- **Yes**: validate it against a schema, build the filter from the validated values, and add `untrusted` as a safety net.
+- **Your own code created the value**: you don't need `untrusted`.
+
+## When not to use it [#when-not-to-use]
+
+For values you built yourself from validated fields, `untrusted` is an extra pass. It doesn't replace checking types and ranges, and it doesn't decide which fields the client may request.
+
+## Troubleshooting [#troubleshooting]
+
+**`untrusted` was taken for input validation.** It looks only at keys. The string `"; drop"` or a negative number pass without a problem. Check the type, shape, and range separately.
+
+**Not everything is marked.** Only what went through the function is protected. If `untrusted` wraps `body.name`, but `body.filter` goes into the query as is, an operator gets through. Wrap every piece of client data.
+
+## Full example [#full-example]
+
+<Snippet id="policies/untrusted-input/full-example" title="users/users.service.ts" twoslash />
+
+<Callout type="migration">
+
+Mongoose has `sanitizeFilter` for this, and you have to turn it on. In Typemo the strict filter checks always work, and `untrusted` also forbids operators and `+` keys inside client data.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Prevent typos in field names" href="./strict-paths.mdx">
+  What happens to unknown fields in filters and updates.
+</Card>
+<Card title="SoftDelete and untrusted" href="../reference/policies/soft-delete-and-untrusted.mdx#untrusted">
+  The signatures and errors of `untrusted` and `Untrusted.check`.
+</Card>
+</Cards>

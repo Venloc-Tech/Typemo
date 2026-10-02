@@ -1,0 +1,138 @@
+---
+title: A multi-tenant app
+description: "An orders service where every request sees only its own organization's data, and cancellations and changes go into a log"
+icon: Building2
+---
+
+A multi-tenant app keeps the data of many organizations in shared collections. A request of one organization can neither see nor change the data of another. Let's build such a service from start to finish. The organization comes from the request token, the [tenant](../policies/tenants.mdx), [soft delete](../policies/soft-delete.mdx), and [audit](../policies/audit.mdx) policies are turned on in the schema, and tests check that nothing leaks.
+
+A **tenant** is an organization whose data is kept apart from the rest. The main idea of the recipe is that you don't pass the tenant as a parameter to every function or write it into every condition. The request layer opens a scope once, and the model adds the tenant to every operation on its own. Forgetting the "`orgId = …`" condition becomes impossible.
+
+## What you need [#prerequisites]
+
+- A client connected as in [Connect to the database](../connection/connect.mdx), and a `crm` database.
+- MongoDB running as a replica set (several MongoDB servers holding copies of the same data, though one server is enough for transactions). The audit log is written in a transaction.
+- The policy basics from [Split data by organization](../policies/tenants.mdx). Here we build a finished app on top of them.
+
+## Quick start [#quick-start]
+
+The model is marked with three policies, and the request handler opens a [`PolicyContext.run`](../reference/policies/policy-context.mdx#policy-context.run) scope with the tenant and the actor, the one who acts.
+
+<Snippet id="recipes/multi-tenant/quick-start" twoslash />
+
+The model set the tenant, and `create` doesn't have it. Next we build the request layer, the order operations, canceling and restoring, a report across all organizations, and tests.
+
+## Describe the model with policies [#define-model-with-policies]
+
+The tenant field is declared with the [`TenantField`](../reference/schemas/field-markers.mdx#tenant-field) type and marked with the [`@Tenant()`](../reference/schemas/field-markers.mdx#tenant) decorator next to `@Prop`. The [`tenant`](../reference/policies/schema-options.mdx#tenant), [`softDelete`](../reference/policies/schema-options.mdx#soft-delete), and [`audit`](../reference/policies/schema-options.mdx#audit) options turn the policies on.
+
+You can't skip the mark. It tells the schema which field to fill with the tenant, and without it a schema with the `tenant` option won't build. The error text is under "Troubleshooting". The `deletedAt` field is for soft delete: instead of deleting the document, a date is written into it.
+
+<Snippet id="recipes/multi-tenant/define-model-with-policies" title="orders/order.ts" twoslash />
+
+## Open a scope for every request [#scope-per-request]
+
+The request layer checks the token and opens a scope around the whole handling. Checking the token is your code (`__verifyToken__`). Typemo doesn't know where the organization comes from. The scope lives through every `await` inside, so services don't need the tenant passed in.
+
+<Snippet id="recipes/multi-tenant/scope-per-request" title="http/handle.ts" twoslash />
+
+It's better to reject an empty organization yourself, in the request layer. Then the client gets a clear authorization failure. If an empty string reaches `PolicyContext.run`, it refuses with `StrictModeError: PolicyContext.run: the tenant is empty (""); a tenant is a non-empty value, or allTenants: true for cross-tenant work [tenant]`, but that's a server error, not a client one.
+
+The token must confirm the organization. If you take it from a header the client sets itself, any user can pose as another organization.
+
+## Write and read an organization's orders [#write-and-read-orders]
+
+The service functions don't know about the tenant at all. They call the model, and that's it.
+
+<Snippet id="recipes/multi-tenant/write-and-read-orders" title="orders/orders.service.ts" twoslash />
+
+Say `acme` created the order `A-1`, and `globex` created `B-1`. `listOrders` with the `acme` token returns only `A-1`. Looking up the other organization's order by `_id` gives `null`, changing it gives `matchedCount: 0`, and deleting it gives `deletedCount: 0`. For an organization, other organizations' documents don't exist. The model won't let you slip in another tenant either. `create` with `tenantId: "globex"` under the `acme` tenant throws a `StrictModeError`.
+
+<Snippet id="recipes/multi-tenant/write-and-read-orders-2" />
+
+## Cancel an order and bring it back [#cancel-and-restore-order]
+
+With `softDelete` on, [`deleteOne`](../reference/writes/writes.mdx#delete-one) doesn't delete the document. It writes a date into `deletedAt`, and normal reads don't see deleted orders. You bring an order back with [`SoftDelete.restore`](../reference/policies/soft-delete-and-untrusted.mdx#soft-delete.restore), and you see the canceled ones with the `onlyDeleted` option of the [`.policy`](../reference/policies/policy-context.mdx#policy-values) builder.
+
+<Snippet id="recipes/multi-tenant/cancel-and-restore-order" title="orders/orders.service.ts" twoslash />
+
+After the cancellation, `listOrders` returns an empty list, and `listCancelled` returns the order `A-1`. After the restore, the order is back in the list. Notice that `restore` runs in the same scope, so one organization can't bring back another organization's canceled order.
+
+## Read the audit log [#read-audit-log]
+
+The `audit` option records every write in the `orders_audit` collection, in the same transaction as the write itself, with the tenant and actor from the scope. There's no model for reading the log, so an administrator reads it through the driver. [`client.unsafeDriver()`](../reference/connection/typemo-client.mdx#client.unsafe-driver) bypasses the policies, and that's a deliberate choice, only for an administrator's task.
+
+<Snippet id="recipes/multi-tenant/read-audit-log" title="admin/audit.ts" twoslash />
+
+The log is read after two creates, a cancellation, and a restore. The cancellation is recorded as `deleteOne` with the flag `softDelete: true`, and the restore as `updateMany` that resets `deletedAt`. `SoftDelete.restore` always writes through `updateMany`, so the restore line holds the condition, not the `_id` of the affected order. There's more in the recipe [Change history](./change-history.mdx#troubleshooting). What goes into the log at all is described in [`AuditEntry`](../reference/policies/schema-options.mdx#audit-entry).
+
+## A report across all organizations [#cross-tenant-report]
+
+An internal task, like counting every order in the system, needs to see everyone. A scope without a tenant won't do, because the model rejects the operation. You have to say explicitly that the task is cross-tenant, and that's visible in the code.
+
+<Snippet id="recipes/multi-tenant/cross-tenant-report" title="admin/report.ts" twoslash />
+
+`allTenants` never turns on by itself, so ordinary handlers never get it. Don't open it in `handle`. Client requests must not have access to it.
+
+## Check that nothing leaks [#check-no-leaks]
+
+The leak test creates data for two organizations and checks that no operation of one touches the other. It runs on a real database, since there's no other way to check the policy.
+
+<Snippet id="recipes/multi-tenant/check-no-leaks" title="orders/orders.test.ts" twoslash />
+
+The last check catches a forgotten scope. A query without a tenant doesn't return everything. It fails with a `StrictModeError`.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether an organization should ever see another one's data**.
+
+- **Never**: use the `tenant` policy, as here.
+- **Some data is shared**, like reference lists and price plans: don't mark their model with a tenant. A model without the `tenant` option is available to everyone.
+- **There are few organizations, and they're large**: consider a separate database per organization through [`useDb`](../reference/connection/connection.mdx#connection.use-db). The isolation is stronger, but each database has its own indexes and migrations.
+
+## When not to use it [#when-not-to-use]
+
+If the app's users aren't grouped into organizations and each one only sees their own records, an ordinary `owner` filter is enough. The tenant policy is for when a mistake in a condition turns into a data leak between customers.
+
+## Troubleshooting [#troubleshooting]
+
+**An operation fails with `StrictModeError`.** You called the model outside a scope. The error names the method you called (`Order.find`, `Order.create`) and tells you how to call that particular one correctly.
+
+<Snippet id="recipes/multi-tenant/troubleshooting" />
+
+That's protection, not a failure. Without a tenant, the operation would see everyone's data. Call it inside `handle`. There's more in the [Troubleshooting](../policies/tenants.mdx#troubleshooting) section of the tenant guide.
+
+**The schema won't build because the tenant field isn't marked.** `client.db().model(Order)` throws a `ConfigurationError` if the schema has the `tenant` option and the field isn't marked with `@Tenant()`.
+
+<Snippet id="recipes/multi-tenant/troubleshooting-2" />
+
+Add `@Tenant()` next to `@Prop` on a field of type `TenantField<T>`. The reverse violations, like a mark without the `tenant` option or marks on two fields, are described in the [`@Tenant` reference](../reference/schemas/field-markers.mdx#tenant).
+
+**The organization comes from a request header.** If `handle` reads the organization from a header the client sets, there's no isolation. A token signed by your server must confirm the organization.
+
+## Full example [#full-example]
+
+<Snippet id="recipes/multi-tenant/full-example" title="orders/orders.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, isolating organizations was built with a plugin and `pre` hooks on `find` and `update`, and any path around the hooks (an aggregation, `lean`, the driver) could return someone else's data. Here the policy is built into the shared operation pipeline and doesn't depend on which method you read with.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Split data by organization" href="../policies/tenants.mdx">
+  Every rule of the tenant policy: aggregations, related data, change streams.
+</Card>
+<Card title="Delete with a way to restore" href="../policies/soft-delete.mdx">
+  How `includeDeleted`, `onlyDeleted`, and deleting for good work.
+</Card>
+<Card title="Keep an audit log" href="../policies/audit.mdx">
+  What goes into the log and how secrets are masked.
+</Card>
+<Card title="Change history" href="./change-history.mdx">
+  How to show the user who changed what.
+</Card>
+</Cards>

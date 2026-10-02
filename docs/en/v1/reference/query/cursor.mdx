@@ -1,0 +1,261 @@
+---
+title: Cursor
+description: "The query cursor: next, toArray, map, eachAsync, close, for await, the QueryCursor and CursorSource types, and the EachAsyncError error"
+icon: Rows3
+---
+
+A **cursor** hands you a query's documents one at a time, as they're read from the database, instead of as a whole array. You get one from [`.cursor()`](./reading.mdx#cursor) on a [`find`](./reading.mdx#model.find) query when there are so many documents that holding them all in memory is awkward. That means an export to another system, a data migration, or a nightly report. This page describes every cursor method and the error it throws during processing.
+
+If you're new to this, read the guide [Large results](../../queries/large-results.mdx) first. This page is the reference.
+
+All the examples use one order model. To start with it has two fields, and the rest aren't needed.
+
+<Snippet id="queries/large-results/prerequisites" title="models/order.ts" twoslash />
+
+The collection holds five orders numbered 1 to 5. The odd orders are paid (`paid`), the even ones are new (`new`). They're always read in ascending number order, so the order of the results is clear.
+
+A cursor returns the same rows that `await` would return. They are documents, a [`.lean()`](./reading.mdx#lean) result, or a [`.plain()`](./reading.mdx#plain) result, depending on the chain. [`.skip`](./reading.mdx#skip), [`.limit`](./reading.mdx#limit), and [`.batchSize`](./options.mdx#batch-size) work with a cursor too.
+
+The cursor type is called [`QueryCursor<T>`](#query-cursor), where `T` is the row type. You can name it in your own signature by importing it from the package. A function that accepts an order cursor doesn't care what's inside: documents, or a `.lean()` or `.plain()` result.
+
+<Snippet id="reference/query/cursor/intro" twoslash />
+
+---
+
+## for await [#for-await]
+
+Most often you read a cursor with a `for await ... of` loop. The cursor iterates asynchronously, and the loop gets the next document when it's done with the previous one. Only the current batch lives in memory at any moment.
+
+<Snippet id="reference/query/cursor/for-await" twoslash />
+
+When the documents run out, the loop ends and the cursor closes itself. It also closes on an early exit: a `break` or an error inside the loop frees the cursor on the server. That matters, because an unclosed cursor holds server resources. But after an early exit you can't read the same cursor again, or you get a `QueryError`.
+
+<Snippet id="reference/query/cursor/for-await-2" twoslash />
+
+That's intentional. Reading a cursor you closed yourself would mean the code reads different data than it thinks, and a silent empty result would hide the mistake. To read the data again, open a new cursor. A cursor read to the end doesn't answer with an error. It's exhausted, and `.next` on it returns `null`.
+
+---
+
+## .next [#next]
+
+`.next` returns the next document, or `null` when the documents have run out. It helps when a loop doesn't fit: you read documents one at a time in different places in the code, or take only the first few.
+
+<Snippet id="reference/query/cursor/next" twoslash />
+
+<Returns type="Promise<T | null>">
+
+The next row, or `null` if the cursor is exhausted. On an exhausted cursor `.next` keeps returning `null`, and calling it again isn't an error. If you closed the cursor yourself ([`.close`](#close), leaving a `for await`, [`.eachAsync`](#each-async)), `.next` throws a `QueryError` with the text `the cursor is closed (close() or a left for-await); open a new one`.
+
+</Returns>
+
+It takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/query/cursor/next-2" />
+
+</FullType>
+
+---
+
+## .toArray [#to-array]
+
+`.toArray` reads the cursor to the end and returns the remaining documents as an array. Use it when you first need to take a few documents off the cursor with [`.next`](#next) and then take the rest whole. It also fits when the cursor came to you from someone else's code.
+
+<Snippet id="reference/query/cursor/to-array" twoslash />
+
+<Returns type="Promise<T[]>">
+
+All the documents not yet read. The cursor is exhausted and closes itself. On a cursor you closed, `.toArray` throws a `QueryError`, like [`.next`](#next).
+
+</Returns>
+
+It takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/query/cursor/to-array-2" />
+
+</FullType>
+
+### When not to use it [#to-array.when-not-to-use]
+
+`.toArray` collects everything into memory and returns the same as an ordinary `await`. If there are many documents and memory is tight, process them one at a time in a [`for await`](#for-await) or with [`.eachAsync`](#each-async).
+
+---
+
+## .map [#map]
+
+`.map` transforms the cursor's documents. It returns a **new** cursor, and its documents come from calling your function on each original row. That way you can bring rows to the shape you need before the code starts reading them.
+
+<Snippet id="reference/query/cursor/map" twoslash />
+
+<Returns type="QueryCursor<U>">
+
+A new cursor with the transformed documents. The original cursor doesn't change, but **they share one data stream**. They read the same documents, and a document read through one cursor won't be seen by the other.
+
+</Returns>
+
+<Params>
+<Param name="fn" type="(doc: T) => U" required>
+
+The transform function. It's called on every row that the new cursor reads. The function's result is the new cursor's row, and `U` is inferred from it.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/cursor/map-2" />
+
+</FullType>
+
+### A stream shared with the original cursor [#shared-stream]
+
+The MongoDB driver would change the cursor itself and return that same cursor. Here `.map` returns a new cursor, but you can't read from both at once. Each row goes to only one of them.
+
+<Snippet id="reference/query/cursor/shared-stream" twoslash />
+
+If you need both kinds of rows, transform the row inside one loop instead of creating two cursors.
+
+---
+
+## .eachAsync [#each-async]
+
+`.eachAsync` calls your function for every document and waits for it to finish. This processes all the cursor's documents without a loop, with configurable concurrency, batches, and error collection. At the end the cursor closes itself, even if the function threw.
+
+<Snippet id="reference/query/cursor/each-async" twoslash />
+
+<Returns type="Promise<void>">
+
+A promise that completes when all documents are processed. By then the cursor is closed and can't be read further, which gives a `QueryError`, as after leaving a `for await`. If the function threw, the promise rejects with an error, details below.
+
+</Returns>
+
+<Params>
+<Param name="fn" type="(doc: T, index: number) => unknown" required>
+
+The processing function. It receives the document and its sequence number from zero. The function can be async, and `.eachAsync` waits for its result. With the `batchSize` option, an array of documents arrives instead of a document, and a batch number instead of a document number.
+
+</Param>
+<Param name="options.parallel" type="number" default="1">
+
+How many `fn` calls can run at the same time. Documents are still read one at a time, and only your function runs in parallel. The value must be a positive integer, otherwise you get a `QueryError` with the text `eachAsync: parallel must be a positive integer, got 0 (number)`. The value is printed together with its type. The string `"2"` gives `got "2" (string)`, not a silent cast to a number.
+
+</Param>
+<Param name="options.continueOnError" type="boolean" default="false">
+
+Keep going after an error in `fn`. Errors pile up and are thrown together at the end as an [`EachAsyncError`](#each-async-error). Without this option the first error stops processing and is thrown as is.
+
+</Param>
+<Param name="options.batchSize" type="number">
+
+Pass `fn` batches of up to `batchSize` documents instead of one document. The value must be a positive integer, otherwise you get a `QueryError` with the text `eachAsync: batchSize must be a positive integer, got 0 (number)`. Don't confuse it with the query's [`.batchSize`](./options.mdx#batch-size). That option sets the batch size when reading from the network, and this one sets the size of the batch your function receives.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/cursor/each-async-2" />
+
+</FullType>
+
+### Parallel processing [#parallel-processing]
+
+By default `.eachAsync` calls `fn` for documents in turn. The next call starts after the previous one finishes. If the function waits on the network, for example on sending to another system, that's idle time. `parallel` lets you keep several calls going at once.
+
+<Snippet id="reference/query/cursor/parallel-processing" twoslash />
+
+No more than three calls ran at the same time. The order in which they finish isn't guaranteed, and order 3 may finish before order 2. If order matters, leave `parallel` at one.
+
+### Batches [#batches]
+
+If the receiver prefers to take data in bunches, for example when inserting into another database, `batchSize` collects documents into arrays.
+
+<Snippet id="reference/query/cursor/batches" twoslash />
+
+The last batch can be shorter than the others. In the example it has one order.
+
+### Errors in the handler [#handler-errors]
+
+Without `continueOnError`, the function's first error stops processing. No new documents are started, calls already started under `parallel` are awaited, and the error itself is thrown without a wrapper. By then the cursor is closed.
+
+With `continueOnError: true`, processing runs to the end, and errors pile up and are thrown together as an `EachAsyncError`.
+
+<Snippet id="reference/query/cursor/handler-errors" twoslash />
+
+### When not to use it [#each-async.when-not-to-use]
+
+If you need to stop reading on a condition, for example to take documents until you meet a particular one, use a [`for await`](#for-await) with `break`. `.eachAsync` reads the cursor to the end. If you need all the documents at once in memory, use [`.toArray`](#to-array) or an ordinary `await`.
+
+---
+
+## .close [#close]
+
+`.close` closes the cursor and frees the resources on the server. You call it by hand only if you didn't read the cursor to the end and didn't leave through `for await` or `.eachAsync`. For example, you took a few documents through [`.next`](#next) and stopped.
+
+<Snippet id="reference/query/cursor/close" twoslash />
+
+<Returns type="Promise<void>">
+
+A promise with no value. Closing is idempotent, and calling `.close` again isn't an error. It never throws an error, even if the server couldn't close the cursor. After closing, any read (`.next`, `.toArray`, `for await`) throws a `QueryError` with the text `the cursor is closed (close() or a left for-await); open a new one`.
+
+</Returns>
+
+It takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/query/cursor/close-2" />
+
+</FullType>
+
+---
+
+## EachAsyncError [#each-async-error]
+
+[`.eachAsync`](#each-async) throws `EachAsyncError` with `continueOnError: true` when at least one call of the function ended in an error. It extends the general Typemo error class. All the function's errors are in the `errors` field in document order, and the first of them is also available as `cause`.
+
+<TypeTable
+  type={{
+    errors: { description: "All the errors the function threw, in document order. The array is frozen.", type: "readonly unknown[]" },
+    cause: { description: "The first of the function's errors.", type: "unknown" },
+    message: { description: "The text `eachAsync: N call(s) of the callback failed (continueOnError)`, where `N` is the number of errors.", type: "string" },
+  }}
+/>
+
+Without `continueOnError`, `EachAsyncError` isn't thrown, and you get the function's first error as is. The class is also described in the error reference: [`EachAsyncError`](../errors/query-errors.mdx#each-async-error).
+
+---
+
+## QueryCursor [#query-cursor]
+
+`QueryCursor<T>` is the cursor type. It's an interface with the methods `next`, `toArray`, `map`, `eachAsync`, and `close`, and with async iteration. [`.cursor()`](./reading.mdx#cursor) returns it, and it's handy for describing the parameters of functions that read a cursor. The function doesn't care which rows are inside, only the type `T` matters.
+
+Behind the interface stands the `TypedCursor` class. You need it when you have to build a cursor yourself, for example in a test, to replace reads from the database with your own data. The source is described by the type `CursorSource<T>`, an async iterable object with an optional `close` method.
+
+<Snippet id="reference/query/cursor/query-cursor" twoslash />
+
+The source's `close` method is called once, when the cursor closes. It shouldn't throw errors, because closing a cursor throws none, and an exception from `close` is swallowed.
+
+Two types describe the parameters of [`.eachAsync`](#each-async). `EachAsyncOptions` (`parallel`, `continueOnError`) fits when the function receives a document. `EachAsyncBatchOptions` adds a required `batchSize` and fits when it receives a batch. TypeScript picks the right form of `fn` itself, and with `batchSize` the first argument is an array.
+
+<FullType>
+
+<Snippet id="reference/query/cursor/query-cursor-2" />
+
+</FullType>
+
+---
+
+## Further reading [#further-reading]
+
+<Cards>
+<Card title="Reading" href="./reading.mdx">
+  `.cursor()`, how to get a cursor from a query, and `.batchSize`, `.skip`, `.limit`, which work with it.
+</Card>
+<Card title="Query options" href="./options.mdx">
+  `.batchSize`, `.timeoutMS`, and other options that affect reading with a cursor.
+</Card>
+</Cards>

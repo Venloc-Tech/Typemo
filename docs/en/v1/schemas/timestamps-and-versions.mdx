@@ -1,0 +1,97 @@
+---
+title: Timestamps and versions
+description: "Get createdAt, updatedAt, and a document version number, and see what happens to them on every write"
+icon: Clock
+---
+
+Almost every entity needs to know when it was created, when it last changed, and whether someone else changed it while you were editing. Typemo doesn't add these fields behind your back. You get them by extending a base class. [`Timestamped`](../reference/schemas/base-classes.mdx#timestamped) adds `createdAt` and `updatedAt`, and [`Versioned`](../reference/schemas/base-classes.mdx#versioned) adds a numeric version, `__v`. The fields are visible to the compiler, your editor's hints, and the result types, and the core sets their values.
+
+In Mongoose the `timestamps` and `versionKey` options do the same job. The difference is that here they're ordinary class fields. They're always in the result type, and you don't pass them on create.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the post model from `posts/post.ts`.
+
+## Quick start [#quick-start]
+
+Wrap the base class: `Timestamped(Entity)`. The dates appear on create, and `updatedAt` moves on the very first change.
+
+<Snippet id="schemas/timestamps-and-versions/quick-start" title="posts/post.ts" twoslash />
+
+Below we'll look at exactly when the timestamps change, and add a version.
+
+## How the timestamps change [#how-timestamps-change]
+
+`createdAt` is written once, on create, and never changes after that. The field's type is `Immutable`, and an update that tries to change it is rejected.
+
+`updatedAt` is updated by every write that reaches the document: a [`$save`](../reference/documents/document-api.mdx#save) with changes, [`updateOne`](../reference/writes/writes.mdx#update-one), `updateMany`, `findOneAndUpdate`, a replacement, and an upsert. You don't set it yourself. `updatedAt` moves even on a write that changes nothing in value. For example, on a `$set` of the same title, or an `$addToSet` of a value that's already in the array (the server reports `modifiedCount: 1` in that case). Before the write, the core can't know whether the server will change anything.
+
+<Snippet id="schemas/timestamps-and-versions/how-timestamps-change" title="posts/posts.service.ts" twoslash />
+
+An attempt to change `createdAt` in an update is stopped by a [`StrictModeError`](../reference/errors/data-errors.mdx#strict-mode-error) with the reason `immutable`: `$set.createdAt: "createdAt" is immutable; it is written only when the document is created ($setOnInsert on upsert) [immutable]`. With types, such an update won't compile. On an upsert, when the update creates the document, both timestamps get the same value.
+
+You can set the timestamps deliberately, and the types allow it. On create both are optional (`create({ title, createdAt, updatedAt })`), and in an update you can write `updatedAt`. The core leaves a date you set as is, and `$save` won't overwrite an `updatedAt` you assigned on the document. That's how you migrate old data along with its history. In normal code don't pass the timestamps, since `createdAt` can't change after creation anyway.
+
+## Add a version [#add-version]
+
+`Versioned(Entity)` adds `__v`. It's a counter the core increments when a change depends on the position of array elements. Otherwise two processes changing the same array by index would overwrite each other. The mixins combine in any order: `Timestamped(Versioned(Entity))`.
+
+<Snippet id="schemas/timestamps-and-versions/add-version" title="posts/post.ts" twoslash />
+
+Changing an ordinary field doesn't increment the version. And replacing the whole document with `replaceOne` keeps `createdAt` and the current value of `__v`.
+
+The timestamps work as keys for paged reading. [`keysetPage`](../reference/query/keyset.mdx#model.keyset-page) sorts by `createdAt` and `updatedAt` (`sort: [["createdAt", "desc"]]`), because these fields are always filled in and never `null`.
+
+## Guard against concurrent edits [#concurrent-edits]
+
+To keep a save from overwriting someone else's change, add `optimisticConcurrency: true` to the schema. Then [`$save`](../reference/documents/document-api.mdx#save) goes through only if the document in the database hasn't changed since it was read, and otherwise throws a [`VersionError`](../reference/errors/query-errors.mdx#version-error). The option needs `Versioned`, and without it the model won't build. This is covered in detail in [Don't lose concurrent changes](../documents/versions.mdx), and the option itself is described in [`@Schema`](../reference/schemas/schema.mdx#optimistic-concurrency).
+
+## How to choose [#how-to-choose]
+
+Ask yourself: **what do you need to know about the document?**
+
+- **When it was created and when it changed**: `Timestamped`.
+- **You need protection against concurrent editing and races on arrays**: `Versioned` with `optimisticConcurrency`.
+- **Both**: mix in both.
+
+Your own fields like `publishedAt` stay ordinary fields. `Timestamped` covers only the creation and modification of the record.
+
+## When not to use it [#when-not-to-use]
+
+Lookup tables that change once a year don't need timestamps, and every extra field is extra weight. Logs and events that are only ever written don't need `updatedAt`. A `createdAt` declared as an ordinary field with `default` is enough. And not every model needs a version. If one process changes the entity, there won't be conflicts.
+
+## Troubleshooting [#troubleshooting]
+
+**An update of `createdAt` isn't saved.** The field is created once. To write it by hand, you'll have to create the document again.
+
+**`optimisticConcurrency` in a model without `Versioned`.** The model won't build.
+
+<Snippet id="schemas/timestamps-and-versions/troubleshooting" />
+
+Add `Versioned` to the inheritance chain: `class Account extends Versioned(Entity)`.
+
+**The timestamps are missing from the response.** `createdAt` and `updatedAt` are in `.plain()` and `.lean()` results. But if you pick fields with `select({ title: 1 })`, the result holds only the selected ones. Add the timestamps you need to the selection.
+
+## Full example [#full-example]
+
+<Snippet id="schemas/timestamps-and-versions/full-example" title="posts/posts.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose the `timestamps: true` schema option turns timestamps on, and the `__v` version is always there. In Typemo it's inheritance. You add `Timestamped` and `Versioned` separately, the fields are visible in the types, and the `optimisticConcurrency` option turns on the version check on save.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Don't lose concurrent changes" href="../documents/versions.mdx">
+  How to catch a `VersionError`, retry the operation, and protect arrays.
+</Card>
+<Card title="Base classes" href="../reference/schemas/base-classes.mdx">
+  `Entity`, `Timestamped`, and `Versioned` with their exact types.
+</Card>
+<Card title="Immutable fields" href="./immutable.mdx">
+  How to forbid changing a field after creation, the way it's done for `createdAt`.
+</Card>
+</Cards>

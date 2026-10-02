@@ -1,0 +1,111 @@
+---
+title: How to read types in your editor
+description: "What editor hints show for a document, for .lean() and .plain() results, and for Selected, and how to tell from a compiler message what's wrong with a query"
+icon: MousePointer2
+---
+
+In Typemo, half of what you need to know about a query result lives in its types. Which fields a row has, what happened to a `bigint`, whether a hidden field dropped out, whether `null` can come back: hover over a variable and you see it all. No need to run the code. Below we'll cover what the hint shows, what its odd-looking parts mean, and how to read a compiler message when a query doesn't compile.
+
+Typemo's types are **inferred from your class**, nobody writes them by hand. The hint for a whole document is short. It holds the class name, `HydratedDoc<Account>`, and, if the document differs from a normal read, a list of the fields that differ. Read and serialization results (`lean`, `plain`, `$toPlain()`, `$toObject()`, `$toJSON()`) are expanded down to their fields. Hover over a single property to see its exact type.
+
+All the hints below came from the real compiler on one account model. It has a hidden field `pin` that doesn't appear in normal results (more in the [`Hidden`](../reference/schemas/field-markers.mdx#hidden) reference). It shows how such a field drops out of the types.
+
+<Snippet id="concepts/reading-types/intro" title="accounts/account.ts" twoslash />
+
+## Document [#document]
+
+A **document** is the result of a normal read. This model object has the `$save` and `$set` methods and tracks its changes. Its type is called `HydratedDoc`, and inside the angle brackets Typemo writes the model's data. Hover over a variable holding a document, then over its properties.
+
+<Snippet id="concepts/reading-types/document" twoslash />
+
+The hint for `account` is `HydratedDoc<Account>`: an `Account` document as a normal read returns it. It has every field of the class except the hidden ones. By default `pin` isn't in the document, and `account.pin` won't compile. `new()` and `create()` return the same `HydratedDoc<Account>`, so feel free to use it in the signatures of functions that take a document you've read.
+
+Properties read as ordinary values: `account.balance` is a `bigint`, `account._id` is an `ObjectId`. Hints carry no service markers such as "this field can't change after creation". Those live only in the class declaration, and the [Field marker types](../reference/schemas/field-markers.mdx) reference explains what they're for.
+
+If a document differs from a normal read, the hint is called `HydratedDocWith`, and its second argument lists only the fields that differ. That happens in three cases.
+
+- A reference was loaded with populate: `HydratedDocWith<Post, { author: HydratedDoc<User> | null }>`.
+- A hidden field was requested with a `+` sign (see the example in [Hidden fields](#hidden-fields)).
+- A field was narrowed with a `.where(…).in(…)` condition.
+
+The other fields are the same as in the `HydratedDoc` of that class. [Make sure a reference is populated](../populate/type-checks.mdx) shows how to read the hint of a populated document.
+
+Forget [`.orFail()`](../reference/query/reading.mdx#or-fail), and `| null` shows up in the hint, and the compiler demands a check. A `findOne` result can be empty.
+
+<Snippet id="concepts/reading-types/document-2" twoslash />
+
+## `.lean()` and `.plain()` [#lean-and-plain]
+
+`.lean()` and `.plain()` return a result with no methods, data only. In a `.lean()` result the values are as the driver returned them (`ObjectId`, `bigint`). In `.plain()` the MongoDB types are turned into strings so you can hand the data to the client. You can see the difference in the properties.
+
+<Snippet id="concepts/reading-types/lean-and-plain" twoslash />
+
+The `lean` type is fully expanded, with `_id` as an `ObjectId` and `balance` as a `bigint`. In the `.plain()` result the same fields became `` `${bigint}` `` and `string`. The `${bigint}` string means "the decimal notation of an integer", and the write methods accept it back. [Reading data](../queries/reading-data.mdx) explains how to choose between them, and every form type is listed in the [Form types](../reference/values/form-types.mdx) reference.
+
+You can get the same forms from a document, too, with [`$toPlain()`](../reference/documents/document-api.mdx#to-plain), [`$toObject()`](../reference/documents/document-api.mdx#to-object), and [`$toJSON()`](../reference/documents/document-api.mdx#to-json). Their hints are expanded down to the fields, and the hidden field isn't there.
+
+<Snippet id="concepts/reading-types/lean-and-plain-2" twoslash />
+
+Look at the fields. `$toPlain()` turns `balance` into `` `${bigint}` `` and `_id` into a string. `$toObject()` keeps the driver's values, `bigint` and `ObjectId`. And `$toJSON()` also turns the date into a string, because JSON doesn't know `Date`.
+
+## Hidden fields [#hidden-fields]
+
+A hidden field drops out of the result type until you ask for it explicitly with a `+` sign in [`.select`](../reference/query/reading.mdx#select). Then it shows up in the document type, but it won't get into a response to the client until you allow that separately. The type tells you whether a field can end up in the response before you run anything.
+
+<Snippet id="concepts/reading-types/hidden-fields" twoslash />
+
+The document's hint is `HydratedDocWith<Account, { pin?: string }>`. Compared with a normal read, it has one extra field, and the hint names only that one. Both in the document and in `$toPlain()` with `{ hidden: true }` the field reads as `string | undefined`. Since you requested it with `+`, it's an ordinary string. In a regular `$toPlain()` the field isn't there, and the compiler won't let you access it. If `pin` isn't in the type, you can't send it to the client by accident. [Reading data](../queries/reading-data.mdx#hide-secrets) covers hidden fields in full.
+
+## Selected [#selected]
+
+If you pick some of the fields with [`.select`](../reference/query/reading.mdx#select), the row type narrows to those fields and `_id`. You can write that shape as a separate type, [`Selected`](../reference/query/contracts.mdx#selected): "these fields of the model as a `.plain()` result". It comes in handy for describing a result in a function signature, and the hint expands it in full.
+
+<Snippet id="concepts/reading-types/selected" twoslash />
+
+The type inferred from the query (`rows`) and the type written by hand (`BalanceRow`) have the same fields. Only their order in the hint differs. If they ever drift apart, [`.expect`](../reference/query/contracts.mdx#expect) tells you at compile time.
+
+## When it doesn't compile [#compile-errors]
+
+Compiler messages for Typemo can be long, because the types are nested inside each other. Read them from both ends. The first line names the rule (`Property … does not exist`, `is possibly 'null'`), and the last nested line usually names the reason. Here are five typical cases with the real compiler text.
+
+**A document method on a `.lean()` result.** `.lean()` returns data without methods, so there's no `$save`. The message expands the row type, and you can see from it that there are no methods.
+
+<Snippet id="concepts/reading-types/compile-errors" twoslash />
+
+To change and save, read a document, not `.lean()`.
+
+**The result can be `null`.** If nothing is found, `findOne` without `.orFail()` returns `null`, and the compiler makes you deal with it.
+
+<Snippet id="concepts/reading-types/compile-errors-2" twoslash />
+
+Add `.orFail()` if a missing document is an error for you, or check for `null` yourself.
+
+**A wrong value type in a write.** Here the whole point is in the last line of the message. The first lines only say that neither of the two `create` overloads matched, and the reason is written at the end of each overload. The `balance` field is declared as `bigint`, so the input can be a `bigint` or its decimal string, but not a number.
+
+<Snippet id="concepts/reading-types/compile-errors-3" twoslash />
+
+Change it to `balance: 5n` or `balance: "5"`.
+
+**A field that doesn't exist.** The compiler won't let an unknown name through in `.select`, in a filter, or in an update. In a filter it's `Object literal may only specify known properties`, with a suggestion of the closest name. In `.select` the message is the same on any model. It contains the pair `"projection error"` with the reason `unknown field "nope"`, so the compiler names the unknown field outright.
+
+<Snippet id="concepts/reading-types/compile-errors-4" twoslash />
+
+**The result contract doesn't match.** `.expect` compares the expected row shape with the real one. If they differ, the message lists the extra fields (`extra`) and the ones that don't match (`mismatch`).
+
+<Snippet id="concepts/reading-types/compile-errors-5" twoslash />
+
+The method is the same every time. Find the field or method name in the message, see which type is named on the right, hover over the variable, and compare. And if the query compiles but fails at runtime, the problem is in the data, not the types. The rules of strictness are on the [Strictness](./strictness.mdx) page.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Value forms" href="../reference/values/value-forms.mdx">
+  How each MongoDB type looks in a document, in `.lean()`, `$toObject()`, `.plain()`, and JSON.
+</Card>
+<Card title="Checking the response shape" href="../queries/contracts.mdx">
+  `.expect`, `.parse`, and `Selected`: how to describe the shape of a response and check it.
+</Card>
+<Card title="Strictness" href="./strictness.mdx">
+  What Typemo treats as an error at runtime and at compile time.
+</Card>
+</Cards>

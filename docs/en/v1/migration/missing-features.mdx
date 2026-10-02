@@ -1,0 +1,131 @@
+---
+title: What Typemo doesn't have
+description: "What Mongoose can do and Typemo deliberately can't (Mixed, strict false, next in hooks, string select and sort) and what to use instead"
+icon: Ban
+---
+
+A lot of Mongoose is missing from Typemo, and not because nobody got around to it. These features are inseparable from implicit behavior, the very "I'll silently cast", "I'll silently drop", "I'll silently skip". Below they're listed, each with its reason and its replacement.
+
+If you're looking for a specific method, the tables in [API mapping](../reference/migration/api-mapping.mdx) are faster. This page covers the cases where you need a different approach, not a new name.
+
+## What you need [#prerequisites]
+
+The examples are built around a blog with users and posts. `Posts` is the post model, obtained from the client with `client.db().model(Post)`.
+
+## Quick start [#quick-start]
+
+Here are the five gaps almost everyone runs into, and what to use instead.
+
+| In Mongoose | In Typemo |
+|---|---|
+| a `Mixed`, `Object`, or `{}` field | a nested class or [`Spec.map`](../reference/schemas/types-and-spec.mdx#spec.map) |
+| `strict: false`, `strictQuery: false` | none, an unknown field is an error |
+| `select("a -b")`, `sort("-age")` | an object, for example `select({ a: 1 })`, `sort({ age: -1 })` |
+| `next()` and callbacks | async methods and exceptions |
+| `this` as a `Query` in hooks | a typed context with a `.modify` method |
+
+We'll go through each below.
+
+## A free-form field, `Mixed` [#mixed]
+
+Say a document holds an object whose shape the schema doesn't know in advance, for example settings the user defines. Mongoose accepts any object, but you have to flag changes inside it by hand with `markModified`. Typemo refuses as early as the model declaration.
+
+<Snippet id="migration/missing-features/mixed" twoslash />
+
+Mixed turns off everything Typemo exists for: value checks, the field type, updates by nested paths, and protection against unknown keys. Neither the compiler nor the database knows anything about such a field, and neither `save` nor `$getChanges` sees changes inside the object.
+
+There are two replacements, and the choice depends on whether the keys are known. If they are, describe a nested class with [`nested: true`](../reference/schemas/schema.mdx#nested). If the keys are arbitrary but the values share one type, use [`Spec.map`](../reference/schemas/types-and-spec.mdx#spec.map), a map with string keys and checked values.
+
+<Snippet id="migration/missing-features/mixed-2" twoslash />
+
+If you really need arbitrary JSON, store it as a string and parse it yourself. Or go to the driver through [`client.unsafeDriver()`](../reference/connection/typemo-client.mdx#client.unsafe-driver), but remember that Typemo's policies and checks don't apply there.
+
+## Turning strictness off with `strict: false` [#strict-false]
+
+Sometimes one part of the code writes fields to a document that aren't in the schema, and another part reads them. Typemo has no `strict`, `strictQuery`, `strictPopulate`, `useNestedStrict`, or `sanitizeFilter` options. The compiler rejects them in [`@Schema`](../reference/schemas/schema.mdx#schema) as unknown.
+
+From untyped JavaScript (or with `as never`) such a key won't slip through silently either. Any key that isn't on the list of options gives a [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configuration-error) when the model is built, with the list of allowed options, for example `Account: @Schema has no "strict" option (the options are: collection, nested, ext, discriminatorKey, discriminators, timeseries, capped, collation, clustered, changeStreamPreAndPostImages, validator, autoIndex, autoCreate, readConcern, writeConcern, optimisticConcurrency, shardKey, tenant, softDelete, audit)`. `toJSON` and `toObject` get their own text, which suggests passing serialization parameters to each call.
+
+Strictness you can turn off stops being a guarantee. If a library sometimes drops an unknown field and sometimes writes it, you have to remember which mode you're in right now. If the fields really are in the database but your code doesn't need them, describe them in the class. Data written by another application stays in the document untouched. At the top level that happens on any save, and in subdocuments with your explicit consent, as described in the [Handle fields that aren't in the schema](../documents/unknown-fields.mdx) guide.
+
+## Strings instead of objects in `select` and `sort` [#string-select-and-sort]
+
+Mongoose accepts `select("name -password")`, `select("+passwordHash")`, and `sort("-age name")`. Typemo accepts only objects, because types can't check a string. The compiler catches the typo `"nmae"` in an object, but not in a string.
+
+<Compare>
+
+<Snippet id="migration/missing-features/string-select-and-sort" />
+
+<Snippet id="migration/missing-features/string-select-and-sort-2" twoslash />
+
+</Compare>
+
+You can write the directions `1` and `-1` as words too, `"asc"` and `"desc"`. You can't mix inclusion and exclusion in one projection. Mongoose quietly picked one of the two in that case, and Typemo throws an error. A hidden field comes back only with an explicit `+` in the projection, and only if the field is declared as [`Hidden`](../reference/schemas/field-markers.mdx#hidden). More in the [`.select`](../reference/query/reading.mdx#select) and [`.sort`](../reference/query/reading.mdx#sort) references.
+
+## Callbacks and `next()` [#callbacks-and-next]
+
+Mongoose dropped callbacks on model methods back in version 7, and in version 9 it dropped the `next` parameter of `pre` hooks too. If you're coming from 9.x, you most likely already write `async` functions and won't have to change anything. If your code is still on an older version, move it to promises inside Mongoose first. Regressions are easier to find that way than while switching libraries at the same time.
+
+In Typemo a hook is a class method, an error is an exception, and to skip an operation a query hook calls `this.skip`. There are no callbacks, no `next`, and no `error` event.
+
+## `this` in hooks [#this-in-hooks]
+
+In a Mongoose query hook, `this` is a `Query`. Through it you can rewrite the condition (`this.where`), add `populate`, or change options. All of that happens after the checks and bypasses the policies, so Typemo has no such access. Here, in a query hook, `this` is a typed context, [`OperationHookContext`](../reference/hooks/operation-context.mdx#operation-hook-context). The operation's values in it are read-only, you change them with the [`.modify`](../reference/hooks/operation-context.mdx#modify) method, and the result goes through the policies again.
+
+<Compare>
+
+<Snippet id="migration/missing-features/this-in-hooks" />
+
+<Snippet id="migration/missing-features/this-in-hooks-2" twoslash />
+
+</Compare>
+
+In a document hook, `this` is the document itself, as in Mongoose, only with `$` methods. More in the [Run code when a document is saved](../hooks/document-hooks.mdx) and [Hook into an operation](../hooks/operation-hooks.mdx) guides.
+
+## Regular expressions in events, `pre("save")` for everything [#regex-events]
+
+`schema.pre(/^find/, fn)` catches all the `find`, `findOne`, and `findOneAnd*` events at once. In Typemo the list of events is explicit, [`HOOK_EVENTS`](../reference/hooks/pre-post.mdx#hook-events), and you can attach one method to several events with several decorators. That way the event name tells you what will happen, and a regular expression won't pick up a new operation you didn't know about.
+
+## Setters and the order of value processing [#setters-and-order]
+
+In Mongoose, setters run in reverse order of registration, and `trim` and `lowercase` are setters like any other. In Typemo the order is fixed. First type casting, then [`trim`](../reference/schemas/prop.mdx#trim), then [`lowercase` or `uppercase`](../reference/schemas/prop.mdx#lowercase), and finally your own [`set`](../reference/schemas/prop.mdx#set). Setters don't see `null` in a nullable field. They work only with a real value.
+
+## Function plugins and changing schemas globally [#function-plugins]
+
+A Mongoose plugin is a function that mutates the schema. Global plugins apply when each model is created, except models already compiled. A Typemo plugin is an object with an `apply` method that works on a metadata draft. Registration closes as soon as the first model compiles successfully, and a late registration is an error, not a silent skip. Details are in the [Reuse behavior across models](../hooks/plugins.mdx) guide.
+
+For the typical jobs people wrote Mongoose plugins for, there are built-in mechanisms. Soft delete, tenants, and audit are turned on with [`@Schema`](../reference/schemas/schema.mdx#soft-delete) options and apply to every operation, including aggregation. Plugins like `mongoose-delete` and `mongoose-history` become unnecessary after the switch.
+
+## Debugging queries and `mongoose.set("debug")` [#debug]
+
+There's no global `debug`. Instead there's a subscriber to events. [`Typemo.instrument`](../reference/connection/typemo.mdx#typemo.instrument) receives the start and end of every operation, the time, the error, and the command. More in the [Operation events](../observability/events.mdx) guide.
+
+## JavaScript code in queries: `$where`, `$function`, `$accumulator` [#javascript-in-queries]
+
+Mongoose lets you pass JavaScript code into a query or a pipeline: a `$where` condition, a `$function` expression, an `$accumulator`. Typemo doesn't run server-side JavaScript. Such code runs with the database's privileges, it can't be checked against the schema, and injected input becomes executable code.
+
+The [`fn.function` and `fn.accumulator`](../reference/aggregation/accumulators.mdx#javascript-code) calls are compile errors, and their text names the replacement. An operator passed around the types is rejected before it's sent, with a `StrictModeError` (the `sanitize` rule). Write conditions with query operators or an [`$expr`](../queries/filters.mdx) expression, group values with the `fn.sum`, `fn.push`, and `fn.top` accumulators, and calculations with the `fn.cond`, `fn.map`, and `fn.reduce` operators.
+
+## When not to use it [#when-not-to-use]
+
+You don't have to move everything. Some data is free-form by nature: an event log with fields that clients define, or a snapshot of someone else's responses. A strict model for it is impossible, and Typemo brings more friction than benefit. Keep such collections on Mongoose or on the driver, and move the rest to Typemo. Both libraries work with the same database, as described in the [Step-by-step migration](./step-by-step.mdx) guide.
+
+## Troubleshooting [#troubleshooting]
+
+**The model isn't created, with `Object (Mixed) is not supported`.** The field is declared as `@Prop(() => Object)` or as an array without an element type. Replace it with a nested class or `Spec.map`, as shown above.
+
+**The compiler doesn't accept a schema option.** You carried over `@Schema({ strict: false })` or `toJSON`. The decorator deliberately has no such options. The compiler won't let them through, and untyped code gets a `ConfigurationError` when the model is built. Remove them, and pass serialization parameters when you call [`$toJSON`](../reference/documents/document-api.mdx#to-json).
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Behavior differences" href="./behavior-differences.mdx">
+  What works differently in Typemo than in Mongoose, and why.
+</Card>
+<Card title="Step-by-step migration" href="./step-by-step.mdx">
+  How to move collections one at a time without stopping the app.
+</Card>
+<Card title="API mapping" href="../reference/migration/api-mapping.mdx">
+  Tables of Mongoose methods and their Typemo counterparts.
+</Card>
+</Cards>

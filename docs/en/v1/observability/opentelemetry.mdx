@@ -1,0 +1,110 @@
+---
+title: OpenTelemetry
+description: "Spans and metrics for Typemo operations in OpenTelemetry, with no user data in your traces"
+icon: Radar
+---
+
+The `@venloc/typemo-opentelemetry` package turns every Typemo operation into a **span**, a segment of a trace with a name, a duration, and attributes. It also records duration and connection pool metrics. In a request's trace you see right away which operation on which model took the time and how it ended, with no manual wrappers. The package is separate, and the core knows nothing about OpenTelemetry.
+
+If OpenTelemetry is new to you, remember the main thing. The application picks the SDK, the exporter, and the context manager, and the adapter only creates spans through `@opentelemetry/api`. The API details are in the [reference](../reference/observability/opentelemetry.mdx).
+
+## What you need [#prerequisites]
+
+An OpenTelemetry SDK set up in your app: a tracer provider, and for metrics a meter provider as well. The client is created as in the [quick start](../getting-started/quick-start.mdx), and the examples use the account model from the bank app. The docs build doesn't install the OpenTelemetry packages, so the code blocks here aren't compiled. They were checked by running them.
+
+## Quick start [#quick-start]
+
+```package-install
+@venloc/typemo-opentelemetry @opentelemetry/api
+```
+
+<Snippet id="observability/opentelemetry/quick-start" title="telemetry.ts" />
+
+Now every operation produces a span: `Typemo.find (Account)`, `Typemo.insertOne (Account)`, and so on. We'll go through the tasks one by one below.
+
+## Nest spans inside each other [#nested-spans]
+
+You have spans, but none of them has a parent. That happens when the process has no **context manager**, the object that carries the "current span" across `await`. The adapter makes the operation's span active for the duration of the operation. Spans from your hooks and from the subqueries that load related data nest inside it, but only if a context manager is registered.
+
+<Snippet id="observability/opentelemetry/nested-spans" title="telemetry.ts" />
+
+Here `exporter` is your exporter. On Bun this manager kept the context across `await`, inside a transaction, and when the transaction was retried.
+
+A query is lazy. It takes the active context at the moment it runs, that is, at `await`. So `context.with(ctx, () => Accounts.find())` without `await` runs the query outside `ctx`. Write `context.with(ctx, async () => await Accounts.find())`.
+
+## What you see in the trace [#trace-view]
+
+Here are the spans produced by `create`, `find`, a repeated insert, and a transaction with `stepSpans: true` and `commandSpans: true`.
+
+<Snippet id="observability/opentelemetry/trace-view" />
+
+The OpenTelemetry conventions suggest naming a span like `find accounts`, but here the name is different: `Typemo.find (Account)`. That way you see right away that the span comes from the ODM and which model it's about. The collection is in `db.collection.name`. The full tables of attributes and metrics are in the [reference](../reference/observability/opentelemetry.mdx#attributes).
+
+## Find the step that took the time [#slow-step]
+
+Step spans are off by default, because the core has to build extra events for them. Turn on `stepSpans` when you need to know what took the time inside an operation: type casting, validation, your hooks, or loading related data.
+
+<Snippet id="observability/opentelemetry/slow-step" />
+
+Child spans appear: `Typemo.step cast`, `Typemo.step validate`, `Typemo.step populate`. A step span is created after the step has already finished, and its start is moved back by the step's duration.
+
+## Driver command spans [#command-spans]
+
+Sometimes you need to know which server ran a command and how long it took. For that, the client must be created with `monitorCommands: true`, otherwise registration throws `ConfigurationError: TypemoClient "default": driver command events need the client option monitorCommands: true`.
+
+<Snippet id="observability/opentelemetry/command-spans" />
+
+A command span is named after the command (`find`, `insert`) and nested in the operation span. Its `server.address` and `server.port` point at the server that actually ran the command, which isn't always the first host in the connection string. It also has `db.collection.name`.
+
+## Connection pool metrics [#pool-metrics]
+
+`poolMetrics: true` turns on the `db.client.connection.count`, `pending_requests`, `wait_time`, `use_time`, and other metrics. The `db.client.operation.duration` metric is always recorded. A pool created before the adapter subscribed isn't counted in the limits, because the adapter didn't see it being created.
+
+## Database-level operations [#database-operations]
+
+Sometimes an aggregation runs over the whole database, through [`connection.aggregate`](../reference/connection/connection.mdx#connection.aggregate) with stages like `$documents`, `$currentOp`, or `$listLocalSessions`. Such an operation has no model, so the adapter names the span after the database: `Typemo.aggregate (database bank)`. It has no `typemo.model` or `db.collection.name` attributes, because the adapter doesn't write empty values.
+
+The exception is `Pipeline.sessions()`. It reads the `config.system.sessions` collection, and its span `Typemo.aggregate (database config)` carries `db.namespace: "config"` and `db.collection.name: "system.sessions"`. More in the [Database-level queries](../aggregation/database-level.mdx) guide.
+
+## Keep user data private [#hide-user-data]
+
+Traces usually go to an external service. The `db.query.text` attribute holds the shape of the query, and by default every value in it is replaced with `"?"`: `{"filter":{"balance":{"$gt":"?"},"iban":"?"}}`. The `sensitive` option works the same way as for a [core subscriber](../reference/observability/events.mdx#subscriber-sensitive), including on the exception recorded in the span. Fields marked `sensitive` in the schema stay masked even with `"show"`. The tenant goes into the operation span's `typemo.tenant` only with `includeTenant: true`.
+
+<Snippet id="observability/opentelemetry/hide-user-data" />
+
+## How to choose [#how-to-choose]
+
+Ask yourself **what you want to see**.
+
+- **The call tree and the time inside an operation**: turn on `stepSpans`.
+- **Which commands went to which servers**: `commandSpans`.
+- **The state of the pool**: `poolMetrics`.
+- **Only the basic picture**: keep the defaults, they're the cheapest.
+
+## When not to use it [#when-not-to-use]
+
+If all you need is errors in a tracker, [Sentry](./sentry.mdx) is enough. For your own system, write a subscriber as in [Custom integration](./custom-integration.mdx).
+
+Don't turn on the adapter together with `@opentelemetry/instrumentation-mongodb`. That package patches the driver and creates its own span for every command, so commands show up in the trace twice. If you need command spans, use `commandSpans`.
+
+## Troubleshooting [#troubleshooting]
+
+**Two spans for one operation.** The adapter is registered twice, for example on the client and on `Typemo`. Register it once per target.
+
+**Spans have no parent.** No context manager is registered. The section above shows how to register one.
+
+**Command spans don't appear.** `commandSpans: true` requires `monitorCommands: true` on the client, and without it registration fails with `ConfigurationError`. No spans are created for commands Typemo didn't send.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="@venloc/typemo-opentelemetry" href="../reference/observability/opentelemetry.mdx">
+  Every option, attribute, and metric.
+</Card>
+<Card title="Sentry" href="./sentry.mdx">
+  Errors with context and breadcrumbs.
+</Card>
+<Card title="Operation events" href="./events.mdx">
+  What the adapter receives from the core.
+</Card>
+</Cards>

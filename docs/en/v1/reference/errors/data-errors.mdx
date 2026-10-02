@@ -1,0 +1,273 @@
+---
+title: Data errors
+description: "ValidationError, CastError, StrictModeError, UnknownFieldsError, DirectWriteError, and PartialArrayError: when thrown, their fields, and how to handle them"
+icon: ShieldAlert
+---
+
+Data errors come from the library itself, before anything goes to the server. A value doesn't fit the schema, a query breaks a strictness rule, or a save would erase data the schema doesn't know. Almost always this is bad client input or a bug in your code, not a database failure. Every error has structured fields, so a handler answers the client precisely and doesn't parse the message text.
+
+If you're new here, read the [Error handling](../../errors/handling.mdx) guide first. The shared root of all errors and their tree are described in [Error hierarchy](./hierarchy.mdx).
+
+All the examples use one account model. The fields `balance`, `status`, `tags`, and `lines` are there so that different errors show up on them: a numeric bound, a list of allowed values, an array of strings, and an array of nested documents.
+
+<Snippet id="reference/errors/data-errors/intro" title="accounts/account.ts" twoslash />
+
+Errors of the neighboring groups are described on other pages: [query errors](./query-errors.mdx), [server errors](./server-errors.mdx), and [configuration and connection errors](./configuration-errors.mdx).
+
+---
+
+## ValidationError [#validation-error]
+
+`ValidationError` is thrown when a document or input broke the schema. It lists **all** the violations found, not only the first. That's how it differs from [`CastError`](#cast-error), which is thrown right at the first value that can't be cast to its type. If a client sends a whole form, it helps to return the full list of problem fields instead of making them fix one at a time.
+
+The error arrives on creation ([`create`](../writes/writes.mdx#create)), on [`$save`](../documents/document-api.mdx#save), and on an explicit [`$validate`](../documents/document-api.mdx#validate). In the example the request body came without an owner, with a negative balance and a status outside the list.
+
+<Snippet id="reference/errors/data-errors/validation-error" twoslash />
+
+The message is built from the violations. For each one it has the path in quotes, a description, and the reason in square brackets. Violations follow the schema field order, not the order the checks finished in. The same input always gives the same message, even with async field checks. The violations themselves are in the `issues` field. The `errors` field groups them by dotted path, which helps when you need to highlight a field in a form.
+
+### Fields [#validation-error.fields]
+
+<Params title="Error fields">
+<Param name="issues" type="readonly SchemaIssue[]">
+
+Every violation in schema field order. The array is frozen. A violation has `path` (path segments, strings and numbers for array elements), `reason` (a machine-readable reason), `message` (text for a human), `value` (the checked value as is), and an optional `cause` (a cast error or the original violation of an external schema).
+
+</Param>
+<Param name="errors" type="Readonly<Record<string, readonly SchemaIssue[]>>">
+
+The same violations grouped by dotted path (`lines.0.sku`). A path with several violations has several items in its group. A value may fail both casting and a bound.
+
+</Param>
+</Params>
+
+The violation `reason` is a closed list.
+
+- `cast`: the value wasn't cast, and `cause` holds a `CastError`. Only [`Model.validate`](../documents/model-document-methods.mdx#model.validate) and Standard Schema build such an entry, while `create` and `$save` throw the `CastError` itself.
+- `required`: a required field is missing or `null`.
+- `unknown-key`: a key that isn't in the schema.
+- `enum`, `min`, `max`, `minLength`, `maxLength`, `match`: the built-in checks of field options.
+- `validator`: your `validate` function returned a message or threw an error.
+- `discriminator`: the discriminator value doesn't name a known class.
+- `schema`: an external Standard Schema passed to `.parse` reported the violation.
+
+### Answering the client [#response]
+
+Violation values can be large or secret, so `toJSON()` leaves them out. It returns only the name, the message, and the list of `path`, `reason`, `message`. It's safe to give such an object to a client as the body of a 422 response.
+
+<Snippet id="reference/errors/data-errors/response" twoslash />
+
+### When not to use it [#validation-error.when-not-to-use]
+
+You don't need to check client input with this class before calling the library. The model schema is the check, and the error is its result. If you need to check the shape of a response, not data for a write, use [`.expect`](../query/contracts.mdx#expect) and [`.parse`](../query/contracts.mdx#parse).
+
+---
+
+## CastError [#cast-error]
+
+`CastError` is thrown when a value can't be turned into its field's type. Typemo doesn't guess. The string `"12"` won't become a number in a numeric field, and an object won't become a string in a string field. Otherwise a client's typo would silently turn into a wrong value in the database. The error carries the path, the value, the expected type, and a machine-readable reason, so you can answer precisely.
+
+There is one rule for the whole library. A value that can't be cast always gives `CastError`, one error per field at any depth. The field's constraints (`min`, `enum`, your checks) don't run in that case. The value has the wrong type, and asking about its range makes no sense.
+
+When the error comes depends on how the value got into the library. Through its methods (`create`, `Model.new`, [`$set`](../documents/document-api.mdx#set), array and Map methods, filters, and updates) it's cast immediately. A plain assignment `account.balance = …` can't be intercepted. The error arrives on the nearest [`$validate`](../documents/document-api.mdx#validate) or [`$save`](../documents/document-api.mdx#save), before any schema check, and nothing goes to the database.
+
+In the example the request body came with a string balance.
+
+<Snippet id="reference/errors/data-errors/cast-error" twoslash />
+
+The message has everything you need: the expected type, the path, a short description of the value (long strings are truncated and arrays are described by length, not content), an explanation, and the reason. For an array element the path includes the index, so the value `[1]` in the `tags` field gives the path `tags.0`.
+
+### Fields [#cast-error.fields]
+
+<Params title="Error fields">
+<Param name="path" type="string">
+
+The dotted path of the value (`tags.0`). An empty string if the value was cast on its own.
+
+</Param>
+<Param name="value" type="unknown">
+
+The value that failed casting, as it was passed, without copying and without turning it into a string. It can be large or secret, so `toJSON()` doesn't include it.
+
+</Param>
+<Param name="expected" type="string">
+
+The expected type in the library's vocabulary: `number`, `string`, `ObjectId`, `Int32`, `Array<string>`.
+
+</Param>
+<Param name="reason" type="CastReason">
+
+The machine-readable reason. You can branch on it without parsing the message.
+
+</Param>
+<Param name="detail" type="string">
+
+One sentence for a human about what exactly is wrong.
+
+</Param>
+</Params>
+
+<TypeTable
+  type={{
+    undefined: { description: "The value `undefined`. It's not allowed, because the driver would write `null` instead." },
+    "null": { description: "`null` where the field doesn't allow `null`." },
+    type: { description: "The wrong JavaScript or BSON type, and there is no allowed conversion from it." },
+    format: { description: "The type is right, but the text has the wrong format: a hexadecimal string, ISO 8601, UUID, a decimal number." },
+    integer: { description: "A fractional number where an integer is needed." },
+    range: { description: "Outside the range of the target type: Int32, Int64, int8, float32, dates." },
+    finite: { description: "`NaN` or infinity where a finite number is needed." },
+    precision: { description: "The conversion would lose precision: an unsafe integer, an inexact Decimal128." },
+    subtype: { description: "A Binary of another subtype or a vector of another element type." },
+    dimensions: { description: "A vector of the wrong length." },
+    flags: { description: "Regular expression flags that don't survive a write to BSON." },
+    key: { description: "A Map key that MongoDB can't store or address." },
+    "unknown-key": { description: "A field that isn't in the description of the nested document or model." },
+    "union-no-match": { description: "No variant of the union accepts the value." },
+    "union-ambiguous": { description: "Several variants of the union accept the value, and the library doesn't choose for you." },
+    json: { description: "The value has no JSON form: `NaN`, a raw `Long`." },
+    discriminator: { description: "The discriminator value in a nested document doesn't name a known class." },
+  }}
+/>
+
+There are seventeen reasons. The `reason` value from this table is visible in square brackets at the end of the message.
+
+### Assignment without casting [#assign-without-cast]
+
+A plain assignment to a document field (`account.balance = ...`) doesn't throw. The field type forbids a wrong value at compile time, and if one still got in through a type cast, Typemo finds out on the next [`$validate`](../documents/document-api.mdx#validate) or [`$save`](../documents/document-api.mdx#save). There it throws the same `CastError` with the same message as `$set`. Assigning `"12"` to a number field, with `$save` and with `$set` plus `$validate`, gave the same error. Only the moment differs. `$set` casts the value immediately, while an assignment waits for the call.
+
+[`Model.validate`](../documents/model-document-methods.mdx#model.validate) and Standard Schema collect values without a write. Casting there doesn't throw but lands in a [`ValidationError`](#validation-error) as an entry with the reason `cast`. These calls collect all the problems of a form on purpose and don't stop at the first. The original `CastError` is in the `cause` of such an entry.
+
+### When not to use it [#cast-error.when-not-to-use]
+
+If you need to collect all the problems of a form instead of stopping at the first, use [`ValidationError`](#validation-error). If a client sends numbers as strings, like values from a page URL, cast them in your own code before the call. Typemo won't turn `"12"` into a number by itself.
+
+---
+
+## StrictModeError [#strict-mode-error]
+
+`StrictModeError` is thrown when an operation broke a strictness rule. Typemo doesn't soften these rules with options or modes. A rule is either followed or the operation doesn't go to the server. Thanks to that, a typo in a field name, an empty filter, or a competing call doesn't turn into silent loss or corruption of data.
+
+The `reason` field names the broken rule. The `path` field shows where in the input it's broken, and equals `undefined` if the rule concerns the whole operation. The reason is appended to the end of the message in square brackets.
+
+<TypeTable
+  type={{
+    "unknown-path": { description: "A path that isn't in the schema, in a filter, update, projection, sort, or pipeline." },
+    "not-hidden": { description: "`+name` in a projection for a field that isn't hidden, because such a key would change nothing." },
+    undefined: { description: "`undefined` as a value, because the driver would send `null`." },
+    "empty-filter": { description: "An empty filter in a write: `updateOne`, `updateMany`, `deleteOne`, `deleteMany`, `replaceOne`, `findOneAnd*`, and such an operation inside `bulkWrite`." },
+    "empty-logical": { description: "An empty `$and`, `$or`, or `$nor`." },
+    "empty-update": { description: "An update that is empty after casting." },
+    immutable: { description: "A write to an immutable field outside `$setOnInsert`." },
+    limit: { description: "A `limit` of zero or less." },
+    sanitize: { description: "An operator where a value was expected, which protects against a client query substituting the value." },
+    tenant: { description: "The operation would go outside the tenant or has no tenant." },
+    "soft-delete": { description: "An operation whose scope the soft delete policy can't determine." },
+    "transaction-option": { description: "`readConcern` or `writeConcern` on an operation inside a transaction." },
+    "concurrent-session": { description: "The session is already busy with another operation." },
+  }}
+/>
+
+The query builder catches some of these violations earlier and reports them as [`QueryError`](./query-errors.mdx#query-error). That's how `limit(0)` and `undefined` in a filter arrive, for example. You don't need to branch on `reason` for them, so catch both classes. The reasons `unknown-path`, `not-hidden`, `empty-filter`, `immutable`, `sanitize`, `tenant`, `soft-delete`, `transaction-option`, and `concurrent-session` were checked in practice, and their texts are in the [Policy violations](../policies/violations.mdx) reference. The other four are caught by `QueryError` in ordinary calls.
+
+### Unknown path [#unknown-path]
+
+This is the most frequent reason. A filter or update names a field that isn't in the model. In the example the filter came from a client as JSON.
+
+<Snippet id="reference/errors/data-errors/unknown-path" twoslash />
+
+The path is printed once in the message, at the start. The full path is in the `path` field and starts at the place of the input: `filter.nope` for a filter, `$set.nope` for an update, `projection.nope` for a projection, `sort.nope` for a sort. Inside `$or` the path is longer, for example `filter.$or.0.nope`.
+
+### Empty filter [#empty-filter]
+
+An empty filter in a write means "all documents" (or "any document", if you change one). One typo, and you'd wipe the collection or change a random document. So `updateOne`, `updateMany`, `deleteOne`, `deleteMany`, `replaceOne`, and `findOneAnd*` with an empty filter are rejected before sending, inside `bulkWrite` too. The error text suggests how to say "all" on purpose (`Filters.all()`).
+
+<Snippet id="reference/errors/data-errors/empty-filter" twoslash />
+
+The text is the same for all these operations. For `updateOne` and `deleteOne` it also starts with the call name and says "every document", though only one would be affected. The `empty-filter` reason and the fix are the same. For reads an empty filter is allowed, and `find()` returns everything.
+
+### Fields [#strict-mode-error.fields]
+
+<Params title="Error fields">
+<Param name="reason" type="StrictModeReason">
+
+The broken rule, one of the values in the table above.
+
+</Param>
+<Param name="path" type="string | undefined">
+
+The place in the input where the rule is broken (`filter.nope`, `$set.nope`), or `undefined` if the rule concerns the whole operation.
+
+</Param>
+</Params>
+
+The reasons `transaction-option` and `concurrent-session` are covered in detail in the [Transactions](../../transactions/transactions.mdx) and [Manual sessions](../../transactions/sessions.mdx) guides. Their exact messages are there too.
+
+### When not to use it [#strict-mode-error.when-not-to-use]
+
+You can't soften a rule. There is no option that would allow an empty filter or an unknown path. If you really want to do the forbidden thing, say so explicitly, for example through [`Filters.all()`](../../writes/empty-filters.mdx). Or choose another tool. Bulk and service commands go through [`client.unsafeDriver()`](../connection/typemo-client.mdx#client.unsafe-driver), and Typemo's protections don't apply there.
+
+---
+
+## UnknownFieldsError [#unknown-fields-error]
+
+`UnknownFieldsError` is thrown on a save that would **erase from the database** fields of a nested document that the schema doesn't know. This is data from an older or newer schema version, and Typemo doesn't lose it silently. When a document is read, the library remembers such keys, and that needs no extra query. On save it checks them. If the write replaces a nested document entirely or rewrites the array or Map it lies in, the unknown fields would be gone.
+
+Say the first line of an account in the database still has a `legacy` field that the schema no longer has. Changing neighboring fields or adding a line at the end is safe, but replacing the line itself is not.
+
+<Snippet id="reference/errors/data-errors/unknown-fields-error" twoslash />
+
+<Params title="Error fields">
+<Param name="fields" type="readonly UnknownFields[]">
+
+Every nested document the write would rewrite without its unknown fields. For an item, `path` is the path in code (`lines.0`, `address`, `notes.home`), and `keys` are the stored keys the schema lacks, in storage order. The array is frozen.
+
+</Param>
+</Params>
+
+There are two ways out. The right one is to move the data or update the schema so the field becomes known. The deliberate one is to call `$save({ dropUnknownFields: true })` (the same for `bulkSave`), which accepts the loss explicitly.
+
+Replacing an element with unknown fields (`set`, `replace`, `splice`) and `clear()` on an array or Map throw the same error as `set`. Each of these calls was checked. Removing an element through `pull` or `pop` and `$unset` of a field don't count as a loss, so no permission is needed there. `push` doesn't touch existing elements. For a check in code there is the function `isUnknownFieldsError(error)`, which is equivalent to `instanceof`.
+
+### When not to use it [#unknown-fields-error.when-not-to-use]
+
+If you need to write one field and leave the rest as is, change the field by path instead of replacing the nested document entirely. A path inside the document doesn't touch unknown fields.
+
+---
+
+## DirectWriteError [#direct-write-error]
+
+`DirectWriteError` is thrown on save when a tracked collection (an array, a Map, an array of nested documents) was changed **around its methods**. That means a write by index, a write to `length`, a direct call of `Map.prototype.set`, or replacing a container field with a plain value. The type forbids all of this at compile time, so the error is possible only through a type cast, `any`, or plain JavaScript. Typemo doesn't try to guess what such a write meant. The save is rejected, and the text names the method to use.
+
+<Snippet id="reference/errors/data-errors/direct-write-error" twoslash />
+
+<Params title="Error fields">
+<Param name="path" type="string">
+
+The path of the collection in code (`tags`, `revisions.1.lines`).
+
+</Param>
+</Params>
+
+The fix is always in the message. For a write by index it's `use set(0, value)`. For a change of `length` it's `its length is 0 instead of 2 (use push(), pop(), splice(), clear() or replace())`. For replacing a container field with a plain value it's `the field was replaced by assignment; use $set("tags", value) or the container's methods`. All three texts were obtained on a real database.
+
+---
+
+## PartialArrayError [#partial-array-error]
+
+`PartialArrayError` is thrown on saving an array that was loaded **only partially** (a `$slice`, positional `arr.$`, or `$elemMatch` projection), if the change would overwrite elements you didn't load. You read the first tag and replaced it by index. The positions of the loaded slice don't match the positions in the database, and a write by position would clobber someone else's element. Mongoose made such a write silently. Typemo refuses to send it.
+
+<Snippet id="reference/errors/data-errors/partial-array-error" twoslash />
+
+<Params title="Error fields">
+<Param name="path" type="string">
+
+The path of the array in code.
+
+</Param>
+</Params>
+
+Writes that depend on positions are forbidden: replacing the whole array, a positional `$set`, and `$pop`. Operations without positions stay allowed. `push` appends an element to the end, and `addToSet` and `pull` find an element by value. A `push` to a partially loaded array was saved without an error.
+
+### When not to use it [#partial-array-error.when-not-to-use]
+
+If you need to replace an array element by position, load the whole array. Or update by condition through [`updateOne`](../writes/writes.mdx#update-one) with a filter on the element's value.

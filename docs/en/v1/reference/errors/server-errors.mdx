@@ -1,0 +1,314 @@
+---
+title: Server errors
+description: "ServerError, DuplicateKeyError, ServerValidationError, WriteConflictError, TimeoutError, BulkWriteError, ServerErrorCodes, and ErrorLabels"
+icon: ServerCrash
+---
+
+Server errors come up when the database itself refused. A unique index was violated, a collection validator rejected a document, two writes touched one document, time ran out, or part of a bulk write failed. Typemo turns a driver error into its own class by the server code, so you decide by class and fields, not by text. The original stays in `cause` unchanged.
+
+If you're new here, read the [Error handling](../../errors/handling.mdx) guide first. The class tree is described in [Error hierarchy](./hierarchy.mdx).
+
+The examples use an account model with a unique title. Both a uniqueness violation and a bulk write show up on it.
+
+<Snippet id="errors/handling/prerequisites" title="accounts/account.ts" twoslash />
+
+Errors of the neighboring groups are described on other pages: [data errors](./data-errors.mdx), [query errors](./query-errors.mdx), and [configuration and connection errors](./configuration-errors.mdx).
+
+---
+
+## ServerError [#server-error]
+
+`ServerError` is the general class of a server refusal. Typemo throws it when there is no more precise class for the error code. The three other classes on this page, [`DuplicateKeyError`](#duplicate-key-error), [`ServerValidationError`](#server-validation-error), and [`WriteConflictError`](#write-conflict-error), are its descendants, so a check against `ServerError` catches all four.
+
+The class copies the code, the code name, and the labels from the driver error. The driver error itself stays in `cause` whole. Copying was necessary because Mongoose unwrapped the driver error into its own object and lost the code.
+
+The message of a general `ServerError` is short. It has the reason the server named and the code in parentheses. The server's full text often contains the query plan and values from it, and that must not end up in a log or in a response to a client. So the full text lies separately, in the `serverMessage` field and in `cause`, and `message` keeps only what is needed for understanding.
+
+In the example an index hint (`hint`) names an index that doesn't exist. The server answers with an error with code 2.
+
+<Snippet id="reference/errors/server-errors/server-error" twoslash />
+
+### Fields [#server-error.fields]
+
+<Params title="Error fields">
+<Param name="code" type="number | undefined">
+
+The server error code, if the driver reported it. The names of the known codes are collected in [`ServerErrorCodes`](#server-error-codes).
+
+</Param>
+<Param name="codeName" type="string | undefined">
+
+The code name (`BadValue`, `WriteConflict`, `DuplicateKey`). The server doesn't send it in every response, for example not in write errors. Typemo takes the missing name from the [`ServerErrorCodes`](#server-error-codes) table. That's how a uniqueness violation got `DuplicateKey`, a validator refusal got `DocumentValidationFailure`, and the same for bulk errors. If the code isn't in the table and the server sent it without a name, the field is `undefined`. For decisions, `code` is more reliable.
+
+</Param>
+<Param name="errorLabels" type="readonly string[]">
+
+The error labels (`TransientTransactionError`, `RetryableWriteError`). The array is frozen. The meaning of the labels is described in the [`ErrorLabels`](#error-labels) section.
+
+</Param>
+<Param name="serverMessage" type="string">
+
+The full text the server sent, without shortening. It may contain the query plan and document values, so don't give it to a client. For descendant classes (`DuplicateKeyError`, `ServerValidationError`, `WriteConflictError`) it's the server's text without the prefix Typemo adds to `message`.
+
+</Param>
+</Params>
+
+### hasErrorLabel [#has-error-label]
+
+The `hasErrorLabel(label)` method returns `true` if the error has the label. It's shorter than `error.errorLabels.includes(...)` and reads like a question.
+
+<Snippet id="reference/errors/server-errors/has-error-label" twoslash />
+
+<FullType>
+
+<Snippet id="reference/errors/server-errors/has-error-label-2" />
+
+</FullType>
+
+### When not to use it [#server-error.when-not-to-use]
+
+Don't catch `ServerError` where you need a specific refusal. Check the specific classes first, then the general one. The order of checks is described in the [Error handling](../../errors/handling.mdx) guide.
+
+---
+
+## DuplicateKeyError [#duplicate-key-error]
+
+`DuplicateKeyError` is thrown when a write violated a unique index (server code 11000). It's the most frequent server error in a web application. Two users register with the same email, two requests create the same account. An index guarantees uniqueness, not a "does it exist yet" check before the write. The check and the write aren't atomic, and another request can slip in between. So try to write and catch this error.
+
+<Snippet id="reference/errors/server-errors/duplicate-key-error" twoslash />
+
+A unique index exists only after [`connection.init`](../connection/connection.mdx#connection.init). Without it a duplicate gets written without an error. The message is short: the index, the key value, and the code, `duplicate key on title_1: { title: "Main" } (code 11000 DuplicateKey)`. The server's service details don't make it in. Those are the database and collection names, index build identifiers, and the `:: caused by ::` chain. They are in `serverMessage`.
+
+### Fields [#duplicate-key-error.fields]
+
+<Params title="Additional fields">
+<Param name="keyPattern" type="Record<string, unknown> | undefined">
+
+The keys of the violated index (`{ title: 1 }`), if the server reported them. They show which field caused the conflict, so you don't need to parse the text.
+
+</Param>
+<Param name="keyValue" type="Record<string, unknown> | undefined">
+
+The repeated values (`{ title: "Main" }`). If the field is marked `sensitive`, the value is replaced with `[hidden]` (or `?`, depending on the chosen mode). The replacement is visible in this field, in the message text, in `serverMessage`, and in `cause`. In a bulk write the server doesn't report values, so `keyValue` is `undefined` there and the message has no value.
+
+</Param>
+<Param name="index" type="string | undefined">
+
+The name of the index that refused the write. Typemo takes it from the server's text (`index: title_1`). If parsing failed, the field is `undefined` and the message has no "on …" words.
+
+</Param>
+</Params>
+
+The other fields (`code`, `codeName`, `errorLabels`, and `serverMessage`) are the same as in [`ServerError`](#server-error). For a uniqueness violation `codeName` is `DuplicateKey`. It's worth answering the client with a conflict with existing data, that is, a 409 from your application. Which field repeated is visible in `keyPattern`.
+
+### In a bulk write [#in-bulk-write]
+
+With `insertMany` and `bulkWrite` a duplicate arrives not as a separate error but as an item of a [`BulkWriteError`](#bulk-write-error). In `writeErrors[i].error` there is a `DuplicateKeyError` with the same fields.
+
+### When not to use it [#duplicate-key-error.when-not-to-use]
+
+If you need "create or update", don't catch this error. Use `upsert` in [`updateOne`](../writes/writes.mdx#update-one). If you want to check ahead whether a name is free, remember that the check doesn't replace the index. It only improves the message to the user.
+
+---
+
+## ServerValidationError [#server-validation-error]
+
+`ServerValidationError` is thrown when a collection validator (`$jsonSchema`) on the server rejected a document (code 121). A collection validator is a set of rules the database stores itself. They apply to everyone who writes to the collection, writes that bypass Typemo included. The error arrives when a document passed the schema in your code but failed the database's rules. For example, the schema allows 500 while the collection validator requires at most 100.
+
+In the example the validator of the `posts` collection limits `score` to a hundred.
+
+<Snippet id="reference/errors/server-errors/server-validation-error" twoslash />
+
+### Fields [#server-validation-error.fields]
+
+<Params title="Additional fields">
+<Param name="errInfo" type="Record<string, unknown> | undefined">
+
+The server's explanation of which rule failed and on which field (`errInfo.details`). It held `operatorName: "$jsonSchema"`, the list of violated rules, the field name (`propertyName`), the rule (`maximum`), the considered value (`consideredValue`), and the identifier of the rejected document (`failingDocumentId`).
+
+</Param>
+</Params>
+
+If the field has `sensitive` in the schema, the values in `errInfo` are masked the same way as in other errors. The other fields are the same as in [`ServerError`](#server-error). `codeName` here is `DocumentValidationFailure`, and `serverMessage` is `Document failed validation`.
+
+### When not to use it [#server-validation-error.when-not-to-use]
+
+A collection validator is meant as the last line of defense for writes around Typemo. Validate client input with the model schema. Its [`ValidationError`](./data-errors.mdx#validation-error) lists all the problems at once, while the server error names them one by one.
+
+---
+
+## WriteConflictError [#write-conflict-error]
+
+`WriteConflictError` is thrown when two writes touched one document and the server refused one of them (code 112). The writes may be two transactions or a transaction and a single write. It isn't a breakdown but the server's ordinary way to keep order. The losing write can be run again.
+
+Inside [`connection.transaction`](../transactions/transactions.mdx#transaction) you'll hardly meet this error. The server marks such a refusal with the `TransientTransactionError` label, and the driver repeats the whole transaction function. The error reaches you only if the write is outside a transaction or the retries ran out. The number of attempts and the fate of data inside a transaction are described in the [Transactions](../../transactions/transactions.mdx) guide.
+
+Outside a transaction single writes rarely conflict, because the server repeats them internally. The error could be obtained only artificially, by turning on a failure of the `update` command with code 112 on the server. The class and fields were these.
+
+<Snippet id="reference/errors/server-errors/write-conflict-error" />
+
+The message always starts with `write conflict: `, followed by the server's text. The class has no fields of its own. `code`, `codeName`, and `errorLabels` are the same as in [`ServerError`](#server-error), and `serverMessage` is the server's text without the `write conflict: ` prefix.
+
+### When not to use it [#write-conflict-error.when-not-to-use]
+
+Inside a transaction don't repeat the write by hand, because the driver already does. Outside a transaction a single write is safe to repeat only if it's idempotent, like setting a value. An accumulating write such as `$inc` must not be repeated.
+
+---
+
+## TimeoutError [#timeout-error]
+
+`TimeoutError` is thrown when time ran out. The `kind` field says where exactly. `operation` means the operation's `timeoutMS` fired or the server reported `MaxTimeMSExpired`. `connection` means the client didn't manage to connect within `readyTimeoutMS`. `transaction` means the transaction's `timeoutMS` expired, retries included. In all three cases `timeoutMS` holds the exceeded limit.
+
+First, the operation's time limit. On the server the `find` response is artificially delayed, and the operation is given 100 ms.
+
+<Snippet id="reference/errors/server-errors/timeout-error" twoslash />
+
+Now a client that didn't connect. For a client created through `new TypemoClient` without `connect`, operations wait for the connection no longer than `readyTimeoutMS`. After that an error of the `connection` kind arrives with `timeoutMS` filled in.
+
+<Snippet id="reference/errors/server-errors/timeout-error-2" />
+
+And the transaction's time limit. A transaction with `timeoutMS: 200`, inside which the `find` response is delayed by 400 ms, ended with an error of the other kind.
+
+<Snippet id="reference/errors/server-errors/timeout-error-3" />
+
+The original (the driver's `MongoOperationTimeoutError`) is in `cause`. If the server itself sent an error with code 50 (`MaxTimeMSExpired`), the kind is `operation` and the text starts with `the server stopped the operation (MaxTimeMSExpired):`. This was checked with an artificial server failure.
+
+### Fields [#timeout-error.fields]
+
+<Params title="Error fields">
+<Param name="kind" type="TimeoutKind">
+
+Where time ran out: `operation`, `connection`, or `transaction`.
+
+</Param>
+<Param name="timeoutMS" type="number | undefined">
+
+The exceeded limit in milliseconds. It was filled in for all three kinds: 100 for `operation`, 100 for `connection`, and 200 for `transaction`. It was `undefined` for an error the server reported itself (code 50) when the call had no `timeoutMS` of its own.
+
+</Param>
+</Params>
+
+The original, if there is one, is in `cause`. For an operation's time limit it's the driver error `MongoOperationTimeoutError`. The time ran out on your side, not the user's, so it's worth answering the client with a 503 or 504 from your application, not a 500.
+
+### When not to use it [#timeout-error.when-not-to-use]
+
+Don't raise `timeoutMS` in response to this error until you understand the cause. More often the operation is slow because an index is missing. How to find out is described in the [Query performance](../../queries/performance.mdx) guide.
+
+---
+
+## BulkWriteError [#bulk-write-error]
+
+`BulkWriteError` is thrown when part of a bulk write (`insertMany`, `bulkWrite`) failed. A bulk write isn't atomic. Some writes went through, others may have failed, and only a full report helps sort it out. The error provides it. It has a list of every failed write with the number **in your input** (not inside the driver's batch) and a summary of what was written.
+
+The order affects the result. In a batch of four documents the second and the fourth violate uniqueness. The ordered write stopped at the second, and the unordered one (`ordered: false`) wrote the first and the third.
+
+<Snippet id="reference/errors/server-errors/bulk-write-error" twoslash />
+
+Without `ordered: false` the same call stops at the first error. `writeErrors` holds only index 1, `result.insertedCount` is 1, and `ordered` is `true`.
+
+### Fields [#bulk-write-error.fields]
+
+<Params title="Error fields">
+<Param name="writeErrors" type="readonly BulkWriteFailure[]">
+
+Every failed write, sorted by index in the input. An item has `index` (the number in the input), `code` (the server code, for example 11000 or 121, and `undefined` for a write rejected before the server because of casting or a schema check), `message` (the server's text for a server refusal, and the same as in `error` for the others), and `error` (the parsed error: `DuplicateKeyError`, `ServerValidationError`, `CastError`, or `ValidationError`).
+
+</Param>
+<Param name="result" type="BulkWriteSummary">
+
+What the successful writes changed. These are `insertedCount`, `matchedCount`, `modifiedCount`, `deletedCount`, `upsertedCount`, and also `insertedIds` and `upsertedIds` by input number. Only written inserts go into `insertedIds`. In the example above those are numbers 0 and 2, and the numbers of the failed inserts (1 and 3) aren't there.
+
+</Param>
+<Param name="ordered" type="boolean">
+
+Whether the write was ordered. With `true`, writes after the first failed one weren't executed.
+
+</Param>
+</Params>
+
+The text of the error itself names the failure with the lowest index in the input, not the one found first. If document 2 failed Typemo's check and the server refused document 1, the text will say "first at index 1". To find duplicates among the failures, check the item's class: `failure.error instanceof DuplicateKeyError`.
+
+A cast error in an ordered `insertMany` is thrown immediately as [`CastError`](./data-errors.mdx#cast-error), before the batch is sent, and isn't collected into a `BulkWriteError`. A schema check error in an unordered write does go into the batch (in the example it's index 1).
+
+### When not to use it [#bulk-write-error.when-not-to-use]
+
+If writes must go through together or not at all, a bulk write doesn't fit, since it's partial by nature. Use a [transaction](../transactions/transactions.mdx#transaction).
+
+---
+
+## ServerErrorCodes [#server-error-codes]
+
+`ServerErrorCodes` is a frozen object with the names of the server error codes Typemo reacts to. The driver exports no constants for almost all of these codes, even for 11000, so they are collected here. `error.code === ServerErrorCodes.DuplicateKey` reads better than `error.code === 11000`.
+
+<Snippet id="reference/errors/server-errors/server-error-codes" twoslash />
+
+The `ServerErrorCode` type is the union of all the values in this table. The classes by code are these. 11000 and 11001 give `DuplicateKeyError`, 121 gives `ServerValidationError`, 112 gives `WriteConflictError`, 50 gives `TimeoutError`, and 18 gives `ConnectionError` of the `authentication` kind. The other codes give the general `ServerError`.
+
+<TypeTable
+  type={{
+    HostUnreachable: { description: "Code 6. The host is unreachable.", type: "6" },
+    HostNotFound: { description: "Code 7. The host wasn't found.", type: "7" },
+    Unauthorized: { description: "Code 13. No permission for the operation.", type: "13" },
+    AuthenticationFailed: { description: "Code 18. The server rejected the credentials. Gives a `ConnectionError` of the `authentication` kind.", type: "18" },
+    IllegalOperation: { description: "Code 20. An illegal operation.", type: "20" },
+    NamespaceNotFound: { description: "Code 26. The collection or database doesn't exist.", type: "26" },
+    PathNotViable: { description: "Code 28. The path can't be applied to the document.", type: "28" },
+    ConflictingUpdateOperators: { description: "Code 40. Update operators conflict with each other.", type: "40" },
+    CursorNotFound: { description: "Code 43. The cursor wasn't found on the server.", type: "43" },
+    NamespaceExists: { description: "Code 48. The collection already exists.", type: "48" },
+    MaxTimeMSExpired: { description: "Code 50. The server stopped the operation at its time limit. Gives a `TimeoutError`.", type: "50" },
+    WriteConcernTimeout: { description: "Code 64. The write acknowledgment didn't arrive in time.", type: "64" },
+    IndexOptionsConflict: { description: "Code 85. An index with these keys already exists, but with other options.", type: "85" },
+    IndexKeySpecsConflict: { description: "Code 86. An index with this name already exists, but with other keys.", type: "86" },
+    NetworkTimeout: { description: "Code 89. A network operation timed out.", type: "89" },
+    ShutdownInProgress: { description: "Code 91. The server is shutting down.", type: "91" },
+    WriteConflict: { description: "Code 112. Two writes touched one document. Gives a `WriteConflictError`.", type: "112" },
+    ConflictingOperationInProgress: { description: "Code 117. Another operation is already running in the same session.", type: "117" },
+    DocumentValidationFailure: { description: "Code 121. The collection validator rejected the document. Gives a `ServerValidationError`.", type: "121" },
+    CappedPositionLost: { description: "Code 136. The position in a capped collection was overwritten.", type: "136" },
+    PrimarySteppedDown: { description: "Code 189. The primary node stopped being the primary.", type: "189" },
+    IncompleteTransactionHistory: { description: "Code 217. The transaction history is incomplete.", type: "217" },
+    NoSuchTransaction: { description: "Code 251. There is no such transaction on the server.", type: "251" },
+    TransactionCommitted: { description: "Code 256. The transaction is already committed.", type: "256" },
+    TransactionTooLarge: { description: "Code 257. The transaction is too large.", type: "257" },
+    ExceededTimeLimit: { description: "Code 262. The operation's time limit was exceeded.", type: "262" },
+    ChangeStreamFatalError: { description: "Code 280. The change stream ended with an unrecoverable error.", type: "280" },
+    ChangeStreamHistoryLost: { description: "Code 286. The change stream history is lost.", type: "286" },
+    NotWritablePrimary: { description: "Code 10107. The node isn't the primary and can't be written to.", type: "10107" },
+    DuplicateKey: { description: "Code 11000. A unique index was violated. Gives a `DuplicateKeyError`.", type: "11000" },
+    InterruptedAtShutdown: { description: "Code 11600. The operation was interrupted by a server shutdown.", type: "11600" },
+    InterruptedDueToReplStateChange: { description: "Code 11602. The operation was interrupted by a replica set state change.", type: "11602" },
+    SearchNotEnabled: { description: "Code 31082. The server has no Atlas Search: the `$search`, `$searchMeta`, and `$vectorSearch` stages and the search index commands work only in Atlas or in a local Atlas environment. An application uses this code to tell \"no search\" from other failures, see the [example](#search-without-atlas).", type: "31082" },
+  }}
+/>
+
+The code descriptions follow the code names. The server's behavior wasn't checked in each case, except for codes 11000, 121, 112, 50, 31082, and 2 (the last isn't in the table).
+
+### Search without Atlas [#search-without-atlas]
+
+The `vectorSearch` stage on an ordinary MongoDB server ends with a `ServerError` with the code `SearchNotEnabled`. An application that runs without Atlas in development catches exactly this code and answers with a fallback word search. It rethrows other errors, so a network failure doesn't look like "no search".
+
+<Snippet id="reference/errors/server-errors/search-without-atlas" title="articles/search.service.ts" twoslash />
+
+The message of such an error on the test server is `Using $search and $vectorSearch aggregation stages requires additional configuration. (code 31082 SearchNotEnabled)`. The whole example is covered in the [Search by text and meaning](../../recipes/search.mdx#fallback-to-text) recipe.
+
+---
+
+## ErrorLabels [#error-labels]
+
+`ErrorLabels` is a frozen object with the names of the labels the server and the driver attach to errors. A label doesn't say what happened but hints at what you can do: repeat the write, repeat the transaction, or find out the outcome of a commit. You can read labels on [`ServerError`](#server-error), [`ConnectionError`](./configuration-errors.mdx#connection-error), and [`DriverError`](./configuration-errors.mdx#driver-error) through `errorLabels` and `hasErrorLabel`.
+
+<TypeTable
+  type={{
+    RetryableWriteError: { description: "The write can be repeated as is, because the failure is temporary.", type: '"RetryableWriteError"' },
+    TransientTransactionError: { description: "The transaction can be run again in full. Inside `transaction` the driver does that.", type: '"TransientTransactionError"' },
+    UnknownTransactionCommitResult: { description: "The outcome of the commit is unknown, because it may or may not have gone through. You can repeat the commit, but you can't repeat the whole transaction without checking.", type: '"UnknownTransactionCommitResult"' },
+    ResumableChangeStreamError: { description: "The change stream can be resumed from the last position.", type: '"ResumableChangeStreamError"' },
+  }}
+/>
+
+The `TransientTransactionError` label is visible on a refusal after which the transaction function ran again. With two artificial `update` failures the function got `scope.attempt` equal to 1, 2, and 3, and the transaction committed.
+
+<Snippet id="reference/errors/server-errors/error-labels" twoslash />
+
+The label descriptions, other than `TransientTransactionError`, are taken from the driver documentation and weren't reproduced on a server.

@@ -1,0 +1,117 @@
+---
+title: Change history
+description: "A log of who changed what in an account, the history of one document, and save events for the rest of the app"
+icon: History
+---
+
+To answer "who changed this account and when", you need two things: a log that every write goes into, and a way to pull the history of one document out of it. Let's build both for bank accounts. The [audit](../policies/audit.mdx) policy keeps the log, the actor (the one who acts) comes through the context, and a document hook tells the rest of the app that an account was saved.
+
+The log is written in the same transaction as the write itself. If the log isn't written, the change rolls back too. So the history never drifts from the data, but it costs more than a plain write: every write to an account adds one more write to the log.
+
+## What you need [#prerequisites]
+
+- A client connected as in [Connect to the database](../connection/connect.mdx), and a `bank` database.
+- MongoDB running as a replica set (several MongoDB servers holding copies of the same data, though one server is enough for transactions). The audit log is written in a transaction, and on a standalone `mongod` a write to an audited model ends with a `ConfigurationError`.
+- The guide [Keep an audit log](../policies/audit.mdx), if you want to know exactly what gets recorded and how secrets are masked.
+
+## Quick start [#quick-start]
+
+Turn on `audit: true` in the schema and wrap the write in [`PolicyContext.run`](../reference/policies/policy-context.mdx#policy-context.run) with an actor. A write to an account leaves a log line in the `accounts_audit` collection.
+
+<Snippet id="recipes/change-history/quick-start" twoslash />
+
+Below we show how to read the history of one account, retell it for a person, and send out events.
+
+## Describe the model [#define-model]
+
+An account has a title, a balance, and a card number. The card is marked `sensitive: "mask"`, and the log records it as `?`, not the real number. That way access to the history doesn't expose secrets.
+
+<Snippet id="recipes/change-history/define-model" title="accounts/account.ts" twoslash />
+
+## Write on behalf of a user [#write-as-user]
+
+The log takes the actor from the policy context. Without it the line has no `actor`, and there's no way to know who made the change. The request handling layer opens the context once, as in the recipe [A multi-tenant app](./multi-tenant.mdx). Here that layer is the `asActor` function.
+
+<Snippet id="recipes/change-history/write-as-user" title="http/as-actor.ts" twoslash />
+
+From here on, every write goes inside it. Notice that the context is captured when the operation is **built**. So `asActor("u2", () => doc.$save())` works, but a builder created in advance outside `asActor` won't get the actor.
+
+## Read the history of one account [#account-history]
+
+The log has no model, so you read it through the driver: [`client.unsafeDriver()`](../reference/connection/typemo-client.mdx#client.unsafe-driver). A log line ([`AuditEntry`](../reference/policies/schema-options.mdx#audit-entry)) holds the write's `filter` or the inserted `documents`. So the writes of one account are found in three places.
+
+- `filter._id` equals its `_id`: these are updates and deletes.
+- `filter._id.$in` contains it: a write to several accounts at once, covered in the `updateMany` entry below.
+- `documents._id` equals it: the creation.
+
+<Snippet id="recipes/change-history/account-history" title="accounts/history.ts" twoslash />
+
+Sorting by the log line's `_id` gives the order of the writes. Say `u1` created the account `Main`, then `u2` saved the document with a new balance, and `u3` added 5 with the `$inc` operator. `historyOf` returns three lines with the operations `insertOne`, `updateOne`, `updateOne` and the actors `u1`, `u2`, `u3`. A write through `$save` is marked `document: true` in the log, and a direct update `document: false`.
+
+## Explain the history to a person [#explain-history]
+
+A user needs a line like "u3 increased balance", not a raw log entry. The operator and the field come from `update`. The log stores values already cast to the schema types, and secrets masked.
+
+<Snippet id="recipes/change-history/explain-history" title="accounts/history.ts" twoslash />
+
+For the three writes above you get `created`, `$set balance`, `$inc balance`. The card number doesn't show up here in any form other than `?`.
+
+## Announce a save with an event [#emit-on-save]
+
+The log answers "what happened", and an event answers "what happened a moment ago". That could be a notification to a customer, a cache update, or an email. A document hook, [`@Post`](../reference/hooks/pre-post.mdx#post) on the `document.save` event, is called after the document is written. Sending the event is your code (`__publish__`).
+
+<Snippet id="recipes/change-history/emit-on-save" title="accounts/account.ts" twoslash />
+
+The hook fires on `create` and `$save`, that is, when the write goes through a document. `updateOne` and `updateMany` don't call document hooks. Their change stays in the log but produces no event. If you need an event for them too, use a [change stream](./change-stream-jobs.mdx). It sees every write, wherever it came from.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **who needs the answer: a person or code**.
+
+- **A person needs to know who changed what**: show the history from the log.
+- **Code needs to react to a change**, update a cache, or send an email: use a document hook for writes through a document, or a [change stream](../change-streams/watch.mdx) for any write.
+
+The log doesn't keep the full history of values, every whole version of the document. It keeps operations.
+
+## When not to use it [#when-not-to-use]
+
+If you only need the date of the last change, [`Timestamped`](../reference/schemas/base-classes.mdx#timestamped) with the `createdAt` and `updatedAt` fields is enough. The log doubles the writes, and that's its price. Turn it on where "who changed it" really comes up: for money, permissions, and settings.
+
+## Troubleshooting [#troubleshooting]
+
+**The history has no `updateMany` writes.** An `updateMany` with a filter by title doesn't store the `_id`s of the accounts. The log recorded the condition, not a list of affected documents. `historyOf` by `_id` won't find such a line, and the write won't show up in a single account's history. Read the ids in a transaction and write by them. Then the log line names the `_id` values, and `historyOf` sees it.
+
+<Snippet id="recipes/change-history/troubleshooting" title="accounts/accounts.service.ts" twoslash />
+
+The transaction is there so that reading the ids and writing by them see the same state of the database. The log line of such a write names `filter: { _id: { $in: [...] } }` with every id, and `historyOf` finds it by `filter._id.$in`. Why the log stores the condition is explained in [Keep an audit log](../policies/audit.mdx#document-history).
+
+**The log has no actor.** The write ran outside `asActor`. The log line still appears, but with `actor: null`. Wrap every handler that writes something in `asActor`.
+
+**A write fails on a standalone `mongod`.** The audit log needs a replica set, because the write and the log go in one transaction. Run MongoDB as a replica set. One member is enough. There's more in [Keep an audit log](../policies/audit.mdx#troubleshooting).
+
+## Full example [#full-example]
+
+<Snippet id="recipes/change-history/full-example" title="accounts/accounts.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, history is usually kept with a plugin like `mongoose-history`, which writes a separate record after the main one. A failure between them leaves a write without history. Here the log is written in the same transaction, and secrets are masked by the `sensitive` field option.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Keep an audit log" href="../policies/audit.mdx">
+  What gets recorded, how secrets are masked, and what happens when the log fails.
+</Card>
+<Card title="Pass the tenant and actor through the whole request" href="../policies/policy-context.mdx">
+  How the context with the actor reaches every operation.
+</Card>
+<Card title="Run code when a document is saved" href="../hooks/document-hooks.mdx">
+  Every document event and their order.
+</Card>
+<Card title="Background jobs on a change stream" href="./change-stream-jobs.mdx">
+  How to react to any write, including `updateMany`.
+</Card>
+</Cards>

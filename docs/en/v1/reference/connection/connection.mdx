@@ -1,0 +1,259 @@
+---
+title: Connection
+description: "One database of the client: model, models, useDb, init, syncAll, aggregate, ready, transaction, and connection plugins"
+icon: Database
+---
+
+`Connection` is one database of the client together with its models. Through it you get a model by its entity class, switch to another database of the same client, create everything the models need in the database, and run transactions. `Connection` opens no network connections itself. The network, the pool, and closing stay with [`TypemoClient`](./typemo-client.mdx), and `Connection` only selects the database.
+
+You don't create a `Connection` yourself. [`client.db`](./typemo-client.mdx#client.db) or [`client.connection`](./typemo-client.mdx#client.connection) hands it to you. If you're new here, read the guide [Connect to the database](../../connection/connect.mdx) first. This page is a reference.
+
+The examples use an account model with a unique field, so that `init` and `syncAll` have something to create.
+
+<Snippet id="errors/handling/prerequisites" title="accounts/account.ts" twoslash />
+
+The fields `connection.client` (the owning client) and `connection.name` (the database name) are read-only.
+
+<Snippet id="reference/connection/connection/intro" twoslash />
+
+---
+
+## connection.model [#connection.model]
+
+`connection.model` returns the model for a class with `@Schema`. You read and write documents through the model. The first call compiles the class schema: it checks the field descriptions and applies plugins and extensions. That's why you see schema errors on this call, not on the first operation.
+
+<Snippet id="reference/connection/connection/connection-model" twoslash />
+
+<Returns type="Model<T>">
+
+The model of the class on this connection. For one class you always get the same object. On another connection, that is in another database, the model of the same class is a different one. It has its own database, and the data doesn't overlap.
+
+</Returns>
+
+<Params>
+<Param name="entity" type="EntityClass<T>" required>
+
+A class with `@Schema`. If you pass something that isn't a class, the call throws `ConfigurationError` right away with the text `connection.model: an entity class (@Schema)`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/connection/connection/connection-model-2" />
+
+</FullType>
+
+What to do with the model next is described in the guide [Reading data](../../queries/reading-data.mdx) and in the [reading reference](../query/reading.mdx).
+
+---
+
+## connection.models [#connection.models]
+
+All models already registered on this connection, in the order of registration. The list helps in checks and utility scripts, for example to walk through the models and print the collection names.
+
+<Snippet id="reference/connection/connection/connection-models" twoslash />
+
+The type is `readonly Model<object>[]`. The list holds only the models you called [`connection.model`](#connection.model) for. A class you haven't registered won't appear there.
+
+---
+
+## connection.useDb [#connection.use-db]
+
+`connection.useDb` returns a connection to another database of **the same client**. It lets you work with several databases, say one per tenant or one for reports, without opening new connections. The pool is shared, and each database has its own models.
+
+<Snippet id="reference/connection/connection/connection-use-db" twoslash />
+
+The method does the same as [`client.db(name)`](./typemo-client.mdx#client.db), only it's called on a connection. You don't need to close `reports` separately, and you can't. The whole client closes through [`client.close`](./typemo-client.mdx#client.close). An empty name gives a `ConfigurationError`.
+
+<Params>
+<Param name="name" type="string" required>
+
+The database name.
+
+</Param>
+</Params>
+
+Returns `Connection`.
+
+---
+
+## connection.init [#connection.init]
+
+`connection.init` creates in the database everything the models of the connection need and that isn't there yet. That means collections (with the schema options), indexes, search indexes, and views. Typemo creates nothing on its own. You call `init` explicitly, at application start or as a deploy step, once the models are registered through [`connection.model`](#connection.model).
+
+<Snippet id="reference/connection/connection/connection-init" twoslash />
+
+`init` deletes and changes nothing. An extra index stays, and an index or collection declared differently from what's in the database fails (see "Errors" below). [`connection.syncAll`](#connection.sync-all) can replace what exists.
+
+If `init` returned a report, the database matches the models, and `inSync` is `true`. That holds for the first call, when the method created something, and for repeated calls. What was created is listed in `created` as strings like `"collection accounts"`, `"index accounts.title_1"`, `"search index accounts.default"`, `"view active_accounts"`. If there was nothing to create, the list is empty, and the second call in a row returned `created: []`.
+
+<Returns type="Promise<SyncReport>">
+
+A report of what exists and what was created. It has `collections` and `views` (one entry for each), `created`, `inSync`, and `failed`. A returned report always has `failed: false`, because any failed step becomes an exception (see below). The report fields are described in the reference [`SyncReport`](../collections/sync-all.mdx#sync-report).
+
+</Returns>
+
+Takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/connection/connection/connection-init-2" />
+
+</FullType>
+
+### Errors [#connection.init.errors]
+
+`init` runs all steps of all models to the end, and a failure in one model doesn't stop the others. If at least one step failed, you get a [`SyncError`](../errors/configuration-errors.mdx#sync-error) instead of a report. It has `operation` (`"connection.init"`), `failures` (failures by collections and views), `errors` (all the original errors in a row), and `report` (the full report with `failed: true`). The `cause` holds an `AggregateError` with the same original errors. A typical failure is an index declared in the database differently from the schema.
+
+<Snippet id="reference/connection/connection/connection-init-errors" twoslash />
+
+The message names the connection, the number of failures, and the cause of each. We got this text on a database where the `title_1` index was already created without `unique`.
+
+<Snippet id="reference/connection/connection/connection-init-errors-2" />
+
+Each name appears once in the message. The nested [`IndexSyncError`](../errors/configuration-errors.mdx#index-sync-error) names the model (`Account: 1 index operation(s) failed: …`), and its own failures start with the action and the index. If a nested error names the collection itself, like `CollectionOptionsError` (`collection "logs": exists with options MongoDB cannot change (capped): drop the collection and create it again`), `SyncError` doesn't repeat the collection name.
+
+Nothing is skipped silently here, because `init` promises that after it the database matches the models. An index that stays different breaks that promise, and the application should learn about it at startup, not on the first duplicate write.
+
+How collections and indexes are created is covered in the guides [Create collections with options](../../collections/create.mdx) and [Sync indexes](../../collections/index-sync.mdx).
+
+---
+
+## connection.syncAll [#connection.sync-all]
+
+`connection.syncAll` brings the collections, indexes, search indexes, and views of the database in line with the model schemas. Unlike [`connection.init`](#connection.init), it can replace what exists. It changes indexes that differ from the schema, and with `update` it also changes collection and view options. Like `init`, it runs all steps of all models and reports failures at the end as one [`SyncError`](../errors/configuration-errors.mdx#sync-error). That makes it a good fit for a deploy step that has to show everything that didn't match.
+
+<Snippet id="reference/connection/connection/connection-sync-all" twoslash />
+
+With `dryRun: true` the method only shows what would change. It writes no collections, indexes, or views, so you can check the database before a deploy. While there is something to create or change, `inSync` of a dry run is `false`.
+
+<Params>
+<Param name="options.dryRun" type="boolean" default="false">
+
+Report the differences only, writing nothing. In the report, `created` lists what would be created.
+
+</Param>
+<Param name="options.update" type="boolean" default="false">
+
+Apply what `collMod` can change: collection options and the view pipeline. Without this option such a difference lands in the failures of the step.
+
+</Param>
+</Params>
+
+<Returns type="Promise<SyncReport>">
+
+A report with the fields `collections` and `views` (one entry for each), `created`, `inSync` (`true` if nothing differed and nothing failed), and `failed` (always `false` in a returned report). If a step fails, you get a `SyncError` with `operation: "syncAll"`, and the report with the failures is in its `report` field. The same goes for `dryRun` if the dry run found an impossible change.
+
+</Returns>
+
+<FullType>
+
+<Snippet id="reference/connection/connection/connection-sync-all-2" />
+
+</FullType>
+
+For the report details, see the reference [`SyncAll`](../collections/sync-all.mdx).
+
+---
+
+## connection.aggregate [#connection.aggregate]
+
+`connection.aggregate` runs a database-level aggregation. Such a plan doesn't read a model's collection. It works with the whole database of the connection, with the `admin` database, or with server sessions. With it you get running operations (`$currentOp`), literal documents (`$documents`), or local sessions (`$listLocalSessions`). The plan is built by [`Pipeline.database`](../aggregation/pipeline.mdx#pipeline.database), [`Pipeline.admin`](../aggregation/pipeline.mdx#pipeline.admin), and [`Pipeline.sessions`](../aggregation/pipeline.mdx#pipeline.sessions), and the method runs it.
+
+<Snippet id="reference/connection/connection/connection-aggregate" twoslash />
+
+The operation goes the same way as model queries. Inside `connection.transaction` it takes part on its own, `timeoutMS` applies, server errors arrive as Typemo errors, and the subscribers of [`client.instrument`](./typemo-client.mdx#client.instrument) get events.
+
+The method differs from [`Model.aggregate`](../aggregation/pipeline.mdx#model.aggregate) in two ways. The operation has no model, so in its events `model` and `collection` are `null` (for a `Pipeline.sessions` plan the collection is `"system.sessions"`), and `database` names the database where it ran. And hooks don't run, since they're registered on models. The policies of the models that the plan reaches through `$lookup` or `$unionWith` still apply.
+
+The plan chooses the database. `Pipeline.database()` runs in the database of the connection, `Pipeline.admin()` always in `admin`, and `Pipeline.sessions()` always in `config.system.sessions`, whichever connection you call the method on. The client has the same method: [`client.aggregate`](./typemo-client.mdx#client.aggregate) works with the client's default database.
+
+<Returns type="AggregateQuery<R>">
+
+An aggregation query typed by the rows of the plan. After `await` you get an array of rows. `.cursor()` returns them one by one, `.explain()` shows the server plan, `.plain()` turns BSON values into data for the client, and `.timeoutMS()`, `.session()`, `.policy()`, and the other methods configure the run the same way as in `Model.aggregate`.
+
+</Returns>
+
+<Params>
+<Param name="plan" type="AggregatePlan<R>" required>
+
+The aggregation plan: the result of `.plan()` on the `Pipeline.database()`, `Pipeline.admin()`, or `Pipeline.sessions()` builder.
+
+</Param>
+<Param name="options" type="ModelAggregateOptions">
+
+Optional run parameters. `session` is your own session (`null` runs outside the current transaction), `timeoutMS` is the client-side deadline of the operation, and `policy` holds policy values on top of the surrounding context.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/connection/connection/connection-aggregate-2" />
+
+</FullType>
+
+### Errors [#connection.aggregate.errors]
+
+The method throws right at the call, before touching the database, in two cases. If the argument isn't an aggregation plan, it's a `QueryError` with the name of the called method. If the plan reads a collection (`Pipeline.from(Account)`), it's a `ConfigurationError`, because `Model.aggregate` runs such plans. And `Model.aggregate` throws in turn if you give it a database-level plan.
+
+<Snippet id="reference/connection/connection/connection-aggregate-errors" />
+
+Errors from the server itself during execution arrive as [`ServerError`](../errors/server-errors.mdx#server-error), and the original driver error is in `cause`.
+
+### When it doesn't fit [#connection.aggregate.when-not-to-use]
+
+Read and write model data through the model itself, which applies policies, masks, and hooks. Use the connection's `aggregate` only where the aggregation has no collection. For examples with `$currentOp`, `$documents`, and `$listSessions`, see the guide [Database-level queries](../../aggregation/database-level.mdx).
+
+---
+
+## connection.ready [#connection.ready]
+
+`connection.ready` waits until the client that owns the database is connected. It does the same as [`client.ready`](./typemo-client.mdx#client.ready), and it's for code that received only a `Connection` and wants to wait for readiness.
+
+<Snippet id="reference/connection/connection/connection-ready" twoslash />
+
+<Params>
+<Param name="timeoutMS" type="number" default="client.options.readyTimeoutMS">
+
+How long to wait, in milliseconds. Zero means no limit.
+
+</Param>
+</Params>
+
+Returns `Promise<void>`. When the time runs out, it throws `TimeoutError` with `kind: "connection"`.
+
+---
+
+## connection.transaction [#connection.transaction]
+
+`connection.transaction` runs a transaction on the client of this connection. It's the same [`client.transaction`](./typemo-client.mdx#client.transaction), only called on a `Connection`. A transaction isn't tied to a database, so operations of models from different databases of one client can take part in it.
+
+<Snippet id="reference/connection/connection/connection-transaction" twoslash />
+
+The parameters, errors, and retry behavior are described under [`client.transaction`](./typemo-client.mdx#client.transaction) and in the guide [Transactions](../../transactions/transactions.mdx).
+
+<FullType>
+
+<Snippet id="reference/connection/connection/connection-transaction-2" />
+
+</FullType>
+
+---
+
+## connection.plugins [#connection.plugins]
+
+`connection.plugins` is the registry of schema plugins at the connection level. `connection.plugins.use(plugin)` attaches a plugin to all models of this database, after the global plugins (see [`Typemo.plugin`](./typemo.mdx#typemo.plugin)).
+
+Register a plugin before the first model of the connection. The registry closes with the first **successful** schema compilation on this connection, and a failed compilation doesn't close it. Later the schemas are already compiled and the plugin can't affect them, so you get a `ConfigurationError`.
+
+<Snippet id="reference/connection/connection/connection-plugins" />
+
+How plugins work and what they add to a schema is described in the guide [Reuse behavior across models](../../hooks/plugins.mdx) and in the reference [Plugins](../hooks/plugins.mdx).
+
+---
+
+## When `Connection` doesn't fit [#when-not-to-use]
+
+`Connection` won't give you a session or a connection to another server. For that there are [`client.startSession`](./typemo-client.mdx#client.start-session) and a separate [`TypemoClient`](./typemo-client.mdx). If you need an operation the model doesn't have, reach for [`client.unsafeDriver`](./typemo-client.mdx#client.unsafe-driver) and remember that policies don't apply to it.

@@ -1,0 +1,118 @@
+---
+title: Validate a document before saving
+description: "Validate a document or plain data against the schema, get every error at once, and understand where each one comes from"
+icon: ShieldCheck
+---
+
+To check a document against the schema, call [`$validate`](../reference/documents/document-api.mdx#validate). The method collects every problem it finds into one [`ValidationError`](../reference/errors/data-errors.mdx#validation-error) and writes nothing. For plain data that hasn't become a document yet, like a request body or an import row, there's [`Model.validate`](../reference/documents/model-document-methods.mdx#model.validate). And [`$save`](../reference/documents/document-api.mdx#save) validates the document on its own before every write.
+
+Problems are collected all together, not one at a time. A person who filled in a form needs a list of what to fix, not the first of five errors. Each problem is an entry with the field path, the reason, and a message.
+
+## What you need [#prerequisites]
+
+A `Product`. It has a required name with an async validator, a number with bounds and a default, and a field with an enum. Field rules are described in [Validate field values](../schemas/validation.mdx).
+
+<Snippet id="documents/validation/prerequisites" title="models/product.ts" twoslash />
+
+## Quick start [#quick-start]
+
+<Snippet id="documents/validation/quick-start" twoslash />
+
+Below we cover what each problem holds, how to check data without a document, and when validation runs on its own.
+
+## Validate a document [#validate-document]
+
+[`$validate`](../reference/documents/document-api.mdx#validate) checks the whole document: required fields, bounds, enums, and your `validate` functions. It waits for async validators. On success the method returns `void`, on any problem it throws a `ValidationError`, and it never changes the document.
+
+[`$save`](../reference/documents/document-api.mdx#save) makes the same call, so you don't need to validate by hand before saving. `$validate` comes in handy when you need to know about errors **before** the write, for example to show them to the user.
+
+Each entry in `issues` is an object with four fields.
+
+- `path`: the field path, an array of segments.
+- `reason`: the reason, for example `required`, `min`, `max`, `enum`, `validator`, or `cast`.
+- `message`: the text.
+- `value`: the value.
+
+The full list of reasons is in the [`ValidationError`](../reference/errors/data-errors.mdx#validation-error) reference.
+
+<Snippet id="documents/validation/validate-document" />
+
+The entries come in the same order as the fields in the class. The errors of `$save` and `Model.validate` are ordered the same way.
+
+## See that a document won't save [#will-not-save]
+
+Types are cast on creation, and rules are checked on validation. So you can create a document that you can't save. Here the `qty` of an order line can't be negative (`min: 0`), but you can still add such a line to the array. The rule fires only on `$validate` and `$save`.
+
+<Snippet id="documents/validation/will-not-save" twoslash />
+
+The path `lines.0.qty` names the exact place: the line and the field. The document isn't written, neither whole nor in part.
+
+## Validate data without a document [#validate-without-document]
+
+If the data comes from outside, there's no need to create a document. [`Model.validate`](../reference/documents/model-document-methods.mdx#model.validate) casts and checks a plain object and returns the ready value with the defaults filled in, including `_id`.
+
+<Snippet id="documents/validation/validate-without-document" twoslash />
+
+Notice the order of the entries. They follow the order the fields are declared in the class (`name`, `size`, `kind`), even though the name validator is async and finishes after the others. The order doesn't depend on which check finished first, so the list in a form doesn't "jump" from run to run.
+
+If you only need to cast values without checking rules, there's [`Model.castObject`](../reference/documents/model-document-methods.mdx#model.cast-object). It stops at the first cast error and doesn't fill in defaults.
+
+## Read a cast error [#inspect-cast-error]
+
+Casting a value to the field type and checking its rules are two different steps, and they have different errors. A value that can't be cast to the type gives a `CastError`. There's no point checking it against rules yet: `"abc"` isn't a number, and there's nothing to compare with `max`. A value of the right type that breaks a rule becomes an entry of a `ValidationError`.
+
+Where a `CastError` shows up depends on how the value got into the document. Methods like `Model.new`, `$set`, and array methods cast the value right away, on the call. A plain assignment `product.size = "abc"` is cast later, on the next `$validate()` or `$save()`. The method throws a `CastError` before any validation, and nothing goes to the database. The constraints of that field aren't checked, so there's no second, side error for the same field.
+
+<Snippet id="documents/validation/inspect-cast-error" />
+
+`Model.validate` behaves differently, because its job is to collect every problem of data from outside. It doesn't throw on a value of the wrong type. It adds an entry with the reason `cast` to the list. The `CastError` itself is in that entry's `cause`. There's one entry per field, and if the value can't be cast, its constraints aren't checked.
+
+<Snippet id="documents/validation/inspect-cast-error-2" />
+
+The strictness here is deliberate. `"4"` won't silently turn into a number.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether you have a document**.
+
+- **You already have a document**, created with `Model.new` or read from the database: [`$validate`](../reference/documents/document-api.mdx#validate), or [`$save`](../reference/documents/document-api.mdx#save) right away.
+- **You only have data from outside**, and you need to know whether it's valid: [`Model.validate`](../reference/documents/model-document-methods.mdx#model.validate).
+- **You only need to cast types**: [`Model.castObject`](../reference/documents/model-document-methods.mdx#model.cast-object).
+
+## When not to use it [#when-not-to-use]
+
+You don't need to call `$validate` separately before `$save`, because saving validates the document on its own. For changes through [`updateOne`](../reference/writes/writes.mdx#update-one) you don't need a document at all. How types are cast and checks run on update is described in [Validate field values](../schemas/validation.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**Validation passed, but the save failed.** `$validate` checks the document's data, but not the version or unique indexes. A version conflict is a [`VersionError`](../reference/errors/query-errors.mdx#version-error), and a uniqueness violation is a [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicate-key-error). The database reports them on write, and you can't find them in advance. Catch these errors around `$save`.
+
+**The error doesn't make clear which field is at fault.** The `ValidationError` text names the paths, but for a form it's easier to read `issues`. Each entry has a `path` and a `reason`. Use `error.issues`, as in the examples above, instead of parsing `message`.
+
+## Full example [#full-example]
+
+A function takes a request body, validates it, and returns either the created product or a list of problems by field.
+
+<Snippet id="documents/validation/full-example" title="products/products.service.ts" twoslash />
+
+## Coming from Mongoose [#from-mongoose]
+
+<Callout type="migration">
+
+`doc.validate()` is called `$validate()` here, and `Model.validate(obj)` returns the cast value. A value that can't be cast gives a `CastError`, and in `Model.validate` an entry with the reason `cast`, not `invalidate`. Typemo always waits for async validators. And a `ValidationError` holds every entry in the order of the schema fields, not only the first one.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Validate field values" href="../schemas/validation.mdx">
+  Every field rule: `min`, `max`, `enum`, `match`, and your own validators.
+</Card>
+<Card title="ValidationError" href="../reference/errors/data-errors.mdx#validation-error">
+  The full list of reasons and how `issues` is built.
+</Card>
+<Card title="Model methods for documents" href="../reference/documents/model-document-methods.mdx">
+  `Model.validate` and `Model.castObject` in detail.
+</Card>
+</Cards>

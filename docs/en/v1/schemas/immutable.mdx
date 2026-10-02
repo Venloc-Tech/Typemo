@@ -1,0 +1,89 @@
+---
+title: Immutable fields
+description: "Forbid changing a field after the document is created, and see which writes Typemo stops because of it"
+icon: Lock
+---
+
+Some data is set once and never changes: the country where an account was opened, a number in an external system, a creation date. If such a field can change, one day a stray update or a bug will change it. And you won't notice until the reports stop adding up. The [`immutable: true`](../reference/schemas/prop.mdx#immutable) option and the [`Immutable<T>`](../reference/schemas/field-markers.mdx#immutable) type close that gap. The value is written when the document is created, and any attempt to change it is an error.
+
+`_id` and `createdAt` work the same way, and the same option makes them immutable.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the account model from `accounts/account.ts`.
+
+## Quick start [#quick-start]
+
+You declare the field as a pair: the `immutable: true` option and the `Immutable<T>` type. The compiler checks that they go together and won't let such a field into an update operator.
+
+<Snippet id="schemas/immutable/quick-start" title="accounts/account.ts" twoslash />
+
+Below we'll cover exactly what's forbidden and how to get around the ban where that's legitimate.
+
+## What's forbidden after creation [#forbidden-after-create]
+
+Any write that changes an immutable path is forbidden, including removing it and replacing its parent. The check runs at runtime, so updates built without types go through it too. The error is always the same, a [`StrictModeError`](../reference/errors/data-errors.mdx#strict-mode-error) with the reason `immutable`, and the text names the operator and the path.
+
+<Snippet id="schemas/immutable/forbidden-after-create" title="accounts/accounts.service.ts" twoslash />
+
+`$unset`, [`findOneAndUpdate`](../reference/writes/writes.mdx#find-one-and-update), `bulkWrite`, and [`$save`](../reference/documents/document-api.mdx#save) give the same text with a different operator. The assignment `account.country = "DE"` doesn't throw right away, but you won't be able to save that document. Paths inside subdocuments are protected the same way. Replacing a whole subdocument that has an immutable field won't pass either: `$set.address: "address.country" is immutable; …`.
+
+The document's ordinary fields change as usual, and `$inc` on `balance` goes through. The protection is targeted and covers only the marked paths.
+
+## Write the value on create [#set-on-insert]
+
+An immutable field's value is written when the document is created. If an update with `upsert` creates the document, pass the value through `$setOnInsert`. That operator fires only on insert, and it can't break immutability. `$set` with `upsert` for such a field gives the same error.
+
+<Snippet id="schemas/immutable/set-on-insert" title="accounts/accounts.service.ts" twoslash />
+
+## Replace a whole document [#replace-document]
+
+[`replaceOne`](../reference/writes/writes.mdx#replace-one) rewrites the whole document. So for an immutable field, the replacement has to say the same thing that's already stored. If the field is in the document, the same value. If it isn't, nothing. Only the server knows the stored document, so Typemo adds this condition to the replacement's filter, and the server compares the values in the same operation.
+
+If the replacement disagrees with the document, it isn't written.
+
+- A different value: `a replacement of Account changes the immutable field "country"; the document was not replaced. Carry the stored value [immutable]`.
+- The field is in the document but not in the replacement: `without the immutable field "country" would drop it from the stored document`.
+- The replacement adds a field the document doesn't have: `sets the immutable field "country", which the stored document does not have`.
+
+An optional immutable field that's in neither the replacement nor the document doesn't get in the way. [`findOneAndReplace`](../reference/writes/writes.mdx#find-one-and-replace) and `replaceOne` in `bulkWrite` are checked the same way. The details and `upsert` are in [Replace a document](../writes/replace.mdx#replace-immutable). And `_id` in a replacement is always forbidden, even the old one: `a replacement of Account carries "_id": a replacement keeps the stored _id and cannot change it; leave "_id" out and select the document by _id in the filter [immutable]`.
+
+A pipeline update ([`UpdatePipelines`](../reference/writes/pipeline-updates.mdx#update-pipelines)) is checked as strictly. A `set` of an immutable field gives a `StrictModeError` (`update.0.$set.country: "country" is immutable; …`). Typemo rejects a `replaceWith` stage that loses such a field and tells you to carry the field over as is: `$replaceWith rewrites the whole document and would change or drop the immutable fields country; carry each unchanged (country: "$country") or use $set/$unset of the other fields [immutable]`.
+
+## How to choose [#how-to-choose]
+
+Ask yourself: **can this value ever legitimately become something else?**
+
+- **No** (the country of registration, an external identifier): `immutable`.
+- **It changes rarely, but it happens** (an address): keep an ordinary field and track the history of changes with an [audit log](../policies/audit.mdx).
+- **Only certain roles must not change it**: that's an application rule, not a schema rule.
+
+## When not to use it [#when-not-to-use]
+
+`immutable` protects against updates through Typemo. It won't save you from direct writes to the database or from driver operations through [`client.unsafeDriver`](../reference/connection/typemo-client.mdx#client.unsafe-driver), which bypass every policy. And for fields you occasionally fix by hand, the ban will only get in the way. An ordinary field plus an audit log works better there.
+
+## Troubleshooting [#troubleshooting]
+
+**The option without the type.** The option and the type go as a pair. If the field is declared with a regular type, the compiler answers `@Prop "country": "immutable" is set, declare the field as Immutable<T>`. And on `Immutable<T>` without the option, `@Prop "country": the field is Immutable<T>, add immutable: true`. That keeps the result type in line with how writes behave.
+
+**You need to fix a typo in an immutable field.** The update is rejected, but the value has to be corrected. The model won't let you, and that's by design. Fix the value with a one-off script through [`client.unsafeDriver`](../reference/connection/typemo-client.mdx#client.unsafe-driver), or recreate the document.
+
+**An upsert fails on `$set`.** If an upsert has to create a document with an immutable field, move that field from `$set` to `$setOnInsert`.
+
+## Full example [#full-example]
+
+<Snippet id="schemas/immutable/full-example" title="accounts/accounts.service.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Timestamps and versions" href="./timestamps-and-versions.mdx">
+  `createdAt` is a ready-made example of an immutable field.
+</Card>
+<Card title="Field marker types" href="../reference/schemas/field-markers.mdx">
+  `Immutable`, `Hidden`, and other marker types.
+</Card>
+<Card title="@Prop" href="../reference/schemas/prop.mdx">
+  Every field option, including `immutable`.
+</Card>
+</Cards>

@@ -1,0 +1,351 @@
+---
+title: CollectionManager
+description: "createCollection and ensureCollection on a model, the CollectionManager class, the EnsureCollectionReport report, and collection option differences"
+icon: Package
+---
+
+Collection options are set in [`@Schema`](../schemas/schema.mdx) and applied when the collection is created. They include a capped size (`capped`), time series, a clustered index, a server-side document validator, and the string collation. This page describes how to apply the options and compare them with what's already on the server. It covers the model methods `createCollection` and `ensureCollection`, the static `CollectionManager` class they're built on, and the `EnsureCollectionReport` report.
+
+If you're setting up collections for the first time, start with the [Create collections with options](../../collections/create.mdx) guide. This page is a reference.
+
+Typemo doesn't stay silent about a mismatch. When `createCollection` runs again with different options, the server rejects it with an "already exists" error, and many libraries swallow that error. The changed option then never reaches the server. Typemo compares the options and either confirms they match or names exactly what differs.
+
+The examples use two models: an account with a server-side validator and a capped transaction journal.
+
+<Snippet id="collections/create/prerequisites" title="accounts/account.ts" twoslash />
+
+The results in the comments come from an empty database unless noted otherwise.
+
+---
+
+## Model.createCollection [#model.create-collection]
+
+`createCollection` creates the model's collection with the options from the schema and returns `true` if it created it. Use it when you want to create a collection explicitly and get an error on a mismatch, instead of carrying on with a collection built differently from the schema.
+
+"Already exists" here means one of two things. If the collection exists and its options match the schema, the method returns `false`. If the options differ, it throws a [`CollectionOptionsError`](../errors/configuration-errors.mdx#collection-options-error) and leaves the existing collection alone. To change it, call [`ensureCollection`](#model.ensure-collection) with the `update` option.
+
+<Snippet id="reference/collections/collection-manager/model-create-collection" twoslash />
+
+<Returns type="Promise<boolean>">
+
+`true` if this call created the collection, and `false` if it already existed with the same options. With different options you don't get `false`. You get a [`CollectionOptionsError`](../errors/configuration-errors.mdx#collection-options-error) with the `differences` field.
+
+</Returns>
+
+It takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/collections/collection-manager/model-create-collection-2" />
+
+</FullType>
+
+### The collection already exists with different options [#collection-options-conflict]
+
+Say accounts live in a collection without a validator. The first write could have created it, back when the schema had no `validator` yet. The method won't quietly treat such a collection as ready.
+
+<Snippet id="reference/collections/collection-manager/collection-options-conflict" twoslash />
+
+<Snippet id="reference/collections/collection-manager/collection-options-conflict-2" />
+
+### A schema with `autoCreate: false` [#auto-create-false]
+
+`autoCreate: false` in a schema says someone else creates the collection: an administrator, a neighboring service, or a migration. So `createCollection` on such a model creates nothing and throws a [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error). Otherwise the option would lose its meaning.
+
+<Snippet id="reference/collections/collection-manager/auto-create-false" />
+
+The same rule applies in [`connection.init`](../connection/connection.mdx#connection.init) and [`connection.syncAll`](../connection/connection.mdx#connection.sync-all). They skip the collection options step for such a model.
+
+If a schema has neither indexes nor search indexes, there's nothing to create for it. The model is skipped entirely, and a missing collection isn't an error, because its owner creates it. If there are indexes, the collection doesn't exist yet, and the schema has options that can only be set at creation, an index would create the collection without them. Then `init` and `syncAll` throw a [`SyncError`](../errors/configuration-errors.mdx#sync-error) with the same error as the first write (it's described below).
+
+[`ensureCollection`](#model.ensure-collection) ignores this option. If you call it yourself, the collection is created. On MongoDB 9.0 it returned `"created"` for a model with `autoCreate: false`.
+
+---
+
+## Model.ensureCollection [#model.ensure-collection]
+
+`ensureCollection` brings the collection in line with the schema options and reports what it took. If there's no collection, it creates one. If the collection exists and matches, it does nothing. If only things the server can change on the fly differ, it changes them with the `collMod` command, when `update: true` is set. Everything else is an error. The method is idempotent, and the result shows whether any work was done, so it's the main one for deployment.
+
+By default `ensureCollection` **changes nothing** in an existing collection. The options of a running collection must not change by accident, and any difference without `update: true` is an error. The `dryRun` option shows what would happen and writes nothing.
+
+<Snippet id="reference/collections/collection-manager/model-ensure-collection" twoslash />
+
+<Returns type="Promise<EnsureCollectionReport>">
+
+An [`EnsureCollectionReport`](#ensure-collection-report) with a `result` field (`"created"`, `"unchanged"`, or `"updated"`) and a `differences` list. For `"created"` and `"unchanged"` the list is empty. With `dryRun: true` the report describes what would have been done.
+
+</Returns>
+
+<Params>
+<Param name="options.update" type="boolean" default="false">
+
+Applies, with the `collMod` command, the differences the server can change in place (see [what can be changed](#in-place-changes)). Without this option, any difference is a [`CollectionOptionsError`](../errors/configuration-errors.mdx#collection-options-error).
+
+</Param>
+<Param name="options.dryRun" type="boolean" default="false">
+
+Only reports. `result` and `differences` come back, and the server isn't changed. A difference that `collMod` can't change still throws an error, because it can't be fixed with or without `update`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/collection-manager/model-ensure-collection-2" />
+
+</FullType>
+
+### Change an option of an existing collection [#change-collection-options]
+
+Say the transaction journal was created with a limit of 1024 bytes, and the schema asks for 65,536. The server can change the size and the document count of a capped collection, so with `update: true` one command is enough.
+
+<Snippet id="reference/collections/collection-manager/change-collection-options" twoslash />
+
+Without `update: true`, the same call would throw an error with the list of differences.
+
+<Snippet id="reference/collections/collection-manager/change-collection-options-2" />
+
+### A difference that can't be changed [#fixed-difference]
+
+The server can't turn an ordinary collection into a capped one. You have to drop the collection and create it again. `ensureCollection` never drops collections itself, so it throws an error with `update` and without it.
+
+<Snippet id="reference/collections/collection-manager/fixed-difference" twoslash />
+
+<Snippet id="reference/collections/collection-manager/fixed-difference-2" />
+
+### The first write to a collection that doesn't exist yet [#first-write]
+
+If there's no collection, the server creates it on the first write, and always as an ordinary one: without `capped`, time series, a clustered index, or collation. These four options are set only at creation, so they can't be fixed afterward. Typemo doesn't let that happen by mistake.
+
+The check that the collection exists runs on the first insert, bulk write, upsert, and save of a document of a model with such options. `createIndexes`, `syncIndexes`, and `connection.init` do the same. If the collection doesn't exist, you get a [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error), and nothing appears in the database.
+
+<Snippet id="reference/collections/collection-manager/first-write" />
+
+The check runs once per model. Typemo remembers the collection it found, and later writes cost nothing. Ordinary reads and `updateOne` without `upsert` aren't subject to the check. For a model with `autoCreate: false`, the same error gets an added explanation: the collection must be created by its owner with these options.
+
+The check doesn't cover the validator and the storage of document images, because `collMod` can change them. A write to a missing collection with `validator: true` creates an ordinary collection without a validator. [`ensureCollection`](#model.ensure-collection) will then show that difference (`validator`, `mutable: true`) and fix it with `update: true`.
+
+### A view under the collection name [#view-as-collection]
+
+If a view sits under that name, the method won't treat it as a collection.
+
+<Snippet id="reference/collections/collection-manager/view-as-collection" />
+
+---
+
+## What can be changed in place [#in-place-changes]
+
+In the `differences` list, each difference has a `mutable` field. It says whether the `collMod` command can fix the difference. Typemo knows this in advance, because the list is built into the comparison code.
+
+<TypeTable
+  type={{
+    "validator, validationLevel, validationAction": { description: "The validator and its mode. There's a difference also when the schema declares no validator but the server has one." },
+    "size, max": { description: "The size and document count of a capped collection. They can change while the collection stays capped." },
+    expireAfterSeconds: { description: "The lifetime of documents in a time series or clustered collection." },
+    changeStreamPreAndPostImages: { description: "Storing document images before and after a change for change streams." },
+    "timeseries.granularity, timeseries.bucketMaxSpanSeconds, timeseries.bucketRoundingSeconds": { description: "How time series measurements are grouped." },
+    capped: { description: "**Can't be changed.** A collection becomes capped or ordinary only by recreating it." },
+    collation: { description: "**Can't be changed.** The string collation is set at creation." },
+    clusteredIndex: { description: "**Can't be changed.** A clustered collection is created that way from the start." },
+    "timeseries.timeField, timeseries.metaField": { description: "**Can't be changed.** The time and metadata fields are set at creation." },
+  }}
+/>
+
+Turning an ordinary collection into a time series and back, like a view in place of a collection, always gives a `CollectionOptionsError` with a hint about what to do.
+
+---
+
+## EnsureCollectionReport [#ensure-collection-report]
+
+The result of [`ensureCollection`](#model.ensure-collection) and [`TypedView.ensure`](./typed-view.mdx#typed-view.ensure), and also part of the [`SyncReport`](./sync-all.mdx#sync-report) report.
+
+<TypeTable
+  type={{
+    result: { type: '"created" | "unchanged" | "updated"', required: true, description: "What was done or, with `dryRun`, would have been done. The collection was created, already matched, or was changed with the `collMod` command." },
+    differences: { type: "readonly CollectionDifference[]", required: true, description: "The differences found. Empty for `\"created\"` and `\"unchanged\"`." },
+  }}
+/>
+
+### CollectionDifference [#collection-difference]
+
+One difference between the schema and the server. The same type sits in the `differences` field of a [`CollectionOptionsError`](../errors/configuration-errors.mdx#collection-options-error).
+
+<TypeTable
+  type={{
+    option: { type: "string", required: true, description: "The option name. For example `validator`, `capped`, `size`, `timeseries.granularity`, `pipeline` (for a view), and others." },
+    mutable: { type: "boolean", required: true, description: "`true` if `collMod` can change it and `ensureCollection({ update: true })` will do." },
+    wanted: { type: "unknown", required: true, description: "What the schema declares. `undefined` means not declared." },
+    actual: { type: "unknown", required: true, description: "What the server has. `undefined` means not set." },
+  }}
+/>
+
+### EnsureCollectionOptions [#ensure-collection-options]
+
+The options of [`ensureCollection`](#model.ensure-collection) and [`TypedView.ensure`](./typed-view.mdx#typed-view.ensure). They're `update` and `dryRun`, described above.
+
+---
+
+## CollectionManager [#collection-manager]
+
+`CollectionManager` is the static class that `createCollection` and `ensureCollection` are built on. It's useful where you have a driver database but no good place to call a model method, for example in a utility script, an environment check, or your own deployment tool.
+
+The methods that need a schema (`optionsOf`, `create`, `ensure`) take a **model** or its `schema`, a [`SchemaSource`](#schema-source). The other three (`info`, `differences`, `collMod`) work with ordinary values.
+
+<Snippet id="reference/collections/collection-manager/collection-manager" twoslash />
+
+### CollectionManager.info [#collection-manager.info]
+
+`info` reads from the server the description of one collection, the thing `listCollections` returns for that name. With it, a utility script can look at the type and options of a collection or view without calling the driver by hand. If there's no collection, it returns `undefined`.
+
+<Snippet id="reference/collections/collection-manager/collection-manager-info" twoslash />
+
+<Returns type="Promise<CollectionInfo | undefined>">
+
+A `listCollections` entry, a [`CollectionInfo`](#collection-info) with the fields `name`, `type` (`"collection"`, `"view"`, or `"timeseries"`), and `options`, the options the collection was created with. If there's no collection, `undefined`.
+
+</Returns>
+
+<Params>
+<Param name="db" type="Db" required>
+
+The `mongodb` driver database. You can get it through [`client.unsafeDriver`](../connection/typemo-client.mdx#client.unsafe-driver).
+
+</Param>
+<Param name="name" type="string" required>
+
+The collection name.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/collection-manager/collection-manager-info-2" />
+
+</FullType>
+
+A driver error arrives as a Typemo error (see [`ServerError`](../errors/server-errors.mdx#server-error)).
+
+### CollectionManager.differences [#collection-manager.differences]
+
+`differences` compares the declared collection options with the ones stored on the server and returns a list of differences. First the method checks the **kind** of the collection. If a view sits where a collection should be, or an ordinary collection where a time series should be, it throws a [`CollectionOptionsError`](../errors/configuration-errors.mdx#collection-options-error) right away instead of returning a list.
+
+The declared options are a plain object in the shape the driver's `createCollection` accepts, for example `{ capped: true, size: 65_536, max: 100 }`. For a schema, [`optionsOf`](#collection-manager.options-of) builds such an object. In the example it's written by hand, so you can see what exactly is compared.
+
+<Snippet id="reference/collections/collection-manager/collection-manager-differences" twoslash />
+
+<Returns type="CollectionDifference[]">
+
+The list of differences. If the collection matches what's declared, it's empty.
+
+</Returns>
+
+<Params>
+<Param name="name" type="string" required>
+
+The collection name, used in message texts.
+
+</Param>
+<Param name="wanted" type="Readonly<Record<string, unknown>>" required>
+
+The declared options.
+
+</Param>
+<Param name="info" type="CollectionInfo" required>
+
+The description from the server, from [`info`](#collection-manager.info).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/collection-manager/collection-manager-differences-2" />
+
+</FullType>
+
+### CollectionManager.collMod [#collection-manager.coll-mod]
+
+`collMod` builds the `collMod` command for the server, which applies the changeable differences. The method only assembles the command document and sends nothing. Send it yourself, for example with `db.command`. All the differences you pass must be changeable.
+
+<Snippet id="reference/collections/collection-manager/collection-manager-coll-mod" twoslash />
+
+<Returns type="Document">
+
+The command document for `db.command(...)`.
+
+</Returns>
+
+<Params>
+<Param name="name" type="string" required>
+
+The collection name.
+
+</Param>
+<Param name="wanted" type="Readonly<Record<string, unknown>>" required>
+
+The declared options. The new values are taken from them.
+
+</Param>
+<Param name="differences" type="readonly CollectionDifference[]" required>
+
+The differences to apply.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/collection-manager/collection-manager-coll-mod-2" />
+
+</FullType>
+
+### CollectionManager.optionsOf, create, and ensure [#collection-manager.options-of]
+
+These three methods take a [`SchemaSource`](#schema-source): a model (`connection.model(Account)`) or its `schema`. For an inheriting model (a discriminator), the schema of the root model is used, because they share a collection.
+
+- `optionsOf(source)` builds from the schema the options for the driver's `createCollection`. They are `capped`, `size`, `max`, `timeseries`, `clusteredIndex`, `validator` with its level and action, `collation`, and `changeStreamPreAndPostImages`. The result is frozen. For a schema with `validator: true` it looks like this: `{ validator: { $jsonSchema: … }, validationLevel: "strict", validationAction: "error" }`.
+- `create(db, source)` does the same as [`Model.createCollection`](#model.create-collection), but ignores `autoCreate`. `true` means the collection was created, and `false` means it already existed with these options.
+- `ensure(db, source, options?)` does the same as [`Model.ensureCollection`](#model.ensure-collection).
+
+<Snippet id="reference/collections/collection-manager/collection-manager-options-of" twoslash />
+
+If you pass something other than a model, the method throws a [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error). An object of a similar shape won't do, because the methods need a real compiled schema.
+
+<Snippet id="reference/collections/collection-manager/collection-manager-options-of-2" />
+
+<FullType>
+
+<Snippet id="reference/collections/collection-manager/collection-manager-options-of-3" />
+
+</FullType>
+
+### SchemaSource [#schema-source]
+
+What the schema-level helpers accept: `CollectionManager.optionsOf/create/ensure`, [`SyncAll.collections`](./sync-all.mdx#sync-all.collections), [`JsonSchemaGenerator`](../schemas/json-and-standard-schema.mdx#json-schema-generator), and [`StandardSchema.of`](../schemas/json-and-standard-schema.mdx#standard-schema.of). It's a model or the `SchemaInfo` of a model.
+
+<FullType>
+
+<Snippet id="reference/collections/collection-manager/schema-source" />
+
+</FullType>
+
+### CollectionInfo [#collection-info]
+
+One `listCollections` entry, that is, how the server stores a collection.
+
+<TypeTable
+  type={{
+    name: { type: "string", required: true, description: "The collection name." },
+    type: { type: "string", description: "`collection`, `view`, or `timeseries`." },
+    options: { type: "Readonly<Record<string, unknown>>", description: "The creation options, as the server stores them." },
+  }}
+/>
+
+---
+
+## When not to use it [#when-not-to-use]
+
+To bring all of a connection's collections in order at once, use [`connection.syncAll`](../connection/connection.mdx#connection.sync-all). It calls `ensureCollection` for each model and collects the failures into a report. These methods don't create indexes. For those there's [`syncIndexes`](./model-indexes.mdx#model.sync-indexes). Views are created by [`TypedView.ensure`](./typed-view.mdx#typed-view.ensure), not by `ensureCollection`.
+
+The guide with real tasks is [Create collections with options](../../collections/create.mdx).

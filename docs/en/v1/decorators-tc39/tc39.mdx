@@ -1,0 +1,119 @@
+---
+title: Use TC39 decorators
+description: "Schemas with standard decorators: installation, tsconfig, how they differ from legacy decorators, and why the packages don't mix"
+icon: AtSign
+---
+
+In Typemo you describe schemas with classes and decorators, and decorators come in two kinds. The core `@venloc/typemo` uses **legacy decorators**, the ones TypeScript compiles under `experimentalDecorators`. The `@venloc/typemo-decorators` package gives you the same decorators under the **TC39 standard**, with no compiler flags and no `reflect-metadata`. The names and options are the same. Only two things change: where you import the decorators from and how you declare a field's type.
+
+Both packages write the schema into the same core builder. Models, queries, document types, and errors come out identical. So picking a package means picking a compiler mode, not a feature set.
+
+## What you need [#prerequisites]
+
+A TypeScript project with `@venloc/typemo`, `mongodb`, and `bson` installed ([Installation and setup](../getting-started/installation.mdx)). Keep in mind that the docs build doesn't compile the code on this page, since it checks examples with legacy decorators. The package's behavior was verified by running it against a real database.
+
+## Quick start [#quick-start]
+
+```package-install
+@venloc/typemo-decorators
+```
+
+Your `tsconfig.json` must not contain `experimentalDecorators`, and by default it doesn't. Neither mode needs `emitDecoratorMetadata`, and you don't import `reflect-metadata` either. If you set your own `lib`, you don't have to add `esnext.decorators` to it. A project with `lib: ["ES2022"]` or `lib: ["ES2020"]` compiles against the built package as is. The full `tsconfig` for both modes is on the [Installation and setup](../getting-started/installation.mdx#configure-tsconfig) page. Import the decorators from the new package and everything else from the core.
+
+<Snippet id="decorators-tc39/tc39/quick-start" title="accounts/account.ts" />
+
+On a real database this model saved `create({ title: "  Main ", balance: 5 })` with the title `"Main"`, and `create({ title: "x", balance: -1 })` threw `ValidationError: Validation failed: "balance": must be at least 0 [min]`. We'll cover the differences and the migration below.
+
+## Choose a package [#choose-package]
+
+There's only one question: **does your project turn on `experimentalDecorators`?**
+
+- **Yes, other libraries with legacy decorators need it**: stay on `@venloc/typemo`. The flag applies to the whole project, TypeScript compiles every decorator by the legacy rules, and TC39 decorators won't work.
+- **No**: use `@venloc/typemo-decorators`. It's the language standard and needs neither flags nor `reflect-metadata`.
+
+## The field type is a function [#type-as-function]
+
+Standard decorators have no `design:type` metadata, so the field type is unknown at runtime. That's why you name the type explicitly, in every field, as a function.
+
+<Snippet id="decorators-tc39/tc39/type-as-function" />
+
+`@Prop()` without a type and `@Prop(String)` without a function are compile errors. At runtime they throw a `ConfigurationError` with the text `@Prop "name": the type must be a thunk () => T (for example () => String), got String`. See [`@Prop`](../reference/decorators-tc39/decorators.mdx#prop) for details.
+
+## Stricter than legacy decorators [#stricter-than-legacy]
+
+A standard field decorator gets the field's type, its name, and whether it's `static` or `#private` from the compiler. So mistakes show up at compile time. The compiler reports `TS1240`, and the text names the reason, for example `@Prop "#x": #private fields cannot be schema fields` or `@Prop "label": static fields are not schema fields`.
+
+If someone gets around the types, the same mistakes throw a `ConfigurationError` at runtime.
+
+- `@Prop` on a `#private` field: `@Prop on private field "#x" (#private fields cannot be schema members)`.
+- On a static member: `@Prop on static member "label" (static members are not schema members)`.
+- On a method: `@Prop on "greet", which is a method (getters are virtuals and need no decorator)`.
+
+A getter with a computed value needs no decorator. Relations are described with [`@Virtual`](../reference/decorators-tc39/decorators.mdx#virtual).
+
+## Mark the tenant field [#mark-tenant-field]
+
+In a schema split by tenant, mark the tenant field with the [`@Tenant()`](../reference/decorators-tc39/decorators.mdx#tenant) decorator. It goes next to `@Prop` on a field of type `TenantField<T>`. The TC39 package uses the same name, and the schema build rules are shared with the core. [Split data by organization](../policies/tenants.mdx#define-tenant-field) explains why the mark is required.
+
+<Snippet id="decorators-tc39/tc39/mark-tenant-field" title="notes/note.ts" />
+
+`create({ text: "a" }, { policy: { tenant: "t1" } })` saved the note with `tenantId: "t1"`, and `find()` without a tenant threw `StrictModeError: Note.find: Note is scoped by tenant ("tenantId") and the operation has no tenant; …`.
+
+The build errors are the same as in the core, and they arrive on the first `model()`.
+
+- A schema with `tenant: true` and no mark: `the tenant field "tenantId" must be marked @Tenant() (declare it @Prop(...) @Tenant() tenantId!: TenantField<T>)`.
+- `@Tenant()` in a schema without the `tenant` option: `@Tenant() on "tenantId", but the schema has no tenant policy — add tenant: true (or { field }) to @Schema`.
+- Two marks: `@Tenant() marks "tenantId", "other"; only the tenant field "tenantId" may be marked`.
+
+And `@Tenant()` on a field of another type won't compile: `@Tenant "other": declare the field as TenantField<T>`.
+
+## Don't mix the packages [#dont-mix-packages]
+
+The decorators of the two packages can't live in one project, and the reason is technical. The decorator mode is a compiler flag for the whole project, not for a file. Mixing shows up in two ways, and both end in a `ConfigurationError`, not in fields silently going missing.
+
+The first is a decorator from the wrong package in your project. It sees right away, when the class is declared, which mode it was called in. The core's `@Prop` in a project without `experimentalDecorators` threw `ConfigurationError: @Prop from "@venloc/typemo" is a legacy decorator, but it was applied as a TC39 decorator (experimentalDecorators is off). Use "@venloc/typemo-decorators" in a TC39 project; the two packages cannot be mixed`. The reverse case, a TC39 decorator with `experimentalDecorators` on, gives the same error with the text `… is a TC39 decorator, but it was applied as a legacy decorator (experimentalDecorators is on). Use "@venloc/typemo" in a legacy project; …`.
+
+The second is when each decorator ran in its own mode, but metadata of both kinds met on one class or in one hierarchy. That happens when a base class comes from a library built in the other mode. Then the first `model()` throws `Mixed: mixes legacy decorators ("@venloc/typemo", on Mixed) and TC39 decorators ("@venloc/typemo-decorators", on Mixed) in one class hierarchy; use one decorator package per project`. Failing right away beats getting a schema with some of its fields lost.
+
+Import decorators from one package only. `Entity`, `TypemoClient`, [`Mask`](../reference/query/masks.mdx), the types, and the errors still come from `@venloc/typemo`.
+
+## Move from legacy decorators [#from-legacy-decorators]
+
+First make sure no other library needs `experimentalDecorators`. If one does, don't switch. Otherwise, go step by step.
+
+1. Install `@venloc/typemo-decorators`.
+2. Remove `experimentalDecorators` from `tsconfig.json`. Typemo doesn't need `emitDecoratorMetadata` in either mode, so keep it only if something else needs it.
+3. Move the imports of `Schema`, `Prop`, `Tenant`, `Virtual`, `Index`, `SearchIndex`, `Plugin`, `Discriminator`, `Pre`, `Post`, and `PostError` to the new package.
+4. Run `tsc --noEmit` and your tests. A decorator import you forgot to move from the core throws a `ConfigurationError` when the class is declared.
+
+The type in every `@Prop` should already be a function. The core requires that in legacy mode too.
+
+## The `Symbol.metadata` polyfill [#symbol-metadata-polyfill]
+
+Standard decorators keep their metadata in `context.metadata`, and the class exposes it under `Symbol.metadata`. Bun and Node don't have it yet. The package installs it on load if it isn't defined (`Symbol.metadata ??= Symbol.for("Symbol.metadata")`), so you don't need to do anything. The only thing that matters is that the package loads before the first schema class, and a regular `import { Prop } from "@venloc/typemo-decorators"` takes care of that. Also remember that Bun reads `tsconfig.json` from the directory it starts in. In a monorepo, run your code and tests from the folder of the package in question.
+
+## When not to use it [#when-not-to-use]
+
+Don't switch if the project has legacy-decorator code you can't convert, such as a third-party library. And don't try to keep the packages apart "in different files". There's one compiler flag for the whole project.
+
+## Troubleshooting [#troubleshooting]
+
+**The error `@Prop from "@venloc/typemo" is a legacy decorator`.** A `Prop` import still comes from the core. Replace it with `import { Prop } from "@venloc/typemo-decorators"`.
+
+**An option doesn't fit the field type.** The compiler checks options against the field type the same way as in legacy mode. `@Prop(() => Number, { trim: true })` won't compile, failing with `TS2353: Object literal may only specify known properties, and 'trim' does not exist in type …`. Remove the option or fix the field type.
+
+**A hook is rejected.** `@Pre("document.save")` on a field, a getter, or a method with a symbol name throws `ConfigurationError: @Pre: a hook must be a string-named instance method, got field`. Instead of `field`, the text names the kind of member: `getter` or `method`. A hook is an ordinary instance method with a string name. On a static method or a `#private` member, the error names the reason the same way as for `@Prop`.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="@venloc/typemo-decorators" href="../reference/decorators-tc39/decorators.mdx">
+  Every decorator in the package and how it differs from the core decorators.
+</Card>
+<Card title="Installation and setup" href="../getting-started/installation.mdx">
+  Packages, versions, and the tsconfig for both modes.
+</Card>
+<Card title="Define a model" href="../schemas/define-model.mdx">
+  How a class becomes a model.
+</Card>
+</Cards>

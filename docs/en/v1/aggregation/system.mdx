@@ -1,0 +1,116 @@
+---
+title: System aggregations
+description: "Get collection and index statistics, see current operations and sessions, and run database-level aggregations"
+icon: Activity
+---
+
+An aggregation reads not only documents but also the server's system data. How many documents a collection holds and how much space it takes, how often each index is used, what's running right now, which sessions are open. Such stages are called **system** stages, and each has its own place to run.
+
+- Collection-level stages: [`collStats`](../reference/aggregation/stages.mdx#coll-stats), [`indexStats`](../reference/aggregation/stages.mdx#index-stats), [`planCacheStats`](../reference/aggregation/stages.mdx#plan-cache-stats). You run them through a model, like an ordinary aggregation.
+- Database and server stages: [`currentOp`](../reference/aggregation/stages.mdx#current-op), [`queryStats`](../reference/aggregation/stages.mdx#query-stats), [`listLocalSessions`](../reference/aggregation/stages.mdx#list-local-sessions), and others. They're built in the separate [`Pipeline.database`](../reference/aggregation/pipeline.mdx#pipeline.database) and [`Pipeline.admin`](../reference/aggregation/pipeline.mdx#pipeline.admin) pipelines.
+- The [`listSessions`](../reference/aggregation/stages.mdx#list-sessions) stage is built in [`Pipeline.sessions`](../reference/aggregation/pipeline.mdx#pipeline.sessions).
+
+Database and server plans are run by [`client.aggregate`](../reference/connection/typemo-client.mdx#client.aggregate) and [`connection.aggregate`](../reference/connection/connection.mdx#connection.aggregate), covered in detail in [Database-level queries](./database-level.mdx).
+
+The types won't let you put a stage in the wrong place. A collection pipeline has no `currentOp`, a database pipeline has no `collStats`, and any of these stages can only come first.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and running an aggregation from [Your first aggregation](first-aggregation.mdx). System stages are usually for an administrator or a monitoring script, and the server user needs permission to read statistics. The `orders` collection holds two documents, and the model has one index on `status`.
+
+<Snippet id="aggregation/system/prerequisites" title="orders/order.ts" twoslash />
+
+## Quick start [#quick-start]
+
+For a collection, go through the model. For the server, use a plan from `Pipeline.admin()` and `client.aggregate`.
+
+<Snippet id="aggregation/system/quick-start" twoslash />
+
+Below we'll cover collection statistics, indexes, current operations, and the rules for running.
+
+## Find out a collection's size and document count [#collection-size]
+
+`collStats` returns a collection's statistics, and you list the sections you need.
+
+- `count`: the number of documents.
+- `storageStats`: size and storage, optionally with `scale`.
+- `latencyStats`: latencies.
+- `queryExecStats`: query execution.
+
+The compiler rejects extra keys, and the row type holds only the requested sections.
+
+<Snippet id="aggregation/system/collection-size" twoslash />
+
+The document count `count` has the type `StatNumber`, which is `number | bigint`. While the counter is small, the server writes it as an int32, and once it grows, as an int64. So on a large collection the value arrives as a `bigint`. Compare with `Number(row.count)` or check `typeof`. The stage has to come first in the pipeline, and after it you can put ordinary stages such as `match` and `project` to pick what you need.
+
+## See index usage [#index-usage]
+
+[`indexStats`](../reference/aggregation/stages.mdx#index-stats) returns a row per index: the name, the key, and the number of uses since the server started. It's how you find unused indexes that only slow down writes.
+
+<Snippet id="aggregation/system/index-usage" twoslash />
+
+Besides the index on `status`, there's the built-in `_id_`, which is always created. [`planCacheStats`](../reference/aggregation/stages.mdx#plan-cache-stats) shows the query plans the server has cached for the collection. A fresh collection has none, and the result is empty.
+
+## See what's running now [#current-operations]
+
+`currentOp` lists the server's operations: queries, idle connections, and cursors. It's a server stage. So the pipeline starts with [`Pipeline.admin`](../reference/aggregation/pipeline.mdx#pipeline.admin), and [`client.aggregate`](../reference/connection/typemo-client.mdx#client.aggregate) runs it. The query goes to the `admin` database, the result is typed, errors arrive as Typemo errors, and event subscribers see the operation.
+
+<Snippet id="aggregation/system/current-operations" title="ops/current-ops.ts" twoslash />
+
+Each row describes one operation, and its fields include `type`, `host`, `desc`, and `active`. The `allUsers`, `idleConnections`, `idleCursors`, `idleSessions`, `localOps`, and `backtrace` parameters turn on the corresponding details.
+
+## Sessions, query statistics, and the catalog [#sessions-stats-catalog]
+
+The other system stages work the same way.
+
+- [`listLocalSessions`](../reference/aggregation/stages.mdx#list-local-sessions) shows the sessions of the current node and is built in a database or admin pipeline.
+- [`listSessions`](../reference/aggregation/stages.mdx#list-sessions) reads `config.system.sessions`, meaning what the server has already written, and is built only in `Pipeline.sessions()`. On a freshly started server it returns an empty list.
+- [`queryStats`](../reference/aggregation/stages.mdx#query-stats), [`querySettings`](../reference/aggregation/stages.mdx#query-settings), and [`listSampledQueries`](../reference/aggregation/stages.mdx#list-sampled-queries) require the `admin` database.
+- [`listClusterCatalog`](../reference/aggregation/stages.mdx#list-cluster-catalog) requires MongoDB 8.1 or newer.
+- [`shardedDataDistribution`](../reference/aggregation/stages.mdx#sharded-data-distribution) is for sharded clusters. On an ordinary server it answers with a `ServerError` saying it runs only on a router.
+
+The parameters and row types of each stage are in the [Stages](../reference/aggregation/stages.mdx) reference. On the docs test server, `queryStats`, `querySettings`, and `listSampledQueries` returned an empty list, and `listClusterCatalog` returned a row per collection of the database.
+
+## How to choose [#how-to-choose]
+
+Ask yourself what you're asking the server about.
+
+- **A specific collection or its indexes**: collection-level stages through the model.
+- **The server's state, sessions, queries**: `Pipeline.admin()`, `Pipeline.database()`, or `Pipeline.sessions()` together with `client.aggregate`.
+
+## When not to use it [#when-not-to-use]
+
+If you need only the number of documents, use [`countDocuments`](../reference/query/reading.mdx#model.count-documents). Index statistics that your app needs, rather than an administrator, are better kept in a monitoring system. And you can check that a query uses an index in tests with [`explain`](../reference/aggregation/pipeline.mdx#explain).
+
+## Troubleshooting [#troubleshooting]
+
+**A database plan passed to a model.** `Model.aggregate` accepts only a plan for its own collection. A plan from `Pipeline.admin()` reads the database, so the model rejects it with a `ConfigurationError`, and the text points to the right method.
+
+<Snippet id="aggregation/system/troubleshooting" />
+
+Run such a plan with `client.aggregate`, as above.
+
+**A system stage that isn't first.** Every system stage comes only at the start of a pipeline. After another stage it won't compile.
+
+<Snippet id="aggregation/system/troubleshooting-2" twoslash />
+
+## Full example [#full-example]
+
+<Snippet id="aggregation/system/full-example" title="ops/monitoring.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Database-level queries" href="./database-level.mdx">
+  Run a database, server, or sessions plan: `client.aggregate`, events, and transactions.
+</Card>
+<Card title="Pipeline and Model.aggregate" href="../reference/aggregation/pipeline.mdx#pipeline.admin">
+  `Pipeline.database`, `Pipeline.admin`, `Pipeline.sessions`, and their plans.
+</Card>
+<Card title="Stages" href="../reference/aggregation/stages.mdx#coll-stats">
+  The parameters and row types of every system stage.
+</Card>
+<Card title="Sync indexes" href="../collections/index-sync.mdx">
+  Describe indexes and sync them with the database.
+</Card>
+</Cards>

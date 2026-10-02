@@ -1,0 +1,230 @@
+---
+title: Error hierarchy
+description: "The tree of Typemo error classes, the shared fields of TypemoError, PostHookError, and ErrorClassifier"
+icon: Network
+---
+
+Every Typemo error is an instance of [`TypemoError`](#typemo-error). One `instanceof` separates failures of the library and the database from foreign errors in your code, whether that's a `TypeError` in your function or a network failure in a neighboring library. Descendant classes add structured fields, so you can make a decision without parsing the message text.
+
+If you're new here, read the [Error handling](../../errors/handling.mdx) guide first. This page describes the shared root, and each specific class is on the page of its group. Two elements that belong to no group are here too: [`PostHookError`](#post-hook-error) (the write went through and the hook after it failed) and [`ErrorClassifier`](#error-classifier) (sorts any error for retries, logs, and metrics).
+
+## Class tree [#class-tree]
+
+The classes are grouped by where you'll meet the error, not by source file. Data errors arrive when a value doesn't fit the schema. Query errors arrive when a query can't be built or found nothing. Server errors arrive when the database itself refused. Configuration and connection errors arrive when a setting is wrong or there is no connection.
+
+```tree
+TypemoError
+  ValidationError            # the data failed the schema
+  CastError                  # a value can't be cast to the field type
+  StrictModeError            # an operation broke a strictness rule
+  UnknownFieldsError         # a save would erase unknown fields
+  DirectWriteError           # a collection was changed around its methods
+  PartialArrayError          # the array is loaded partially
+  QueryError                 # the query can't be built
+    KeysetTokenError         # the page token was rejected
+  DocumentNotFoundError      # orFail found nothing
+  VersionError               # the document changed after it was read
+  EachAsyncError             # callback failures in eachAsync
+  ServerError                # the database refused
+    DuplicateKeyError        # a unique index was violated
+    ServerValidationError    # the collection validator refused
+    WriteConflictError       # two writes touched one document
+  BulkWriteError             # part of a bulk write failed
+  TimeoutError               # time ran out
+  ConnectionError            # no connection to the server
+  DriverError                # the driver refused on its own side
+  ConfigurationError         # a wrong setting
+  IndexSyncError             # indexes weren't applied
+  SyncError                  # init() or syncAll() didn't bring the database to the schema
+  CollectionOptionsError     # collection options differ from the schema
+  AuditError                 # the audit write failed
+  PostHookError              # a post hook failed after a successful write
+  InternalError              # an internal invariant was broken
+```
+
+The group pages are [data errors](./data-errors.mdx), [query errors](./query-errors.mdx), [server errors](./server-errors.mdx), and [configuration and connection errors](./configuration-errors.mdx). [`SyncError`](./configuration-errors.mdx#sync-error) is there too.
+
+Two places in the tree aren't obvious. `KeysetTokenError` is a descendant of `QueryError`, so a `catch` on `QueryError` catches it too. `DuplicateKeyError`, `ServerValidationError`, and `WriteConflictError` are descendants of `ServerError`, and a check against `ServerError` catches all three along with the other server failures. So in a handler go from the specific to the general: `DuplicateKeyError` first, then `ServerError`.
+
+---
+
+## TypemoError [#typemo-error]
+
+`TypemoError` is the root of the hierarchy. You rarely meet it itself, because Typemo throws its descendants. It serves as the common denominator in a `catch` and as the base for your own errors if they should pass the same checks.
+
+<Snippet id="reference/errors/hierarchy/typemo-error" twoslash />
+
+### Fields [#typemo-error.fields]
+
+**`message`** is the text for a human. It reads fine without the other fields and includes the model name, the operation, the path, and the reason. Don't make decisions from the text, because it may change between versions. For decisions there are the structured fields of specific classes (`reason`, `code`, `path`).
+
+**`cause`** is the original error that led to this one. For example, a driver error, an error from your function in a hook, or a cast error inside validation. The field is standard for `Error`, and Typemo only fills it. A driver error lies in it unchanged, so all its fields are available.
+
+If the original contained values of fields marked `sensitive`, `cause` holds a copy where they are replaced with `[hidden]`. The secret won't land in a log together with the error. For a `DuplicateKeyError` on a field with `sensitive: "hide"`, the message, `keyValue`, and the text of `cause` all contain `[hidden]`.
+
+**`name`** is the class name, for example `"ConfigurationError"` or `"CastError"`. It lives on the prototype, not on the instance, so it doesn't show up in `Object.keys(error)` and isn't repeated in every line of a structured log. Check the type with `instanceof`, not by comparing `name`, because `instanceof` accounts for inheritance.
+
+<Snippet id="reference/errors/hierarchy/typemo-error-fields" twoslash />
+
+### Constructor [#constructor]
+
+<Params>
+<Param name="message" type="string" required>
+
+A description for a human. It must be understandable without the other fields.
+
+</Param>
+<Param name="options" type="TypemoErrorOptions" default="{}">
+
+An object with the optional `cause` field, the original error.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/errors/hierarchy/constructor" />
+
+</FullType>
+
+You don't create Typemo error classes yourself, because the library picks the right one for the situation. The constructor is handy in tests, when a handler needs a ready-made error.
+
+### When not to use it [#typemo-error.when-not-to-use]
+
+To sort out the reason for a failure, `instanceof TypemoError` is too coarse a check. Catch a specific class, such as [`DuplicateKeyError`](./server-errors.mdx#duplicate-key-error) or [`CastError`](./data-errors.mdx#cast-error). The general `TypemoError` fits the last link of a handler: "this is a library failure, not my bug".
+
+---
+
+## PostHookError [#post-hook-error]
+
+`PostHookError` is thrown when a [post hook](../hooks/pre-post.mdx) failed **after** a successful write. The record is already in the database, and the calling code got an error. If you take it for an ordinary failure and repeat the call, the document is written a second time. So Typemo wraps the hook's error in a class with the `applied` field. It's always `true` and means "the write was applied, don't repeat it".
+
+The error matters in services where hooks do something after the write, such as sending an email, writing to a log, or updating a cache. The failure of such a hook must not look like a failure of the write itself. In the example a document hook fails after `create`.
+
+<Snippet id="reference/errors/hierarchy/post-hook-error" twoslash />
+
+`operation` names the method you called (`create`), not the internal operation it turns into. The document from the example is written to the collection. `error.result` holds what the write returned. For `create` that's the saved document, for `updateOne` the update result, for `insertMany` an array of documents, and for `$deleteOne` the delete result. The `result` field is non-enumerable. It doesn't show up in `Object.keys(error)` and doesn't go to a log with the error, because documents may contain secrets.
+
+### Fields [#post-hook-error.fields]
+
+<Params title="Error fields">
+<Param name="model" type="string">
+
+The name of the model whose hook failed.
+
+</Param>
+<Param name="operation" type="string">
+
+The method that called the write: `create`, `save`, `updateOne`, or `insertMany`.
+
+</Param>
+<Param name="applied" type="true">
+
+Always `true`, the write stayed in the database. The type is `true`, not `boolean`, so the check leaves no doubt.
+
+</Param>
+<Param name="result" type="unknown">
+
+What the write returned. The field is non-enumerable. The type is `unknown`, so narrow it to the operation you called.
+
+</Param>
+<Param name="cause" type="unknown">
+
+The error the hook threw, in the form it threw it.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/errors/hierarchy/post-hook-error-fields" />
+
+</FullType>
+
+### Inside a transaction [#in-transaction]
+
+Everything is different in a transaction. A post hook failure aborts the transaction, the write rolls back, and the calling code gets the hook's error **as it was thrown**, with no wrapper. `PostHookError` is needed only where there is nothing to roll back, that is, outside a transaction. A `document.save` hook that threw inside `transaction` gave the same error outside, and the collection stayed empty.
+
+### Read hook and error hook [#read-and-error-hooks]
+
+A post hook for **reads** (`query.find`) wrote nothing, so its error arrives as is. If the `@PostError` hook itself throws, the original error of the operation isn't lost. It lies in the `cause` of the hook's error.
+
+### When not to use it [#post-hook-error.when-not-to-use]
+
+Don't repeat the call on `PostHookError`, because the record is already there. If a hook must roll back together with the write, run the write inside a [transaction](../../transactions/transactions.mdx). Then the hook's error cancels the write too. The order of hooks and their errors is described in the [Hook order and errors](../../hooks/order-and-errors.mdx) guide.
+
+---
+
+## ErrorClassifier [#error-classifier]
+
+`ErrorClassifier` answers the questions that logs, metrics, and retries ask. What kind of error is it, does it have a server code, will a retry help. It accepts **any** thrown value. That can be a Typemo error, a raw error from the `mongodb` driver (it classifies it as the Typemo class the library would turn it into), or anything else. So the classifier also works where the error came not through a model but from [`client.unsafeDriver()`](../connection/typemo-client.mdx#client.unsafe-driver).
+
+<Snippet id="reference/errors/hierarchy/error-classifier" twoslash />
+
+For a uniqueness violation it returned `{ kind: "duplicate-key", name: "DuplicateKeyError", code: 11000, errorLabels: [], retryable: false, transient: false }`. A raw driver error from an `insertOne` run around Typemo gave the same result. For a write conflict with the `TransientTransactionError` label the result is `{ kind: "write-conflict", name: "WriteConflictError", code: 112, errorLabels: ["TransientTransactionError"], retryable: true, transient: true }`.
+
+### Methods [#methods]
+
+The class has six static methods and no other public members.
+
+<TypeTable
+  type={{
+    "ErrorClassifier.classify": { description: "A full breakdown: kind, class name, server code, labels, retry flags. The result is frozen.", type: "(error: unknown) => ErrorClassification" },
+    "ErrorClassifier.isDuplicateKey": { description: "`true` for a uniqueness violation. Narrows the type to `DuplicateKeyError`. Doesn't count a bulk error.", type: "(error: unknown) => error is DuplicateKeyError" },
+    "ErrorClassifier.hasDuplicateKey": { description: "`true` for a uniqueness violation and for a `BulkWriteError` with at least one duplicate.", type: "(error: unknown) => boolean" },
+    "ErrorClassifier.isRetryable": { description: "Whether repeating the same operation unchanged can help.", type: "(error: unknown) => boolean" },
+    "ErrorClassifier.isTransient": { description: "The error has the `TransientTransactionError` label, so the whole transaction can be run again.", type: "(error: unknown) => boolean" },
+    "ErrorClassifier.isTimeout": { description: "`true` for a `TimeoutError` of any kind. Narrows the type to `TimeoutError`.", type: "(error: unknown) => error is TimeoutError" },
+  }}
+/>
+
+### classify [#classify]
+
+`classify` returns an `ErrorClassification`. It holds `kind` (the kind, see the table below), `name` (the error's class name, or the `typeof` of the value for a non-error), `code` (the server code, if there is one), `errorLabels`, `retryable`, and `transient`.
+
+`retryable` is `true` in three cases. The error has the `TransientTransactionError` or `RetryableWriteError` label. It's a `ConnectionError`, but not of the `closed` or `authentication` kind. Or the server code belongs to temporary states: a node shutting down, a primary change, a network timeout, a write conflict, and the like. A uniqueness violation, a cast error, and a collection validator refusal give `false`, because repeating with the same data gives the same result.
+
+<TypeTable
+  type={{
+    validation: { description: "`ValidationError`." },
+    cast: { description: "`CastError`." },
+    strict: { description: "`StrictModeError`." },
+    query: { description: "`QueryError`, including `KeysetTokenError`." },
+    configuration: { description: "`ConfigurationError`." },
+    "not-found": { description: "`DocumentNotFoundError`." },
+    version: { description: "`VersionError`." },
+    "duplicate-key": { description: "`DuplicateKeyError`." },
+    "server-validation": { description: "`ServerValidationError`." },
+    "write-conflict": { description: "`WriteConflictError`." },
+    timeout: { description: "`TimeoutError`." },
+    "bulk-write": { description: "`BulkWriteError`." },
+    "index-sync": { description: "`IndexSyncError` and `SyncError`: index and collection sync failed." },
+    "post-hook": { description: "`PostHookError`: the write succeeded and a post hook failed. A retry would write the document a second time." },
+    audit: { description: "`AuditError`: the audit write failed and the operation was rolled back." },
+    "each-async": { description: "`EachAsyncError`: callback failures of `eachAsync` with `continueOnError`." },
+    connection: { description: "`ConnectionError`." },
+    server: { description: "`ServerError` without a more specific class." },
+    driver: { description: "`DriverError`." },
+    other: { description: "Everything else: foreign errors (including an error from your hook) and non-errors." },
+  }}
+/>
+
+`PostHookError`, `AuditError`, and `EachAsyncError` have their own kinds, so you can't mistake them for a foreign error. `PostHookError` (a `document.save` post hook threw after `create`) gave `{ kind: "post-hook", name: "PostHookError", errorLabels: [], retryable: false, transient: false }`. The `post-hook` kind outweighs the others. The write is already there, `retryable` is `false`, and a retry would create a duplicate. If your shared handler repeats calls, check the kind before retrying.
+
+<FullType>
+
+<Snippet id="reference/errors/hierarchy/classify" />
+
+</FullType>
+
+### Scenarios [#scenarios]
+
+The first scenario is a decision "created, taken, or try later" in one place.
+
+<Snippet id="reference/errors/hierarchy/scenarios" twoslash />
+
+The second scenario is a bulk write. `isDuplicateKey` returns `false` for a `BulkWriteError`, because a bulk error is a different class. Ask `hasDuplicateKey` whether one of the failures was a duplicate. `insertMany` with one repeat and `ordered: false` gave `isDuplicateKey: false`, `hasDuplicateKey: true`, and the `bulk-write` kind.
+
+### When not to use it [#error-classifier.when-not-to-use]
+
+The classifier doesn't replace `instanceof` when you need the fields of a specific class: `keyValue`, `failures`, `errors`. Narrow the type with a class check first, then read the fields. It doesn't decide what to answer the client either. Your application defines how kinds map to HTTP codes, and the [Error handling](../../errors/handling.mdx#http-status) guide has an example.

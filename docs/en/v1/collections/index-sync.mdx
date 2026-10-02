@@ -1,0 +1,145 @@
+---
+title: Sync indexes
+description: "Create indexes from the schema, see the drift from the database before a deploy, fix it, and never miss a failure at startup"
+icon: ListChecks
+---
+
+The indexes from your schema (`unique`, `index`, [`@Index`](../reference/schemas/index-decorators.mdx#index)) don't appear in the database by themselves. Typemo creates them only when you ask. That's why every app has a step that brings the indexes in line with the schema: at startup, during a deploy, or in a migration script. Below we cover three variants of this step and how to pick one.
+
+An **index** is a MongoDB structure that speeds up searching by a field. A `unique` index also keeps two documents with the same value from being written. Until the index exists, a duplicate is written without an error. On a new model, after `create`, the collection has only `_id_`.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and an account model with two indexes: a unique title and an index on the owner.
+
+<Snippet id="collections/index-sync/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+There are three methods for three situations.
+
+- **App startup**: [`connection.init`](../reference/connection/connection.mdx#connection.init) creates what's missing.
+- **Deploy**: [`connection.syncAll`](../reference/connection/connection.mdx#connection.sync-all) brings everything exactly in line with the schema.
+- **One model**: [`syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes).
+
+<Snippet id="collections/index-sync/quick-start" twoslash />
+
+We'll go through each variant on real tasks below.
+
+## Create indexes at startup [#create-indexes-on-start]
+
+The app starts on a new or an existing database, and the indexes from the schema must exist. Register the models and call [`connection.init`](../reference/connection/connection.mdx#connection.init). It creates what's missing and **doesn't delete or change anything**.
+
+<Snippet id="collections/index-sync/create-indexes-on-start" title="db/start.ts" twoslash />
+
+On the first run `init` created the collection and both indexes and listed them in `created`. After a successful `init` the database matches the schema, so `inSync` is `true` here too. The second run creates nothing, and `toCreate` and `created` are empty. A failed `init` doesn't look like `inSync: false`. It throws, as described a little further down.
+
+`init` leaves an index that isn't in the schema alone, in case another app needs it. But an index that exists both in the schema and in the database, declared differently, `init` treats as an error. It can't be changed without your consent. Say someone made `owner_1` unique by hand. Then startup stops with a [`SyncError`](../reference/errors/configuration-errors.mdx#sync-error) that lists every failure.
+
+<Snippet id="collections/index-sync/create-indexes-on-start-2" />
+
+Three fields of the error help you handle the failure in code.
+
+- `failures`: failures per collection and view, that is the name, the model class, and the list of errors.
+- `errors`: all the original errors in a row. Here there's one, an [`IndexSyncError`](../reference/errors/configuration-errors.mdx#index-sync-error), and the same one sits in `cause`, inside an `AggregateError`.
+- `report`: the full report of what was found and what was done.
+
+Only `syncIndexes` throws an `IndexSyncError` directly. `init` and `syncAll` wrap it in a `SyncError`.
+
+## See the drift before a deploy [#diff-before-deploy]
+
+You changed the indexes in the schema and want to know what will happen to the database before you roll out. [`connection.syncAll`](../reference/connection/connection.mdx#connection.sync-all) with `dryRun: true` writes nothing (no indexes, collections, or views) and returns a plan.
+
+<Snippet id="collections/index-sync/diff-before-deploy" title="scripts/check-indexes.ts" twoslash />
+
+`closed_1` is in the database but not in the schema, so it went into `toDrop`. And `owner_1` is declared differently in the database than in the schema, so its name is in both `toDrop` and `toCreate`. It will be dropped and created again. How the method decides that an index is "the same" is described in the [`diffIndexes`](../reference/collections/model-indexes.mdx#model.diff-indexes) reference. For a single model [`diffIndexes`](../reference/collections/model-indexes.mdx#model.diff-indexes) gives you the same plan.
+
+## Apply the changes [#apply-changes]
+
+The plan looks right, so it's time to bring the database in line. Call [`connection.syncAll`](../reference/connection/connection.mdx#connection.sync-all) without `dryRun`. It drops the extra indexes, recreates the changed ones, and creates the missing ones. What can change in place, namely visibility and the TTL expiry, it changes without recreating the index.
+
+<Snippet id="collections/index-sync/apply-changes" title="scripts/sync-indexes.ts" twoslash />
+
+The first call changed the database, so `inSync` is `false`. The second one confirms there's no drift left.
+
+On a failure `syncAll`, like `init`, throws a [`SyncError`](../reference/errors/configuration-errors.mdx#sync-error). The returned report always has `failed` set to `false`, and the report with the failures is in `error.report`. So a deploy with an index that wasn't built can't pass as "successful", even if you check nothing.
+
+## An index wasn't built [#index-build-failed]
+
+Most often the problem is data that already breaks uniqueness. Say `accounts` has two accounts titled `Main`. [`syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes) doesn't stop at the first error. It creates everything it can, and at the end throws one [`IndexSyncError`](../reference/errors/configuration-errors.mdx#index-sync-error) with all the failures. Through `init` or `syncAll` the same error arrives inside a [`SyncError`](../reference/errors/configuration-errors.mdx#sync-error).
+
+<Snippet id="collections/index-sync/index-build-failed" title="scripts/sync-accounts.ts" twoslash />
+
+`owner_1` was created, and `title_1` wasn't. The message is short, without the internal details of the index build: `duplicate key on title_1: { title: "Main" } (code 11000 DuplicateKey)`. The server's long text is in the `serverMessage` of the nested error. Fix the duplicates by deleting or renaming one of the accounts, and call `syncIndexes` again. Only the missing index gets created.
+
+## A text index and a rerun [#text-index-rerun]
+
+Sometimes the schema declares a text index over several fields, and the app restarts. The server stores field weights with a text index and sets a weight of 1 for the fields where you didn't give one. Typemo accounts for this when it compares. Right after creation such an index matches the schema, and a second `init` finds no drift and doesn't fail.
+
+<Snippet id="collections/index-sync/text-index-rerun" title="posts/start.ts" twoslash />
+
+An explicit weight other than one (`weights: { title: 5 }`) is compared like any other index option. Change the weight in the schema, and `syncAll` recreates the index.
+
+## Exclude a model from `init` and `syncAll` [#exclude-model]
+
+Sometimes another system manages a collection or its indexes, and the app shouldn't touch them. The schema option [`autoIndex: false`](../reference/schemas/schema.mdx#auto-index) removes the model's indexes from `init` and `syncAll`, and [`autoCreate: false`](../reference/schemas/schema.mdx#auto-create) removes the collection itself. Only these two connection methods read the options. A direct call to [`syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes) on the model still builds the indexes.
+
+<Snippet id="collections/index-sync/exclude-model" title="legacy/start.ts" twoslash />
+
+`init` and `syncAll` skip a schema with `autoCreate: false` and no indexes or search indexes entirely. That's useful for a log with "at creation only" options (`capped`, `timeseries`, `clustered`, `collation`) that its owner creates and maintains. While the collection doesn't exist, `init` and `syncAll` don't treat that as an error.
+
+It's different if such a schema has indexes but the collection doesn't exist. An index would create the collection without those options, so the call stops with a `SyncError`, as described [below](#troubleshooting).
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether this step is allowed to delete anything**.
+
+- **At startup the app must not change anything in someone else's database**: call [`connection.init`](../reference/connection/connection.mdx#connection.init). It's safe, and it stops startup if the database is set up differently.
+- **It's a deploy step you control**: [`connection.syncAll`](../reference/connection/connection.mdx#connection.sync-all). It brings the database exactly in line and reports failures as one `SyncError` with the whole report.
+- **You need to fix one model**: [`syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes).
+- **You only need to add what's missing, without comparing**: [`createIndexes`](../reference/collections/model-indexes.mdx#model.create-indexes).
+
+## When not to use it [#when-not-to-use]
+
+You don't need syncing in tests with an empty database that don't check uniqueness, or in one-off scripts that don't search for anything. The index methods don't touch collection options like `capped` or the validator. Those are covered in [Create collections with options](./create.mdx). And don't run `syncAll` on every request or in a hot path of the app. These are admin commands, and they belong at startup and in deploys.
+
+## Troubleshooting [#troubleshooting]
+
+**Uniqueness doesn't work.** A write with a duplicate went through without an error. An index from the schema isn't created by itself, and until you call [`init`](../reference/connection/connection.mdx#connection.init), [`syncAll`](../reference/connection/connection.mdx#connection.sync-all), or [`syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes), the database has only `_id_`. Call one of them at startup.
+
+**Startup stopped with a `SyncError` from `init`.** The message contains `exists on the server with other keys or options`. An index with that name is set up differently in the database than in the schema, and `init` doesn't change anything. Look at the drift with `syncAll({ dryRun: true })`. If the index can be dropped and recreated, apply `syncAll()`.
+
+**Startup stopped with a `SyncError` and the text `exists with options MongoDB cannot change`.** The collection already exists, and the schema declares an option MongoDB doesn't change on an existing collection: `capped`, the kind of collection, or `collation`. The message names the option and the way out: `collection "logs": exists with options MongoDB cannot change (capped): drop the collection and create it again`. The text is the same as from [`createCollection`](../reference/collections/collection-manager.mdx#model.create-collection) and `ensureCollection`, only with the collection name. Typemo won't drop the collection itself, so drop it and call `init` again.
+
+**A `ConfigurationError` because the collection doesn't exist and the options are set only at creation.** The model has `capped`, `timeseries`, `clustered`, or `collation`, and the collection doesn't exist yet. [`syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes) and [`createIndexes`](../reference/collections/model-indexes.mdx#model.create-indexes) create nothing in this case, because an index would create a regular collection and the options would be lost. Create the collection first. [`init`](../reference/connection/connection.mdx#connection.init) and [`syncAll`](../reference/connection/connection.mdx#connection.sync-all) do everything in the right order. See [Create collections with options](./create.mdx).
+
+## Full example [#full-example]
+
+The deploy script builds a plan first and then applies it. A failure is printed per collection and stops the deploy.
+
+<Snippet id="collections/index-sync/full-example" title="scripts/deploy-database.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose indexes were built by default on their own when a model was registered (`autoIndex`), and `syncIndexes` stopped at the first error. In Typemo indexes are never built on their own. You call [`init`](../reference/connection/connection.mdx#connection.init), [`syncAll`](../reference/collections/sync-all.mdx), or [`syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes) explicitly. All failures are collected, not only the first, and arrive as one [`SyncError`](../reference/errors/configuration-errors.mdx#sync-error).
+
+The comparison is exact. `unique: false` and `sparse: false` on the server don't count as a difference, a collation rule is compared the way the server applies it, and the TTL expiry and index visibility change without recreating the index.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Create collections with options" href="./create.mdx">
+  Collection options (`capped`, the validator, time series) and how to apply them before the first write.
+</Card>
+<Card title="Define and sync search indexes" href="./search-indexes.mdx">
+  Atlas Search and Vector Search indexes: how to describe them and how to sync them.
+</Card>
+<Card title="Model indexes" href="../reference/collections/model-indexes.mdx">
+  `diffIndexes`, `syncIndexes`, `createIndexes`, and the exact types of their results.
+</Card>
+<Card title="SyncAll" href="../reference/collections/sync-all.mdx">
+  The sync report: what each field means and how to read failures.
+</Card>
+</Cards>

@@ -1,0 +1,256 @@
+---
+title: Accumulators
+description: "Reference for fn.sum, fn.avg, fn.min, fn.first, fn.push, fn.top, and the other operators that reduce many documents to one value"
+icon: Sigma
+---
+
+An **accumulator** reads a value from every document in a group and reduces them to one: a sum, an average, a list, or the first value. Accumulators go in the values of the [`group`](./stages.mdx#group) stage, in the `output` of `bucket` and [`bucketAuto`](./stages.mdx#bucket-auto), and in the `output` of [`setWindowFields`](./stages.mdx#set-window-fields). They all live on the `fn` object and are called inside a `(f) => …` callback, where `f` is a proxy of the model's fields. The compiler knows the fields and their types, so you see a typo like `f.totl` right away.
+
+If you're starting out, read the guide [Grouping and reports](../../aggregation/grouping.mdx). It shows how a group's `_id` and accumulators add up to a report. This page is a reference. Use it to check what a particular accumulator returns and when it gives `null`.
+
+All examples use one shop order model. It has a number, an optional number, an array of numbers, and a date.
+
+<Snippet id="reference/aggregation/accumulators/intro" title="shop/order.ts" twoslash />
+
+The collection holds six orders, and the results in the `// →` comments come from them.
+
+- Alice: paid for 120 (discount 10, items 20 and 100, January 5) and paid for 80 (no discount, item 80, January 12).
+- Bob: new for 45 (discount 5, items 30 and 15, January 19) and paid for 200 (no discount, items 50, 50, and 100, February 2).
+- Carol: canceled for 60 (no discount, item 60, February 9) and paid for 95 (discount 15, items 45 and 50, February 16).
+
+In every `group` block, the `_id` is built from the `customer` or `status` field, and a `sort` by `_id` follows so the row order stays stable. [`.plain()`](./pipeline.mdx#plain) returns each block's result row. Numbers stay numbers, and dates become strings.
+
+## How accumulators work [#how-accumulators-work]
+
+The same operator can appear in different places, and its node type depends on the place. The compiler checks this, not the server.
+
+Some operators work both as an expression and as an accumulator. These are `fn.sum`, `fn.avg`, `fn.min`, `fn.max`, `fn.first`, `fn.last`, `fn.stdDevPop`, `fn.stdDevSamp`, `fn.median`, `fn.percentile`, `fn.firstN`, `fn.lastN`, `fn.minN`, and `fn.maxN`. With one argument, such an operator in a group collects a value across documents. In `project` or `addFields`, the same call works on an array inside a single document.
+
+<Snippet id="reference/aggregation/accumulators/how-accumulators-work" twoslash />
+
+`fn.sum(f.prices)` added up the items inside each order, so 20 and 100 gave 120. These operators also have a form with two or more arguments. It's always an expression, never an accumulator.
+
+<Snippet id="reference/aggregation/accumulators/how-accumulators-work-2" twoslash />
+
+`fn.push`, `fn.addToSet`, `fn.count`, `fn.top`, `fn.bottom`, `fn.topN`, and `fn.bottomN` work only as accumulators, because the server has no expressions with those names. You can put them in `group`, in the `output` of `bucket` and `bucketAuto`, and in `setWindowFields`. In `project` and `addFields` the compiler rejects them.
+
+<Snippet id="reference/aggregation/accumulators/how-accumulators-work-3" twoslash />
+
+The error shows up by name in a `PathError`: `field "all": an accumulator or window function is not an expression here`. The server would answer the same call with `ServerError: Unknown expression $push`, but Typemo stops the call earlier.
+
+One query shows what accumulators do with a missing field and with `null`. In the `cancelled` status, Carol's only order has no `discount` field.
+
+<Snippet id="reference/aggregation/accumulators/how-accumulators-work-4" twoslash />
+
+`fn.sum` gives `0` when there is nothing to add, and it never returns `null`. In that case `fn.avg`, `fn.first`, and `fn.max` return `null`, because there's no average and no value. In the `paid` status, two of the four orders have a discount, and the average counts only those, that is, `(10 + 15) / 2 = 12.5`.
+
+## Sum and average [#sum-and-average]
+
+### fn.sum [#fn.sum]
+
+`fn.sum` adds numbers. It accepts a number or an array of numbers and returns the sum. Missing and non-numeric values count as zero.
+
+<Snippet id="reference/aggregation/accumulators/fn-sum" twoslash />
+
+The result type is the widest numeric type among the inputs. For `number` it's `number`. For `bigint` that may be `null`, it's `bigint | number`, because the sum of a skipped value is a plain zero. You saw the multi-argument form and the sum of an array in an expression above.
+
+### fn.avg [#fn.avg]
+
+`fn.avg` computes the average and returns `number | null`. If there's nothing to average, you get `null`.
+
+<Snippet id="reference/aggregation/accumulators/fn-avg" twoslash />
+
+### fn.stdDevPop [#fn.std-dev-pop]
+
+`fn.stdDevPop` computes the standard deviation over the whole population of the group's documents. For a single value it's zero.
+
+<Snippet id="reference/aggregation/accumulators/fn-std-dev-pop" twoslash />
+
+The `paid` status has four orders (120, 80, 200, 95), and the deviation is about 46.28. `cancelled` and `new` have one order each, so they get 0.
+
+### fn.stdDevSamp [#fn.std-dev-samp]
+
+`fn.stdDevSamp` computes the standard deviation of a sample. For a single value it's undefined, and the operator returns `null`. The result type is `number | null`.
+
+<Snippet id="reference/aggregation/accumulators/fn-std-dev-samp" twoslash />
+
+Pick the operator by asking whether you have the whole population or a sample of it. A report on all of a month's orders calls for `fn.stdDevPop`. An estimate from some of the orders calls for `fn.stdDevSamp`.
+
+### fn.median [#fn.median]
+
+`fn.median` computes an approximate median. It accepts an object with an `input` field. The `method` field allows a single value, `"approximate"`, and Typemo sends it for you.
+
+<Snippet id="reference/aggregation/accumulators/fn-median" twoslash />
+
+The algorithm is approximate, so on large data the median can differ from the exact one. For a single document it equals that document's value.
+
+### fn.percentile [#fn.percentile]
+
+`fn.percentile` computes approximate percentiles. It accepts `input` and an array of fractions `p`, and returns an array with one value per fraction.
+
+<Snippet id="reference/aggregation/accumulators/fn-percentile" twoslash />
+
+A fraction is a number from 0 to 1. If a literal falls outside that range, the compiler refuses it.
+
+<Snippet id="reference/aggregation/accumulators/fn-percentile-2" twoslash />
+
+The compiler doesn't check a number it knows nothing about (say, one from a variable of type `number`) and lets it through. Then the server checks the bound.
+
+## Minimum and maximum [#min-and-max]
+
+### fn.min [#fn.min]
+
+`fn.min` returns the smallest value. It accepts a value of any type, not just a number, and returns `null` if there are no values.
+
+<Snippet id="reference/aggregation/accumulators/fn-min" twoslash />
+
+Dates work the same way, and the output is the earliest date.
+
+<Snippet id="reference/aggregation/accumulators/fn-min-2" twoslash />
+
+### fn.max [#fn.max]
+
+`fn.max` returns the largest value. Like `fn.min`, it takes one argument (an accumulator or an array) or two or more that are compared with each other.
+
+<Snippet id="reference/aggregation/accumulators/fn-max" twoslash />
+
+The multi-argument form sets a lower bound on the value.
+
+<Snippet id="reference/aggregation/accumulators/fn-max-2" twoslash />
+
+### fn.minN [#fn.min-n]
+
+`fn.minN` collects the `n` smallest values in ascending order. It accepts `{ input, n }`. If there are fewer than `n` documents, the array holds as many values as there are.
+
+<Snippet id="reference/aggregation/accumulators/fn-min-n" twoslash />
+
+### fn.maxN [#fn.max-n]
+
+`fn.maxN` collects the `n` largest values in descending order.
+
+<Snippet id="reference/aggregation/accumulators/fn-max-n" twoslash />
+
+It skips `null` and missing fields. Alice has two candidate discounts, but one isn't set, so the array holds one number.
+
+<Snippet id="reference/aggregation/accumulators/fn-max-n-2" twoslash />
+
+## First and last [#first-and-last]
+
+These accumulators depend on document order, so put a [`sort`](./stages.mdx#sort) before `group`. Without one, "first" means "whichever the server met first", and the result can change from run to run.
+
+### fn.first [#fn.first]
+
+`fn.first` returns the value of the group's first document. If the field is missing, the result is `null`, not a missing key. The result type includes `null`.
+
+<Snippet id="reference/aggregation/accumulators/fn-first" twoslash />
+
+### fn.last [#fn.last]
+
+`fn.last` returns the value of the group's last document.
+
+<Snippet id="reference/aggregation/accumulators/fn-last" twoslash />
+
+### fn.firstN [#fn.first-n]
+
+`fn.firstN` collects the group's first `n` values in document order. It accepts `{ input, n }`.
+
+<Snippet id="reference/aggregation/accumulators/fn-first-n" twoslash />
+
+A missing field goes into the array as `null`. `fn.minN` skips it in that case.
+
+<Snippet id="reference/aggregation/accumulators/fn-first-n-2" twoslash />
+
+### fn.lastN [#fn.last-n]
+
+`fn.lastN` collects the group's last `n` values.
+
+<Snippet id="reference/aggregation/accumulators/fn-last-n" twoslash />
+
+### fn.top [#fn.top]
+
+`fn.top` returns the `output` field of the document that comes first by `sortBy`. The order is given as `[field, direction]` pairs. The field is an `f.field` reference, and the direction is `1`, `-1`, or one of the words `"asc"`, `"desc"`, `"ascending"`, `"descending"` in lowercase. The server always receives `1` or `-1`.
+
+<Snippet id="reference/aggregation/accumulators/fn-top" twoslash />
+
+You can write the direction as a word.
+
+<Snippet id="reference/aggregation/accumulators/fn-top-2" twoslash />
+
+The field must be a reference. A computed expression (`fn.add(f.total, 1)`) or a variable won't do, and the compiler refuses it. If such a value still reaches stage construction, Typemo throws a `ConfigurationError`.
+
+<Snippet id="reference/aggregation/accumulators/fn-top-3" />
+
+The order of the pairs sets the sort priority.
+
+### fn.bottom [#fn.bottom]
+
+`fn.bottom` returns the `output` of the document that comes last by `sortBy`.
+
+<Snippet id="reference/aggregation/accumulators/fn-bottom" twoslash />
+
+`fn.bottom` with a descending sort gives the smallest value, which is the same as `fn.top` ascending.
+
+### fn.topN [#fn.top-n]
+
+`fn.topN` returns an array of the `output` of the first `n` documents by `sortBy`. It accepts `{ output, sortBy, n }`.
+
+<Snippet id="reference/aggregation/accumulators/fn-top-n" twoslash />
+
+### fn.bottomN [#fn.bottom-n]
+
+`fn.bottomN` returns an array of the `output` of the last `n` documents by `sortBy`.
+
+<Snippet id="reference/aggregation/accumulators/fn-bottom-n" twoslash />
+
+The orders are sorted by amount in descending order, so "the last two" are the smallest. For `paid` those are 95 and 80.
+
+## Collect values [#collect-values]
+
+### fn.push [#fn.push]
+
+`fn.push` collects a value from every document into an array. It skips missing fields and keeps `null`. The order in the array matches the order of the input documents.
+
+<Snippet id="reference/aggregation/accumulators/fn-push" twoslash />
+
+### fn.addToSet [#fn.add-to-set]
+
+`fn.addToSet` collects distinct values. The order in the array is undefined, so don't rely on it.
+
+<Snippet id="reference/aggregation/accumulators/fn-add-to-set" twoslash />
+
+### fn.count [#fn.count]
+
+`fn.count` counts the group's documents. It takes no arguments and returns `number`. It works both as a `group` accumulator and in a window.
+
+<Snippet id="reference/aggregation/accumulators/fn-count" twoslash />
+
+Don't confuse it with the [`count`](./stages.mdx#count) stage. The stage replaces the whole result with a single row, while the accumulator counts the documents in each group.
+
+## JavaScript code [#javascript-code]
+
+### fn.accumulator [#fn.accumulator]
+
+`fn.accumulator` matches the server operator `$accumulator`, which runs your own accumulator written in JavaScript. Typemo doesn't support server-side JavaScript. Such code runs with the database's privileges, the schema doesn't check it, and any input substituted into it becomes executable code. That's why every `fn.accumulator` call is a compile error, and its text names the replacement right away.
+
+<Snippet id="reference/aggregation/accumulators/fn-accumulator" />
+
+If JavaScript code calls the operator without type checking, the refusal comes before the query is sent. Typemo checks the pipeline and rejects every operator that runs JavaScript on the server.
+
+<Snippet id="reference/aggregation/accumulators/fn-accumulator-2" />
+
+You can almost always build the value you need from the ready-made accumulators on this page: `fn.sum`, `fn.avg`, `fn.top`, `fn.firstN`. For complex processing, use `fn.push` and application code.
+
+### fn.function [#fn.function]
+
+`fn.function` matches the server operator `$function`, an expression written in JavaScript. Like `fn.accumulator`, every call is a compile error, and the text names the replacement.
+
+<Snippet id="reference/aggregation/accumulators/fn-function" />
+
+A call without type checking is rejected before sending with the same `StrictModeError`, only with `"$function"` instead of the operator name. Write branching with [`fn.cond` and `fn.switch`](./expr-logic.mdx) and array processing with [`fn.map`, `fn.filter`, and `fn.reduce`](./expr-array.mdx). For strings and numbers, use the operators from the pages on [strings](./expr-string.mdx) and [arithmetic](./expr-arithmetic.mdx).
+
+## When not to use it [#when-not-to-use]
+
+- **You need to keep the group's documents, not reduce them.** Add `fn.push(f.total)` to the group, or use `fn.top` and `fn.topN`.
+- **You need a sum or average inside one document, over an array.** Use `fn.sum(f.prices)` in [`project`](./stages.mdx#project) or [`addFields`](./stages.mdx#add-fields) without `group`.
+- **You need a value that builds up in order, such as a running total or a moving average.** Use [`withWindow`](./window-operators.mdx#with-window) and the window operators, not `group`.
+- **You need a count by field value.** The [`sortByCount`](./stages.mdx#sort-by-count) stage is shorter.

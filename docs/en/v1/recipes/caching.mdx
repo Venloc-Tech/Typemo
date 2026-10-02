@@ -1,0 +1,111 @@
+---
+title: Caching responses
+description: "A cache of ready .plain() responses with masks, invalidated by a change stream so it never serves stale data"
+icon: Zap
+---
+
+A cache speeds up reads, but it hides two dangers. You can put something into it that doesn't belong there, like secret fields. And you can serve stale data after a change. Let's build a cache of a customer card that handles both.
+
+We won't cache the document or the `.lean()` result, but the finished response: the `.plain()` result with masks. It has no hidden fields, the values are already JSON types, and the email and phone are masked. A change stream clears what goes stale.
+
+Don't cache a document (`HydratedDoc`). It's tied to the model and the connection, doesn't turn into JSON without loss, and holds hidden fields. The `.lean()` result won't do either, because the `ObjectId` and `bigint` in it don't turn into JSON on their own. `.plain()` exists exactly so that data can leave the process, and a cache is such a case.
+
+## What you need [#prerequisites]
+
+- A client connected as in [Connect to the database](../connection/connect.mdx), and a `shop` database.
+- The cache itself. Here it's a small in-process class. In production it's usually an external cache, but the requirements are the same: a key, a string value, a time to live, and deletion.
+- A replica set for invalidation through a change stream (several MongoDB servers holding copies of the same data, though a single server is enough). There's more in [Watch for changes](../change-streams/watch.mdx).
+
+## Quick start [#quick-start]
+
+Read through `.plain()`, mask, put the result into the cache as a JSON string, and serve it from the cache while the entry is alive.
+
+<Snippet id="recipes/caching/quick-start" twoslash />
+
+Next, step by step: what goes into the cache, where to put the mask, how to invalidate the cache, and what to do about the staleness window.
+
+## Describe the model [#define-model]
+
+A customer has a hidden field `passwordHash`, and it must never reach either a response or the cache. The email and phone are needed, but they're shown masked.
+
+<Snippet id="recipes/caching/define-model" title="customers/customer.ts" twoslash />
+
+## A cache with a time to live [#ttl-cache]
+
+The cache stores strings. The value comes in as JSON and goes out as JSON, so an external cache fits without changes. The time to live is a safety net. Even if invalidation through the change stream fails once, stale data won't outlive the TTL. The `hits` and `misses` counters show whether the cache works.
+
+<Snippet id="recipes/caching/ttl-cache" title="cache/ttl-cache.ts" twoslash />
+
+## Cache the masked .plain() result [#cache-masked-plain]
+
+[`.mask`](../reference/query/masks.mdx#mask) applies as the last step, after [`.plain()`](../reference/query/reading.mdx#plain). So the value that goes into the cache is already masked, and even if you read the cache directly, you won't find the email there. The hidden `passwordHash` field isn't in the `.plain()` result anyway.
+
+The key is the id in lowercase. [`findById`](../reference/query/reading.mdx#model.find-by-id) accepts a string in any case, and without normalizing, one customer would end up with two cache entries.
+
+<Snippet id="recipes/caching/cache-masked-plain" title="customers/customers.service.ts" twoslash />
+
+The card of Alice with the email `alice@gmail.com` and the phone `+79161234567` sits in the cache as `{"_id":"…","name":"Alice","email":"a***@gmail.com","phone":"+7********67"}`. If there's no phone (`null`), the mask gives `"?"`, not `null`, because the phone in the response is a string. Masks are covered in [Response masks](../queries/response-masks.mdx).
+
+## Invalidate the cache on change [#invalidate-cache]
+
+The TTL doesn't remove stale data right away. To make a change visible immediately, clear the entry on a change stream event. [`Model.watch`](../reference/change-streams/watch.mdx#model.watch) sends every change, wherever it came from, including another process and `updateMany`. Update, replace, and delete events carry a `documentKey` with the document's `_id`.
+
+<Snippet id="recipes/caching/invalidate-cache" title="cache/invalidate.ts" twoslash />
+
+`await Customers.watch(...)` returns when the stream is already open on the server. So a change that happened before reading started isn't lost from the stream. How to survive a process restart reliably is shown in the recipe [Background jobs on a change stream](./change-stream-jobs.mdx). Start `invalidateOnChange` when the app starts, and stop it with a signal.
+
+Between the write and the arrival of the event there's a **staleness window**, milliseconds when a reader still gets the old card. If that's unacceptable for your data, like an account balance, don't cache it. Or clear the entry right after your own write in the same process, by calling `cache.delete(key)` in the change handler. The change stream stays for changes from other processes.
+
+## Check that the cache works and gets invalidated [#check-cache]
+
+The first read is a miss, the second is a hit. After the customer is changed in the database, the third read goes to the database again and returns the fresh value.
+
+<Snippet id="recipes/caching/check-cache" title="cache/cache.test.ts" twoslash />
+
+## How to choose [#how-to-choose]
+
+Ask yourself **what happens if the client sees data that's a second old**.
+
+- **Nothing serious**, as with a product card, a profile, or a reference list: cache it and invalidate through a change stream.
+- **It's a bug**, as with a balance, stock levels, or access rights: don't cache it, or invalidate synchronously where you write.
+
+Always set a TTL. It limits the damage from a missed event.
+
+## When not to use it [#when-not-to-use]
+
+If the query is already fast and rare, a cache only adds a layer you have to invalidate, with no gain. If the response depends on who's asking, like their own orders or permissions, the user must be part of the key. Otherwise one client gets another's response, and it's often simpler not to cache at all. And measure first. Look at the query plan with [`.explain`](../reference/query/search-and-explain.mdx#explain). An index may help instead of a cache.
+
+## Troubleshooting [#troubleshooting]
+
+**Secret data ended up in the cache.** You put a document or a `.lean()` result into the cache without a mask. A document's hidden fields aren't serialized, but `email` and `phone` are in the clear, and `.lean()` even contains the hidden fields. See [Hidden and sensitive fields](../schemas/hidden-and-sensitive.mdx). Cache only `.plain().mask(...)`, as in `getCustomerCard`.
+
+**The same customer is in the cache twice.** The key became the id from the URL, and the client sent it in uppercase. Normalize the key with `toLowerCase`, as in the example. Otherwise invalidation through the change stream deletes one entry, and the other lives until its TTL runs out.
+
+**The cache was cleared, but a reader sees old data.** The change stream event arrived after the reader's request. That's the staleness window. Clear the entry in the handler of your own write too, and keep the change stream for other processes.
+
+## Full example [#full-example]
+
+<Snippet id="recipes/caching/full-example" title="customers/customers.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose people usually cache the `.lean()` result, and hidden fields (`select: false`) have to be stripped by hand before writing to the cache. Here the `.plain()` result has no hidden fields, the values are already JSON types, and the mask is applied right in the query.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Response masks" href="../queries/response-masks.mdx">
+  Every ready-made mask and your own functions for sensitive values.
+</Card>
+<Card title="Background jobs on a change stream" href="./change-stream-jobs.mdx">
+  How to read a change stream reliably and survive a restart.
+</Card>
+<Card title="A REST API for bank accounts" href="./rest-api.mdx">
+  The handlers the cache sits on top of.
+</Card>
+<Card title="Reading data" href="../queries/reading-data.mdx">
+  How `.plain()` differs from `.lean()` and from a document.
+</Card>
+</Cards>

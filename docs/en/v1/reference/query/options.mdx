@@ -1,0 +1,403 @@
+---
+title: Query options
+description: "What session, policy, hint, collation, comment, timeoutMS, batchSize, readPreference, readConcern, allowDiskUse, and validateReads change"
+icon: SlidersHorizontal
+---
+
+Query options don't change **which** documents you look for. They change **how** the database looks for them and in what environment: in which transaction, with which index, with which timeout, with which view of the model's policies. Options go into the query chain like [`.sort`](./reading.mdx#sort) or [`.limit`](./reading.mdx#limit), and like the other builder methods they return a new query and leave the old one unchanged.
+
+If you're new to this, read the guide [Query performance](../../queries/performance.mdx) first. It explains when you need `hint`, `comment`, and `timeoutMS`. This page is the reference.
+
+Not every query has every option. The first six (`session`, `policy`, `hint`, `collation`, `comment`, `timeoutMS`) are available on all read queries: [`find`](./reading.mdx#model.find), [`findOne`](./reading.mdx#model.find-one), [`findById`](./reading.mdx#model.find-by-id), the value queries [`countDocuments`](./reading.mdx#model.count-documents), [`exists`](./reading.mdx#model.exists), [`distinct`](./reading.mdx#model.distinct), and [`estimatedDocumentCount`](./reading.mdx#model.estimated-document-count), and also on write methods. `batchSize` and `allowDiskUse` exist only on `find`, because they belong to reading in batches. `readPreference`, `readConcern`, and `validateReads` exist on the builder (`find`, `findOne`, `findById`, and the "find and modify" operations), and not on the value queries.
+
+All the examples use one order model. It has an index on `number`, and soft delete is on. Deleted orders stay in the database, but ordinary queries don't see them.
+
+<Snippet id="reference/query/options/intro" title="models/order.ts" twoslash />
+
+The collection holds three orders. No. 1 with the status `Paid`, No. 2 with the status `paid` (notice the case), and No. 3 with the status `new`, which is deleted. The `number_1` index is created. The results in the `// →` comments are order numbers in ascending order.
+
+---
+
+## .session [#session]
+
+`.session` binds the query to a driver session, that is, to a transaction. The query will see the changes the transaction has already made and itself becomes part of its atomic result. Inside [`client.transaction`](../connection/typemo-client.mdx#client.transaction) the session is filled in on its own, so you need an explicit `.session` for manual sessions from [`client.startSession`](../connection/typemo-client.mdx#client.start-session).
+
+<Snippet id="reference/query/options/session" twoslash />
+
+<Returns type="the same query, with a session">
+
+A new query bound to the session.
+
+</Returns>
+
+<Params>
+<Param name="session" type="ClientSession | null" required>
+
+A driver session or `null`. `null` means "run outside the transaction, even if the call is made inside one".
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/options/session-2" />
+
+</FullType>
+
+### Leave the transaction [#leave-transaction]
+
+Inside `client.transaction`, all queries run in the transaction. To run one read outside it on purpose, pass `null`. It won't see changes that aren't committed yet.
+
+<Snippet id="reference/query/options/leave-transaction" twoslash />
+
+Inside the transaction order No. 10 is already visible, and outside it isn't yet. Transactions are covered in more detail in the guide [Transactions](../../transactions/transactions.mdx) and the reference [Transactions](../transactions/transactions.mdx).
+
+---
+
+## .policy [#policy]
+
+`.policy` sets the **policy context** of one operation. It says which tenant the data belongs to, on whose behalf the action runs, and whether deleted documents are visible. The context adds to the one the query was built in, and doesn't replace it entirely. Policies (tenant, soft delete, audit) work in the model independently of the query. You need `.policy` where one operation must see data differently from the others.
+
+Most often that's soft delete. An ordinary query doesn't see deleted documents, and `includeDeleted` or `onlyDeleted` change that for one operation.
+
+<Snippet id="reference/query/options/policy" twoslash />
+
+<Returns type="the same query, with policies">
+
+A new query. The `.policy` values are merged with the context the query was built in, and an explicit value overrides one that came from the environment. If the values contradict the context, the query throws a policy error.
+
+</Returns>
+
+<Params>
+<Param name="values" type="PolicyValues" required>
+
+An object with policy values. The allowed keys are `tenant` (the tenant), `allTenants: true` (work across all tenants at once), `actor` (who acts, goes into the audit), `includeDeleted: true`, `onlyDeleted: true`, and `hardDelete: true` (for writes). Flags accept only `true` or nothing. An unknown key gives a `QueryError` with the text `find.policy: unknown policy value "foo" (known: tenant, allTenants, actor, includeDeleted, onlyDeleted, hardDelete)`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/options/policy-2" />
+
+</FullType>
+
+### A model without the policy [#model-without-policy]
+
+`.policy` doesn't require the model to have the matching policy turned on. A `tenant` value for a model without a tenant field is accepted and changes nothing. So the same code works with different models.
+
+### When not to use it [#policy.when-not-to-use]
+
+If the context is needed by all operations of a block of code and not by one, set it once for the whole block instead of on every query. The [policy context](../policies/policy-context.mdx) applies to all queries built inside. Policies are covered in more detail in the guide [Pass the tenant and actor through the whole request](../../policies/policy-context.mdx).
+
+---
+
+## .hint [#hint]
+
+`.hint` makes the database use the index you name. Usually the database picks an index itself and does it well, so you rarely need `.hint`. It helps when the query plan ([`.explain`](./search-and-explain.mdx#explain)) showed a poor choice and you can't rebuild the indexes.
+
+<Snippet id="reference/query/options/hint" twoslash />
+
+<Returns type="the same query, with a hint">
+
+A new query that forces the database to use the index.
+
+</Returns>
+
+<Params>
+<Param name="hint" type="string | { [path]: 1 | -1 | &quot;text&quot; | &quot;2dsphere&quot; | &quot;2d&quot; | &quot;hashed&quot; }" required>
+
+The index name (`"number_1"`) or its keys (`{ number: 1 }`). In the keys the compiler suggests only model paths. It doesn't see the schema's indexes, so the database checks that the name is right. An empty string and an empty object give a `QueryError` with the text `hint: an index name or a non-empty key pattern`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/options/hint-2" />
+
+</FullType>
+
+### There is no index with that name [#index-not-found]
+
+If there's no such index, the database refuses to run the query, and Typemo throws a [`ServerError`](../errors/server-errors.mdx#server-error). The message holds the reason and the server code: `hint provided does not correspond to an existing index (code 2 BadValue)`. The full server text is in the `serverMessage` field. Usually it's a typo in the name or an index that hasn't been created yet. Indexes are created by [index sync](../../collections/index-sync.mdx), not by the query itself.
+
+### When not to use it [#hint.when-not-to-use]
+
+If a query is slow, first look at its plan with [`.explain`](./search-and-explain.mdx#explain). Most often it helps to add or change an index in the model instead of pinning an index with a hint. A hint stays in the code even after the data has changed and another index has become better.
+
+---
+
+## .collation [#collation]
+
+`.collation` sets the string comparison rules for one query: whether to take case and diacritics into account, and how to sort in a particular language. Without it the database compares strings byte by byte, and `"paid"` and `"Paid"` are different values.
+
+<Snippet id="reference/query/options/collation" twoslash />
+
+`strength: 2` means "tell letters apart, but not case", so `Paid` and `paid` count as one value.
+
+<Returns type="the same query, with comparison rules">
+
+A new query. Typemo copies the `collation` object, so changing your object afterward doesn't affect the query.
+
+</Returns>
+
+<Params>
+<Param name="collation" type="CollationOptions" required>
+
+A rules object of the `mongodb` driver. `locale` is required, and the others (`strength`, `caseLevel`, `numericOrdering`, and more) are optional. See the driver documentation for the full list.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/options/collation-2" />
+
+</FullType>
+
+### When not to use it [#collation.when-not-to-use]
+
+If you need case-insensitive search all the time, create an index with the same collation and give it in every query. Without an index with the same `collation`, the database scans the whole collection. For a one-off search by part of a string, [`$regex`](./filter-operators.mdx#regex) with the `i` flag works.
+
+---
+
+## .comment [#comment]
+
+`.comment` attaches a text label to the query. It doesn't change the result, but it shows up in the server profiler and in the logs, and you can tell from it which code produced a slow query.
+
+<Snippet id="reference/query/options/comment" twoslash />
+
+The label reached the profiler. With profiling on, the query is visible in `system.profile` as a command with a `comment` field equal to `"dashboard: recent orders"`.
+
+<Returns type="the same query, with a label">
+
+A new query with the label.
+
+</Returns>
+
+<Params>
+<Param name="comment" type="string" required>
+
+The label text. Put the place in the code in it, not data, because the label goes into the server logs.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/options/comment-2" />
+
+</FullType>
+
+A label on the whole filter rather than the query is set by the [`$comment`](./filter-operators.mdx#comment) operator.
+
+---
+
+## .timeoutMS [#timeout-ms]
+
+`.timeoutMS` limits the time of the whole operation on the client side. If the query doesn't finish in time, the driver aborts it and throws an error. That way one heavy query won't hold up the application for long. The value `0` means "no limit".
+
+<Snippet id="reference/query/options/timeout-ms" twoslash />
+
+<Returns type="the same query, with a timeout">
+
+A new query with the timeout.
+
+</Returns>
+
+<Params>
+<Param name="ms" type="number" required>
+
+The time in milliseconds, an integer of at least zero. Any other value gives a `QueryError` with the text `timeoutMS must be a non-negative integer, got -1 (number)`. The value replaces `maxTimeMS`, and the limit applies on the client side to the whole operation.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/options/timeout-ms-2" />
+
+</FullType>
+
+If `timeoutMS` is set on the transaction itself, a query inside it can't have its own. The transaction's settings take priority, and Typemo reports this through a [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error), as it does for [`.readConcern`](#read-concern).
+
+<Snippet id="reference/query/options/timeout-ms-3" />
+
+If the transaction has no `timeoutMS` of its own, a query inside it gets its own without an error.
+
+---
+
+## .batchSize <Badge>find only</Badge> [#batch-size]
+
+`.batchSize` sets how many documents the server sends to the client in one batch when reading with a cursor. A smaller batch lowers peak memory use, and a larger one cuts the number of network round trips. The batch doesn't affect the query result. The method exists only on [`find`](./reading.mdx#model.find).
+
+Zero isn't allowed. The driver reads `batchSize(0)` as "the default batch size", while someone who writes zero more likely expects zero documents. So that such a value, for example from an empty parameter, doesn't silently change meaning, Typemo answers with an error. You get the default batch by not calling the method.
+
+<Snippet id="reference/query/options/batch-size" twoslash />
+
+<Returns type="the same query, with a batch size">
+
+A new query.
+
+</Returns>
+
+<Params>
+<Param name="n" type="number" required>
+
+The number of documents in a batch, a positive integer. Any other value, including `0`, gives a `QueryError`: `batchSize must be a positive integer, got -1 (number)`. For zero an explanation is added to the text: `batchSize must be a positive integer, got 0 (number) (the driver reads 0 as "the server default"; leave batchSize out for the default)`. On `findOne` the method doesn't compile, and at run time it throws a `QueryError` with the text `batchSize applies to find() only, not findOne()`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/options/batch-size-2" />
+
+</FullType>
+
+Don't confuse it with the `batchSize` option of the [`.eachAsync`](./cursor.mdx#each-async) method. That one sets the size of the batch your function receives, not the size of a network batch.
+
+---
+
+## .readPreference [#read-preference]
+
+`.readPreference` says which nodes of the replica set to read from: the primary, a secondary, or the nearest. Reading from secondaries takes load off the primary, but it can return data that hasn't caught up with the primary node yet.
+
+<Snippet id="reference/query/options/read-preference" twoslash />
+
+<Returns type="the same query, with a read preference">
+
+A new query.
+
+</Returns>
+
+<Params>
+<Param name="mode" type="ReadPreferenceMode" required>
+
+One of the driver's modes: `"primary"`, `"primaryPreferred"`, `"secondary"`, `"secondaryPreferred"`, `"nearest"`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/options/read-preference-2" />
+
+</FullType>
+
+### Inside a transaction [#read-preference.in-transaction]
+
+A transaction always reads from the primary node. So inside `client.transaction`, any mode other than `"primary"` gives a [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error).
+
+<Snippet id="reference/query/options/read-preference-in-transaction" />
+
+Without the error the setting would silently have no effect, and the application would read something other than what you asked for.
+
+---
+
+## .readConcern [#read-concern]
+
+`.readConcern` sets the read consistency level, that is, how well confirmed the data you read must be (`"local"`, `"majority"`, `"snapshot"`, and others). `"majority"` returns only data that a majority of nodes confirmed and that won't roll back.
+
+<Snippet id="reference/query/options/read-concern" twoslash />
+
+<Returns type="the same query, with a read level">
+
+A new query.
+
+</Returns>
+
+<Params>
+<Param name="level" type="ReadConcernLevel" required>
+
+A driver level: `"local"`, `"available"`, `"majority"`, `"linearizable"`, `"snapshot"`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/options/read-concern-2" />
+
+</FullType>
+
+### Inside a transaction [#read-concern.in-transaction]
+
+A transaction has its own read level, set when it starts. A query inside a transaction with its own `readConcern` gives a [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error).
+
+<Snippet id="reference/query/options/read-concern-in-transaction" />
+
+To set the level for a transaction, pass it in the options of [`client.transaction`](../connection/typemo-client.mdx#client.transaction).
+
+---
+
+## .allowDiskUse <Badge>find only</Badge> [#allow-disk-use]
+
+`.allowDiskUse` lets the server use the disk when a sort runs out of its allotted memory. Without it, a big sort without an index ends with a server error. The method exists only on [`find`](./reading.mdx#model.find).
+
+<Snippet id="reference/query/options/allow-disk-use" twoslash />
+
+<Returns type="the same query, with disk use allowed">
+
+A new query.
+
+</Returns>
+
+<Params>
+<Param name="allow" type="boolean" required>
+
+`true` allows the disk, `false` forbids it. On `findOne` the method doesn't compile, and at run time it throws a `QueryError` with the text `allowDiskUse applies to find() only, not findOne()`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/options/allow-disk-use-2" />
+
+</FullType>
+
+### When not to use it [#allow-disk-use.when-not-to-use]
+
+Sorting on disk is many times slower than sorting in memory. If a query runs into the memory limit, it's better to add an index that already sorts it than to allow the disk.
+
+---
+
+## .validateReads [#validate-reads]
+
+`.validateReads` turns on **strict reading** for one query. Every document the database returned is checked against the schema before it becomes a result, and a value of another type gives a [`CastError`](../errors/data-errors.mdx#cast-error) with the field path. By default a read doesn't check documents. Data written through the model was checked on write, and checking would cost time on every read. You need the method when something writes to the collection bypassing the model: an import, another service, a script on the driver.
+
+Say another service wrote an order with a string number to the collection, `{ number: "4", status: "paid" }`. An ordinary query returns it as is, and with `.validateReads()` it stops at that document.
+
+<Snippet id="reference/query/options/validate-reads" twoslash />
+
+What exactly is checked (fields, arrays, `Map`, subdocuments, `null`, value masking) and why there's no check by default is described under the client option [`validateReads`](../connection/typemo-client.mdx#validate-reads). Documents the query pulls in through `populate` are checked by the same decision as the query itself.
+
+<Returns type="the same query, with its own check decision">
+
+A new query. The query's decision beats the client option. `.validateReads()` checks even on a client without `validateReads`, and `.validateReads(false)` doesn't check on a client with `validateReads: true`.
+
+</Returns>
+
+<Params>
+<Param name="enabled" type="boolean" default="true">
+
+`true` checks documents against the schema, `false` doesn't. Any other value in code without types gives a `QueryError` with the text `validateReads: true or false`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/options/validate-reads-2" />
+
+</FullType>
+
+### Turn the check off for one query [#disable-check-per-query]
+
+A client with strict reading (`validateReads: true`, or `"development"` in development) checks every document. For a heavy report over millions of rows you've already verified, you can turn the check off for that query only: `Orders.find(filter).validateReads(false)`. On a client with `validateReads: true`, such a query returned the order with the number `"4"` without an error.
+
+### When not to use it [#validate-reads.when-not-to-use]
+
+Strict reading finds corrupted data but doesn't fix it. If a known source writes documents of another shape, fix it and bring the old documents up to date with a migration. If turning the check on in every query is awkward, set it on the client with the [`validateReads`](../connection/typemo-client.mdx#validate-reads) option. Aggregation rows aren't checked, so verify them against a schema with [`.parse`](./contracts.mdx#parse).

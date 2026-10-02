@@ -1,0 +1,122 @@
+---
+title: Indexes
+description: "Declare indexes in a model class, see which kinds there are, and create them in the database"
+icon: ListTree
+---
+
+An **index** is a helper structure in the database. With it, a document is found by a field without scanning the whole collection, and some indexes also stop a value from repeating. Typemo describes indexes right in the model class. Simple cases use field options, and compound and special ones use the [`@Index`](../reference/schemas/index-decorators.mdx#index) decorator. The description by itself creates nothing in the database. Indexes appear on [`connection.init()`](../reference/connection/connection.mdx#connection.init) or [`connection.syncAll()`](../reference/connection/connection.mdx#connection.sync-all).
+
+If MongoDB indexes are new to you, remember the main thing. Without an index a query reads the whole collection, and with one it reads only the part it needs. So you put indexes on fields you search and sort by, and uniqueness on fields that must not repeat.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the bank account model from `accounts/account.ts`. The model grows as the page goes on.
+
+## Quick start [#quick-start]
+
+A unique account number and an index on the owner are set with [`@Prop`](../reference/schemas/prop.mdx#unique) options, and a compound index with [`@Index`](../reference/schemas/index-decorators.mdx#index).
+
+<Snippet id="schemas/indexes/quick-start" title="accounts/account.ts" twoslash />
+
+The `init()` report lists everything it created: the collection first, then each index. Below we'll go through every kind of index on real tasks.
+
+## One index per field [#one-index-per-field]
+
+The [`index`](../reference/schemas/prop.mdx#index) option creates an index on a single field. `true` or `1` is ascending, `-1` is descending, and `"hashed"` is hashed. To see what Typemo is going to create without touching the database, ask for the schema's description. [`Accounts.schema.describe()`](../reference/schemas/schema-info.mdx#describe) returns the indexes the way they'll reach the server.
+
+<Snippet id="schemas/indexes/one-index-per-field" title="accounts/account.ts" twoslash />
+
+The server names the index itself from its keys, here `owner_1`. You can't declare an index on `_id`, since the server already builds a unique one.
+
+## Keep out duplicates [#prevent-duplicates]
+
+[`unique`](../reference/schemas/prop.mdx#unique) creates a unique index. The server won't let you write a second document with the same value, and Typemo turns the refusal into a [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicate-key-error). The option needs one of three things: `required: true`, `sparse: true`, or a partial `@Index`.
+
+That's down to how MongoDB works. A document without the field is indexed as `null`, and a second such document would break uniqueness. Typemo refuses right when you describe the model, so you don't run into this in production.
+
+<Snippet id="schemas/indexes/prevent-duplicates" title="accounts/accounts.service.ts" twoslash />
+
+If the field is optional and only a filled-in value must be unique, add [`sparse: true`](../reference/schemas/prop.mdx#sparse). Only documents that have the field go into the index. On a field with `nullable: true`, uniqueness is forbidden altogether. `null` values collide even in a sparse index, and you need the partial index from the next section. The model won't build: `Account.nick: "unique" on a nullable field — null values collide even in a sparse index; use a partial @Index`.
+
+## Uniqueness for some documents only [#partial-unique]
+
+An email must be unique among active accounts, but closed ones may repeat it. For that you need a **partial index**. It includes only documents that match the `partialFilterExpression` condition. The condition is checked against the class at compile time, so a typo in a field name won't pass.
+
+<Snippet id="schemas/indexes/partial-unique" title="accounts/account.ts" twoslash />
+
+## Delete old documents automatically [#expire-documents]
+
+[`expires`](../reference/schemas/prop.mdx#expires) on a `Date` field creates a TTL index. MongoDB deletes a document on its own once the given number of seconds has passed since the date in the field. That's how you clean up sessions, confirmation codes, and temporary accounts. The server checks TTL about once a minute, so the document doesn't disappear instantly. For conditions more complex than one field, use [`expireAfterSeconds`](../reference/schemas/index-decorators.mdx#expire-after-seconds) in `@Index`.
+
+<Snippet id="schemas/indexes/expire-documents" title="accounts/session.ts" twoslash />
+
+## Full-text search [#full-text-search]
+
+A text index lets you search for words in strings. A collection can have **only one**, so fields with [`text: true`](../reference/schemas/prop.mdx#text) are gathered into a single index. If you need field weights or a language, describe the index with `@Index` and `weights`, and don't put `text: true` on the fields. You can't combine the two.
+
+<Snippet id="schemas/indexes/full-text-search" title="accounts/account.ts" twoslash />
+
+[Full-text and vector search](../queries/text-and-vector-search.mdx) shows how to search with such an index. The server stores a text index's keys as `_fts` and `_ftsx` and leaves the default weight (1) out of the description if you didn't set one. Typemo accounts for this when comparing with the database. A repeated `connection.init()` on a model with a text index creates nothing and doesn't fail, and the second call's report is empty (`created` is `[]`, `inSync` is `true`).
+
+## Geo, wildcard, and search indexes [#geo-wildcard-search-indexes]
+
+A direction in `@Index` can be not only `1` and `-1` but also `"hashed"`, `"2dsphere"`, and `"2d"`. Geo queries need `"2dsphere"` (see [Geo queries](../queries/geo.mdx)). A key like `"$**"` or `"path.$**"` creates a **wildcard index** for fields whose names you don't know in advance. `wildcardProjection` limits which paths it covers.
+
+Atlas Search full-text and vector indexes are described with a separate decorator, [`@SearchIndex`](../reference/schemas/index-decorators.mdx#search-index), and created on an Atlas server. On a regular `mongod`, `connection.init()` with them throws a [`SyncError`](../reference/errors/configuration-errors.mdx#sync-error), and among the failures is the server's `SearchNotEnabled` response with code 31082. To sync search indexes, see [Define and sync search indexes](../collections/search-indexes.mdx).
+
+## Create the indexes in the database [#create-indexes]
+
+Declaring an index in the class creates nothing, neither when the model is created nor on the first write. Until you call `init` there are no indexes, which means uniqueness doesn't work either. Call [`connection.init()`](../reference/connection/connection.mdx#connection.init) at startup. It creates what's missing, the collection and the indexes, and never deletes or changes anything.
+
+If an index on the server is declared differently from the schema, `init` throws a [`SyncError`](../reference/errors/configuration-errors.mdx#sync-error) with the failure in `failures` and a hint: `Conf: index "owner_1" exists on the server with other keys or options; init() never drops or changes an index — run syncIndexes()/syncAll() to replace it`. The methods it names replace the index. The whole process is described in [Sync indexes](../collections/index-sync.mdx).
+
+## How to choose [#how-to-choose]
+
+Ask yourself: **how many fields does the index have, and what conditions?**
+
+- **One field, no conditions**: the `index`, `unique`, or `expires` option right on the field. The description sits next to the field.
+- **Several fields, `partialFilterExpression`, weights, collation, `hidden`**: `@Index`.
+
+The order of keys in a compound index matters. The index `{ owner: 1, opened: -1 }` serves queries on `owner` and on `owner` together with `opened`, but not queries on `opened` alone.
+
+## When not to use it [#when-not-to-use]
+
+Don't index fields you don't search or sort by. Every index slows down writes and takes up memory. Small collections that fit entirely in memory gain almost nothing from indexes. And enforce uniqueness with an index, not with a check in code. Two simultaneous writes would both pass the check, and only the index can stop the second one.
+
+## Troubleshooting [#troubleshooting]
+
+**`unique` without `required`.** The option is rejected when the model is created. Documents without the field are indexed as `null`, and a second such document would break uniqueness.
+
+<Snippet id="schemas/indexes/troubleshooting" />
+
+Add `required: true` or `sparse: true`, or use a partial `@Index`.
+
+**A typo in an index field name.** Paths in `@Index` are checked against the class at compile time, and `@Index({ ownr: 1 })` won't compile. The compiler says `@Index: "ownr" is not a field of the class`.
+
+**Uniqueness doesn't work.** The same value was written twice because there are no indexes. Either `connection.init()` wasn't called at startup, or the collection was excluded with the [`autoIndex`](../reference/schemas/schema.mdx#auto-index) option: with `autoIndex: false`, `init()` doesn't build this model's indexes. Check that the indexes are in place with [`Accounts.listIndexes()`](../reference/collections/model-indexes.mdx#model.list-indexes).
+
+## Full example [#full-example]
+
+Here's everything together in one file: a model with every kind of index and their creation at startup.
+
+<Snippet id="schemas/indexes/full-example" title="accounts/account.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose indexes are created on their own when you connect (`autoIndex`), and `unique` on an optional field passes silently. In Typemo only an explicit `connection.init()` (or `syncAll()`) creates indexes, and `unique` without `required`, `sparse`, or a partial index is an error as soon as you describe the model.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Sync indexes" href="../collections/index-sync.mdx">
+  How to compare the schema's indexes with the database and bring the database in line.
+</Card>
+<Card title="@Index and @SearchIndex" href="../reference/schemas/index-decorators.mdx">
+  Every index option with its exact types and errors.
+</Card>
+<Card title="Special collections" href="./special-collections.mdx">
+  Capped collections, time series, and other collections with special properties.
+</Card>
+</Cards>

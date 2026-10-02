@@ -1,0 +1,108 @@
+---
+title: Don't lose concurrent changes
+description: "Protect a document that several clients change at once with the __v version, VersionError, and a retry"
+icon: GitMerge
+---
+
+Two clients read the same document at the same time, and both save it. Whoever saves last wins, and the first one's edit silently disappears. To prevent that, Typemo keeps a **version** in the document, a number in the `__v` field, and checks it on save. If the document changed after you read it, [`$save`](../reference/documents/document-api.mdx#save) doesn't overwrite the other edit. It throws a [`VersionError`](../reference/errors/query-errors.mdx#version-error).
+
+The `Versioned` base class turns the version on, and it has two modes. By default it protects changes to **arrays by position**. The `optimisticConcurrency` schema option protects **any** change. A document without `Versioned` has no version and no protection.
+
+## What you need [#prerequisites]
+
+The main order example, which extends `Versioned` so its arrays are protected, and a `Ledger` account with `optimisticConcurrency` turned on. The basics of changing a document are in [Change and save a document](./change-and-save.mdx).
+
+<Snippet id="documents/versions/prerequisites" title="models/ledger.ts" twoslash />
+
+## Quick start [#quick-start]
+
+<Snippet id="documents/versions/quick-start" twoslash />
+
+The second client didn't silently overwrite the balance. It got an error. Below we cover what the error holds, how to retry the operation, and when the version works without `optimisticConcurrency`.
+
+## Catch a conflict [#catch-conflict]
+
+The error names the model, the version you read, and the changed paths. The database keeps what the first client wrote.
+
+<Snippet id="documents/versions/catch-conflict" twoslash />
+
+<Snippet id="documents/versions/catch-conflict-2" />
+
+The message says "modified or deleted", because the version can't tell one from the other. If the document really was deleted, Typemo finds that out with one extra read and throws a [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#document-not-found-error) instead of a `VersionError`.
+
+<Snippet id="documents/versions/catch-conflict-3" />
+
+## Retry the operation [#retry-operation]
+
+The right response to a `VersionError` is to read the document again, apply the change to the fresh state, and save again. Don't blindly retry saving the old document, because it still has the stale version.
+
+<Snippet id="documents/versions/retry-operation" twoslash />
+
+The number of attempts is limited. If conflicts keep repeating, it's better to report that than to spin forever. And counters that many clients change are safer to change with an atomic `$inc` through [`updateOne`](../reference/writes/writes.mdx#update-one). It never conflicts.
+
+## Protect arrays without optimisticConcurrency [#protect-arrays]
+
+A document with `Versioned` but without `optimisticConcurrency` protects only array changes **by position**. An operation like `tags.1 = "B"` refers to an index. If another client managed to remove the first element, index `1` now points to a different element, and the edit would land in the wrong place. So Typemo makes such an update conditional on the version.
+
+<Snippet id="documents/versions/protect-arrays" twoslash />
+
+Changes that don't depend on positions don't need a version. A scalar field, `push`, `pull`, and `addToSet` give updates that apply independently of each other. So if one client changed `customer` and another added a tag, there's no conflict.
+
+## What optimisticConcurrency does [#optimistic-concurrency]
+
+With `optimisticConcurrency: true`, **every** save is conditional on the version and bumps it. Two clients that changed different scalar fields get a conflict too. There are more conflicts, but no lost updates at all.
+
+Instead of `true` you can pass a list of paths. Then only a save that touches those paths behaves this way, and the rest is protected as with a plain `Versioned`. The option is described in the [`@Schema`](../reference/schemas/schema.mdx) reference.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **what happens if one client's edit is lost**.
+
+- **Nothing serious**, it's a note or a tag: the default `Versioned` is enough.
+- **It's money, a balance, or a state you can't lose**: turn on `optimisticConcurrency`, or change the value with an atomic operator.
+
+## When not to use it [#when-not-to-use]
+
+If only one client changes the document, like user settings or a draft, the version gives you nothing, and you don't need `Versioned`. If a change can be expressed as an atomic operation on the database side, like [`$inc`](../reference/writes/update-operators.mdx) or `$push`, you don't need conflicts and retries either.
+
+## Troubleshooting [#troubleshooting]
+
+**The document was read without the version.** You read the document with a projection that leaves out `__v`, and the save needs the version. Then [`$save`](../reference/documents/document-api.mdx#save) refuses to work, because silently skipping the check would turn the protection off.
+
+<Snippet id="documents/versions/troubleshooting" />
+
+Add `__v` to the projection or read the whole document.
+
+**The version was changed by hand.** The core manages the `__v` field. You can assign it only by bypassing the types, and then the save refuses to work, and [`$getChanges`](../reference/documents/document-api.mdx#get-changes) shows the reason in `$problems`.
+
+<Snippet id="documents/versions/troubleshooting-2" />
+
+Leave `__v` alone. If you need protection from conflicts, turn on `optimisticConcurrency`.
+
+**A retry applies a stale version.** Retrying `$save` on the same object after a `VersionError` is useless, because its version is out of date. Read the document again, as in the `deposit` function above.
+
+## Full example [#full-example]
+
+<Snippet id="documents/versions/full-example" title="ledgers/ledgers.service.ts" twoslash />
+
+## Coming from Mongoose [#from-mongoose]
+
+<Callout type="migration">
+
+Mongoose has the `__v` field and `VersionError` too, but there the version check was silently skipped if the document was read without `__v`. In Typemo the version appears only with `Versioned`, and a save without the needed version is an error. An empty save with `optimisticConcurrency` sends nothing and doesn't bump the version.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="VersionError" href="../reference/errors/query-errors.mdx#version-error">
+  The error's fields and every case where it happens.
+</Card>
+<Card title="Timestamps and versions" href="../schemas/timestamps-and-versions.mdx">
+  How to add `Versioned` and `Timestamped` to a schema.
+</Card>
+<Card title="Transactions" href="../transactions/transactions.mdx">
+  How to group several writes and retry an operation on a conflict.
+</Card>
+</Cards>

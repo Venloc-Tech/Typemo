@@ -1,0 +1,243 @@
+---
+title: "@venloc/typemo-opentelemetry"
+description: "The OpenTelemetry adapter: TypemoOpenTelemetry.instrument, every option, span names, attributes, and metrics"
+icon: Radar
+---
+
+`@venloc/typemo-opentelemetry` turns Typemo [operation events](./events.mdx) into OpenTelemetry **spans** and **metrics**. A span is a segment of a trace, with a name, a duration, a parent, and attributes. The package is separate. The core `@venloc/typemo` has not a line of OpenTelemetry code. The adapter subscribes to events through [`client.instrument`](../connection/typemo-client.mdx#client.instrument) or [`Typemo.instrument`](../connection/typemo.mdx#typemo.instrument) and talks to the `@opentelemetry/api` API.
+
+The guide [OpenTelemetry](../../observability/opentelemetry.mdx) explains how to attach the adapter to an application and what to do with the spans. This page is a reference. It covers the connection function, the options, the span names and attributes, and the metrics.
+
+The package needs `@opentelemetry/api` version 1.9.1 or higher as a peer dependency. The application chooses and configures the SDK (the provider, the exporter, the context manager).
+
+```package-install
+@venloc/typemo-opentelemetry @opentelemetry/api
+```
+
+All the examples use the account model from a banking application.
+
+<Snippet id="reference/observability/opentelemetry/intro" title="accounts/account.ts" />
+
+The documentation build doesn't compile the code blocks of this page, because it doesn't connect third-party packages. We got the results by running the adapter on a real database with `InMemorySpanExporter` and `InMemoryMetricExporter` from `@opentelemetry/sdk-trace-base` and `@opentelemetry/sdk-metrics`.
+
+---
+
+## TypemoOpenTelemetry.instrument [#typemo-opentelemetry.instrument]
+
+`TypemoOpenTelemetry.instrument` subscribes the adapter to the operations of a client (or of all clients in the process), and every operation becomes a span. A slow query is then visible in the trace at once: which operation, on which model, how long it took, and how it ended. You don't need to wrap every call by hand.
+
+<Snippet id="reference/observability/opentelemetry/typemo-opentelemetry-instrument" title="telemetry.ts" />
+
+Register the adapter on a target once, since two registrations give two spans per operation. Don't turn it on together with `@opentelemetry/instrumentation-mongodb`. That one patches the driver and creates its own span for every command, and the commands end up in the trace twice. Typemo gives command spans inside the operation span through the [`commandSpans`](#command-spans) option.
+
+<Params>
+<Param name="target" type="InstrumentTarget" required>
+
+A client (`TypemoClient`) or the global `Typemo` class. Any object with an `instrument(subscriber)` method that returns a subscription will do. For `Typemo` the adapter sees all clients of the process.
+
+</Param>
+<Param name="options" type="OpenTelemetryOptions" default="{}">
+
+The adapter settings in [`OpenTelemetryOptions`](#opentelemetry-options).
+
+</Param>
+</Params>
+
+<Returns type="Subscription">
+
+A subscription. Its `unsubscribe()` (and leaving a `using` scope) removes the registration from the core and **closes spans that are still open**, so no unfinished spans hang in the trace after unsubscribing.
+
+</Returns>
+
+On the path of an operation the adapter throws no exceptions. If handling an event goes wrong, it writes to the OpenTelemetry diagnostic logger (`diag.error`) and the operation continues. The registration error is the same as in the core. For `commandSpans: true` without `monitorCommands: true` on the client, [`client.instrument`](../connection/typemo-client.mdx#client.instrument) throws `ConfigurationError: TypemoClient "default": driver command events need the client option monitorCommands: true`.
+
+<Callout type="warning">
+
+Spans nest inside each other only through the active OpenTelemetry context. If the process has no context manager (for example, `AsyncLocalStorageContextManager` from `@opentelemetry/context-async-hooks`), spans have no parent. Operations, hooks, and commands end up as separate trees. With this manager on Bun the context survived `await`, a transaction, and its retry.
+
+</Callout>
+
+<FullType>
+
+<Snippet id="reference/observability/opentelemetry/typemo-opentelemetry-instrument-2" />
+
+</FullType>
+
+---
+
+## InstrumentTarget [#instrument-target]
+
+`InstrumentTarget` is everything the adapter needs from the connection target, that is the `instrument` method. Both the client and the `Typemo` class have it, so the adapter doesn't have to import either.
+
+<Snippet id="reference/observability/opentelemetry/instrument-target" />
+
+<FullType>
+
+<Snippet id="reference/observability/opentelemetry/instrument-target-2" />
+
+</FullType>
+
+---
+
+## OpenTelemetryOptions [#opentelemetry-options]
+
+`OpenTelemetryOptions` is the settings object, the second argument of [`TypemoOpenTelemetry.instrument`](#typemo-opentelemetry.instrument). All fields are optional. Without settings the adapter takes the global OpenTelemetry providers, builds one span per operation and per transaction, creates no command or step spans, and writes no user data.
+
+<Snippet id="reference/observability/opentelemetry/opentelemetry-options" />
+
+### tracerProvider [#tracer-provider]
+
+The trace provider the adapter takes a `Tracer` from. The type is `TracerProvider` from `@opentelemetry/api`. The default is the global one (`trace.getTracerProvider()`), and if the SDK in the application is registered globally, you don't set the option. An explicit provider is needed in tests and when the process has several independent SDKs.
+
+### meterProvider [#meter-provider]
+
+The metrics provider the adapter takes a `Meter` from. The type is `MeterProvider`. The default is the global one (`metrics.getMeterProvider()`).
+
+### commandSpans [#command-spans]
+
+`boolean`, `false` by default. Creates a child span for every driver command sent by a Typemo operation. The span is named after the command (`find`, `insert`, `update`) and nests inside the operation span. Commands Typemo didn't send (handshakes, monitoring, your code using the driver directly) get no spans. For this option the client must be created with `monitorCommands: true`, otherwise the registration throws a `ConfigurationError` from [`client.instrument`](../connection/typemo-client.mdx#client.instrument).
+
+### stepSpans [#step-spans]
+
+`boolean`, `false` by default. Creates a child span for every completed step of an operation: `cast`, `validate`, hooks, populate. The span is named `Typemo.step <step name>`. It's created after the step, and its start is shifted back by the step's duration. That shows what really took the time: type casting, your hook, or populate. Without the option the core doesn't build step events at all, so turn it on only when you need such detail.
+
+### poolMetrics [#pool-metrics]
+
+`boolean`, `false` by default. Collects connection pool metrics from driver events. The list of metrics is in the section [Metrics](#metrics). A pool created before the adapter subscribed isn't counted in the limits (`db.client.connection.max`), because the adapter didn't see its creation event.
+
+### sensitive [#sensitive]
+
+`SubscriberSensitive`, `"mask"` by default. It determines how values look in `db.query.text` and in recorded exceptions. It matches the [`sensitive`](./events.mdx#subscriber-sensitive) field of the core subscriber. `"mask"` replaces unmarked values with `"?"`, `"show"` keeps the real ones (then spans contain user data), `"hide"` replaces a field's whole condition with `"[hidden]"`, and `{ mask }` passes values through your function. Fields with `sensitive` in the schema and hidden fields stay masked in any mode. The mode applies to the exception recorded in the span too.
+
+### includeTenant [#include-tenant]
+
+`boolean`, `false` by default. Puts the operation's tenant into the attribute `typemo.tenant`, with the value converted to a string. The tenant is absent by default, because it's your customers' data, and traces go to an external service.
+
+<FullType>
+
+<Snippet id="reference/observability/opentelemetry/include-tenant" />
+
+</FullType>
+
+---
+
+## Spans [#spans]
+
+The adapter creates six kinds of spans. Take an operation inside a transaction with `stepSpans: true` and `commandSpans: true`. The span `Typemo.transaction` contains the span `Typemo.updateOne (Account)`, and inside it are the spans `Typemo.step cast`, `Typemo.step validate`, `update` (the command), and `Typemo.step populate`.
+
+<TypeTable
+  type={{
+    "Typemo.<operation> (<Model>)": { description: "One operation, for example `Typemo.find (Account)` or `Typemo.insertOne (Account)`. The kind is `CLIENT`. The parent is the outer operation it's nested in (populate), then the transaction, then the active context.", type: "CLIENT" },
+    "Typemo.<operation> (database <database>)": { description: "A database-level operation ([`connection.aggregate`](../connection/connection.mdx#connection.aggregate), [`client.aggregate`](../connection/typemo-client.mdx#client.aggregate)), for example `Typemo.aggregate (database bank)`. It has no model, so the name holds the database, and the attributes `typemo.model` and (except for `Pipeline.sessions()`) `db.collection.name` are absent.", type: "CLIENT" },
+    "Typemo.<operation>.cursor (<Model>)": { description: "An operation run through a cursor, for example `Typemo.find.cursor (Account)`. Cursor batches arrive as `cursor.batch` events of this span.", type: "CLIENT" },
+    "Typemo.transaction": { description: "One `client.transaction`. Operations inside it nest under this span while it's active, and a span you opened yourself inside the callback takes priority. Transaction retries are `transaction.retry` events.", type: "INTERNAL" },
+    "Typemo.step <step>": { description: "One step of an operation, only with `stepSpans: true`, for example `Typemo.step cast`.", type: "INTERNAL" },
+    "<command>": { description: "A driver command, only with `commandSpans: true`: `find`, `insert`, `update`.", type: "CLIENT" },
+  }}
+/>
+
+**The span name.** The OpenTelemetry convention suggests `find accounts`, that is the operation and the collection. The adapter chose `Typemo.find (Account)`, so the trace shows at once that the span was born in the ODM, and from which model. The collection name is in the attribute `db.collection.name`, and a string in the style of the convention is in `db.query.summary`. A database-level operation has no model, and the parentheses hold the database, `Typemo.aggregate (database bank)`. For `Pipeline.sessions()` it's `Typemo.aggregate (database config)` with `db.collection.name: "system.sessions"`.
+
+**An operation error.** The span gets the status `ERROR` with a message equal to the error class name, an `exception` event with the error itself in masked form, and the attributes `error.type` and `db.response.status_code`. A repeated insert of the same `title` produced a `Typemo.insertOne (Account)` span with the status `ERROR`, `error.type: "DuplicateKeyError"`, and `db.response.status_code: "11000"`.
+
+**A transaction rollback.** The `Typemo.transaction` span gets the status `ERROR`, `error.type` (the error class or `TransactionAborted`), and an `exception` event if the cause is an `Error`. The number of attempts is in the attribute `typemo.transaction.attempts`.
+
+**A mask failure.** If your `mask` function threw an exception, the adapter adds an event `typemo.instrumentation.error` to the active span with the attributes `typemo.instrumentation.source`, `typemo.path`, `typemo.model`, and `exception.message`. Outside a span it writes a warning to the OpenTelemetry diagnostic logger. The value in such a situation is replaced with `"?"`.
+
+**Nesting and context.** The core runs the operation inside the adapter's `wrap`, and the operation span is active there. So the spans of your hooks and of nested populate queries nest inside the operation span. The context is taken at execution time, that is at `await`, not when the query is built. Because of that, `context.with(ctx, () => Accounts.find())` without `await` inside runs the query outside `ctx`. Write `context.with(ctx, async () => await Accounts.find())`.
+
+---
+
+## Attributes [#attributes]
+
+The names come from the OpenTelemetry semantic conventions for databases.
+
+<TypeTable
+  type={{
+    "db.system.name": { description: "Always `\"mongodb\"`. On operation, transaction, and command spans.", type: "string" },
+    "db.namespace": { description: "The database name, for example `\"bank\"`. For `Pipeline.admin()` it's `\"admin\"`, and for `Pipeline.sessions()` it's `\"config\"`.", type: "string" },
+    "db.collection.name": { description: "The collection on operation and command spans. Absent for a database-level operation (for `Pipeline.sessions()` it's `\"system.sessions\"`) and for commands without a collection (`aggregate: 1`).", type: "string" },
+    "db.operation.name": { description: "For an operation, the Typemo operation name (`find`, `insertOne`), and for a command, the server command name (`find`, `insert`).", type: "string" },
+    "db.query.summary": { description: "The operation and the collection, for example `\"find accounts\"`. For a database-level operation without a collection, only the operation, `\"aggregate\"`. Only on operations.", type: "string" },
+    "db.query.text": { description: "The JSON of the input shape. For an operation it's an [`OperationSummary`](./events.mdx#operation-summary), for example `{\"filter\":{\"balance\":{\"$gt\":\"?\"}}}`, and for `create` it's `{\"count\":1}`. For a command it's the command itself with masked values. Always written, because it's already masked.", type: "string" },
+    "server.address, server.port": { description: "Two attributes, the host and the port. For an operation it's the first host of the connection string, and for a command it's the server that ran it. The address has no port and no brackets, `::1` for IPv6, not `[::1]:27017`.", type: "string, number" },
+    "db.response.returned_rows": { description: "How many documents were returned or affected, if known. Only on successful operations.", type: "number" },
+    "db.response.status_code": { description: "The server error code as a string (`\"11000\"`), if the operation error has one.", type: "string" },
+    "error.type": { description: "The error class (`DuplicateKeyError`). On an operation, a transaction, and a command with an error.", type: "string" },
+    "typemo.model": { description: "The model class name. Absent for a database-level operation.", type: "string" },
+    "typemo.operation.mode": { description: "`\"run\"`, `\"cursor\"`, or `\"explain\"`.", type: "string" },
+    "typemo.transaction": { description: "Whether the operation runs inside a transaction.", type: "boolean" },
+    "typemo.populate.path": { description: "The path of the relation being populated, on a nested populate query.", type: "string" },
+    "typemo.tenant": { description: "The tenant, only with `includeTenant: true`.", type: "string" },
+    "typemo.connection": { description: "The client name on a transaction span.", type: "string" },
+    "typemo.transaction.attempts": { description: "The number of attempts on a transaction span.", type: "number" },
+    "typemo.step": { description: "The step name on a step span.", type: "string" },
+    "typemo.cursor.batch, typemo.cursor.batch.size": { description: "The number and size of a batch, attributes of the `cursor.batch` event.", type: "number" },
+  }}
+/>
+
+An operation and a command take the address differently. The operation span gets the address and port from the first host of the connection string, and the command span gets them from the server that ran it. In a replica set (several MongoDB servers holding copies of the same data, though one server is enough for transactions) these can be different servers, so look for the exact address in the command spans. The collection name is in the command span, in `db.collection.name`, and in the command itself in `db.query.text` (`{"update":"accounts","updates":[…]}`), as with `find` and `insert`. The values in the command are replaced with `"?"`.
+
+---
+
+## Metrics [#metrics]
+
+The duration metric is always created, and the pool metrics only with [`poolMetrics`](#pool-metrics). The unit of measurement is seconds.
+
+<TypeTable
+  type={{
+    "db.client.operation.duration": { description: "A histogram of operation durations in seconds, with the bucket boundaries `[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 10]` from the convention. The attributes are the system, database, collection, operation, server, model, and `error.type` on errors.", type: "Histogram, s" },
+    "db.client.connection.count": { description: "Connections by state. The attributes are `db.client.connection.pool.name` (the server address) and `db.client.connection.state` (`idle` or `used`).", type: "UpDownCounter" },
+    "db.client.connection.pending_requests": { description: "Requests waiting for a free connection.", type: "UpDownCounter" },
+    "db.client.connection.timeouts": { description: "How many times getting a connection ended in a timeout.", type: "Counter" },
+    "db.client.connection.max": { description: "The maximum number of pool connections (`maxPoolSize`), not reported when `maxPoolSize: 0`. Taken from the pool creation event.", type: "UpDownCounter" },
+    "db.client.connection.idle.min": { description: "The minimum number of idle connections (`minPoolSize`), if it's greater than zero.", type: "UpDownCounter" },
+    "db.client.connection.create_time": { description: "How long creating a connection took.", type: "Histogram, s" },
+    "db.client.connection.wait_time": { description: "How long a connection from the pool was waited for.", type: "Histogram, s" },
+    "db.client.connection.use_time": { description: "How long a connection was busy, from checkout to return.", type: "Histogram, s" },
+  }}
+/>
+
+`db.client.connection.idle.max` isn't reported, because a MongoDB pool has no such limit. A `find`, a `create`, and a transaction with `poolMetrics: true` created `db.client.operation.duration` (4 sets of values), `db.client.connection.count`, `db.client.connection.pending_requests`, `db.client.connection.wait_time`, and `db.client.connection.use_time`. The metrics `create_time`, `max`, and `idle.min` came only with connections and pools created after the adapter subscribed.
+
+---
+
+## SemConv [#sem-conv]
+
+`SemConv` is a class with static constants, that is the attribute and metric names the adapter uses. It's useful if you read spans in your own processor and don't want to scatter strings like `"db.query.text"` through your code. The names are copied from the semantic conventions (version 1.43), not imported, since a few strings aren't worth a dependency.
+
+<Snippet id="reference/observability/opentelemetry/sem-conv" />
+
+<TypeTable
+  type={{
+    "DB_SYSTEM_NAME, DB_SYSTEM_NAME_VALUE_MONGODB": { description: "`\"db.system.name\"` and the value `\"mongodb\"`.", type: "string" },
+    "DB_NAMESPACE, DB_COLLECTION_NAME, DB_OPERATION_NAME": { description: "`\"db.namespace\"`, `\"db.collection.name\"`, `\"db.operation.name\"`.", type: "string" },
+    "DB_QUERY_SUMMARY, DB_QUERY_TEXT": { description: "`\"db.query.summary\"`, `\"db.query.text\"`.", type: "string" },
+    "DB_RESPONSE_STATUS_CODE, DB_RESPONSE_RETURNED_ROWS": { description: "`\"db.response.status_code\"`, `\"db.response.returned_rows\"`.", type: "string" },
+    "SERVER_ADDRESS, SERVER_PORT, ERROR_TYPE": { description: "`\"server.address\"`, `\"server.port\"`, `\"error.type\"`.", type: "string" },
+    "METRIC_DB_CLIENT_OPERATION_DURATION": { description: "`\"db.client.operation.duration\"`.", type: "string" },
+    "METRIC_DB_CLIENT_CONNECTION_*": { description: "The pool metric names: `COUNT`, `TIMEOUTS`, `PENDING_REQUESTS`, `MAX`, `IDLE_MIN`, `CREATE_TIME`, `WAIT_TIME`, `USE_TIME`.", type: "string" },
+    "DB_CLIENT_CONNECTION_POOL_NAME, DB_CLIENT_CONNECTION_STATE": { description: "The pool metric attributes. The state values are `DB_CLIENT_CONNECTION_STATE_VALUE_IDLE` and `DB_CLIENT_CONNECTION_STATE_VALUE_USED`.", type: "string" },
+    "DURATION_BUCKETS": { description: "The duration bucket boundaries in seconds.", type: "readonly number[]" },
+  }}
+/>
+
+---
+
+## When the adapter doesn't fit [#when-not-to-use]
+
+If you need only the numbers "how many operations and how long they take", without tracing, your own subscriber on [`operation.end`](./events.mdx#operation-end-event) is enough. See the guide [Custom integration](../../observability/custom-integration.mdx). If you need errors with context in Sentry, use [`@venloc/typemo-sentry`](./sentry.mdx). The OpenTelemetry adapter records errors in the span, but it doesn't send them to a tracker.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="OpenTelemetry" href="../../observability/opentelemetry.mdx">
+  The guide: attach the SDK, see spans and metrics, and avoid leaking data.
+</Card>
+<Card title="Events" href="./events.mdx">
+  What exactly the adapter receives and how values are masked.
+</Card>
+<Card title="@venloc/typemo-sentry" href="./sentry.mdx">
+  Errors and breadcrumbs in Sentry on top of the same events.
+</Card>
+</Cards>

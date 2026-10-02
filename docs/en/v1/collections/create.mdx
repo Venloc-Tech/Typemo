@@ -1,0 +1,136 @@
+---
+title: Create collections with options
+description: "Create a collection with a size limit and a validator from the schema, change the options of an existing one, and keep them on the first write"
+icon: FolderPlus
+---
+
+A regular MongoDB collection appears on its own on the first write, and that's enough for most models. But sometimes the schema sets collection options: a size limit (`capped`), a server validator, time series, a clustered index, or a string collation rule. These have to be applied **before the first write**, because many options can't be changed on an existing collection.
+
+Below we cover how to create such a collection, how to find out that it's set up differently in the database than in the schema, and how to fix that.
+
+Unlike many libraries, Typemo doesn't stay quiet about drift. The database itself answers a repeated create with "already exists". Swallow that error, and a changed option never reaches the server. Typemo compares the options and tells you exactly what differs.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and two models.
+
+- An account with a server validator.
+- A ledger that keeps at most a hundred entries.
+
+<Snippet id="collections/create/prerequisites" title="accounts/models.ts" twoslash />
+
+## Quick start [#quick-start]
+
+When the app starts, call [`connection.init`](../reference/connection/connection.mdx#connection.init). It creates the collections of all registered models with their options. For a single model there's [`createCollection`](../reference/collections/collection-manager.mdx#model.create-collection) and [`ensureCollection`](../reference/collections/collection-manager.mdx#model.ensure-collection).
+
+<Snippet id="collections/create/quick-start" twoslash />
+
+We'll go through each case on real tasks below.
+
+## Create collections at startup [#create-collections-on-start]
+
+The app starts on a new database, and the collections need the options from the schema. Register the models with [`connection.model`](../reference/connection/connection.mdx#connection.model) and call `init`.
+
+<Snippet id="collections/create/create-collections-on-start" title="db/start.ts" twoslash />
+
+`init` creates what's missing and leaves existing things alone. If a collection already exists and is set up differently, that's a failure, not a silent substitution. At the end `init` throws a [`SyncError`](../reference/errors/configuration-errors.mdx#sync-error) with all the failures.
+
+In the report, the `created` list names everything `init` created (`"collection accounts"`, `"collection ledger"`), and `inSync` is `true`. Along the way `init` also creates the indexes, which are covered in [Sync indexes](./index-sync.mdx).
+
+## Create the collection of one model [#create-collection]
+
+You need one collection, and it matters whether this call created it or it already existed. [`createCollection`](../reference/collections/collection-manager.mdx#model.create-collection) returns `true` if it created the collection, and `false` if the collection already exists with the same options.
+
+<Snippet id="collections/create/create-collection" twoslash />
+
+In this example the ledger keeps at most three entries. After the fourth, the oldest one, `a`, is gone. That's how a capped collection works. And it works that way only because it was created with the schema's options.
+
+## Keep the options on the first write [#first-write-options]
+
+Say you described `capped` or a collation rule but forgot to create the collection. The server creates it on the first write, but as a **regular** one, with no size limit and no collation rule. And a regular collection can't be turned into a capped one later.
+
+That's why Typemo doesn't trust the first write. For a model with options that can only be set at creation (`capped`, `timeseries`, `clustered`, `collation`), the first insert, bulk write, upsert, or document save checks first that the collection exists. If it doesn't, you get a [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configuration-error), and nothing is written.
+
+<Snippet id="collections/create/first-write-options" twoslash />
+
+The same happens if you call [`syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes) or [`createIndexes`](../reference/collections/model-indexes.mdx#model.create-indexes) first, since an index needs a collection too. So the order is: the collection first, then indexes and data. [`connection.init`](../reference/connection/connection.mdx#connection.init) and [`connection.syncAll`](../reference/connection/connection.mdx#connection.sync-all) follow it on their own. The check runs once per model, and Typemo remembers a collection it has found.
+
+The check has a boundary. It covers only the "at creation" options. There's none for the validator (`validator: true`), because the server can change a validator on an existing collection. The first write to a missing collection whose schema has a validator creates a regular collection without one. [`ensureCollection`](../reference/collections/collection-manager.mdx#model.ensure-collection) then shows that difference and fixes it with `update: true`. Still, for these models too it's better to create the collection at startup.
+
+## Server validator [#server-validator]
+
+Sometimes you want the server itself to reject bad documents, even when a write goes around Typemo, from a driver script or another service. Turn on `validator: true` in `@Schema`. Typemo builds a server rule (`$jsonSchema`) from the field definitions and sets it when the collection is created.
+
+Typemo itself checks the data before the server does, so in normal work you get a [`ValidationError`](../reference/errors/data-errors.mdx#validation-error). The validator is the last line of defense. The server rejects a write through the driver with a title that's too short.
+
+<Snippet id="collections/create/server-validator" twoslash />
+
+By default the validator is strict. It checks every insert and update and rejects violations. You change that with the `validationLevel` and `validationAction` options of `validator`, with the values `"strict" | "moderate" | "off"` and `"error" | "warn"`, for example `validator: { validationAction: "warn" }`.
+
+You can see on the server what went into the rule. For `Account` it requires `_id` and `title` (a string of at least two characters), allows `balance` (a number no less than zero), and forbids any other fields.
+
+## Change the options of an existing collection [#change-collection-options]
+
+The collection is already in use, and an option in the schema has changed. [`ensureCollection`](../reference/collections/collection-manager.mdx#model.ensure-collection) compares the options and, if you allow it, changes what the server can change in place. Say the ledger was created with a limit of 1024 bytes, and the schema now asks for 65,536.
+
+<Snippet id="collections/create/change-collection-options" twoslash />
+
+There are three steps here.
+
+- `dryRun` shows the differences and writes nothing.
+- `update: true` applies them.
+- A plain call confirms there's no drift left.
+
+Without `update`, any difference throws a [`CollectionOptionsError`](../reference/errors/configuration-errors.mdx#collection-options-error), so the options of a live collection don't change by accident. Which options change in place and which don't is listed in the [`CollectionManager`](../reference/collections/collection-manager.mdx#in-place-changes) reference.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether you're creating the collections of all models at once or of one**.
+
+- **All at once**: call [`connection.init`](../reference/connection/connection.mdx#connection.init) at startup. If a deploy also has to change what already exists, use [`connection.syncAll`](../reference/connection/connection.mdx#connection.sync-all).
+- **One, and it matters whether this call created it**, with any drift stopping the work: [`createCollection`](../reference/collections/collection-manager.mdx#model.create-collection).
+- **One, and you need to see or fix the drift**: [`ensureCollection`](../reference/collections/collection-manager.mdx#model.ensure-collection).
+
+## When not to use it [#when-not-to-use]
+
+If the schema has no collection options, you don't need to create the collection in advance. It appears on the first write exactly as it should be. Don't create collections for views either. A [`TypedView`](./views.mdx) has its own check, and `init` and `syncAll` call it themselves.
+
+`init` and `syncAll` skip a schema with `autoCreate: false` at the collection options step, and `createCollection` on such a model throws a `ConfigurationError`. That's useful for collections another system manages. `ensureCollection` ignores this option and creates the collection anyway, so call it on such a model deliberately.
+
+## Troubleshooting [#troubleshooting]
+
+**A `ConfigurationError` on the first write.** The text contains `the collection "ledger" does not exist, and MongoDB would create it as a plain collection`. The model has "at creation only" options, and the collection doesn't exist. Call [`connection.init`](../reference/connection/connection.mdx#connection.init) or [`ensureCollection`](../reference/collections/collection-manager.mdx#model.ensure-collection) before writing.
+
+**A collection whose schema has a validator has no validator.** The first write created the collection, and there's no existence check for the validator. Call `ensureCollection({ update: true })`, and the validator is applied with the `collMod` command.
+
+**A `CollectionOptionsError` on create.** The text names the option in parentheses: `exists with other options (validator)`. If the differences include an option MongoDB can't change, the text is `exists with options MongoDB cannot change (capped)`. `ensureCollection({ update: true })` fixes an option that can change. One that can't (`capped`, `collation`, the kind of collection) needs the collection dropped and created again, and you have to drop it yourself, because Typemo doesn't drop collections.
+
+**`init` didn't create a collection.** The schema declares `autoCreate: false`, so `init` skips it, and the `options` field in the report is empty. Remove the option or create the collection by hand. [`createCollection`](../reference/collections/collection-manager.mdx#model.create-collection) throws on such a model, and [`ensureCollection`](../reference/collections/collection-manager.mdx#model.ensure-collection) creates it.
+
+## Full example [#full-example]
+
+The startup file creates the collections, checks the report, and stops startup if anything drifts.
+
+<Snippet id="collections/create/full-example" title="db/start.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose `Model.createCollection` silently skipped an existing collection, even if its options differed from the schema, and a changed option never reached the database. In Typemo [`createCollection`](../reference/collections/collection-manager.mdx#model.create-collection) returns `false` only when the options match, and throws a [`CollectionOptionsError`](../reference/errors/configuration-errors.mdx#collection-options-error) on drift.
+
+You allow changes to an existing collection explicitly, with [`ensureCollection({ update: true })`](../reference/collections/collection-manager.mdx#model.ensure-collection). And registering a model doesn't create collections. You call `init` yourself.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Sync indexes" href="./index-sync.mdx">
+  Bring indexes in line with the schema without missing a failure.
+</Card>
+<Card title="Read a predefined selection through a view" href="./views.mdx">
+  Virtual collections on top of other collections, and their types.
+</Card>
+<Card title="CollectionManager" href="../reference/collections/collection-manager.mdx">
+  `createCollection`, `ensureCollection`, the report, and the full list of options that can change.
+</Card>
+</Cards>

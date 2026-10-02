@@ -1,0 +1,99 @@
+---
+title: Delete with a way to restore
+description: "A delete you can undo: a mark instead of erasing, viewing deleted documents, restoring them, and purging for good"
+icon: Trash2
+---
+
+Deleted data is sometimes needed again. A user changed their mind, an operator made a mistake, the lawyers ask for history. **Soft delete** makes a delete reversible. The document isn't erased. It gets a timestamp in a field, and the model's other operations stop seeing it.
+
+Turn on the [`softDelete`](../reference/policies/schema-options.mdx#soft-delete) option in the schema, and from then on `deleteOne` and `deleteMany` work as usual. You bring documents back with [`SoftDelete.restore`](../reference/policies/soft-delete-and-untrusted.mdx#soft-delete.restore). If policies are new to you, start with the [overview](./overview.mdx).
+
+## What you need [#prerequisites]
+
+A connected client and a blog where a post has a title and a delete mark. The collection has three posts: One, Two, and Three.
+
+## Quick start [#quick-start]
+
+Add a `Date | null` field to the class and turn on the policy. A `null` mark means the post is alive.
+
+<Snippet id="policies/soft-delete/quick-start" title="posts/post.ts" twoslash />
+
+<Snippet id="policies/soft-delete/quick-start-2" twoslash />
+
+## Delete a document [#delete-document]
+
+Normal deletes turn into an update of the mark, but their result is still a delete result. `deletedCount` is the number of marked documents. That's how `deleteOne`, `deleteMany`, `findOneAndDelete`, deletes in `bulkWrite`, and a document's `$deleteOne` behave. `findOneAndDelete` returns the document as it was before the mark.
+
+<Snippet id="policies/soft-delete/delete-document" twoslash />
+
+Deleting an already deleted document again finds nothing. There are no live posts with that title, and the mark isn't overwritten.
+
+## See deleted documents [#see-deleted]
+
+By default a read hides marked documents. This applies to `find`, `findOne`, `countDocuments`, `distinct`, and aggregations. To see everything, or only the deleted documents, pass [`includeDeleted`](../reference/policies/policy-context.mdx#policy-values) or `onlyDeleted` to `.policy()`.
+
+<Snippet id="policies/soft-delete/see-deleted" twoslash />
+
+Your condition on the mark field doesn't replace the policy's condition. Both have to hold. So `find({ deletedAt: { $ne: null } })` without a context finds nothing, but together with `onlyDeleted` it finds the documents deleted in the period you want.
+
+Documents pulled in through `$lookup`, `$unionWith`, `$graphLookup`, or `populate` are never deleted ones. Typemo takes the policy of the pulled-in collection from the class named in the stage, so you don't need to register its model.
+
+## Restore and purge for good [#restore-and-purge]
+
+[`SoftDelete.restore`](../reference/policies/soft-delete-and-untrusted.mdx#soft-delete.restore) removes the mark from matching deleted documents, and [`SoftDelete.purge`](../reference/policies/soft-delete-and-untrusted.mdx#soft-delete.purge) erases deleted documents for good. Both take a model and a filter and return a normal model write. You can await it, bind it to a session, and add `.policy()`.
+
+<Snippet id="policies/soft-delete/restore-and-purge" twoslash />
+
+Notice that the live post `One` wasn't purged. The function works only with deleted documents, so a wrong filter won't erase live data. For a model without the policy, both functions throw `ConfigurationError: SoftDelete.purge: Plain has no soft delete; declare @Schema({ softDelete })`.
+
+## Count fast [#fast-count]
+
+`estimatedDocumentCount` reads the collection's metadata, and that counts deleted documents too. So that the number doesn't lie silently, Typemo throws a [`StrictModeError`](../reference/policies/violations.mdx#soft-delete) with the text `Post.estimatedDocumentCount: the collection's metadata counts soft-deleted documents too; use countDocuments() (or includeDeleted: true to count them all) [soft-delete]`. For live documents use `countDocuments()`, and for the total `.policy({ includeDeleted: true })`.
+
+## Unique indexes [#unique-indexes]
+
+A deleted document still holds its value in a unique index. A new post with the same unique `slug` won't be written, and the server answers `E11000`. That's why, when a model is created, Typemo suggests for each unique index how to make it partial over live documents: `partialFilterExpression: { deletedAt: { $type: "null" } }`. The condition is exactly `$type: "null"`, because an insert always writes `null`, and a partial index can't express "the field is missing".
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether this document should ever come back**.
+
+- **Yes, like orders, posts, or accounts**: turn on soft delete.
+- **The data must be erased by law**, for example on a "delete my data" request: use `SoftDelete.purge` or a separate retention policy. A mark physically deletes nothing.
+- **The data is temporary and should clean itself up**: a [TTL index](../collections/index-sync.mdx) fits better.
+
+## When not to use it [#when-not-to-use]
+
+If the deleted data will never be needed, soft delete only wastes space and complicates unique indexes. And if you need an archive with a life of its own, move the documents to another collection explicitly.
+
+## Troubleshooting [#troubleshooting]
+
+**A deleted document "can't be found".** After the delete, `findOne({ title: "Two" })` returns `null`. That's the policy at work, and the data isn't lost. You can see the document through `.policy({ onlyDeleted: true })`.
+
+**A unique value is taken by a deleted document.** Creating fails with `DuplicateKeyError`, even though no live document has that value. Make the index partial over live documents. Typemo suggests this when the model is created, for every `unique` index that "also counts deleted documents".
+
+**`estimatedDocumentCount` refuses to count.** The error text is above. Replace the call with `countDocuments()`.
+
+## Full example [#full-example]
+
+<Snippet id="policies/soft-delete/full-example" title="posts/posts.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, soft delete comes from a plugin like `mongoose-delete`. It intercepts only some operations, and `lean()`, `aggregate`, and `updateMany` are often left unprotected. In Typemo the policy is built into the pipeline and covers every path, including aggregations and related data. Restoring and purging are separate, explicit functions.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="SoftDelete and untrusted" href="../reference/policies/soft-delete-and-untrusted.mdx">
+  The exact types of `restore` and `purge`, their results, and errors.
+</Card>
+<Card title="Split data by organization" href="./tenants.mdx">
+  How to combine soft delete with splitting the data of organizations.
+</Card>
+<Card title="Keep an audit log" href="./audit.mdx">
+  How a soft delete shows up in the log as a delete.
+</Card>
+</Cards>

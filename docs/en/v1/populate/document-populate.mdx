@@ -1,0 +1,131 @@
+---
+title: Populate a document you already have
+description: "Load related data on a document you've already read, find out the original identifiers, and put them back"
+icon: RefreshCw
+---
+
+You already have a document, and you need its related data later? Call [`$populate`](../reference/documents/document-api.mdx#populate) on it. It reads the relation and puts it right into this document. This happens in a handler that got a post from shared code and needs the author's name in only one branch. [`$depopulate`](../reference/documents/document-api.mdx#depopulate) does the opposite and puts the identifiers back. And [`$populated`](../reference/documents/document-api.mdx#populated) shows which identifiers stand behind a populated field.
+
+Only a document with a schema has these methods, meaning the result of a normal read without `.lean()` and `.plain()`. Plain objects have no methods, so for them you populate the relation in the query itself, as covered in [Show related data](./basics.mdx).
+
+## What you need [#prerequisites]
+
+The client and the blog models from [Show related data](./basics.mdx). A post has `author`, a single reference, and `tags`, an array of references. The database holds two users, Alice and Bob, the tags `db` and `ts`, and the post "Hello" by Alice, with the tags `db` and `ts`.
+
+## Quick start [#quick-start]
+
+Let's read a post, populate the author, look at the original identifier, and put it back.
+
+<Snippet id="populate/document-populate/quick-start" twoslash />
+
+Below we'll cover each method and what happens on save and serialization.
+
+## Populate a relation (`$populate`) [#populate]
+
+You got a post, and the response needs the author. The method takes the same arguments as [`.populate`](../reference/populate/populate.mdx#populate) in a query: a path, or an object with options such as `select`, `match`, and a nested `populate`.
+
+<Snippet id="populate/document-populate/populate" twoslash />
+
+The method changes the document itself and returns it, the same object but with a new type. On `loaded` the `tags` field holds tag documents, while on `post` the compiler still sees identifiers. So work with the returned value, not with the original variable.
+
+The method takes one path, one object, or a list of paths and objects. A list populates all the relations in one call, and the result type shows every populated field.
+
+<Snippet id="populate/document-populate/populate-2" twoslash />
+
+The subqueries follow the same rules as in `.populate`. They're ordinary operations of the target model.
+
+## Find out the original identifiers (`$populated`) [#populated]
+
+A populated field shows documents, but you need the original identifiers, for example to log them or compare them. The method returns a copy of the original value: one `ObjectId` for a single reference and an array for an array of references. If the path isn't populated, you get `undefined`.
+
+<Snippet id="populate/document-populate/populated" twoslash />
+
+It's a copy, and you can't change the document through it. The result type is `unknown`, since the method doesn't know which path you'll ask about. Narrow the value yourself with `Array.isArray` or `instanceof ObjectId`. `undefined` means "not populated".
+
+If you need a yes-or-no answer with type narrowing rather than the value, there's [`isPopulated`](../reference/populate/populate-types.mdx#is-populated). And you can require population with [`$assertPopulated`](./type-checks.mdx#assert-populated). It takes the same list of paths as `$populate`, so after `$populate(["author", "tags"])` one call of `$assertPopulated(["author", "tags"])` checks both paths.
+
+## Put the identifiers back (`$depopulate`) [#depopulate]
+
+You need to change and save a document with populated relations, and the other documents inside get in the way. [`$depopulate`](../reference/documents/document-api.mdx#depopulate) without an argument puts the identifiers back into every populated path, and with a key only into that path. The method changes the same document and returns it with a type where the field is `Ref<User>` again.
+
+<Snippet id="populate/document-populate/depopulate" twoslash />
+
+Look at the order. `$depopulate("author")` put back only the author, the tags stayed populated, and only the call without an argument put back everything else.
+
+## Populate a path again [#repopulate]
+
+You can populate an already populated path once more. `$populate` won't refuse. It reads the relation again and replaces the populated value. This is useful to reread the author after a change, or to populate the same path with a different `select`.
+
+The second call replaces the first one completely, with its `select` and nested paths. If the first time you selected only the name and the second time you set no `select`, the document gets all the fields. You get the same document back, and the type describes the second call.
+
+<Snippet id="populate/document-populate/repopulate" twoslash />
+
+You don't need to call `$depopulate` to reload, because it only puts identifiers back. The compiler blocks only a path **below** an already populated field. After `$populate("author")`, the call `$populate("author.posts")` is stopped by the error `"author" is populated already: $depopulate("author") first`. A nested relation is populated with the `populate` option, and then `author` is reread along with it. Or put the identifiers back with `$depopulate("author")` and start over.
+
+<Snippet id="populate/document-populate/repopulate-2" twoslash />
+
+## Save a document with populated relations [#save-populated]
+
+Populated documents don't get in the way of `$save`. The database gets identifiers, not nested copies. If you changed only the post's title, `author` in the database stays an identifier, and `$getChanges` doesn't count population as a change.
+
+<Snippet id="populate/document-populate/save-populated" twoslash />
+
+`stored.author` here is still an `ObjectId`, not a user. A document found for several owners at once is one shared object by default (see [`clone`](../reference/populate/populate.mdx#clone)). Change it through one post, and the change is visible through another.
+
+## Replace a relation [#replace-ref]
+
+To change a post's author, assign the new author to the field, as a document or as its identifier. The database always gets the `_id`, not a copy of the document. If the field is populated, the assigned document stays in it as the populated value, and `$populated` shows the new identifier. Before the save, `$getChanges` shows the assigned object, as with any direct assignment, and after `$save` there are no changes.
+
+<Snippet id="populate/document-populate/replace-ref" twoslash />
+
+You can assign a document directly only to a populated field. A field holding an identifier has the type `Ref<User>` and won't accept a document. Use [`$set`](../reference/documents/document-api.mdx#set) there. It accepts a model document, a `.lean()` result, or an identifier, and casts the value right away, so `$getChanges` shows the identifier. You can't assign a `.lean()` result to a populated field directly, but you can through `$set`.
+
+<Snippet id="populate/document-populate/replace-ref-2" twoslash />
+
+## Send a populated document to the client [#send-populated]
+
+You need to send a post with its populated author as JSON. [`$toPlain`](../reference/documents/document-api.mdx#to-plain) and [`$toJSON`](../reference/documents/document-api.mdx#to-json) turn both the document and the populated author into plain objects, and [`$toObject`](../reference/documents/document-api.mdx#to-object) turns them into ordinary driver objects.
+
+<Snippet id="populate/document-populate/send-populated" twoslash />
+
+Populated documents are serialized together with the main one, and the client gets the whole user. To keep extras like the email from leaking out, populate the author with `select`, and the response contains only what you selected.
+
+## How to choose between the query and the document method [#how-to-choose]
+
+Ask yourself whether you already have the document or are only about to read it.
+
+- **About to read it**: add `.populate` to the query. There's no extra query, and the type is right from the start.
+- **You already have the document** (it came from another function, a transaction cache, a loop) **and you don't always need the relation**: call `$populate` in place.
+- **A whole list of documents needs the relation**: populate it in the query. `$populate` in a loop makes a query per document.
+
+## When not to use it [#when-not-to-use]
+
+If the data goes out and you won't change the document, read with [`.plain()`](../reference/query/reading.mdx#plain) and populate the relations in the query. Plain objects are cheaper, and you won't need document methods. If you read the document only for the relation, a normal query with [`.populate`](../reference/populate/populate.mdx#populate) is shorter. And if every document of a list needs the relations, don't populate them in a loop, run one query.
+
+## Troubleshooting [#troubleshooting]
+
+**The field is still an identifier after `$populate`.** You called `await post.$populate("author")` and keep working with the `post` variable, where `author` is still `Ref<User>`. The document did change, but the original variable's type didn't, hence `Property 'name' does not exist on type 'Ref<User>'`. Use the returned value, `const loaded = await post.$populate("author")`, or [`$assertPopulated`](./type-checks.mdx#assert-populated).
+
+**The path isn't found.** At runtime you get one of these errors.
+
+<Snippet id="populate/document-populate/troubleshooting" />
+
+The first means the path isn't in the model, and the compiler never saw it. The second means `$depopulate` got something other than a string. The method accepts only a field name or a path.
+
+## Full example [#full-example]
+
+<Snippet id="populate/document-populate/full-example" title="blog/post-page.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Make sure a reference is populated" href="./type-checks.mdx">
+  `isPopulated`, `$assertPopulated`, and type narrowing: accept a document in any state and require population.
+</Card>
+<Card title="Show related data" href="./basics.mdx">
+  Populate relations in the query itself, shorter and without extra queries.
+</Card>
+<Card title="Document API" href="../reference/documents/document-api.mdx">
+  The full description of `$populate`, `$depopulate`, `$populated`, and the other document methods.
+</Card>
+</Cards>

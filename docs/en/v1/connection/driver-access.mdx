@@ -1,0 +1,123 @@
+---
+title: Driver access
+description: "Get the driver's own MongoClient, learn when you need it, and see which Typemo protections stop working"
+icon: Unplug
+---
+
+Typemo doesn't wrap the whole MongoDB driver. Admin commands, GridFS, and other driver features stay outside the models. For them the client gives you the `MongoClient` itself: [`client.unsafeDriver`](../reference/connection/typemo-client.mdx#client.unsafe-driver).
+
+The word `unsafe` in the name is there for a reason. Everything you do through this object goes around Typemo's protections. Below we cover when you really need the driver, what you lose, and how to do without it.
+
+If you haven't connected to a database yet, start with [Connect to the database](./connect.mdx).
+
+## What you need [#prerequisites]
+
+A connected client from `db/client.ts` and the account model from `accounts/account.ts`. The model grows as the page goes on. It starts with two fields, and later gets a hidden PIN and soft delete.
+
+<Snippet id="connection/driver-access/prerequisites" title="db/client.ts" twoslash />
+
+## Quick start [#quick-start]
+
+[`client.unsafeDriver`](../reference/connection/typemo-client.mdx#client.unsafe-driver) returns the driver's `MongoClient`. Through it you can, for example, send the server a ping, which models don't have.
+
+<Snippet id="connection/driver-access/quick-start" twoslash />
+
+The method returns the same object every time, so there's no need to keep it in a variable. Next comes what you lose and how to tell that you really need the driver.
+
+## Send an admin command [#admin-command]
+
+Server commands like `ping`, `buildInfo`, or user management work at the database level and don't belong to any model. Models can't express them, so here the driver is the only way. And you lose almost nothing, since the command doesn't touch your models' data.
+
+<Snippet id="connection/driver-access/admin-command" title="db/health.ts" twoslash />
+
+The driver works through the same connection and the same pool as the models. You don't need a separate client for it.
+
+## Read a collection past the model [#read-raw-collection]
+
+Sometimes you need to see the data exactly as it sits in the database: while debugging, during a migration, or when looking into an odd case. The driver returns the document without the Typemo layer. The difference is easiest to show with an example. Say the model has a hidden field `pin` that Typemo never hands out.
+
+<Snippet id="connection/driver-access/read-raw-collection" title="accounts/account.ts" twoslash />
+
+Through the model, the hidden field doesn't get into the `.plain()` result, but the driver returns the whole document. Take the record `{ title: "Main", owner: "alice", pin: "1234" }`. The model's result has the keys `_id`, `title`, and `owner`, while the document from the driver also has `pin` with the value `"1234"`. The id differs too. In the driver `_id` is an `ObjectId` object, and in the model's results it's a string.
+
+<Snippet id="connection/driver-access/read-raw-collection-2" title="accounts/inspect.ts" twoslash />
+
+Nothing that protects data works here. Hidden fields, `sensitive` masks, and the audit log won't help, and any code that holds the `MongoClient` will see the secret. Don't pass it to places that only need your models' data.
+
+## What you lose [#what-you-lose]
+
+All of Typemo's checks live inside model operations, and the driver knows nothing about them. Let's see what happens to the collection in four cases.
+
+**Soft delete stops working.** Let's give the model the `softDelete` option and a `deletedAt` field. After a `deleteOne` through the model, the document is marked as deleted, and the model no longer sees it. The driver still sees the record.
+
+<Snippet id="connection/driver-access/what-you-lose" title="accounts/account.ts" twoslash />
+
+<Snippet id="connection/driver-access/what-you-lose-2" twoslash />
+
+**Data checks don't run.** The driver writes a document with a number in the `title` field, and by default the model reads it as is. Reads don't compare every document with the schema. Data written through the model was already checked on write, and a comparison would cost time on every read. A write through the model would have failed with an error, but nobody checks a write that goes around it.
+
+To keep such a document from reaching your code under the wrong type, turn on **strict reads**. That's the [`.validateReads()`](../reference/query/options.mdx#validate-reads) call on a query, or the client option [`validateReads`](../reference/connection/typemo-client.mdx#validate-reads).
+
+<Snippet id="connection/driver-access/what-you-lose-3" twoslash />
+
+The first read returned `title: 5`, even though the field's type is `string`. The second one compared the document with the schema and stopped at `title` with a [`CastError`](../reference/errors/data-errors.mdx#cast-error).
+
+If other programs or scripts write to the collection through the driver, set `validateReads: "development"` on the client. Then every read is checked in development and tests, and in production (`NODE_ENV=production`) the check costs nothing. See the [Strictness](../concepts/strictness.mdx#existing-data) concept for details.
+
+**Transactions don't pick up driver writes.** Model operations inside [`client.transaction`](../reference/connection/typemo-client.mdx#client.transaction) join it on their own, but a driver call doesn't. The transaction rolled back, and the `raw.insertOne` write from it stayed: `raw in tx survived rollback: 1`.
+
+To make a driver operation part of the transaction, pass it the session explicitly: `raw.insertOne(doc, { session: scope.session })`, where `scope` is the argument of the transaction function. With the session, the document isn't in the collection after the rollback, and the counter shows `0`.
+
+**Events and the audit log don't see these calls.** [`client.instrument`](../reference/connection/typemo-client.mdx#client.instrument) subscribers never learn about driver operations, and a model with an audit log leaves no trace.
+
+## Model or driver [#model-or-driver]
+
+Ask yourself **whether the operation touches your models' data**.
+
+- **Yes**: use the model, even if the code comes out longer. Policies, checks, masks, and events work only there.
+- **The operation is about the server, or about something models don't have**, like admin commands, GridFS, or collecting statistics: use the driver.
+- **Not sure**: look through the model reference. Much of what seems out of reach is already there, for example aggregation ([`Pipeline`](../reference/aggregation/pipeline.mdx)) and change streams ([`Model.watch`](../reference/change-streams/watch.mdx)).
+
+## When not to use it [#when-not-to-use]
+
+Read and write your models' data through the model. Soft delete, hidden fields, and the audit log work only there. If you want to express a query differently, look at the [filter operators](../reference/query/filter-operators.mdx) and [aggregation pipelines](../aggregation/first-aggregation.mdx). Most likely you won't have to go around the model.
+
+## Troubleshooting [#troubleshooting]
+
+**A hidden field leaked into a response.** A handler sends the client a document read through the driver, and the hidden field goes along with it. The document didn't come through the model, so nothing was there to hide the field. Read through the model and send the `.plain()` result. The result forms are covered in [Reading data](../queries/reading-data.mdx).
+
+**A deleted document "came back".** A report built on the driver counts deleted records, because soft delete doesn't work around the model. Read through the model, or add a condition on the `deletedAt` field to the driver query.
+
+**A write in a transaction didn't roll back.** The rollback didn't touch the driver write. Model operations get the transaction on their own, but the driver needs it passed explicitly (`{ session: scope.session }`). If you can, replace the driver write with a model operation.
+
+## Full example [#full-example]
+
+An environment check script. It sends a command through the driver, counts documents through the model, and closes the client.
+
+<Snippet id="connection/driver-access/full-example" title="scripts/check-environment.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose you reach the driver through `mongoose.connection.getClient()` or `Model.collection`, and those calls bypass schemas, validation, and hooks too. In Typemo the bypass is called `unsafeDriver`, and it's a method, not a property. You can see it at the call site and find it by searching the code. And Typemo models have no direct access to the driver's collection at all. `Model.collection` doesn't exist.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="TypemoClient" href="../reference/connection/typemo-client.mdx#client.unsafe-driver">
+  The exact description of `unsafeDriver` and the other client methods.
+</Card>
+<Card title="Reading data" href="../queries/reading-data.mdx">
+  Read through the model and choose the form to hand data out in, without bypassing protections.
+</Card>
+<Card title="Hidden and sensitive fields" href="../schemas/hidden-and-sensitive.mdx">
+  How hidden fields and masks work, the ones the driver doesn't apply.
+</Card>
+<Card title="Strictness" href="../concepts/strictness.mdx#existing-data">
+  Why reads don't compare documents with the schema by default, and how to turn on strict reads.
+</Card>
+<Card title="Transactions" href="../transactions/transactions.mdx">
+  How model writes join a transaction, and how to pass the session by hand.
+</Card>
+</Cards>

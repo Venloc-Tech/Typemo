@@ -1,0 +1,168 @@
+---
+title: Keyset pagination
+description: "Model.keysetPage, page options, the result, token signing, the Keyset helpers, and KeysetTokenError"
+icon: ArrowRightToLine
+---
+
+**Keyset pagination** returns a page as "the rows after the last one you saw", not as "skip N rows". A page costs the same at any depth. Records added or deleted between page requests are neither repeated nor lost. This page describes the [`Model.keysetPage`](#model.keyset-page) method, its options and result, the signing of the next-page token, and the [`KeysetTokenError`](#keyset-token-error) error.
+
+If you're new to this, read the guide [Keyset pagination](../../queries/keyset-pagination.mdx) first. It explains why [`.skip`](./reading.mdx#skip) works badly on long lists. This page is the reference.
+
+All the examples use one post model. Its fields are picked so that every special case shows up. The required fields work for sorting, and the optional and nullable ones don't.
+
+<Snippet id="reference/query/keyset/intro" title="models/post.ts" twoslash />
+
+The collection holds seven posts titled `A` to `G`. `A` has 50 views, `B` and `C` have 40 each, `D` has 30, `E` has 20, and `F` and `G` have 10 each. The posts were created in alphabetical order. The results in the `// →` comments are post titles in page order.
+
+---
+
+## Model.keysetPage [#model.keyset-page]
+
+`keysetPage` returns one page of posts and the token you use to request the next one. Use it for infinite scroll and long lists where the user pages forward: a news feed, an event log, an order list.
+
+The page order is **total**. Typemo adds `_id` as the last key to your sort keys, so rows with equal views also come in a defined order, and the page boundary is always unambiguous. The token remembers the key values of the last row on the page, and the next query starts right after them.
+
+<Snippet id="reference/query/keyset/model-keyset-page" twoslash />
+
+Between `B` and `C`, which have equal views, `_id` decides. `desc` in the sort applies to it too, so the newer post `C` comes before `B`.
+
+<Returns type="Promise<KeysetPage<Row>>">
+
+A page with three fields. `items` holds the rows in the requested order, documents or a `.lean()` result with `lean: true`. `nextCursor` is the token for the next page, and `null` on the last one. `hasMore` says whether there's a next page. An empty selection gives `{ items: [], nextCursor: null, hasMore: false }`, not an error.
+
+</Returns>
+
+<Params>
+<Param name="options.sort" type="KeysetSort<T>" required>
+
+The order, a non-empty list of `[field, direction]` pairs. The direction is `1`, `-1`, `"asc"`, `"desc"`, `"ascending"`, or `"descending"`. Keys can only be required, non-nullable top-level fields that have an order (numbers, strings, dates, identifiers), `_id`, and also `createdAt` and `updatedAt` of models with [`Timestamped`](../schemas/base-classes.mdx#timestamped). The core fills them on every insert, so they never have missing values. A key must be a position, and a missing value has no position. `_id` is added at the end on its own, with the direction of the last key. If you list it yourself, it stays where you put it.
+
+It's a list of pairs and not an object, because the key order of an object doesn't always match the order it was written in. JavaScript sorts numeric-like keys its own way.
+
+</Param>
+<Param name="options.limit" type="number" required>
+
+How many rows per page, a positive integer. Otherwise you get a `QueryError` with the text `keysetPage: limit must be a positive integer, got 0 (number)`. The value is printed with its type, so the string `"3"` gives `got "3" (string)`.
+
+</Param>
+<Param name="options.after" type="string | null">
+
+The `nextCursor` token of the previous page. For the first page you pass nothing or `null`. The token comes from the client, so Typemo doesn't trust it and checks it in full, see [The token and its check](#token-and-check).
+
+</Param>
+<Param name="options.filter" type="Filter<T>">
+
+Which documents to page through. The filter is checked the same way as in [`find`](./reading.mdx#model.find) and applies to every page. So a token doesn't open access to documents outside the filter.
+
+</Param>
+<Param name="options.lean" type="boolean" default="false">
+
+Return a [`.lean()`](./reading.mdx#lean) result instead of documents.
+
+</Param>
+<Param name="options.session" type="ClientSession | null">
+
+Run in this session. `null` runs outside the transaction, as with [`.session`](./options.mdx#session).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/keyset/model-keyset-page-2" />
+
+</FullType>
+
+### The last page [#last-page]
+
+When no more than `limit` rows are left, `hasMore` is `false` and `nextCursor` is `null`. Typemo works this out by requesting one more row than `limit`. So even a last page of exactly `limit` rows reports that there's no continuation, and you don't make an extra empty request.
+
+<Snippet id="reference/query/keyset/last-page" twoslash />
+
+### Records added between pages [#inserted-between-pages]
+
+The main difference from `.skip` is that pages don't shift. If a record is added at the start of the list between requests, the next page stays the same. The token remembers a position, not a number.
+
+<Snippet id="reference/query/keyset/inserted-between-pages" twoslash />
+
+With `.skip(2)`, the second page would start with `C`, which the reader has already seen. The new record would shift all the others.
+
+### Sorting by time [#sort-by-time]
+
+A "newest first" feed sorts by creation time, and a "recently changed" list by change time. For models with [`Timestamped`](../schemas/base-classes.mdx#timestamped), both fields work as keys, `createdAt` and `updatedAt`, even though the schema doesn't declare them as `required`. The core fills them on every insert, and there's no missing value. The examples below use a note model with a `title` field. The collection holds five notes `s1` to `s5`, created one after another.
+
+<Snippet id="reference/query/keyset/sort-by-time" twoslash />
+
+`updatedAt` changes on any write, so the order by it is live. A note changed a moment ago lands on the first page of a "changed first" list. If the list must be stable, page by `createdAt`, not `updatedAt`.
+
+<Snippet id="reference/query/keyset/sort-by-time-2" twoslash />
+
+The date is stored in the token without loss. Timestamps that match to the millisecond are told apart by `_id`, which Typemo adds as the last key.
+
+### A key you can't use [#forbidden-key]
+
+A field that may be missing from the document or may be `null` doesn't work as a key. A missing value has no place in the order. The compiler won't let you name such a field, and at run time Typemo throws a [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error).
+
+<Snippet id="reference/query/keyset/forbidden-key" twoslash />
+
+<Snippet id="reference/query/keyset/forbidden-key-2" />
+
+Boolean fields, regular expressions, and vectors are rejected the same way (`is not an orderable scalar field`). An unknown field and the same field twice give a [`QueryError`](../errors/query-errors.mdx#query-error) with the texts `keysetPage: sort "nope" is not a top-level field of Post` and `keysetPage: sort names "views" twice`. An empty key list gives `keysetPage: sort is a non-empty list of [field, direction] pairs`.
+
+### The token and its check [#token-and-check]
+
+The token is a string. You give it to the client, and the client sends it back. So the client can send anything: a truncated token, a forged one, or one built for another sort. Typemo checks the token before it builds a query from it. It looks at the length and alphabet, the structure, whether the keys and directions match your sort, and the type of each value. A token that fails the check turns into a [`KeysetTokenError`](#keyset-token-error) and never reaches a query.
+
+<Snippet id="reference/query/keyset/token-and-check" twoslash />
+
+A token issued for one sort can't be used with another. You get `keysetPage: invalid cursor — it was made for another sort`.
+
+### Token signing [#token-signature]
+
+By default the token is unsigned. It says where the page stopped, but it doesn't grant access. The query's filter still applies to every page, so a forged token can't get you other people's data, and at most shifts the position. If the client mustn't change the position, turn on signing. The client option `keysetSecret` (a key of at least 32 bytes) turns the token into `payload.signature`, where the signature is an HMAC-SHA256 of the payload.
+
+<Snippet id="reference/query/keyset/token-signature" twoslash />
+
+The signature is checked before the token is parsed, and the comparison takes the same time regardless of how many characters match. With signing on, three rules apply.
+
+- An unsigned token is rejected with the text `keysetPage: invalid cursor — it is not signed (the client signs its tokens: keysetSecret)`.
+- A modified token is rejected with the text `keysetPage: invalid cursor — the signature is not valid`.
+- A client without a key rejects a signed token with the text `keysetPage: invalid cursor — it is signed, but this client has no keysetSecret`.
+
+A list of keys lets you rotate a key without a break. The first key signs, and any key in the list verifies. The client option is described in the reference [`TypemoClient`](../connection/typemo-client.mdx#client-options).
+
+### When not to use it [#when-not-to-use]
+
+The method pages only forward and doesn't know the total number of pages. It can't jump to page 17 or show "page 3 of 40". For such a list, use [`.skip`](./reading.mdx#skip) with [`.limit`](./reading.mdx#limit), and get the total through [`countDocuments`](./reading.mdx#model.count-documents). The price is that deep pages are slower, and records added between requests shift the boundaries.
+
+---
+
+## Keyset [#keyset]
+
+`Keyset` is a class of static helpers that `keysetPage` builds a page from. You need them only if you build your own keyset selection, for example for an aggregation.
+
+<TypeTable
+  type={{
+    "Keyset.keys": { description: "Resolves the sort. Adds `_id` as the last key and checks every key against the schema. Takes the model's internal schema type.", type: "(schema, sort) => readonly [string, 1 | -1][]" },
+    "Keyset.plan": { description: "Plans a page: the keys, the size, and the checked \"after the token\" condition. Takes the model's internal schema type.", type: "(schema, options, secrets?) => KeysetPlan" },
+    "Keyset.decode": { description: "Parses and checks a client token, and returns the position as one value per key. Throws `KeysetTokenError`.", type: "(schema, keys, token, secrets?) => unknown[]" },
+    "Keyset.encode": { description: "Makes the token for the position after a row. If `secrets` is set, signs it with the first key from it.", type: "(keys, row, secrets?) => string" },
+    "Keyset.afterFilter": { description: "Builds the \"rows after this position\" condition, an `$or` chain over the keys.", type: "(keys, values) => Record<string, unknown>" },
+  }}
+/>
+
+`Keyset.afterFilter` and `Keyset.encode` work without a schema. `afterFilter` builds a lexicographic condition. In the example it's the rows after the position `views = 40`, `_id = …` in the order "views descending, then `_id` descending".
+
+<Snippet id="reference/query/keyset/keyset" twoslash />
+
+`Keyset.keys`, `Keyset.plan`, and `Keyset.decode` take the internal schema type, which the public API doesn't have, since `Model.schema` gives out only its trimmed representation. So you don't call them outside `keysetPage`.
+
+---
+
+## KeysetTokenError [#keyset-token-error]
+
+`KeysetTokenError` is the error that [`keysetPage`](#model.keyset-page) throws when the `after` token doesn't fit. The token may be truncated, modified, built for another sort, unsigned, or wrongly signed. It's an error in the client's data, not a server failure, and your code can answer it as invalid input. The class is also described in the error reference: [`KeysetTokenError`](../errors/query-errors.mdx#keyset-token-error). It extends [`QueryError`](../errors/query-errors.mdx#query-error), its `path` field equals `"after"`, and the reason sits in the text after `invalid cursor — `.
+
+<Snippet id="reference/query/keyset/keyset-token-error" twoslash />
+
+There are several reasons. `it cannot be read` means the token can't be parsed. `not a string` means the token is empty or isn't a string. `it was made for another sort` means the token comes from another sort. The three other texts about signing are in the section [Token signing](#token-signature).

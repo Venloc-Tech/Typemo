@@ -1,0 +1,187 @@
+---
+title: Model methods for documents
+description: "Model.new, Model.hydrate, Model.castObject, and Model.validate: create a document in memory, revive stored data, and cast or validate an object"
+icon: FilePlus
+---
+
+These are four model methods that work with documents **without a database query**. [`Model.new`](#model.new) creates a new document in memory. [`Model.hydrate`](#model.hydrate) turns data read elsewhere into a model document. [`Model.castObject`](#model.cast-object) casts a plain object to the schema types, and [`Model.validate`](#model.validate) casts it and validates it. None of them touches the database.
+
+If you're new here, read the [Document lifecycle](../../documents/lifecycle.mdx) and [Validate a document before saving](../../documents/validation.mdx) guides first. The methods of the document itself (`$save`, `$set`, and others) are described in the [Document API](./document-api.mdx). Reading and writing through the model ([`create`](../writes/writes.mdx#create), [`find`](../query/reading.mdx#model.find)) live in their own sections.
+
+All the examples use one model. It has a required field with an async validator, a number with bounds and a default value, and an enum field.
+
+<Snippet id="documents/validation/prerequisites" title="models/product.ts" twoslash />
+
+---
+
+## Model.new [#model.new]
+
+`Model.new` creates a new document in memory. Default values are filled in, `_id` is assigned, and every field is cast to its type. The document isn't in the database yet and gets there after [`$save`](./document-api.mdx#save). Use the method when you build a document piece by piece, want to validate it before writing, or save in a batch through [`Model.bulkSave`](../writes/writes.mdx#bulk-save).
+
+Casting happens right away. A value of the wrong type, or a field the model doesn't have, throws [`CastError`](../errors/data-errors.mdx#cast-error) on the `new` call itself. Required fields and rules like `min` and `enum` are checked only by [`$validate`](./document-api.mdx#validate) and [`$save`](./document-api.mdx#save). So you can create a document without a required field in memory, but you can't save it.
+
+<Snippet id="reference/documents/model-document-methods/model-new" twoslash />
+
+<Returns type="UnsavedDocument<T>">
+
+A new unsaved document. Its [`$isNew`](./document-api.mdx#is-new) is `true`, default values are filled in, `_id` is created, and the version field `__v` isn't set. The [`UnsavedDocument<T>`](../values/form-types.mdx#unsaved-document) type includes the `Hidden` fields you passed, while `createdAt`, `updatedAt`, and `__v` are optional because the first `$save` sets them. After `$save()` the document is typed as saved, and those fields are no longer `undefined`.
+
+</Returns>
+
+<Params>
+<Param name="doc" type="CreateInput<T>" required>
+
+The initial data. The type suggests the model fields. Required fields must be passed, and fields with a default value can be skipped. Values are cast to the field types, and strings are accepted for identifiers and int64.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/model-document-methods/model-new-2" />
+
+</FullType>
+
+### Errors [#model.new.errors]
+
+A value of the wrong type and an unknown key throw `CastError` right on the call. That only happens in untyped code. In typed code the compiler stops you earlier.
+
+<Snippet id="reference/documents/model-document-methods/model-new-errors" />
+
+A missing required field comes to light only on save.
+
+<Snippet id="reference/documents/model-document-methods/model-new-errors-2" />
+
+### When not to use it [#model.new.when-not-to-use]
+
+If you need to write the document right away, use [`create`](../writes/writes.mdx#create). It creates the document, validates it, inserts it in one operation, and returns the saved one. If you read data from the database, [`find`](../query/reading.mdx#model.find) returns documents, and you don't need `new` for that.
+
+---
+
+## Model.hydrate [#model.hydrate]
+
+`Model.hydrate` revives data that was read without Typemo. It takes an object **in stored form**, with database field names, and makes a document out of it, with typed collections and change tracking. The method helps when a document came from a cache, a message queue, the driver, or a test fixture, and you need the `$` methods.
+
+Such a document counts as **loaded**. Its [`$isNew`](./document-api.mdx#is-new) is `false`, it has no changes, and any edit goes into the update on [`$save`](./document-api.mdx#save). The data isn't cast or validated up front. The method trusts that what you pass is what lies in the database. `document.init` hooks run immediately, so they must be synchronous.
+
+<Snippet id="reference/documents/model-document-methods/model-hydrate" twoslash />
+
+<Returns type="HydratedDoc<T>">
+
+A loaded document. Arrays, Maps, and subdocuments in it are already typed collections, and for an array of values `constructor.name` is `StrictArray`. Keys the schema lacks don't make it into the document.
+
+</Returns>
+
+<Params>
+<Param name="raw" type="Readonly<Record<string, unknown>>" required>
+
+A stored document. It's a plain object with database field names (`dbName`, if set in `@Prop`), BSON values (`ObjectId`, `Date`, `bigint`), and nested data.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/model-document-methods/model-hydrate-2" />
+
+</FullType>
+
+### Errors [#model.hydrate.errors]
+
+If `raw` isn't a plain object, Typemo throws [`QueryError`](../errors/query-errors.mdx#query-error).
+
+<Snippet id="reference/documents/model-document-methods/model-hydrate-errors" />
+
+`hydrate` creates a document that isn't in the database without complaint. But on save the record won't be found.
+
+<Snippet id="reference/documents/model-document-methods/model-hydrate-errors-2" />
+
+### When not to use it [#model.hydrate.when-not-to-use]
+
+If the data lies in the database, read it with a query. [`find`](../query/reading.mdx#model.find) returns documents itself and applies projections and policies. If you have an object that isn't in the database yet, use [`Model.new`](#model.new). It casts and validates the values, while `hydrate` takes them on trust.
+
+---
+
+## Model.castObject [#model.cast-object]
+
+`Model.castObject` casts a plain object to the schema types and returns the cast fields. It's useful when you need to check and normalize data without a document and without a write. Examples are an external service response, an import row, or a value from settings.
+
+The method casts only what you passed. It doesn't fill in default values, check required fields, or run `min`, `enum`, and async validators. [`Model.validate`](#model.validate) does that. Casting in Typemo is strict. A number won't accept the string `"3"`, while a string turns into an `ObjectId`, because the conversion is unambiguous there.
+
+<Snippet id="reference/documents/model-document-methods/model-cast-object" twoslash />
+
+<Returns type="Partial<DataFields<T>>">
+
+The cast fields. Whatever wasn't in the input isn't in the result either.
+
+</Returns>
+
+<Params>
+<Param name="input" type="unknown" required>
+
+The object to cast.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/model-document-methods/model-cast-object-2" />
+
+</FullType>
+
+### Errors [#model.cast-object.errors]
+
+The first field that can't be cast, and any unknown key, throw [`CastError`](../errors/data-errors.mdx#cast-error).
+
+<Snippet id="reference/documents/model-document-methods/model-cast-object-errors" />
+
+The method stops at the first error. If you need all the problems at once, use [`Model.validate`](#model.validate).
+
+---
+
+## Model.validate [#model.validate]
+
+`Model.validate` casts an object and checks it against all the schema rules: required fields, bounds, enums, custom and async validators. It suits data from outside, such as a request body or an import file. You get either a correct value or the full list of problems. No document is created and nothing is written to the database.
+
+Unlike [`Model.castObject`](#model.cast-object), `validate` fills in default values, `_id` included, and returns a ready value. All problems are collected into one [`ValidationError`](../errors/data-errors.mdx#validation-error). The object you passed isn't changed.
+
+<Snippet id="reference/documents/model-document-methods/model-validate" twoslash />
+
+<Returns type="Promise<DataFields<T>>">
+
+The cast value with default values filled in. If even one problem is found, an error arrives instead.
+
+</Returns>
+
+<Params>
+<Param name="input" type="unknown" required>
+
+The object to validate.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/documents/model-document-methods/model-validate-2" />
+
+</FullType>
+
+### Errors [#model.validate.errors]
+
+All the problems found lie in one `ValidationError`. The method waits for async validators, and the items follow the schema field order, as declared in the class. Which validator finished first doesn't matter.
+
+<Snippet id="reference/documents/model-document-methods/model-validate-errors" />
+
+A value that can't be cast lands in the same list with the reason `cast`, and the `CastError` is in the item's `cause`. That's how `validate` differs from `castObject`, which throws `CastError` itself. Each field has at most one item. If a value can't be cast, its constraints (`min`, `enum`) aren't checked, because there is nothing to check.
+
+<Snippet id="documents/validation/inspect-cast-error-2" />
+
+If the input isn't an object at all, the error looks like this.
+
+<Snippet id="reference/documents/model-document-methods/model-validate-errors-2" />
+
+### When not to use it [#model.validate.when-not-to-use]
+
+To check a document that already exists, use [`$validate`](./document-api.mdx#validate). If you only need to cast values without the rules, [`Model.castObject`](#model.cast-object) is enough.

@@ -1,0 +1,142 @@
+---
+title: Importing large data sets
+description: "Load hundreds of thousands of rows in batches, update existing records, collect errors with row numbers, and keep what's already written"
+icon: Upload
+---
+
+Don't send many rows from a file or an external system one at a time, and don't send them all at once. One at a time means thousands of round trips to the server. All at once means a request that hits the size limit and keeps the whole file in memory. Cut the rows into **batches** and write each batch with one [`bulkWrite`](../reference/writes/writes.mdx#bulk-write) request.
+
+Let's build an import of a product catalog. Existing products get updated, new ones get created, the schema checks every row, and at the end you get a report with the numbers of the rows that didn't make it.
+
+A bulk write isn't atomic. While some operations go through, others may fail, and what's already written doesn't roll back. So this recipe relies not on "all or nothing" but on an exact report: what was written and which rows were rejected.
+
+## What you need [#prerequisites]
+
+- A client connected as in [Connect to the database](../connection/connect.mdx), and a `shop` database.
+- Rows your code has already parsed from the file, whether it's CSV or JSON. Each row is an object `{ sku, name, price }`.
+- The basics of bulk writes from [Bulk writes](../writes/bulk.mdx).
+
+## Quick start [#quick-start]
+
+One batch is one `bulkWrite` call with a list of operations "update by `sku`, and if there's no such product, create it" (`upsert`). The `ordered: false` mode tells the server to run every operation, even if one of them fails.
+
+<Snippet id="recipes/bulk-import/quick-start" twoslash />
+
+Below we add what a real import can't do without: batches, collecting errors, and a report.
+
+## Describe the model [#define-model]
+
+A product has three fields. The `sku` and the name are unique. We find a product by `sku` on update, and the unique name gives us a real server error in the example.
+
+<Snippet id="recipes/bulk-import/define-model" title="products/product.ts" twoslash />
+
+## Cut the rows into batches [#batch-rows]
+
+A batch is a fixed-size slice of the list. Pick the size so the request isn't huge and there aren't many round trips. For small documents, hundreds or thousands of rows work. Make the size a parameter, not a constant in the code, and tune it to your documents.
+
+<Snippet id="recipes/bulk-import/batch-rows" title="import/portions.ts" twoslash />
+
+Each batch comes with its `start`, the number of its first row in the whole file. With it, an error inside a batch names the row number in the file, not the number inside the batch.
+
+## The schema checks every operation [#schema-checks-every-operation]
+
+You don't need to check rows separately before writing. The batch checks each operation against the schema the same way a standalone method does. For an `updateOne` with `upsert`, the values from `$set` are checked, so a price below `min` is rejected. The required fields of the inserted document are checked too. If neither the filter, nor `$set`, nor `$setOnInsert` gives a `price`, there's no insert.
+
+A value of the wrong type is cast or rejected with a [`CastError`](../reference/errors/data-errors.mdx#cast-error). A row with an error doesn't get in the way of the others. In `ordered: false` mode it goes into `writeErrors` as a separate entry, and the valid operations are written.
+
+Say a batch has four operations with the prices `1`, `-1`, `"abc"`, and `4`. The first and the last are written, and `writeErrors` describes the other two like this.
+
+<Snippet id="recipes/bulk-import/schema-checks-every-operation" />
+
+The `BulkWriteError` itself names the number of failures and the first of them: `Product.bulkWrite: 2 write(s) failed (first at index 1: Validation failed: "price": must be at least 0 [min])`. For an insert without the required price the text is `Validation failed: "price": upsert would create a document without the required field "price"; give it in the filter (an equality), in $set or in $setOnInsert [required]`.
+
+In ordered mode, which is `ordered: true` and the default, the same value stops the batch before it's sent. You get the `ValidationError` or `CastError` itself, not a `BulkWriteError`, and nothing is written. A bulk import needs unordered mode.
+
+## Write a batch and collect the failures [#write-batch-collect-failures]
+
+A batch turns into a list of operations. All failures arrive as one [`BulkWriteError`](../reference/errors/server-errors.mdx#bulk-write-error). In its `writeErrors`, each failure has the operation's index, and `result` holds what managed to get written. Schema check failures and server failures are in the same list, because for an import they mean the same thing: the row wasn't written. In unordered mode the successful operations stay written, so the counters are taken from the error too.
+
+<Snippet id="recipes/bulk-import/write-batch-collect-failures" title="import/write-portion.ts" twoslash />
+
+Errors of other classes, like network or server errors, are rethrown. Such an import has to stop, not go into the report.
+
+If the unique name is already taken by another product, you get a `DuplicateKeyError` with the code 11000. Its `message` is short, and in a bulk write it has no value: `duplicate key on name_1 (code 11000 DuplicateKey)`. The server's full text is in `serverMessage`. In a report that goes outside, put `error.name`, as here, or the short `message`, but not `serverMessage`.
+
+## Put it all into one import [#single-import]
+
+`importProducts` goes through the batches, writes each one, and adds up the counters. The row number in the report is the number in the file, counting from zero, that is, the start of the batch plus the operation's index in it.
+
+<Snippet id="recipes/bulk-import/single-import" title="import/import-products.ts" twoslash />
+
+A call on six rows with a batch of two rows shows everything at once.
+
+- The product `S0` is already in the database under the name `Existing`, and row 1 tries to take the same name.
+- The schema rejects row 3 with a negative price.
+- A repeated `S1` in row 4 updates the product created by row 0, so `updated` is 1.
+
+<Snippet id="recipes/bulk-import/single-import-2" twoslash />
+
+## Model hooks work in a batch too [#model-hooks-in-bulk]
+
+If the model has [operation hooks](../hooks/operation-hooks.mdx), each operation of the batch fires the hooks of its standalone counterpart. An `updateOne` from the batch fires the `@Pre` and `@Post` hooks of `query.updateOne`, and an `insertOne` fires document hooks, like [`create`](../reference/writes/writes.mdx#create). A hook learns that it's inside a batch from `this.bulkIndex`. That's the operation's position in the list, and in a normal call it's `undefined`. The details and the hook order are in [Bulk writes](../writes/bulk.mdx#bulk-write-hooks).
+
+For an import, what matters is what happens if the `@Pre` hook of one operation throws. The batch mode decides, the same way as with a schema check error. In an unordered batch, that operation isn't sent and goes into `writeErrors` under its index, while the rest are written. An ordered batch stops before sending, writes nothing, and you get the hook's own exception. Say the hook rejects product codes starting with `X-`.
+
+<Snippet id="recipes/bulk-import/model-hooks-in-bulk" title="products/product.ts" twoslash />
+
+A batch of three operations (`A-1`, `X-1`, `D-1`) in unordered mode wrote `A-1` and `D-1` and threw a `BulkWriteError`. `writeErrors` has one element with the index `1` and no server code, and the hook's exception is in the `cause` of its `error`.
+
+<Snippet id="recipes/bulk-import/model-hooks-in-bulk-2" />
+
+In ordered mode, the same batch wrote nothing and threw the hook's exception as is, without a `BulkWriteError`.
+
+<Snippet id="recipes/bulk-import/model-hooks-in-bulk-3" />
+
+If a row has to be rejected before touching the database and reported under its real number in the file, check it before building the operations. Filter such rows out in `importProducts`. A hook is for what must work the same way on every write, like a log or extending an update through [`modify`](../reference/hooks/operation-context.mdx#modify).
+
+## How to choose [#how-to-choose]
+
+**`bulkWrite` with `upsert`, or `insertMany`.** Ask yourself whether rows of the file can refer to products that already exist. If they can, as when syncing a catalog, use `bulkWrite` with `upsert`, as here. If the file always has only new records, [`insertMany`](../reference/writes/writes.mdx#insert-many) is simpler.
+
+**Ordered or not.** `ordered: false` fits when the rows are independent and one bad row mustn't stop the others. Ordered mode is for when the next operation depends on the previous one. But then, after the first error, the rest of the batch isn't written.
+
+## When not to use it [#when-not-to-use]
+
+If there are only dozens of records, [`insertMany`](../reference/writes/writes.mdx#insert-many) or a loop is enough. If the load must go through completely or not at all, a bulk write doesn't fit. Use a [transaction](../transactions/transactions.mdx), and keep its size and time limits in mind.
+
+A batch also won't do when a hook after the write needs to know how many documents each operation matched and changed. The result of a `@Post` operation hook inside a batch has no counters: `matchedCount` and the rest are `null`. `create` in a loop does give them.
+
+## Troubleshooting [#troubleshooting]
+
+**The whole batch stopped, and no `BulkWriteError` came.** The exception came from ordered mode. A schema check error or an exception from the `@Pre` hook of one operation stopped the batch before sending, and nothing was written. For independent rows, set `ordered: false`. Then such operations go into `writeErrors`, and the rest are written.
+
+**The row number in the report doesn't match the file.** The index in `writeErrors` refers to the batch's operations, not to the file. Without `start` you show the user the number inside the batch. If some rows are dropped before the write, keep a mapping of indexes: an array of file row numbers by position in the batch.
+
+**`$inc` on a bounded field isn't accepted.** If a batch has `$inc` instead of `$set` on a field with `min` or `max`, `bulkWrite` refuses with the text `Validation failed: "balance": $inc on a field with min/max cannot be guarded in bulkWrite (no per-operation match count tells a failed guard from a missing document); use updateOne/updateMany [min]`. Do such updates through [`updateOne`](../reference/writes/writes.mdx#update-one).
+
+## Full example [#full-example]
+
+<Snippet id="recipes/bulk-import/full-example" title="import/import-products.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, `bulkWrite` by default checked only `insertOne` and `replaceOne` against the schema. Values in `updateOne` and `updateMany` went to the database without validators, and the hooks of individual operations weren't called. Only the hooks of `bulkWrite` itself ran. Here each operation goes through the schema check and fires the hooks of its standalone counterpart, and a `BulkWriteError` holds the indexes, codes, and parsed errors right away.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Bulk writes" href="../writes/bulk.mdx">
+  Every kind of bulk operation, ordering modes, and operation hooks.
+</Card>
+<Card title="Server errors" href="../reference/errors/server-errors.mdx#bulk-write-error">
+  The fields of `BulkWriteError` and the classes of server failures.
+</Card>
+<Card title="Large results" href="../queries/large-results.mdx">
+  The reverse task: reading large volumes without running out of memory.
+</Card>
+<Card title="Background jobs on a change stream" href="./change-stream-jobs.mdx">
+  How to react to the import's writes without polling the database.
+</Card>
+</Cards>

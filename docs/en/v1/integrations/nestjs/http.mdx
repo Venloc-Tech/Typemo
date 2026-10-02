@@ -1,0 +1,140 @@
+---
+title: Errors, ids, and the request body
+description: "TypemoExceptionFilter, ParseIdPipe, and ValidateBodyPipe in NestJS: HTTP responses to database errors, ids from the URL, and body checks by the entity schema"
+icon: Globe
+---
+
+At the HTTP boundary an app needs three things. Turn a database error into a clear response, parse an id from the URL, and check the request body before writing it. For that the package has the `TypemoExceptionFilter` filter and the `ParseIdPipe` and `ValidateBodyPipe` pipes. All three work in the Express HTTP context.
+
+## What you need [#prerequisites]
+
+The app from the [Connect Typemo to NestJS](./setup.mdx) guide. The user model grows as the page goes on, and it starts with two fields.
+
+<Snippet id="integrations/nestjs/http/prerequisites" title="users/user.ts" twoslash />
+
+## Quick start [#quick-start]
+
+The filter is attached once, and the pipes go on the handler's parameters.
+
+<Snippet id="integrations/nestjs/http/quick-start" title="users/users.controller.ts" twoslash />
+
+Below we'll go through each part task by task.
+
+## Respond to a database error [#handle-database-error]
+
+A write broke a unique index, a document wasn't found, or the database didn't answer in time. The client needs a clear status, not a 500 with the server's text. [`TypemoExceptionFilter`](../../reference/integrations/nestjs.mdx#typemo-exception-filter) determines the kind of error with [`ErrorClassifier.classify`](../../reference/errors/hierarchy.mdx#classify) and responds in the same format as Nest's own errors: `statusCode`, `error`, `message`, and fields that depend on the kind.
+
+<Snippet id="integrations/nestjs/http/handle-database-error" title="main.ts" twoslash />
+
+A second user with the same email gets a 409 with the **names** of the key fields.
+
+<Snippet id="integrations/nestjs/http/handle-database-error-2" />
+
+Values don't go into the response. A key field may be hidden or `sensitive`, and there's no reason to hand someone else's email back to whoever is trying to guess it.
+
+The other kinds of errors respond like this.
+
+- `orFail()` that found nothing: 404 `{ "message": "Not found" }`.
+- An expired `timeoutMS`: 504.
+- An unreachable database: 503.
+- Anything unrecognized: 500 without the server's text, because it can contain node hosts and fragments of data.
+
+The full table of kinds and statuses is in the filter reference.
+
+The filter classifies errors from the "raw" driver, obtained through `client.unsafeDriver()`, the same way. A duplicate `_id` inserted directly by the driver also gives a 409. The filter writes 500 responses to the Nest log together with the error text, so you can find the cause.
+
+## Your own response format [#custom-response]
+
+If your API has its own error format, extend the filter and override [`toResponse`](../../reference/integrations/nestjs.mdx#to-response) for the kinds you need.
+
+<Snippet id="integrations/nestjs/http/custom-response" title="errors/api-exception.filter.ts" twoslash />
+
+The filter catches only Typemo and driver errors. `NotFoundException` and other Nest errors, like your own, are handled as usual.
+
+## Parse an id from the URL [#parse-id]
+
+The `GET /users/:id` route can receive anything in the URL. [`ParseIdPipe.for(User)`](../../reference/integrations/nestjs.mdx#parse-id-pipe) turns the string into the model's `_id` or responds with 400.
+
+<Snippet id="integrations/nestjs/http/parse-id" />
+
+The pipe knows the type of the model's `_id`: `ObjectId`, `UUID`, a string ([`EntityWithId`](../../reference/schemas/base-classes.mdx#entity-with-id)), or a number. It parses a numeric `_id` strictly. `"42"` gives `42`, and `"42abc"` gives 400 `Invalid id: expected number (expected a number)`, not 42 as `parseInt` would return. The parameter type is [`IdOf<User>`](../../reference/values/form-types.mdx#helper-types), the same one `findById` accepts.
+
+## Check the request body against the schema [#validate-body]
+
+`POST /users` accepts JSON, and you need to check it before writing. [`ValidateBodyPipe.for(User)`](../../reference/integrations/nestjs.mdx#validate-body-pipe) checks the body against the entity itself: types, `required`, lengths, `min` and `max`, `enum`, validators. So you don't need a separate DTO class that you'd have to keep in sync with the entity. Let's add an age and a role to the model.
+
+<Snippet id="integrations/nestjs/http/validate-body" title="users/user.ts" twoslash />
+
+The body `{ "email": "bob@x.io", "name": "B", "age": 200, "role": "root" }` gets one 422 response with all the errors at once.
+
+<Snippet id="integrations/nestjs/http/validate-body-2" />
+
+The pipe returns the fields that were sent, already cast to their types, but without default values. `create` adds those. The parameter type is [`CreateInput<User>`](../../reference/writes/input-types.mdx#create-input).
+
+## Unknown and forbidden fields [#unknown-and-forbidden-fields]
+
+The client sent a field the entity doesn't have, or a field it isn't allowed to set. By default an unknown field gives 422 `{ "nickname": "not a field of User" }`. A typo like `emial` doesn't vanish silently, and the client learns right away that the field wasn't accepted. If your API should tolerate extra fields, turn on `dropUnknown: true`, and they're dropped.
+
+Exclude a field the client isn't allowed to set, such as the role or the owner, with the `omit` option.
+
+<Snippet id="integrations/nestjs/http/unknown-and-forbidden-fields" title="users/users.controller.ts" twoslash />
+
+`role` in the body gives 422 `{ "role": "not allowed here" }`. `pick` does the opposite and accepts only the listed fields. The compiler checks the names in `pick` and `omit`.
+
+A string instead of a number (`"age": "30"`) is a 422 too, because the core doesn't cast strings to numbers. In JSON a number arrives as a number, and `"30"` in a numeric field points to a client bug.
+
+## A partial update [#partial-update]
+
+`PATCH /users/:id` sends one field. `partial: true` checks only the fields that were sent, and a required field may be missing.
+
+<Snippet id="integrations/nestjs/http/partial-update" title="users/users.controller.ts" twoslash />
+
+The type of the update body is [`UpdateInput<User>`](../../reference/writes/input-types.mdx#update-input). It has no `_id` and no immutable fields, and `$set` accepts it. The pipe rejects such fields at runtime too: `{ "_id": …, "createdAt": … }` in a `PATCH` body gives 422 `"cannot be changed"`. And `{ "age": -1 }` gives 422 `{ "age": "must be at least 0" }`.
+
+## How to choose between ValidateBodyPipe and your own DTO [#how-to-choose]
+
+Ask yourself whether the request body matches the document.
+
+- **The body is the entity's fields**, on create or update. Use `ValidateBodyPipe`. It checks the body with the same schema as the write, so the rules don't drift apart.
+- **The body has a different shape**, for example a "move 100 from account A to account B" command or a nested search query. That's not a document, so describe a DTO with your own validator. A Typemo model implements Standard Schema, so validators that understand it can check documents too.
+
+## When not to use it [#when-not-to-use]
+
+Even if a handler takes an id and passes it straight to `findById`, `ParseIdPipe` is useful. Without it, a bad id would become a cast error inside the query (a 400 from the filter with `path: "_id"`) instead of a clear response about the parameter. The filter, on the other hand, isn't needed in an app with its own common error handler. Use `ErrorClassifier.classify` in it directly.
+
+## Troubleshooting [#troubleshooting]
+
+**A 500 response instead of 409 or 422.** The filter isn't attached, and the error reached Nest's default handler. Add `app.useGlobalFilters(new TypemoExceptionFilter())` or `{ provide: APP_FILTER, useClass: TypemoExceptionFilter }`.
+
+**An unknown field in the body gives 400 without the pipe.** Without `ValidateBodyPipe` the body goes straight into `create`, and the core rejects the unknown field with a cast error. The filter responds 400 `{ "message": "Invalid value", "path": "nickname" }`. With the pipe you get a 422 with all the errors at once.
+
+**PATCH rejects createdAt.** The core maintains timestamps, and the client doesn't change them, so `partial` responds `"cannot be changed"`. Remove the field from the body or turn on `dropUnknown`.
+
+## Full example [#full-example]
+
+A users controller: creating without a role, reading by id, and a partial update. The filter is attached in `main.ts`.
+
+<Snippet id="integrations/nestjs/http/full-example" title="users/users.controller.ts" twoslash />
+
+<Callout type="migration" title="Coming from @nestjs/mongoose">
+
+`ParseObjectIdPipe` → `ParseIdPipe.for(Entity)`, and it understands any `_id` type, not only `ObjectId`. `@nestjs/mongoose` has no error filter, and a unique index error reaches the client there as a 500. `ValidateBodyPipe` replaces a DTO with `class-validator` for the entity's fields.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="The filter and pipes in the reference" href="../../reference/integrations/nestjs.mdx#typemo-exception-filter">
+  Every kind of error with its status, the pipe options, and the error texts.
+</Card>
+<Card title="Error handling" href="../../errors/handling.mdx">
+  Typemo's error classes and their classification, without Nest.
+</Card>
+<Card title="A REST API with NestJS" href="../../recipes/nestjs-rest-api.mdx">
+  Everything together: the module, a service, a controller, errors, and tests.
+</Card>
+<Card title="Testing a Nest app" href="./testing.mdx">
+  How to check error responses in an e2e test.
+</Card>
+</Cards>

@@ -1,0 +1,144 @@
+---
+title: Money without losing a cent
+description: "Amounts in cents as int64, transfers between accounts in a transaction, and exchange rates in Decimal128, without losing a single cent"
+icon: Coins
+---
+
+You can't store money as an ordinary floating-point number. In JavaScript `0.1 + 0.2` gives `0.30000000000000004`, and after thousands of operations those crumbs add up to a mismatch in a report. Typemo has two exact ways.
+
+- **A whole number of cents** in a 64-bit `int64` field. In the schema it's `BigInt`.
+- The decimal number `Decimal128` for values with a fractional part, like an exchange rate.
+
+Let's build a bank account on them with deposits, transfers between accounts, and currency conversion.
+
+If BSON types are new to you, start with [MongoDB data types](../concepts/bson-types.mdx). It explains why `int64` and `Decimal128` don't fit into JSON and how Typemo returns them.
+
+## What you need [#prerequisites]
+
+A client connected as in [Connect to the database](../connection/connect.mdx), and a `bank` database. A transfer needs a transaction, and that means a replica set (several MongoDB servers holding copies of the same data, though one server is enough for transactions).
+
+## Quick start [#quick-start]
+
+An amount is a whole number of cents in a `BigInt` field, and you add to it with the `$inc` operator. Converting between whole currency units and cents is up to the app. Here's how the amount looks at different stages.
+
+<Snippet id="recipes/money/quick-start" twoslash />
+
+Below we go through each step: how to parse an amount from a string, how not to go negative, how to make a transfer, and when you need `Decimal128` instead of `int64`.
+
+## Store the amount as whole cents [#amount-in-cents]
+
+The `balance` field has the type `BigInt`. In MongoDB that's `int64`, an integer up to 9,223,372,036,854,775,807. An ordinary JavaScript number stores integers exactly only up to 2⁵³, about nine quadrillion. That would be enough for cents, but `int64` gives you headroom and doesn't let you write a fraction. `1.5` instead of a cent becomes an error, not a silent rounding. The `min: 0n` option forbids a negative balance.
+
+<Snippet id="recipes/money/amount-in-cents" title="accounts/account.ts" twoslash />
+
+A number of cents mustn't be a `number`. The field takes a `bigint` or a decimal string, and a fraction is cut off at the type level already. If a `number` does reach the write, say from `any` or someone else's JSON, the rest depends on the value. A safe integer is cast to `int64`, while a fraction or an integer above `Number.MAX_SAFE_INTEGER` gives a [`CastError`](../reference/errors/data-errors.mdx#cast-error) with a hint on how to write the number correctly. The error texts are under "Troubleshooting".
+
+What comes back in the different kinds of result? A document and `.lean()` return a `bigint`, while `.plain()` and JSON return a decimal string (`"10000"`). A JavaScript number loses precision above 2⁵³, and `JSON.stringify` can't handle `bigint`. The table of forms is on [Value forms](../reference/values/value-forms.mdx#numbers).
+
+## Parse and show an amount [#parse-and-show-amount]
+
+The client sends an amount as the string `"12.34"`, and you return it as a string too. Converting between the string and cents is your app's code, and Typemo doesn't have it. Put it in one class and parse strictly. Three digits after the point are the client's mistake, not a reason to round.
+
+<Snippet id="recipes/money/parse-and-show-amount" title="money/money.ts" twoslash />
+
+`Money.parse("12.3")` gives `1230n`, `Money.parse("7")` gives `700n`, and `Money.format(5n)` gives `"0.05"`. The strings `"12.345"`, `"-1"`, `"abc"`, and `"1e3"` throw `__BadRequest__` with the text `"12.345" is not an amount like 12.34`. The client never sends negative amounts. The operation itself sets the sign: a deposit or a withdrawal.
+
+## Deposit and withdraw [#deposit-and-withdraw]
+
+Add and subtract with the [`$inc`](../reference/writes/update-operators.mdx#inc) operator. Don't read the balance to compute in code and write it back. Two simultaneous requests would read the same number, and one change would be lost. `$inc` runs entirely in the database, so there's no race. It takes the value as a `bigint` or its decimal string.
+
+<Snippet id="recipes/money/deposit-and-withdraw" title="accounts/accounts.service.ts" twoslash />
+
+The `min: 0n` bound protects from an overdraft right in the write. If a withdrawal is larger than the balance, [`updateOne`](../reference/writes/writes.mdx#update-one) rejects it, and the document doesn't change. For an account with 112.34 on the balance, a withdrawal of 1000.00 gives a [`ValidationError`](../reference/errors/data-errors.mdx#validation-error) with the text `Validation failed: "balance": $inc -100000 on 11234 gives -88766, below the minimum 0; nothing was written [min]`.
+
+And `.orFail()` turns "no such account" into a [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#document-not-found-error). Without it, `updateOne` would return `matchedCount: 0`, and a deposit to an account that doesn't exist would look successful.
+
+## Transfer money between accounts [#transfer-money]
+
+A transfer is two writes, and they must succeed or fail together. That takes a transaction. [`client.transaction`](../reference/transactions/transactions.mdx#transaction) runs a function in a shared session, and any error rolls back both writes. You don't pass the session to every call, because model operations find it on their own. There's more in [Transactions](../transactions/transactions.mdx).
+
+<Snippet id="recipes/money/transfer-money" title="accounts/accounts.service.ts" twoslash />
+
+The account `Main` holds 100.00, and `Savings` is empty. After `transfer("Main", "Savings", "30.50")` the balances became `"6950"` and `"3050"` cents. Two failed attempts change nothing.
+
+<Snippet id="recipes/money/transfer-money-2" twoslash />
+
+In the second attempt, the debit from `Main` inside the transaction had already gone through, but the credit to an account that doesn't exist threw an error, and the debit rolled back. After both attempts `Main` still holds `"6950"`.
+
+The transaction function may run again on transient server failures. So don't send emails or call external payment systems inside it. There's more in [Retries](../reference/transactions/transactions.mdx#retries).
+
+## Send the amount to the client [#send-amount]
+
+The client needs the string `"69.50"`, not `"6950"`. Read through [`.plain()`](../reference/query/reading.mdx#plain). There `balance` is a decimal string of cents that `Money.format` turns into a readable amount, and `JSON.stringify` passes without errors.
+
+<Snippet id="recipes/money/send-amount" title="accounts/accounts.service.ts" twoslash />
+
+The type of `account.balance` here isn't `string` but `` `${bigint}` ``. The compiler knows it's a string holding an integer, so `BigInt(account.balance)` is safe. A value above 2⁵³ goes through without loss: an account with `9007199254740993n` cents comes back as `"9007199254740993"`.
+
+## Store a rate in Decimal128 [#rate-in-decimal128]
+
+An exchange rate has a fractional part, and you can't round it to a cent. For example, `92.5031` rubles per dollar. `Decimal128` suits such values. It's a decimal number with up to 34 significant digits and no binary errors.
+
+<Snippet id="recipes/money/rate-in-decimal128" title="rates/rate.ts" twoslash />
+
+In [`create`](../reference/writes/writes.mdx#create) you can pass the value as a string: `Rates.create({ pair: "USD/RUB", value: "92.5031" })`. A read document holds a real `Decimal128`, and `rateDoc.value.toString()` gives `"92.5031"`, while `.plain()` returns the string `"92.5031"`. Typemo won't accept a string with stray characters and answers `Cast to Decimal128 failed at path "value" for "abc" (string): not a decimal number string [format]`.
+
+`Decimal128` has no arithmetic in JavaScript, so convert in integers. Split the rate string into an integer and a number of decimal places, and multiply `bigint`s.
+
+<Snippet id="recipes/money/rate-in-decimal128-2" title="money/convert.ts" twoslash />
+
+The formula divides with rounding to the nearest integer. Each conversion gives a whole number of cents, not a fraction you'd have to put somewhere.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether the value has a fractional part you can't lose**.
+
+- **No, it's an integer in the smallest unit**, like account amounts, prices in cents, and stock levels: use `int64` in cents. The database computes it faster, it works with `$inc`, and it won't let you write a fraction.
+- **Yes**, as with rates, percentages, per-unit tariffs with four decimal places, and anything multiplied by amounts: use `Decimal128`.
+
+A floating-point number (`Number`) never works for money. It can't store even `0.1` exactly.
+
+## When not to use it [#when-not-to-use]
+
+If you store points, likes, and counters rather than money, an ordinary `Number` with `$inc` is simpler. If there are many currencies, each with its own number of decimal places (like the yen with none, or the dinar with three), store the currency code and the number of places in a field next to it. Keep the amounts in `int64` in each currency's smallest unit.
+
+## Troubleshooting [#troubleshooting]
+
+**The amount is stored as a fraction.** You keep `balance: number` and write `12.34`. After a couple of operations, `0.1 + 0.2` drifts from what you expect. Change the field to `BigInt` in cents. If you try to write a fraction into a `BigInt` field, Typemo stops the write.
+
+<Snippet id="recipes/money/troubleshooting" />
+
+In `$inc` the text is the same, except the path is `$inc.balance`. An integer above `Number.MAX_SAFE_INTEGER` arrives already imprecise, and Typemo doesn't guess which number you meant. The error is `Cast to Long failed at path "balance" for 9007199254740992 (number): beyond Number.MAX_SAFE_INTEGER the number is already imprecise; pass a bigint (5n) or a decimal integer string ("5") [precision]`. Write `9007199254740993n` or `"9007199254740993"`.
+
+**The balance turned into `NaN` on the client.** The client got `"9007199254740993"` and called `Number(balance)`, and the value lost its last digit. Convert the string to `BigInt` with `BigInt(account.balance)`, not to `number`.
+
+**A withdrawal went negative.** Without `min: 0n` in the schema, an account can go below zero. The bound protects even from two simultaneous withdrawals, because each `$inc` is checked against the current balance.
+
+Be careful with `bulkWrite`. It doesn't accept `$inc` on a field with a bound and answers `ValidationError: Validation failed: "balance": $inc on a field with min/max cannot be guarded in bulkWrite (no per-operation match count tells a failed guard from a missing document); use updateOne/updateMany [min]`. There's more in [`bulkWrite`](../reference/writes/writes.mdx#bulk-write). Use `updateOne` in a loop or in a transaction.
+
+## Full example [#full-example]
+
+<Snippet id="recipes/money/full-example" title="bank/money.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, money was often stored in `Number` or `Decimal128` with a cast through `mongoose.Types.Decimal128.fromString`, and `int64` needed a plugin. Here `BigInt` is an ordinary field type, and every write method accepts a string, so you don't call `Decimal128.fromString`.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Value forms" href="../reference/values/value-forms.mdx">
+  How `int64` and `Decimal128` look in a document, in `.lean()`, in `.plain()`, and in JSON.
+</Card>
+<Card title="Transactions" href="../transactions/transactions.mdx">
+  Retries, rollback, and transaction options for transfers.
+</Card>
+<Card title="Change history" href="./change-history.mdx">
+  How to record who changed the balance and when.
+</Card>
+<Card title="Update documents" href="../writes/update.mdx">
+  The `$inc` and `$set` operators and their checks.
+</Card>
+</Cards>

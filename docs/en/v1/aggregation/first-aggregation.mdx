@@ -1,0 +1,140 @@
+---
+title: Your first aggregation
+description: "Build a pipeline from stages, get rows with exact types, and send them to the client, read them with a cursor, or view the server's plan"
+icon: Workflow
+---
+
+An **aggregation** is a query that doesn't only select documents but reshapes them. It filters, groups, sums, and pulls in data from a neighboring collection. You describe it with a **pipeline** ([see the reference](../reference/aggregation/pipeline.mdx#pipeline.from)), a list of **stages** where each takes the documents from the previous one and passes its result to the next. An aggregation differs from [`find`](../reference/query/reading.mdx#model.find) in its output: not the collection's documents but **rows**. These are new objects, and the stages decide their shape.
+
+Typemo builds a pipeline with methods, not raw objects. Each stage is a method that returns a new builder, and with it a new **row type**. After `group` the row is no longer an `Order` but whatever you described in the grouping. So the compiler catches a typo in a field name or a sum over a string before anything runs, and the result of `await` is typed without a single manual annotation.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and a shop's order model. The `orders` collection holds five orders.
+
+- Three paid ones: two from `alice` and one from `bob`.
+- One canceled order from `bob`.
+- One new order from `carol`.
+
+<Snippet id="aggregation/facets/prerequisites" title="orders/order.ts" twoslash />
+
+## Quick start [#quick-start]
+
+To find out how much each customer spent, pass a function to [`Orders.aggregate`](../reference/aggregation/pipeline.mdx#model.aggregate). It gets an empty builder and adds stages: the [`match`](../reference/aggregation/stages.mdx#match) filter, the [`group`](../reference/aggregation/stages.mdx#group) grouping, and the [`sort`](../reference/aggregation/stages.mdx#sort) sorting.
+
+<Snippet id="aggregation/first-aggregation/quick-start" twoslash />
+
+If the rows go to a client as JSON, add [`.plain()`](../reference/aggregation/pipeline.mdx#plain), and the identifiers become strings. If there are many rows, read them one at a time with [`.cursor()`](../reference/aggregation/pipeline.mdx#cursor). And if the pipeline is built in one place and run in another, build a plan with [`Pipeline.from(...).plan()`](../reference/aggregation/pipeline.mdx#pipeline.from) and pass it to `aggregate`. We'll cover each option below.
+
+## Build a pipeline from stages [#build-pipeline]
+
+Say you need a report of how many orders, and for how much, each paying customer placed. The pipeline has three stages, and the row type changes after each one. To see it, let's build the pipeline in parts. [`Pipeline.from`](../reference/aggregation/pipeline.mdx#pipeline.from) creates an empty builder over an entity, and the `RowOf` type extracts the row type from a builder.
+
+<Snippet id="aggregation/first-aggregation/build-pipeline" twoslash />
+
+`match` only selects documents, and the row's shape doesn't change. It's still an order. `group` rebuilds the rows. Only `_id` (the customer), `orders`, and `spent` remain, while `placedAt` and `status` are gone, and the compiler won't let later stages reach them.
+
+Inside the `group` callback, the parameter `f` describes the fields of the current row. Your editor suggests `f.customer`, and `f.customr` won't compile. Calculation functions such as `fn.sum` and `fn.count` live in the [`fn`](expressions.mdx) object, and how they work is covered in [Calculations in aggregation](expressions.mdx).
+
+Each builder method returns a **new** builder, and the old one stays as it was. So you can take `paid` above twice and add different stages, and the shared part of the pipeline isn't copied.
+
+## Run it and get rows [#run-and-get-rows]
+
+Pass the whole builder to `Model.aggregate`. The query is lazy and, like other Typemo queries, goes to the database on `await`.
+
+<Snippet id="aggregation/first-aggregation/run-and-get-rows" title="orders/orders.service.ts" twoslash />
+
+The word `descending` in `sort` instead of `-1` is deliberate. A number is easy to mix up, and the word is clear without the reference. It still goes into the stage as `-1`.
+
+If you await the same query twice, it runs once, because the rows are remembered on the query object. To really run the query again, call [`.exec({ force: true })`](../reference/aggregation/pipeline.mdx#exec). You get a new array, not the remembered one.
+
+## Send rows to the client [#send-rows]
+
+Rows without `.plain()` hold driver values, and a document's `_id` there is an `ObjectId`, not a string. Inside your app that's handy. But to send a row as JSON you need ordinary objects, where identifiers, `int64`, and `Decimal128` are written as strings. [`.plain()`](../reference/aggregation/pipeline.mdx#plain) does this both in the type and in the values.
+
+<Snippet id="aggregation/first-aggregation/send-rows" title="orders/orders.service.ts" twoslash />
+
+Dates stay dates, and `JSON.stringify` turns them into strings on its own. An aggregation has no result schema, because the pipeline decides the row's shape, not a class. So `.plain()` here works only from the BSON type table. An aggregation has no separate `.lean()`, unlike [`find`](../reference/query/reading.mdx#model.find). A row without `.plain()` already holds the driver's values.
+
+## Read rows one at a time [#read-row-by-row]
+
+If the result is large, such as a report download or an export, don't load all the rows into memory. [`.cursor()`](../reference/aggregation/pipeline.mdx#cursor) returns a **cursor**, an async iterator that fetches rows from the database in batches and hands them out one at a time.
+
+<Snippet id="aggregation/first-aggregation/read-row-by-row" title="orders/export.ts" twoslash />
+
+[`.batchSize(2)`](../reference/aggregation/pipeline.mdx#batch-size) says how many rows the server sends at a time. Every query setting, [`.session`](../reference/aggregation/pipeline.mdx#session), [`.policy`](../reference/aggregation/pipeline.mdx#policy), [`.comment`](../reference/aggregation/pipeline.mdx#comment), [`.timeoutMS`](../reference/aggregation/pipeline.mdx#timeout-ms), and the rest, returns a new query, and you can set them in any order.
+
+## Show the server's plan [#show-plan]
+
+If an aggregation is slow, ask the server how it runs it. [`.explain()`](../reference/aggregation/pipeline.mdx#explain) doesn't run the pipeline but returns a description of the plan.
+
+<Snippet id="aggregation/first-aggregation/show-plan" twoslash />
+
+The level sets the detail: `"queryPlanner"` by default, `"executionStats"`, or `"allPlansExecution"`. The chosen plan is already in `"queryPlanner"`. `"executionStats"` adds the actual counters, and to get them the server really runs the query.
+
+## Build a plan in advance [#prebuild-plan]
+
+Sometimes a pipeline is built in one module and run in another. Say the report is described in `reports/spending.ts`, and several services call it. For that, [`Pipeline.from`](../reference/aggregation/pipeline.mdx#pipeline.from) takes an entity, and [`.plan()`](../reference/aggregation/pipeline.mdx#pipeline.from) freezes the pipeline into a **plan** that `aggregate` takes instead of a callback.
+
+<Snippet id="aggregation/first-aggregation/prebuild-plan" title="reports/spending.ts" twoslash />
+
+A plan is an ordinary frozen object with a source (the collection name and the entity), stages, and options. It's tied to a collection. A plan from `Pipeline.from(Order)` won't fit a model of another collection, and `aggregate` throws a [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configuration-error) before it reaches the database.
+
+This is a pipeline plan, an `AggregatePlan`. The plan that `.build()` returns on a query is a different object, with a model and run parameters. How they differ is described in [Two forms of a plan](../reference/aggregation/pipeline.mdx#plan-forms). A callback right in place is more convenient, though: the stages and the run sit together, and you see the row type right away.
+
+## How to choose [#how-to-choose]
+
+Ask yourself whether you need this pipeline in several places.
+
+- **No, it's a one-off**: write a callback in `aggregate`. The row type is inferred right in place, with nothing extra.
+- **Yes, it's shared**: build it with `Pipeline.from(...).plan()` in a separate file and import it from there.
+
+Add `.plain()` to rows that go out of your app. For downloads of thousands of rows, use `.cursor()`.
+
+## When not to use it [#when-not-to-use]
+
+If you need whole documents of a collection, with filtering, sorting, and pages, use [`find`](../reference/query/reading.mdx#model.find). It returns model documents with methods and virtual fields. For a simple count there's [`countDocuments`](../reference/query/reading.mdx#model.count-documents), and for the unique values of a field there's [`distinct`](../reference/query/reading.mdx#model.distinct). An aggregation is for when the result doesn't look like documents: sums, groups, pulled-in data.
+
+## Troubleshooting [#troubleshooting]
+
+**A typo in a field name.** A stage reads a field that the current row doesn't have, and the compiler stops it right away.
+
+<Snippet id="aggregation/first-aggregation/troubleshooting" twoslash />
+
+The compiler suggests the closest name (`Did you mean 'customer'?`) and shows one error. A typo in the group key doesn't drag a second error about the accumulators along with it. It answers a typo in an accumulator's argument the same way, for example `fn.sum(f.totl)`. Most often the error shows up after `group`: the row is already different, but the next stage still reaches for the order's fields. Hover over `f` and see which fields are left.
+
+**A sum that isn't an accumulator.** In `group`, every field except `_id` has to be an **accumulator**, a function that folds many documents into one value, such as `fn.sum`, `fn.avg`, or `fn.count`. A plain calculation over one document, such as `fn.add`, doesn't fit here.
+
+<Snippet id="aggregation/first-aggregation/troubleshooting-2" twoslash />
+
+The compiler names the field and the reason in the `PathError` text: `$group field "doubled" needs an accumulator (fn.sum, fn.avg, fn.push, fn.first, fn.count, ...)`. Replace the calculation with an accumulator, and move a formula over the row into a separate [`addFields`](../reference/aggregation/stages.mdx#add-fields) stage before or after `group`.
+
+**A plan without stages.** `plan()` freezes a pipeline, and an empty pipeline does nothing. So the method exists only on a builder that already has at least one stage.
+
+<Snippet id="aggregation/first-aggregation/troubleshooting-3" twoslash />
+
+Add a stage before `.plan()`.
+
+## Full example [#full-example]
+
+<Snippet id="aggregation/first-aggregation/full-example" title="reports/spending.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Calculations in aggregation" href="./expressions.mdx">
+  How `fn` and `f` work, what `null` does in a calculation, and why raw `$expr` is forbidden.
+</Card>
+<Card title="Grouping and reports" href="./grouping.mdx">
+  `group`, accumulators, buckets by range, and counting values.
+</Card>
+<Card title="Joins" href="./joins.mdx">
+  Pull in data from another collection with `lookup`.
+</Card>
+<Card title="Database-level queries" href="./database-level.mdx">
+  Aggregations without a collection: server operations, literal documents, and sessions.
+</Card>
+<Card title="Pipeline and Model.aggregate" href="../reference/aggregation/pipeline.mdx">
+  Every method of an aggregation query and the `Pipeline` entry points.
+</Card>
+</Cards>

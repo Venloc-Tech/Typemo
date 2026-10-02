@@ -1,0 +1,155 @@
+---
+title: Create documents
+description: "Create one or many documents, get default values filled in, and deal with validation errors and duplicates"
+icon: FilePlus
+---
+
+[`create`](../reference/writes/writes.mdx#create) writes new data. Hand it the data, and it returns a ready **document**: an object of the model class that already has an `_id` and its default values. Typemo checks the data before it goes to the database. It casts values to the schema types, rejects unknown fields, and runs validators, so a bad write stops in your code instead of becoming junk in the collection. Every way of creating runs the `document.validate` and `document.save` document hooks, so a save rule fires for each of them.
+
+There are several ways.
+
+- [`create`](../reference/writes/writes.mdx#create): one document or an ordered list.
+- [`insertOne`](../reference/writes/writes.mdx#insert-one): the same write of one document.
+- [`insertMany`](../reference/writes/writes.mdx#insert-many): a list in one request, unordered if you like.
+- [`Model.new`](../reference/documents/model-document-methods.mdx#model.new) with [`$save`](../reference/documents/document-api.mdx#save): when you need to prepare and change the document before writing it.
+
+If MongoDB is new to you, two things are enough to know. A document is a record in a **collection**, and `_id` is its unique identifier, which the database assigns itself.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and an account model. An account has two required fields and a unique name, and the `unique` index was created in advance with `connection.init()`.
+
+<Snippet id="errors/handling/prerequisites" title="accounts/account.ts" twoslash />
+
+## Quick start [#quick-start]
+
+`create` makes one document. For many, use `create` with a list, or `insertMany`. Each returns documents with an `_id`.
+
+<Snippet id="writes/create/quick-start" twoslash />
+
+Below we'll cover default values, errors, lists of documents, `Model.new`, and which method to use when.
+
+## Create one document [#create-one]
+
+A user opens an account, and you need to save it and get its `_id` right away. Call `create` with the document's data. Pass the model's required fields yourself, and Typemo fills in the rest.
+
+<Snippet id="writes/create/create-one" title="accounts/accounts.service.ts" twoslash />
+
+Typemo checked the data, added an `_id` and the default values, wrote the document, and returned it. It's an instance of the `Account` class, not a bare object. The document remembers that it's already saved, so [`$save`](../reference/documents/document-api.mdx#save) sends later changes as an update, not as an insert. For a response to a client, where `_id` should be in a simple form, the document has [`$toPlain()`](../reference/documents/document-api.mdx#to-plain).
+
+## Default values and checks [#defaults-and-validation]
+
+A field can have a **default value** and **bounds**. Say an account gets a balance. It's never negative, and it starts at zero. The model grows like this.
+
+<Snippet id="writes/create/defaults-and-validation" title="accounts/account.ts" />
+
+`Defaulted<number>` tells the compiler that you may leave the field out when creating, because the library fills in the value. Without this marker the field would be required in the input too. Arrays are an exception. A `tags!: string[]` field without `required` or `default` can also be left out, a new document gets an empty `[]`, and you don't need `Defaulted` here.
+
+<Snippet id="writes/create/defaults-and-validation-2" twoslash />
+
+If a bound is violated, creation stops before it reaches the database, with a [`ValidationError`](../reference/errors/data-errors.mdx#validation-error).
+
+<Snippet id="writes/create/defaults-and-validation-3" twoslash />
+
+<Snippet id="reference/writes/writes/create-errors" />
+
+An unknown field or a value of the wrong type gives a [`CastError`](../reference/errors/data-errors.mdx#cast-error). Typemo doesn't save what isn't in the schema. Otherwise a typo in a field name would become an extra field in the database.
+
+<Snippet id="reference/writes/writes/create-errors-2" />
+
+## Create many documents [#create-many]
+
+An import, initial seeding, a batch of events: in all these cases, pass a list to `create`. The documents go out as **one ordered write**, in the order you gave them. You get back an array of documents in the same order.
+
+<Snippet id="writes/create/create-many" twoslash />
+
+The order isn't an accident. If the documents were created in parallel, after an error you couldn't tell which of them were already written. This way the write goes one by one and stops at the first database error.
+
+The whole list is checked before anything is sent. If even one document fails the check, **nothing** is written.
+
+<Snippet id="writes/create/create-many-2" twoslash />
+
+### Unordered insert with insertMany [#unordered-insert-many]
+
+When order doesn't matter and you want to write everything that passes the check, use [`insertMany`](../reference/writes/writes.mdx#insert-many). It checks values and runs document hooks the same way `create` does, but it goes to the database in one request. It can also do an **unordered** insert. With `ordered: false` everything that can be written is written, and the errors are collected and arrive at the end.
+
+<Snippet id="writes/create/unordered-insert-many" twoslash />
+
+`U1` and `U4` are written, the second and third documents aren't. In a [`BulkWriteError`](../reference/errors/server-errors.mdx#bulk-write-error) each failure carries its position in the input list, and `result.insertedCount` says how many were written. Typemo's validation errors and server errors sit in the same `writeErrors` list. For the calling code there's no difference: the document isn't written.
+
+## Create a document with new and $save [#new-and-save]
+
+Sometimes you have to prepare a document first, change it, check it, and only then write it. [`Model.new`](../reference/documents/model-document-methods.mdx#model.new) creates a document **in memory**. Values are cast to their types and default values are filled in, but the document isn't in the database yet. [`$save`](../reference/documents/document-api.mdx#save) writes it.
+
+<Snippet id="writes/create/new-and-save" twoslash />
+
+`new` checked the data and returned the document, and `$isNew()` showed that it isn't written yet. `$save` inserted it. You need this path when something happens to the document between creating and writing it. Otherwise `create` is shorter and does the same thing.
+
+## Duplicates [#duplicates]
+
+Suppose `title` has to be unique. A `unique` index in the database enforces that, not Typemo. The library sees one document, not the whole collection, so it can't check this itself. Create the index in advance with [`connection.init()`](../reference/connection/connection.mdx#connection.init) or [`Model.syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes). Until the index exists, the database has nothing to stop a duplicate with.
+
+A duplicate throws a [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicate-key-error), not a generic server error. Its `keyPattern` and `keyValue` fields are already parsed.
+
+<Snippet id="writes/create/duplicates" twoslash />
+
+<Snippet id="reference/collections/materialized/when-matched" />
+
+The message holds only the index, the key value, and the code. The server's full text is in `serverMessage`, and the original driver error is in `cause`. The key value, both in the message and in `keyValue`, follows [`sensitive`](../schemas/hidden-and-sensitive.mdx).
+
+If a duplicate turns up in a list, you get a `BulkWriteError`, with the `DuplicateKeyError` in `writeErrors[0].error`. The documents before it are written, the ones after it aren't.
+
+<Snippet id="writes/create/duplicates-2" />
+
+The text says `Account.create`, the method you called, not the internal write mechanism. With `insertMany` it says `Account.insertMany`.
+
+## How to choose [#how-to-choose]
+
+Ask yourself what you'll do with the document after the write.
+
+- **Read it, change it, and keep saving it**: for example, you return it from a service and keep working with it as an object. Use [`create`](../reference/writes/writes.mdx#create). It gives you a document, runs the save hooks, and writes a list in order.
+- **Nothing, you only need to load a lot of data**, and you're ready to handle partial errors. Use [`insertMany`](../reference/writes/writes.mdx#insert-many) with `ordered: false`. Only this way does everything that passes the check get written, since `create` with a list is always ordered.
+- **Prepare and change it first**: start with `Model.new`.
+
+## When not to use it [#when-not-to-use]
+
+Writing a mix of **different** operations, such as inserts, updates, and deletes? You need [`bulkWrite`](../reference/writes/writes.mdx#bulk-write), covered in [Bulk writes](./bulk.mdx). If a record has to be inserted or updated depending on whether it already exists, use [`upsert`](../reference/writes/writes.mdx#upsert), see [Update documents](./update.mdx). And if the data is already in the database and needs changing, `create` isn't the tool. Use [`updateOne`](../reference/writes/writes.mdx#update-one).
+
+## Troubleshooting [#troubleshooting]
+
+**Only half the list was created.** `create` or `insertMany` threw a `BulkWriteError`, but some of the documents are in the collection. The list is written **one by one**, and everything before the error is already saved. If you need all or nothing, run the write in a transaction, see [Transactions](../transactions/transactions.mdx). Then a failure rolls back everything written before it.
+
+**A typo in a field name.** You can't write this.
+
+<Snippet id="writes/create/troubleshooting" twoslash />
+
+The compiler points out the extra field. And if the data came from outside, at runtime the field is stopped by a [`CastError`](../reference/errors/data-errors.mdx#cast-error) with the text `Cast to Account failed at path "ownr" … not a field of Account`. Fix the field name.
+
+## Full example [#full-example]
+
+Everything in one file: opening an account, importing a list with partial error handling, and a draft through `new`.
+
+<Snippet id="writes/create/full-example" title="accounts/accounts.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, `Model.create([...])` created documents in parallel. In Typemo a list goes out as one ordered write. `Model.new` replaces `new Model(data)` and casts every field right away, rejecting unknown ones. Default values are filled in on creation, and checks that were options in Mongoose always run here.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Update documents" href="./update.mdx">
+  Change a document, get it back, and insert it if it doesn't exist yet.
+</Card>
+<Card title="Bulk writes" href="./bulk.mdx">
+  Many different operations in one request and handling partial errors.
+</Card>
+<Card title="Writing" href="../reference/writes/writes.mdx">
+  Every write method with its options, results, and errors.
+</Card>
+<Card title="Transactions" href="../transactions/transactions.mdx">
+  Make a write all or nothing.
+</Card>
+</Cards>

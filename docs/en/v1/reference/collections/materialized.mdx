@@ -1,0 +1,190 @@
+---
+title: Materialized
+description: "A materialized aggregation result: Materialized.define, refresh, model, MaterializedInfo, and the merge and replace write modes"
+icon: DatabaseZap
+---
+
+A **materialized view** is an ordinary collection that holds the result of an aggregation. A [`TypedView`](./typed-view.mdx) is recomputed on every read, while `Materialized` computes the result once, when you call `refresh`, and stores it on disk. It reads as fast as any collection, and you can put indexes on it. You pay in freshness. The result updates only on your command and never changes by itself.
+
+`Materialized` describes a "source and result" pair in types. The target collection is an ordinary model with a class, and the pipeline's rows are checked against that class at compile time. Inside, `refresh` runs an aggregation over the source and finishes it with a `$merge` stage (the default) or `$out` (the `replace` mode). Typemo adds these stages itself, and your pipeline must not have them.
+
+If you're new to materialized results, start with the [Save an aggregation result and keep it up to date](../../collections/materialized-views.mdx) guide. This page is a reference.
+
+The examples use accounts. `accounts` has three documents: Main (owner alice, balance 120, open), Old (alice, 0, closed), and Savings (bob, 500, open). The result is totals by owner.
+
+<Snippet id="collections/materialized-views/prerequisites" title="accounts/models.ts" twoslash />
+
+The result class is described as an entity with its own `_id` type. [`EntityWithId`](../schemas/base-classes.mdx#entity-with-id) with the type `String` makes `_id` a string, here the owner's name, and the other fields are the totals. For more on such identifiers, see the [Use your own _id type](../../schemas/custom-ids.mdx) guide.
+
+---
+
+## Materialized.define [#materialized.define]
+
+`define` describes a materialized result and **computes and writes nothing**. The result collection appears when you call [`refresh`](#materialized.refresh). You pass the connection, the result class, and the definition: the source model (`from`), the pipeline, and the way to write.
+
+The pipeline is checked against the result class. If it doesn't produce a field of the class, the compiler points at that field. There's one relaxation. A row may lack `_id` if the pipeline doesn't provide it, because `$merge` and `$out` assign `_id` to the inserted row themselves.
+
+<Snippet id="reference/collections/materialized/materialized-define" twoslash />
+
+<Returns type="Materialized<InstanceType<Target>>">
+
+A `Materialized` object with the fields `model` (an ordinary [model](../connection/connection.mdx#connection.model) of the result), `definition` ([`MaterializedInfo`](#materialized-info)), and the method [`refresh`](#materialized.refresh). Until `refresh` is called, there's no result collection in the database. After `define` there's only `accounts`.
+
+</Returns>
+
+<Params>
+<Param name="connection" type="Connection" required>
+
+The connection that owns both models, the source and the result.
+
+</Param>
+<Param name="target" type="EntityClass" required>
+
+The result class. Its collection is the target one. If a view ([`TypedView`](./typed-view.mdx)) is defined under that name, `define` throws a `ConfigurationError`, namely `OwnerTotal: a materialized result is a regular collection; "owner_totals" is a view`.
+
+</Param>
+<Param name="definition.from" type="EntityClass" required>
+
+The source model whose data the pipeline is computed over. The aggregation goes through this model's operational pipeline, like an ordinary [`aggregate`](./typed-view.mdx#typed-view.aggregate). Hidden fields, `dbName` substitution, and the discriminator condition work the same way.
+
+</Param>
+<Param name="definition.pipeline" type="(p) => StagedPipeline" required>
+
+A function that receives a builder and returns the computation pipeline. It doesn't include the `$merge` and `$out` stages, because `refresh` adds them.
+
+</Param>
+<Param name="definition.mode" type='"merge" | "replace"' default='"merge"'>
+
+How rows get into the target collection. For details, see [Write modes](#write-modes).
+
+</Param>
+<Param name="definition.on" type="string | [string, ...string[]]" default='"_id"'>
+
+The field or fields `$merge` uses to recognize "the same" row. Only the fields of the result class and `_id` are accepted. Only for the `merge` mode.
+
+</Param>
+<Param name="definition.whenMatched" type='"replace" | "keepExisting" | "merge" | "fail"'>
+
+What to do if a row with such `on` values already exists in the result. Only for the `merge` mode. If you don't set it, the server default applies.
+
+</Param>
+<Param name="definition.whenNotMatched" type='"insert" | "discard" | "fail"'>
+
+What to do if there's no such row in the result yet. Only for the `merge` mode. If you don't set it, the server default applies.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/materialized/materialized-define-2" />
+
+</FullType>
+
+### The `on` field isn't in the class [#on-not-in-class]
+
+`define` checks the `$merge` keys at the call. A key that isn't among the fields of the result class gives a `ConfigurationError` of the form `OwnerTotal: $merge on "…", which is not a field of the class`. The compiler rejects such a key even earlier, because the type of `on` is the keys of the result class.
+
+---
+
+## Materialized.refresh [#materialized.refresh]
+
+`refresh` recomputes the result and writes it. It runs the pipeline over the source and finishes it with a `$merge` or `$out` stage. Call it when it's time to update the totals: on a schedule, after a batch load, from a button in a dashboard. The result never refreshes itself.
+
+<Snippet id="reference/collections/materialized/materialized-refresh" twoslash />
+
+<Returns type="Promise<void>">
+
+It returns nothing. The rows are in the result collection, and you read them through `materialized.model`. The promise settles when the server has written all the rows.
+
+</Returns>
+
+<Params>
+<Param name="options" type="ModelAggregateOptions">
+
+The options of the aggregation over the source: `session`, `timeoutMS`, `policy`. They go into the aggregation of the source model.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/collections/materialized/materialized-refresh-2" />
+
+</FullType>
+
+### What `$merge` doesn't do [#merge-limits]
+
+In the `merge` mode the result is never cleaned. `$merge` inserts new rows and updates matching ones, and rows that no longer have data in the source stay. Say the Savings account was closed, and Main was topped up to 150. After another `refresh`, Main's total is updated, but bob keeps the old value, although he has no open accounts anymore.
+
+<Snippet id="reference/collections/materialized/merge-limits" twoslash />
+
+If the result must repeat the pipeline exactly, use the `replace` mode.
+
+### Merging on a field other than `_id` [#merge-on-non-id]
+
+If `on` names a field other than `_id`, `$merge` needs a unique index on exactly those fields in the target collection. Otherwise the server can't tell "the same" row unambiguously. Typemo checks this before the run and gives a clear error instead of the server's answer. Say the result is a copy of balances by account title, unique by `title`.
+
+<Snippet id="reference/collections/materialized/merge-on-non-id" title="accounts/models.ts" twoslash />
+
+While there's no index in the database, `refresh` refuses to work.
+
+<Snippet id="reference/collections/materialized/merge-on-non-id-2" twoslash />
+
+### Matching rows and the whenMatched option [#when-matched]
+
+The `whenMatched` and `whenNotMatched` values go into `$merge` as is, so the server decides the behavior. Two values were verified by running them. `keepExisting` keeps the already written row, and after the source changed the total stayed the same. `fail` stops `refresh` with a `DuplicateKeyError` as soon as it finds a matching row.
+
+<Snippet id="reference/collections/materialized/when-matched" />
+
+The values `replace`, `merge`, `insert`, `discard`, and `fail` for `whenNotMatched` are typed, but weren't run separately on the server.
+
+---
+
+## Write modes [#write-modes]
+
+**`merge`** (the default) inserts new rows and updates matching ones without cleaning the collection. It fits cumulative totals and incremental updates where old rows can't be lost. Rows are compared by `on` (`_id` by default).
+
+**`replace`** replaces the whole collection with the pipeline's result (the `$out` stage). It fits when the result must repeat the current pipeline exactly and rows that disappeared must go. The `on`, `whenMatched`, and `whenNotMatched` parameters aren't accepted in this mode.
+
+Verified on the same data. After the Savings account was closed, the `replace` mode left one row in the result (alice), and `merge` left two.
+
+<Snippet id="reference/collections/materialized/write-modes" twoslash />
+
+You can describe one target collection with several `Materialized` objects if you need different modes or pipelines in different places. `Materialized` doesn't check definitions for conflicts.
+
+---
+
+## materialized.model [#materialized.model]
+
+The ordinary model of the target collection. It has `find`, `aggregate`, `syncIndexes`, and everything else a model has. You read the result and build its indexes through it. The collection is ordinary, so [`connection.syncAll`](../connection/connection.mdx#connection.sync-all) handles it too. The result's indexes are created, and the collection itself appears. `syncAll` won't fill the result, and rows appear only after [`refresh`](#materialized.refresh).
+
+The field is read-only, of type `Model<T>`.
+
+---
+
+## MaterializedInfo [#materialized-info]
+
+The result definition, the `definition` field of `Materialized`. It's frozen.
+
+<TypeTable
+  type={{
+    from: { type: "string", required: true, description: "The name of the source collection." },
+    into: { type: "string", required: true, description: "The name of the target collection." },
+    mode: { type: '"merge" | "replace"', required: true, description: "`merge` writes with a `$merge` stage, and `replace` with a `$out` stage." },
+    on: { type: "readonly string[]", required: true, description: "The `$merge` keys. Empty for the `replace` mode." },
+    pipeline: { type: "readonly PipelineStage[]", required: true, description: "The computation stages without the final `$merge` or `$out`, which `refresh` adds." },
+  }}
+/>
+
+### MaterializedWrite and MaterializedRowCheck [#materialized-write]
+
+`MaterializedWrite<Target>` is the type of the write options. These are `mode`, `on`, `whenMatched`, and `whenNotMatched` for the `merge` mode, and `mode: "replace"` for replacement. It's covered in the description of [`define`](#materialized.define). `MaterializedRowCheck<Row, V>` is a service type that checks the pipeline's rows against the result class. It works like the view check but allows a row without `_id`.
+
+---
+
+## When not to use it [#when-not-to-use]
+
+If the result must always be fresh and there aren't many queries, use [`TypedView`](./typed-view.mdx). It stores nothing and needs no refreshing. If you don't need to store the result in a collection and only need to read it once, an ordinary [aggregation](../aggregation/pipeline.mdx) is enough. Typemo has no automatic refresh on a schedule. You call `refresh` yourself, from a scheduled job or after the data changes.
+
+The guide with real tasks is [Save an aggregation result and keep it up to date](../../collections/materialized-views.mdx).

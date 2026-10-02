@@ -1,0 +1,273 @@
+---
+title: Transactions
+description: "Arguments, retries, and errors of transaction, currentTransaction, TransactionOptions, TransactionCallback, startSession, and TransactionScope"
+icon: ArrowLeftRight
+---
+
+A **transaction** groups several writes into one. Either all of them apply or none does. Until the transaction is committed, other readers don't see its changes, and on an error everything rolls back. Typemo starts a transaction with a single call to [`transaction`](#transaction), passes its session to every operation inside, and reruns the whole function on transient server failures.
+
+If you're new to transactions, read the guide [Transactions](../../transactions/transactions.mdx) first. This page is the reference. Manual sessions are covered in the guide [Manual sessions](../../transactions/sessions.mdx).
+
+Transactions work only on a replica set (several MongoDB servers holding copies of the same data, though one server is enough for transactions) and on a sharded cluster. On a standalone `mongod`, `transaction` throws [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error) before it calls the function, so nothing is written. You can check this ahead of time with [`client.supportsTransactions`](../connection/typemo-client.mdx#client.supports-transactions). A transaction spans all databases and collections of one client, but goes no further.
+
+All the examples use one account model.
+
+<Snippet id="reference/transactions/transactions/intro" title="accounts/account.ts" twoslash />
+
+---
+
+## transaction [#transaction]
+
+`transaction` runs a function in a transaction and, after the commit, returns whatever the function returned. Both the client ([`client.transaction`](../connection/typemo-client.mdx#client.transaction)) and the connection ([`connection.transaction`](../connection/connection.mdx#connection.transaction)) have the method. The connection passes the call to its client, so the result is the same. Use it when several writes must go through together: a transfer between accounts, an order with its items, an invoice and a log entry.
+
+You pass nothing into the function. Every model operation (a read, a write, a cursor, an aggregation, `populate`, a bulk write) finds the transaction on its own and works in its session. You can't forget the session in one of the calls, while in Mongoose such an operation silently ran outside the transaction.
+
+<Snippet id="reference/transactions/transactions/transaction" twoslash />
+
+If the function throws, the transaction rolls back, and the error reaches you **unchanged**, without a wrapper. In the example `caught === thrown` is `true`. Errors of the library itself, such as a uniqueness violation or a validation error, also roll the transaction back and arrive as they are.
+
+<Returns type="Promise<R>">
+
+What the function returned, after a successful commit. If the function fails, you get its error unchanged. If the commit fails, Typemo turns the server or driver error into a [Typemo error](../errors/server-errors.mdx).
+
+</Returns>
+
+<Params>
+<Param name="fn" type="TransactionCallback<R>" required>
+
+The async transaction function. It receives a [`TransactionScope`](#transaction-scope). It **can run more than once**, because on transient server failures the driver reruns it whole. Don't do anything inside that you can't repeat outside the database: emails, payments, calls to external services, changes to objects created outside. See "Retries" for details.
+
+</Param>
+<Param name="options" type="TransactionOptions" default="{}">
+
+Transaction settings: the read level, the write acknowledgment, and the overall deadline. They are described in detail in [`TransactionOptions`](#transaction-options).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/connection/connection/connection-transaction-2" />
+
+</FullType>
+
+### Retries [#retries]
+
+The server marks some failures with the `TransientTransactionError` label ("transient transaction error"), for example when two transactions changed the same document. The driver then reruns the function from the start instead of continuing from the point of failure. Typemo doesn't retry itself, the retry belongs to the driver. All Typemo does is hand the driver the original error instead of a wrapped one. Otherwise the driver wouldn't see the label, and there would be no retry.
+
+Below, two transactions increase the balance of the same account at the same time. Both start on the first attempt, one loses the conflict and starts over.
+
+<Snippet id="reference/transactions/transactions/retries" twoslash />
+
+The losing transaction repeats until the winner commits. The functions ran 9 times in total, and the balance grew by exactly 2. The number of attempts depends on timing and load, so don't rely on it. What matters is something else: with a correctly written function, the result doesn't depend on the number of retries.
+
+Not every failure is retried. A uniqueness violation, a schema validation error, and errors in your own code stop the transaction at once. The function with the duplicate ran once and ended with `DuplicateKeyError`.
+
+### Document state on retry [#state-on-retry]
+
+Documents you saved in the failed attempt roll back in memory to their state before the transaction. The library gives them the "modified" flag back, so a repeated `$save` sends the same write instead of skipping it. In the example the retry saw `$isModified()` equal to `true`. The "new" flag and the document version roll back the same way, but that comes from reading the library code and wasn't verified by a run. The assignments your function made can't be undone by the library. The fields stay as you set them.
+
+So a change to a document loaded **outside** the transaction is applied twice on a retry. In the example the first attempt hits a transient failure on commit. With a balance of 100, the function subtracts 10, the failure happens, the retry sees 90, subtracts another 10, and saves 80, not 90.
+
+<Snippet id="reference/transactions/transactions/state-on-retry" twoslash />
+
+Read the document inside the function, or change it with an atomic write. `updateOne` with `$inc` doesn't depend on what was in memory.
+
+### On errors [#on-errors]
+
+<Snippet id="reference/transactions/transactions/on-errors" twoslash />
+
+Transactions don't nest, because MongoDB has no nested transactions. Calling `transaction` inside a transaction of the same client throws [`ConfigurationError`](../errors/configuration-errors.mdx#configuration-error) at once and doesn't quietly join. The other errors inside a transaction are shown below.
+
+<Snippet id="reference/transactions/transactions/on-errors-2" />
+
+The first error is concurrent operations. Inside a transaction you can't run operations in parallel (`Promise.all`), even reads. The server answers this with an error, and the driver calls the behavior undefined, so the library refuses up front. The second and third are an operation's own settings. `readConcern`, `writeConcern`, `readPreference` (other than `primary`), and `timeoutMS` on a single operation inside a transaction are forbidden, and you set them on the transaction itself. The fourth is a model of another client, which can't join the transaction. In every case it's a [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error) with the reasons `concurrent-session` and `transaction-option`.
+
+A separate case is a server without transactions. On a standalone `mongod`, `transaction` throws `ConfigurationError` at once and doesn't call the function.
+
+<Snippet id="reference/connection/typemo-client/client-transaction-2" />
+
+`session(null)` (or `{ session: null }`) deliberately runs the operation outside the current transaction. The write stays even if the transaction rolls back.
+
+### When not to use it [#transaction.when-not-to-use]
+
+A single write to one document is atomic without a transaction. A transaction adds only overhead and restrictions. If data arrives in a batch and a partial write is acceptable, use `insertMany` or `bulkWrite` and catch [`BulkWriteError`](../errors/server-errors.mdx#bulk-write-error). To manage the session and the commit yourself, there is [`startSession`](#start-session).
+
+---
+
+## TransactionOptions [#transaction-options]
+
+`TransactionOptions` is an optional settings object, the second argument of [`transaction`](#transaction). You give the settings in a plain form, and the library turns them into driver objects. A single operation inside the transaction can't override them and gets a [`StrictModeError`](../errors/data-errors.mdx#strict-mode-error) with the reason `transaction-option`.
+
+<Snippet id="reference/transactions/transactions/transaction-options" twoslash />
+
+<Params title="Object fields">
+<Param name="readConcern" type={'"local" | "majority" | "snapshot"'}>
+
+The read level of the transaction. `snapshot` shows all reads the same snapshot of the data, `majority` shows data acknowledged by a majority of nodes, and `local` shows the node's data as it is. If you don't set it, the server default applies.
+
+</Param>
+<Param name="writeConcern" type="{ w?: number | 'majority'; journal?: boolean }">
+
+The write acknowledgment on commit. `w` says how many nodes must acknowledge, and `journal` says whether the write must reach the journal. The setting applies to the commit, not to individual operations.
+
+</Param>
+<Param name="timeoutMS" type="number">
+
+The deadline of the whole transaction in milliseconds, retries included. When the deadline passes, you get a [`TimeoutError`](../errors/server-errors.mdx#timeout-error) with `kind: "transaction"` and `timeoutMS` filled in. A transaction with `timeoutMS: 200` in which a query blocked for 400 ms ended with the error `transaction timed out after 200 ms (timeoutMS)`. The deadline of a single operation (the query's `timeoutMS`) gives `kind: "operation"`. Inside such a transaction, an operation can't have its own `timeoutMS`.
+
+</Param>
+<Param name="maxCommitTimeMS" type="number">
+
+How many milliseconds the server may spend on the commit. The field is accepted and passed to the driver, but its effect wasn't verified separately.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/transactions/transactions/transaction-options-2" />
+
+</FullType>
+
+---
+
+## TransactionCallback [#transaction-callback]
+
+`TransactionCallback<R>` is the type of the function that [`transaction`](#transaction) accepts. It's an async function that receives a [`TransactionScope`](#transaction-scope) and returns a value of type `R`. The type helps when you move the body of a transaction into a separate function or pass it as a parameter.
+
+<Snippet id="reference/transactions/transactions/transaction-callback" twoslash />
+
+If you don't need `scope`, you can leave the argument out. The operations inside find the transaction on their own anyway.
+
+<FullType>
+
+<Snippet id="reference/transactions/transactions/transaction-callback-2" />
+
+</FullType>
+
+---
+
+## startSession [#start-session]
+
+`startSession` opens an explicit driver session. You need it when you run the transaction yourself, starting and committing it by hand or passing the session to a query through `.session()`. Both the client ([`client.startSession`](../connection/typemo-client.mdx#client.start-session)) and the model have the method. In other cases use [`transaction`](#transaction), which creates and closes the session itself.
+
+You close the session by calling `endSession()`. The library doesn't do it, and an unclosed session holds resources on the server until it expires.
+
+<Snippet id="reference/transactions/transactions/start-session" twoslash />
+
+<Params>
+<Param name="options" type="ClientSessionOptions">
+
+Driver session parameters. Optional.
+
+</Param>
+</Params>
+
+<Returns type="Promise<ClientSession>">
+
+A driver session. The method first waits for the client to be ready, so a call before `connect` doesn't fail, it waits. The method throws [`ConnectionError`](../errors/configuration-errors.mdx#connection-error) if the client is closed, and [`TimeoutError`](../errors/server-errors.mdx#timeout-error) if it didn't connect in time.
+
+</Returns>
+
+How to pass the session to operations, what happens with a forgotten session, and which rules apply to concurrent operations is covered in the guide [Manual sessions](../../transactions/sessions.mdx).
+
+### When not to use it [#start-session.when-not-to-use]
+
+An ordinary transaction doesn't need a manual session. [`transaction`](#transaction) does the same thing, retries the function on transient failures, and closes the session itself.
+
+---
+
+## client.currentTransaction [#client.current-transaction]
+
+`client.currentTransaction()` answers whether the current async call runs inside a transaction of **this** client, and returns its [`TransactionScope`](#transaction-scope). Wrappers use it to decide whether to open a transaction or work in one that's already open. Transactions can't nest, and a second [`transaction`](#transaction) inside the first is an error. That's the principle behind `@Transactional({ join: true })` from the NestJS package ([`Transactional`](../integrations/nestjs.mdx#transactional)), for example.
+
+<Snippet id="reference/transactions/transactions/client-current-transaction" twoslash />
+
+The question starts nothing. The method doesn't open a session and doesn't send commands. It sees the transaction wherever model operations see it: after `await`, in called functions, and in callbacks inside the transaction function.
+
+<Returns type="TransactionScope | undefined">
+
+The transaction of this client that the call runs in, or `undefined`. You get `undefined` outside a transaction and **inside a transaction of another client**. Operations of this client won't join it, so for this client there's no transaction. To find the transaction of any client, call [`TransactionScope.current`](#transaction-scope.current).
+
+</Returns>
+
+It takes no arguments.
+
+<FullType>
+
+<Snippet id="reference/transactions/transactions/client-current-transaction-2" />
+
+</FullType>
+
+### When not to use it [#client.current-transaction.when-not-to-use]
+
+To run code in a transaction, call [`transaction`](#transaction). `currentTransaction` only answers a question. Don't keep the result longer than the transaction function, because the session is closed after it.
+
+---
+
+## TransactionScope [#transaction-scope]
+
+`TransactionScope` is the object the transaction function receives. It describes the current transaction and its current attempt. Usually you need it for two things. The first is to learn the attempt number (`attempt`). The second is to pass the session (`scope.session`) to a driver call that knows nothing about the Typemo transaction.
+
+<Snippet id="reference/transactions/transactions/transaction-scope" twoslash />
+
+The driver write with `session: scope.session` rolled back along with the transaction. Without that argument it would have stayed in the database, because driver calls don't join a transaction on their own.
+
+<Params title="Fields">
+<Param name="id" type="number">
+
+The sequence number of the transaction in the process. It also goes into observability events (`transactionId`), which link the start, the retries, and the end.
+
+</Param>
+<Param name="session" type="ClientSession">
+
+The driver session the transaction runs in.
+
+</Param>
+<Param name="owner" type="object">
+
+The client that owns the session. Model operations of another client don't join the transaction.
+
+</Param>
+<Param name="timeoutMS" type="number | undefined">
+
+The deadline of the transaction, if it's set in [`TransactionOptions`](#transaction-options).
+
+</Param>
+<Param name="startedAt" type="number">
+
+The moment the transaction started, `performance.now()` in milliseconds.
+
+</Param>
+<Param name="attempt" type="number">
+
+The number of the current attempt. On the first run of the function it's 1, on the first retry 2, and so on.
+
+</Param>
+<Param name="participants" type="readonly TransactionParticipant[]">
+
+The participants of the current attempt: objects that keep state in memory and need to learn the outcome of the transaction. Usually these are documents, and they join the list on their own.
+
+</Param>
+</Params>
+
+### TransactionScope.current [#transaction-scope.current]
+
+The static `TransactionScope.current()` returns the transaction of the current async call, for **any** client, and `undefined` outside transactions. Its `owner` is the client. Use it when you need to tell "outside a transaction" from "inside a transaction of another client". For your own client, [`client.currentTransaction`](#client.current-transaction) is simpler. Inside a transaction of a second client, `client.currentTransaction()` returned `undefined`, and `TransactionScope.current()?.owner` was the second client. Like `currentTransaction`, the method starts nothing.
+
+### enlist [#enlist]
+
+The `enlist(participant)` method adds a participant to the current attempt. Calling it again with the same participant changes nothing. Only code that keeps in-memory state depending on the outcome of the transaction needs it, and only if that state should roll back on a retry. The participant defines three optional functions. `onRetry` is called when the attempt failed and the function will run again, `onAbort` when the transaction ended in failure, and `onCommit` when it was committed. All participants are notified, even if one's function throws. The first error is thrown only after the others have been notified.
+
+Ordinary applications don't need `enlist`, because Typemo documents enlist themselves. It's useful if you write your own in-memory state store that should behave like a document. A run verified only the reading of the fields `id`, `attempt`, `timeoutMS`, `session`, `owner`, and `participants`. The order in which participants are called comes from reading the library code.
+
+<FullType>
+
+<Snippet id="reference/transactions/transactions/enlist" />
+
+</FullType>
+
+### When not to use it [#transaction-scope.when-not-to-use]
+
+Don't keep `scope` outside the transaction function, because the session is closed once it ends. Don't call `enlist` for things outside the process memory. It can't roll back a write to an external service.

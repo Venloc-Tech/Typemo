@@ -1,0 +1,118 @@
+---
+title: Search and the query plan
+description: "textScore for ranking full-text search results and explain for the execution plan of a query"
+icon: ScanSearch
+---
+
+Use these two methods when a query is already written but the result is wrong or slow. [`.textScore`](#text-score) adds a relevance score to the rows of a full-text search, showing how well each row matched the search words. [`.explain`](#explain) returns no documents. It shows how the database plans to run the query: which index it will use and how many documents it will scan. Both methods live on the query builder that [`find`](./reading.mdx#model.find) returns.
+
+If you're new to this, read the guides [Full-text and vector search](../../queries/text-and-vector-search.mdx) and [Query performance](../../queries/performance.mdx) first. This page is the reference.
+
+All the examples use one article model with two indexes. The text index covers the title and the body and serves full-text search, and the ordinary one covers the view count.
+
+<Snippet id="queries/text-and-vector-search/prerequisites" title="models/article.ts" twoslash />
+
+The collection holds three articles. "Typed queries" (the body says "queries in mongodb", 5 views), "Mongo tips" (the body has the word "typed" three times and "queries", 50 views), and "Cooking" (the body is "pasta", 500 views). The indexes were created by [index sync](../../collections/index-sync.mdx).
+
+---
+
+## .textScore [#text-score]
+
+Full-text search is a [`$text`](./filter-operators.mdx#text) filter on a text index. `{ $text: { $search: "typed queries" } }` finds the articles with those words, but `$text` itself doesn't say which one matched better. `.textScore` adds a number to every row, the relevance score. The bigger it is, the better the row matched.
+
+<Snippet id="reference/query/search-and-explain/text-score" twoslash />
+
+The score depends on the data and the server version, so compare values with each other, not with the numbers in the documentation. The `score` field appears both in the row and in its type. Without a `.textScore` call it isn't there.
+
+<Returns type="QueryBuilder">
+
+A builder whose rows get a numeric field. In the result type it's a `number`. The field is present in the document and in the `.lean()` and `.plain()` results. If the query is limited by [`.select`](./reading.mdx#select), the score field is still added. After the call, the field name becomes a known key for [`.sort`](./reading.mdx#sort) and [`.select`](./reading.mdx#select), see [sorting by score](#sort-by-score).
+
+</Returns>
+
+<Params>
+<Param name="name" type="string" default="&quot;score&quot;">
+
+The name of the score field. It can't be empty, contain a dot, or start with `$`, otherwise you get a `QueryError` with the text `textScore: invalid field name "a.b"`.
+
+</Param>
+<Param name="options.sort" type="boolean" default="false">
+
+Sorts the rows by descending score, best first. The query is sent with the sort `{ <name>: { $meta: "textScore" } }`. The score is added after the keys you passed to `.sort`. If `.sort` already names the score field, it isn't added a second time.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/search-and-explain/text-score-2" />
+
+</FullType>
+
+### Without $text [#without-text]
+
+The score is computed by the text search, so `.textScore` requires `$text` in the filter. The compiler doesn't check this, the server refuses. Typemo throws a [`ServerError`](../errors/server-errors.mdx#server-error) with the server's message.
+
+<Snippet id="reference/query/search-and-explain/without-text" />
+
+### Sorting by score [#sort-by-score]
+
+The `{ sort: true }` option sorts rows by descending score on the server. Typemo sends the sort `{ score: { $meta: "textScore" } }`. So a [`.limit`](./reading.mdx#limit) after it keeps the best rows, not arbitrary ones.
+
+<Snippet id="reference/query/search-and-explain/sort-by-score" twoslash />
+
+You can also name the score field in an ordinary [`.sort`](./reading.mdx#sort). `.sort({ score: -1 })` turns into the same `$meta` sort, but sits in its own place among the keys. So `.sort({ score: -1, views: 1 })` orders by score, and by views when the score is equal. The score has only one direction, `-1`. The database ranks matches from the best, and there's no reverse order. So `.sort({ score: 1 })` doesn't compile (`Type '1' is not assignable to type 'ScoreDirection | undefined'`), and without types it throws a `QueryError` at the call.
+
+<Snippet id="reference/query/search-and-explain/sort-by-score-2" />
+
+The score field is known in [`.select`](./reading.mdx#select) too. `.select({ title: 1, score: 1 })` after `.textScore()` compiles and keeps `_id`, `title`, and `score` in the row. Before `.textScore` is called there is no such field, and `.sort({ score: -1 })` or `.select({ score: 1 })` don't compile, like any unknown field.
+
+<Snippet id="reference/query/search-and-explain/sort-by-score-3" twoslash />
+
+### When not to use it [#text-score.when-not-to-use]
+
+If you need search by meaning rather than by words, use vector search in [aggregations](../aggregation/stages.mdx). If `$text` isn't capable enough, use search indexes and the `$search` stage, also there.
+
+---
+
+## .explain [#explain]
+
+`.explain` shows the query plan instead of the query itself. It tells you which index the database will choose and, if you ask, how many documents and keys it actually scans. Use it when a query is slow. The plan shows whether the database reads the whole collection or follows an index. No documents are returned.
+
+<Snippet id="reference/query/search-and-explain/explain" twoslash />
+
+<Returns type="Promise<ExplainResult>">
+
+The server's answer as is. `ExplainResult` is a `Readonly<Record<string, unknown>>`, and its shape depends on the server version and the verbosity level. Typemo doesn't parse the answer, so fields like `queryPlanner` and `executionStats` are read without type hints. Your builder stays untouched, and you can run the same query after `.explain` with an ordinary `await`.
+
+</Returns>
+
+<Params>
+<Param name="verbosity" type="ExplainVerbosity" default="&quot;queryPlanner&quot;">
+
+How detailed the explanation is. `"queryPlanner"` gives only the plan, without running the query. `"executionStats"` adds statistics of the real run. `"allPlansExecution"` also shows the statistics of the plans the database tried and rejected. Another value (possible only without types) gives a [`QueryError`](../errors/query-errors.mdx#query-error) before the database is contacted, like the other query settings. For `"nope"` the text is `explain: the verbosity is "queryPlanner", "executionStats" or "allPlansExecution" (got "nope")`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/query/search-and-explain/explain-2" />
+
+</FullType>
+
+### What the plan shows [#plan-contents]
+
+The query by view count follows the `views_1` index. First `IXSCAN` finds the matching keys, then `FETCH` reads the documents. A query on a field without an index does a `COLLSCAN`, which scans the whole collection.
+
+<Snippet id="reference/query/search-and-explain/plan-contents" twoslash />
+
+For a good query, `totalDocsExamined` is close to `nReturned`. The second query scanned all three articles to return one. With three documents you don't notice, but with a million it would become a problem. Then add an index on the filter field.
+
+### Only find and findOne [#find-only]
+
+`.explain` exists on [`find`](./reading.mdx#model.find), [`findOne`](./reading.mdx#model.find-one), and [`findById`](./reading.mdx#model.find-by-id) queries. Queries that return values, like [`countDocuments`](./reading.mdx#model.count-documents), don't have it, and on "find and modify" queries the method doesn't compile. If the call comes from code without types, Typemo throws a `QueryError` with the text `explain applies to find() and findOne(), not findOneAndUpdate()`.
+
+### When not to use it [#explain.when-not-to-use]
+
+`.explain` answers "how does the database run the query", not "why is it slow in the application". The query time in your code includes the network and building the result. To find the real queries of a running application, use [`.comment`](./options.mdx#comment), the profiler, and [operation events](../observability/events.mdx). To force the database to use a particular index, use [`.hint`](./options.mdx#hint).

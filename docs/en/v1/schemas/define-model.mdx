@@ -1,0 +1,134 @@
+---
+title: Define a model
+description: "Describe a collection's document with a class using @Schema and @Prop, and get a model from it to work with the data"
+icon: Shapes
+---
+
+A model in Typemo starts as an ordinary class. [`@Schema`](../reference/schemas/schema.mdx#schema) turns it into a document description, [`@Prop`](../reference/schemas/prop.mdx#prop) declares the fields, and [`connection.model`](../reference/connection/connection.mdx#connection.model) gives you a **model** for the class: the object you read and write the collection through.
+
+A **schema** describes a document: which fields it has, their types, and the rules that check the values. There's no separate object like `new Schema({...})`. Typemo builds the schema from the class itself, and TypeScript takes the document type from the same place, so you never describe the same thing twice.
+
+If MongoDB is new to you, one fact is enough. The server stores **documents** (objects with fields) in **collections**, and by default it doesn't require documents in one collection to have the same fields. A Typemo schema adds that strictness on the application side.
+
+## What you need [#prerequisites]
+
+A connected client from [Connect to the database](../connection/connect.mdx) and a `tsconfig` set up as in [Installation and setup](../getting-started/installation.mdx). The examples register users on a website.
+
+## Quick start [#quick-start]
+
+One class, two decorators, and one line to get a model.
+
+<Snippet id="schemas/define-model/quick-start" title="users/user.ts" twoslash />
+
+`User` extends [`Entity`](../reference/schemas/base-classes.mdx#entity) and gets the `_id` field from it, which MongoDB requires on every document. Below we'll go through each part: fields, the field type, the identifier, the collection name, and getting the model.
+
+## Declare a field [#declare-field]
+
+A field is a pair: a class property with a TypeScript type and the `@Prop` decorator above it. The first argument of `@Prop` is a **function that returns the field's runtime type**, for example `() => String`, `() => Number`, `() => Date`. The second holds optional options such as [`required`](../reference/schemas/prop.mdx#required), [`default`](../reference/schemas/prop.mdx#default), and [`min`](../reference/schemas/prop.mdx#min).
+
+<Snippet id="schemas/define-model/declare-field" title="users/user.ts" twoslash />
+
+Why `() => String` when the property already has the type `string`? TypeScript types disappear at compile time, and at runtime Typemo has to know how to cast and check the value. It could read the compiler's `design:type` metadata, but that metadata can't tell `int32` from `double`, doesn't know an array's element type, and confuses `null` with a missing value. So Typemo doesn't read it, and you need neither `emitDecoratorMetadata` nor `reflect-metadata`.
+
+You set the type explicitly on every field. The arrow is there so that a class declared further down the file or in another module exists by the time the schema is built. All the types and how they differ are collected in [Choose a field type](./field-types.mdx).
+
+The runtime type and the property type have to match, and the compiler checks that. Write `() => Number` above a string property, and the code won't compile.
+
+<Snippet id="schemas/define-model/declare-field-2" title="users/user.ts" twoslash />
+
+The compiler message contains the text `@Prop "login": the runtime type () => X does not match the field type`. In untyped code the same check runs when you get the model and throws a [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configuration-error).
+
+## Get the model [#get-model]
+
+[`connection.model`](../reference/connection/connection.mdx#connection.model) takes a class and returns a model. For one class on one connection it's always the same object. So call `model` wherever it suits you, there's no need to keep the result in a global variable. On the first call Typemo builds and checks the schema, and a mistake in the field descriptions surfaces here, not on the first write.
+
+<Snippet id="schemas/define-model/get-model" title="users/users.service.ts" twoslash />
+
+Without `@Schema` a class won't get a model. Typemo doesn't guess what you meant, and it tells you so right away.
+
+<Snippet id="schemas/define-model/get-model-2" twoslash />
+
+## The document identifier [#document-id]
+
+Every MongoDB document needs a unique `_id`. The easiest way is to extend [`Entity`](../reference/schemas/base-classes.mdx#entity). It declares `_id` of type `ObjectId`, and if you don't pass a value, the library creates one. The `_id` type in `Entity` is set up so that you can leave it out on create and can't change it afterwards.
+
+If the identifier should be your own value, such as a slug string, extend [`EntityWithId`](../reference/schemas/base-classes.mdx#entity-with-id) instead of `Entity` and pass it the `_id` type.
+
+<Snippet id="schemas/define-model/document-id" title="pages/page.ts" twoslash />
+
+Without `default`, such an identifier is required on create. With `default` (`EntityWithId(() => Types.UUID, { default: () => new UUID() })`) it's created for you. String, numeric, and `UUID` identifiers, references to such models, and `$out` with them are covered in [Use your own _id type](./custom-ids.mdx).
+
+A model without `_id` won't build: `NoId: a model needs an _id field (extend Entity or declare @Prop _id)`. Timestamps and a document version come from other base classes, [`Timestamped`](../reference/schemas/base-classes.mdx#timestamped) and [`Versioned`](../reference/schemas/base-classes.mdx#versioned). They're covered in [Timestamps and versions](./timestamps-and-versions.mdx).
+
+## Set the collection name [#collection-name]
+
+The [`collection`](../reference/schemas/schema.mdx#collection) option names the collection in the database. Without it, Typemo takes the class name in lowercase and makes it plural by English rules, so `UserProfile` ends up in the `userprofiles` collection. That's fine for a new collection. But name an existing collection explicitly, or the model will quietly start working with a different one.
+
+<Snippet id="schemas/define-model/collection-name" twoslash />
+
+The naming rules and how to change them for the whole project are described in [Collection names](./collection-names.mdx).
+
+## What the schema does on a write [#schema-on-write]
+
+The schema is always strict. A field that isn't in the class isn't written and isn't dropped quietly either. It raises a [`CastError`](../reference/errors/data-errors.mdx#cast-error) with the reason `unknown-key`. A value of the wrong type is an error too, not a silent conversion. `"5"` won't become a number.
+
+<Snippet id="schemas/define-model/schema-on-write" twoslash />
+
+A typo in a field name or an extra field from an outside request won't reach the database. The `as never` here only makes the compiler accept a call that is wrong on purpose. In normal code [`create`](../reference/writes/writes.mdx#create) stops this at compile time. You don't need options like Mongoose's `strict`, and strictness can't be relaxed.
+
+## How to choose [#how-to-choose]
+
+Ask yourself: **does the document have a natural unique key that you'd want to store as `_id` anyway?**
+
+- **No**, as with a user, an order, or a post: extend `Entity`. The `ObjectId` is created for you and works well in an index.
+- **Yes**, as with a page slug, a currency code, or an external identifier: extend `EntityWithId` with the type you need. A separate key with a unique index would take up space and require a second lookup.
+
+## When not to use it [#when-not-to-use]
+
+You need a class with `@Schema` only for data that lives in the database. A value computed from other fields isn't declared with `@Prop`. Use a getter for it (see [Add computed fields and reverse references](./virtuals.mdx)). Connection and client settings live in [`TypemoClient`](../reference/connection/typemo-client.mdx), not in the schema. And if you only need to check arbitrary data without a collection, use [`Model.validate`](../reference/documents/model-document-methods.mdx#model.validate).
+
+## Troubleshooting [#troubleshooting]
+
+**A class without `@Schema` doesn't become a model.** The field is declared and `@Prop` is in place, but `connection.model(Plain)` throws `ConfigurationError: Plain: not a schema; decorate the class with @Schema()`. `@Prop` only records the field in the class description. It's `@Schema` that builds the schema and marks the class. Add the decorator: `@Schema() class Plain extends Entity {}`.
+
+**A field without `@Prop` isn't part of the schema.** As far as Typemo is concerned, the property doesn't exist. It's not in the checks, the filters, or the writes. TypeScript knows about it, since it's in the class, so the code **compiles**.
+
+But Typemo won't stay quiet about it. If the property really shows up on the instance, building the model throws a [`ConfigurationError`](../reference/errors/configuration-errors.mdx#configuration-error) that names it. A field without an initializer shows up with `useDefineForClassFields: true`, and with `target: "ESNext"` that flag is on by default. A property with an initializer (`cache = new Map()`) or one assigned in the constructor is caught whatever the flag says.
+
+<Snippet id="schemas/define-model/troubleshooting" twoslash />
+
+Add `@Prop(() => String)` above the property, and it becomes a schema field. The check leaves methods, getters, `declare` properties, and non-enumerable properties alone. If a field without an initializer didn't show up on the instance (`useDefineForClassFields: false`), the build passes, and the first write with that key gives a `CastError`: `Cast to User failed at path "nick" for "a" (string): not a field of User [unknown-key]`.
+
+**A default value right in the field declaration.** `login: string = "guest"` in the class body doesn't become a default value. Typemo rejects it when it builds the model, because that's what the [`default`](../reference/schemas/prop.mdx#default) option is for. The error reads `User: field(s) "login" get a value from an initializer or the constructor; use the "default" option — service fields are filled by Typemo`. [Set default values](./defaults.mdx) shows how to use the option.
+
+## Full example [#full-example]
+
+Here's everything together in one file: the model, getting it, and creating a document with error handling at the edge. Code that isn't part of Typemo is marked `__…__`.
+
+<Snippet id="schemas/define-model/full-example" title="users/users.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose you create a schema as a separate object with `new Schema({...})`, a model with `mongoose.model("User", schema)`, and you have to describe the document type in a separate interface. In Typemo the class is both the schema and the type, and the connection gives you the model: `connection.model(User)`. `@Schema` has no `strict`, `timestamps`, `versionKey`, `toJSON`, or `toObject` settings. Strictness is absolute, and timestamps and the version come from base classes.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Use your own _id type" href="./custom-ids.mdx">
+  String, numeric, and UUID identifiers with `EntityWithId`.
+</Card>
+<Card title="Choose a field type" href="./field-types.mdx">
+  Which types fields can have, how each is stored in the database, and what it looks like in code.
+</Card>
+<Card title="Required fields, null, and missing values" href="./required-and-null.mdx">
+  How a required field differs from a field that holds null.
+</Card>
+<Card title="@Schema" href="../reference/schemas/schema.mdx">
+  Every schema option, including special collections and policies.
+</Card>
+<Card title="@Prop" href="../reference/schemas/prop.mdx">
+  Every field option and which types it applies to.
+</Card>
+</Cards>

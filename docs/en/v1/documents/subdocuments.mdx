@@ -1,0 +1,118 @@
+---
+title: Work with nested objects
+description: "Change nested objects and rows of a subdocument array, find out their path, parent, and position, and validate nested fields"
+icon: Boxes
+---
+
+Work with a nested object or an array row as you would with an ordinary object. Read and assign its fields, and Typemo writes exact paths like `address.city` or `lines.1.qty`. Such an object is called a **subdocument**, and it also has a set of `$` methods. They tell you the parent, the path in the document, and the position in the array, replace a field with a type check, and give you a plain copy.
+
+A subdocument isn't a separate record in the database but part of a document. So it has no `$save` of its own. The whole owner document is always saved, and Typemo sends only what changed inside. The path of a subdocument comes in handy when you sort out errors, write hooks, or show the user which order line is wrong.
+
+## What you need [#prerequisites]
+
+The order from [Change and save a document](./change-and-save.mdx). It has a delivery `address`, a nested object without an `_id`, and `lines`, subdocuments with an `_id`.
+
+## Quick start [#quick-start]
+
+<Snippet id="documents/subdocuments/quick-start" twoslash />
+
+Below we cover how a subdocument is tied to its parent, how to replace it, and how its fields are validated.
+
+## Change a field of a nested object [#change-nested-field]
+
+You assign a field of a nested object as usual: `order.address.city = "Rome"`. Typemo writes the path to the field, not the whole object, so another client's change to a neighboring field isn't lost. The object itself may be missing (`address?`), and TypeScript requires a check: `order.address!` or a condition.
+
+A nested class with `@Schema()` or `@Schema({ nested: true })` is stored as part of the document and has no identity of its own. It has no `_id`. A class that extends `Entity` gets an `_id`. That's how order lines work: you can find and remove them by id. You can't declare `_id` on a class with `nested: true`. The schema won't build and gives `ConfigurationError: Bad: a nested object (no _id, no own hooks) — it declares _id`.
+
+## Replace a nested object completely [#replace-nested-object]
+
+You can't replace a subdocument field by assignment. `order.address = { city: "Rome" }` doesn't compile, and if you get around the types, [`$save`](../reference/documents/document-api.mdx#save) refuses to write. For a replacement there's [`$set`](../reference/documents/document-api.mdx#set). It casts the value and makes the new object tracked.
+
+<Snippet id="documents/subdocuments/replace-nested-object" twoslash />
+
+<Snippet id="documents/subdocuments/replace-nested-object-2" />
+
+## Find the parent, path, and position [#parent-path-position]
+
+Every subdocument knows where it sits. The path and position are **computed when you call the method**, so they don't go stale after `unshift`, `splice`, or `reverse` on the array. If the element moved, the method returns the new position.
+
+<Snippet id="documents/subdocuments/parent-path-position" twoslash />
+
+All these methods are described in the reference.
+
+- [`$parent`](../reference/documents/typed-collections.mdx#subdocument): the nearest owner.
+- `$parentArray`: the array the element is in.
+- `$fullPath`: the full path in the document.
+- `$ownerDocument`: the root document.
+- `$index`: the position in the array.
+
+An element that isn't attached to an array yet (`lines.create(…)`) has no path and no parent. `$parent`, `$parentArray`, `$fullPath`, and `$ownerDocument` return `undefined`, and `$index` returns `-1`. A single nested object gives the same `-1`, since it isn't in an array.
+
+## Find out whether a subdocument is new and what changed in it [#subdocument-state]
+
+A subdocument has three methods it shares with the root document: [`$isNew()`, `$isModified()`, and `$isRoot()`](../reference/documents/typed-collections.mdx#subdocument). They matter most in hooks. A document hook declared in the `Line` class runs on every line of the order, and `this` in it is a subdocument.
+
+<Snippet id="documents/subdocuments/subdocument-state" twoslash />
+
+A subdocument's `$isNew()` repeats the answer of the document it belongs to. Until the order is inserted, its lines are new, and after the insert they aren't. A line added to an already saved order answers `false` too, since it reaches the database together with the order.
+
+`$isModified()` looks only at the line's own fields, and `$isRoot()` is always `false` for a subdocument. In a class hook this check narrows the type of `this`. After `if (this.$isRoot())`, the root methods like `$getChanges()` are available. The details are in [Run code when a document is saved](../hooks/document-hooks.mdx#subdocuments).
+
+## Validate nested fields [#validate-nested]
+
+The rules of nested fields (`min`, `required`, `enum`, and others) are checked together with the document. The path in the error names both the line and the field, so the user sees exactly what to fix.
+
+<Snippet id="documents/subdocuments/validate-nested" twoslash />
+
+## Get a plain copy [#plain-copy]
+
+A subdocument's [`$toObject`](../reference/documents/typed-collections.mdx#subdocument) returns a plain object without tracking. [`$toPlain`](../reference/documents/typed-collections.mdx#subdocument) returns the same as the document's `$toPlain()` at that path, with ids as strings. You can change the copy, and the document won't be affected.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether you need to find or remove this object separately from the document**.
+
+- **Yes, like an order line or a comment**: make it a class with an `_id` that extends `Entity`. Then [`lines.id(id)`](../reference/documents/typed-collections.mdx#subdocument-array.id) and `lines.pull(id)` work.
+- **No, the object is only part of a value**, like an address or coordinates: a nested class with `@Schema({ nested: true })` and no `_id` is enough.
+
+## When not to use it [#when-not-to-use]
+
+If you need to find and count order lines separately from orders, for example every line with product `A1` across all orders, subdocuments get in the way. Create a separate collection and a [`ref`](../schemas/references.mdx) link. An array of thousands of subdocuments is also worth moving out, since MongoDB limits the size of a document.
+
+## Troubleshooting [#troubleshooting]
+
+**A subdocument replaced by assignment.**
+
+<Snippet id="documents/subdocuments/replace-nested-object-2" />
+
+An assignment doesn't say whether you want to replace the object or add to it. Use the document's [`$set`](../reference/documents/document-api.mdx#set) or the parent's `$set`.
+
+**A `query.find` hook in the line class doesn't run.** The `Line` class declares an operation hook, for example [`@Pre("query.find")`](../reference/hooks/pre-post.mdx#subdocument-hook), and `Orders.find()` doesn't call it. There's no error at compile time or when the model is created, only zero calls. A subdocument has no operations of its own. The `Order` model runs `find`, `updateMany`, and aggregations, and the operation hooks of its class are the ones that fire.
+
+Document hooks (`document.save`, `document.validate`) in `Line` do work on every line, as described [above](#subdocument-state). Move the operation hook to the `Order` class. There's more in [Hook into an operation](../hooks/operation-hooks.mdx#subdocument-hook-skipped).
+
+## Full example [#full-example]
+
+<Snippet id="documents/subdocuments/full-example" title="orders/orders.service.ts" twoslash />
+
+## Coming from Mongoose [#from-mongoose]
+
+<Callout type="migration">
+
+A subdocument and a subdocument array are Mongoose's `Subdocument` and `DocumentArray`. The difference is strictness. The types won't let you assign an object to a subdocument field or an element to an array by index, and a replacement goes through `$set`. `$parent`, `$index`, and `$fullPath` are computed on the call and don't go stale.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Arrays and Maps in a document" href="./typed-collections.mdx">
+  The methods of subdocument arrays: `create`, `id`, `pull`.
+</Card>
+<Card title="Define nested objects and subdocuments" href="../schemas/nested-and-subdocuments.mdx">
+  How to describe nested classes in a schema.
+</Card>
+<Card title="Typed collections" href="../reference/documents/typed-collections.mdx">
+  Every method of a subdocument and a subdocument array.
+</Card>
+</Cards>

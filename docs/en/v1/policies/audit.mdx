@@ -1,0 +1,98 @@
+---
+title: Keep an audit log
+description: "A log of every write to a model, with the actor and masked secrets, that rolls back together with the write"
+icon: ScrollText
+---
+
+To answer "who changed what" later, turn on the [`audit`](../reference/policies/schema-options.mdx#audit) option. Then every write to the model leaves a line in a separate collection, the **audit log**. The log is written in the same transaction as the write itself, so the write and its trace are saved together or not at all. That needs a replica set.
+
+## What you need [#prerequisites]
+
+MongoDB running as a replica set (several MongoDB servers holding copies of the same data, though one server is enough for transactions). You can check it with [`client.supportsTransactions`](../reference/connection/typemo-client.mdx#client.supports-transactions), as in [Connect to the database](../connection/connect.mdx#replica-set). The example is a bank with transfers between accounts.
+
+## Quick start [#quick-start]
+
+Turn on the option, and pass the actor in the policy context.
+
+<Snippet id="policies/audit/quick-start" title="transfers/transfer.ts" twoslash />
+
+<Snippet id="policies/audit/quick-start-2" twoslash />
+
+## Read the log [#read-log]
+
+By default the log lives in the `<collection>_audit` collection, which for `transfers` is `transfers_audit`. The log has no model, so read it with the driver through [`client.unsafeDriver()`](../reference/connection/typemo-client.mdx#client.unsafe-driver). In the example below the log has two lines.
+
+- The insert: `operation: "insertOne"`, `actor: "user-7"`, `document: true`, and `documents` with the values.
+- The update: `operation: "updateOne"`, `filter: { from: "A" }`, `update: { $set: { amount: 90, card: "?" } }`, `result` with the server's counters, and `outcome: "ok"`.
+
+Every field of a line is described by the [`AuditEntry`](../reference/policies/schema-options.mdx#audit-entry) type.
+
+<Snippet id="policies/audit/read-log" twoslash />
+
+Every write goes into the log: `create`, `insertOne`, `insertMany`, `$save`, updates, replaces, deletes, find-and-modify, and `bulkWrite`. A soft delete is recorded as a delete with the flag `softDelete: true`. Reads don't go into the log. To use your own collection for the log, set `audit: { collection: "transfer_history" }`.
+
+## Hide secrets [#hide-secrets]
+
+Values in the filter, the update, and the documents are masked by the field option [`sensitive`](../reference/schemas/prop.mdx#sensitive). `"mask"` replaces the value with `?`, and `"hide"` with `[hidden]`. That's why the card number `5500000000000004` went into the log as `"card": "?"`, and the `note` field with `sensitive: "hide"` as `"[hidden]"`. The document itself doesn't change in the app. Only the log is masked.
+
+There's a third option, your own function. `sensitive: { mask: (value) => value.slice(-4) }` keeps the last four digits in the log, so the number `4111111111111111` becomes `"1111"`. The function is called only with a value of the type declared for the field.
+
+If the filter compares this field through an operator, for example `{ pan: { $exists: true } }`, the operand has a different type. Then `?` goes into the log without calling the function, and you get `"filter": { "pan": { "$exists": "?" } }`. The function never gets something it doesn't expect, and the secret doesn't leak through a condition.
+
+The mask covers values, not names. The command name and the collection in command events ([`driver.command.started`](../reference/observability/events.mdx) and its neighbors) aren't masked. They aren't secret, and without them you can't tell what ran. But the values of fields marked `sensitive` are masked in these events too, by the field's rule.
+
+## The history of one document [#document-history]
+
+A log line names exactly what the operation named. A write by a filter without `_id`, say `updateMany({ from: "A" }, …)`, leaves **one** line with that filter and the counters, without the ids of the affected documents. So the full history of one document exists only for writes that name it by `_id`: `updateOne({ _id }, …)`, `$save`, `$deleteOne`.
+
+If you need the history of every document under a broad filter, read the ids in a transaction and write by them. Then the log line names the `_id` values.
+
+<Snippet id="policies/audit/document-history" twoslash />
+
+The log line of such a write gets `filter: { _id: { $in: [...] } }` with every id, while a write by `{ status: "open" }` gets only the filter itself. The transaction is there so that reading the ids and writing by them see the same state of the database, and the log is written together with the update.
+
+## What happens if the log isn't written [#audit-write-failed]
+
+If the log isn't written, the whole operation doesn't happen either. It ends with an [`AuditError`](../reference/errors/configuration-errors.mdx#audit-error), and the transaction rolls back together with the write. Say the log's validator rejects every line. Then `create` returns `AuditError: Payment.create: the audit entry could not be written; the transaction is aborted with this error, the write is rolled back`. `cause` holds a `ServerValidationError`, `applied` is `false`, and the document doesn't appear in the database. The text has the name of the method you called (`create`). A write without a trace can't happen this way.
+
+Inside your own [transaction](../transactions/transactions.mdx), the log write joins it. On a rollback, neither the write nor the log line remains. After a `throw` inside `client.transaction`, `countDocuments` is 0, and the log has no line either.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **whether you need to prove what changed and who did it**. For money, access rights, and personal data, yes. For service collections like a cache or sessions, the log only slows writes down, so don't turn it on.
+
+## When not to use it [#when-not-to-use]
+
+Without a replica set, a write to a model with `audit` throws a `ConfigurationError`. The text asks you to run a replica set, and nothing is written. If you need the history of particular fields rather than of every write, write your own [hook](../hooks/operation-hooks.mdx). The log doesn't record reads.
+
+## Troubleshooting [#troubleshooting]
+
+**A write fails on a standalone `mongod`.** A write with a log runs in a transaction, and a standalone server can't do transactions. The error is `ConfigurationError: Order.create: the model is audited (@Schema({ audit })); an audited write outside a transaction runs in its own transaction so that the write and its audit entry commit together — this needs a replica set or a sharded cluster, and the server is a standalone mongod. Run MongoDB as a replica set (a single-member one is enough).`.
+
+The error starts with the name of the method you called. Here it's `create`, and for `insertOne` it would be `Order.insertOne`. Run MongoDB as a replica set.
+
+**The log has no actor.** The actor comes from the policy context. If the write happened outside [`PolicyContext.run`](../reference/policies/policy-context.mdx#policy-context.run) and without `.policy({ actor })`, the line has no `actor` field. Open a scope where request handling starts.
+
+## Full example [#full-example]
+
+<Snippet id="policies/audit/full-example" title="transfers/transfers.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, auditing comes from a plugin that writes to a separate collection without a shared transaction. A log failure leaves a write without a trace. In Typemo the log is written in the write's transaction, and a failure rolls back both.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Policy options in the schema" href="../reference/policies/schema-options.mdx#audit">
+  The settings, the fields of `AuditEntry`, and what stays out of the log.
+</Card>
+<Card title="Pass the tenant and actor through the whole request" href="./policy-context.mdx">
+  How to pass the actor through the whole request.
+</Card>
+<Card title="Transactions" href="../transactions/transactions.mdx">
+  How a write with an audit log behaves inside your transaction.
+</Card>
+</Cards>

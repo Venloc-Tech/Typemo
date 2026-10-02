@@ -1,0 +1,172 @@
+---
+title: Make sure a reference is populated
+description: "Pass a populated document to a function, accept a document in any state, require population, and handle a missing reference"
+icon: ShieldCheck
+---
+
+A field's type depends on whether you called `populate`. Before the call `author` holds a `Ref<User>` identifier, after it a user document, or `null` if the user has been deleted. While the query and the code that uses it sit next to each other, that's handy. But pass the document to another function, and you have to carry the type over there too. And if the document came from somewhere you can't tell whether the relation is populated, you need a check.
+
+There are several ways.
+
+- Name the type of the populated result.
+- Write a function for a document in any state: [`AnyPopulationDoc`](../reference/populate/populate-types.mdx#any-population-doc) and [`isPopulated`](../reference/populate/populate-types.mdx#is-populated).
+- Require population with the [`$assertPopulated`](../reference/documents/document-api.mdx#assert-populated) method.
+- Check it at runtime with [`$populated`](../reference/documents/document-api.mdx#populated).
+- Handle `null`: [`isPresent`](../reference/populate/populate-types.mdx#is-present) and the [`required`](../reference/populate/populate.mdx#required) option.
+
+## What you need [#prerequisites]
+
+The client and the blog models from [Show related data](./basics.mdx). A post has `author` and `tags`, and a comment has `post` and `author`. The database holds two users, Alice and Bob, Alice's post "Hello" with the tags `db` and `ts`, and the comment `c1` on it.
+
+## Quick start [#quick-start]
+
+- **The function needs a document with the relation populated**: type its parameter with the type of the populated result.
+- **The function has to accept a document in any state**: type the parameter with `AnyPopulationDoc` and ask `isPopulated`.
+- **Other code may have populated the relation, and you need to require it**: call `$assertPopulated`.
+
+<Snippet id="populate/type-checks/quick-start" twoslash />
+
+Below we'll cover each way and what to do with a missing reference.
+
+## Pass a populated document to another function [#pass-populated]
+
+A function formats a post for an email and takes the author's name. It needs a post with `author` populated, and the compiler should block a post without it. The most reliable way is to derive that type from the function that does the populating. Then the type can't drift away from the query.
+
+<Snippet id="populate/type-checks/pass-populated" title="blog/posts.service.ts" twoslash />
+
+`LoadedPost` is the post document with `author` replaced by the populated user or `null`. The `?.` and the fallback value are needed because the author could have been deleted after the post was written. How to remove `null` from the type, if a missing reference is an error for you, is covered [below](#null-handling).
+
+Pass a post without populate to `subject`, and the compiler stops the call. Notice the error code. It's `TS2379`, not `TS2345`, because the project builds with `exactOptionalPropertyTypes`.
+
+<Snippet id="populate/type-checks/pass-populated-2" twoslash />
+
+`TS2379` unfolds down to the cause: `Types of property 'author' are incompatible. Type 'Ref<User>' is not assignable to type 'HydratedDoc<User> | null'`. That way a forgotten populate is caught where the document is passed, not where it was read.
+
+The reverse holds too, and it matters for shared functions. A document with a populated relation is a different type, and it **isn't assignable** to a `HydratedDoc<Post>` parameter (`Type 'HydratedDoc<User> | null' is not assignable to type 'Ref<User>'`). A function with a `HydratedDoc<Post>` parameter accepts only documents without populated relations. So code that works with both populated and unpopulated documents is typed not with the full document type but with a type for any state. The next section is about it.
+
+## Accept a document in any state [#accept-any-state]
+
+A function builds a caption for a post. If the author is populated, the caption holds their name, otherwise the caption is empty. It's called both with a post read as is and with a post where the author or the tags are already populated. For such a function there's the type [`AnyPopulationDoc<Post>`](../reference/populate/populate-types.mdx#any-population-doc). Both an ordinary post and a post populated on any paths are assignable to it. References in it read cautiously, as `Ref<User> | AnyPopulationDoc<User> | null`, and [`isPopulated`](../reference/populate/populate-types.mdx#is-populated) finds out at runtime whether the relation is populated and narrows the type.
+
+<Snippet id="populate/type-checks/accept-any-state" twoslash />
+
+One function accepted both posts. In the `true` branch the compiler knows that `post.author` is populated, and the field has the type `AnyPopulationDoc<User> | null`. The `false` branch doesn't have to be empty. In it the post reads as "author not populated, or unknown".
+
+The check looks at what's actually there, not at the variable's type. If other code populated the relation after you got the document, `isPopulated` sees it.
+
+<Snippet id="populate/type-checks/accept-any-state-2" twoslash />
+
+`isPopulated` accepts only a document declared as `AnyPopulationDoc`. A plain `HydratedDoc<Post>` says its references are identifiers, so there's nothing to ask it. The function parameter takes care of this itself, since both kinds of documents are assignable to it, as in the examples above.
+
+For an array of references, narrowing leaves `| null` on the elements.
+
+<Snippet id="populate/type-checks/accept-any-state-3" twoslash />
+
+After `isPopulated` an array element stays `AnyPopulationDoc<Tag> | null`, even though without [`retainNullValues`](../reference/populate/populate.mdx#retain-null-values) there's never a `null` there. The form doesn't know which options the query used. `.filter(isPresent)` removes `null` from the type. A nested relation, for example `isPopulated(post.author, "posts")`, is checked with a second call on the populated document. For how the type works and every shape of relation, see [Populate types](../reference/populate/populate-types.mdx#is-populated).
+
+The form has limits. A document populated with a `select` that dropped required fields, with `transform`, or with `justOne` over an array of references isn't assignable to `AnyPopulationDoc`. It lacks what the form promises. For such a document, type the parameter with the query's result type, as in the section above. The form has no write and populate methods (`$set`, `$populate`, `$depopulate`), because they depend on a state the form doesn't know.
+
+## What to do with null [#null-handling]
+
+You populated the author, and they were deleted. A single reference after populate is a document or `null`, and you can't reach `post.author.name` without a check. There are three ways, and the choice depends on what a missing author means for your code.
+
+If `null` is acceptable and you can show `"anonymous"`, narrow with `?.` and `??`, or with [`isPresent`](../reference/populate/populate-types.mdx#is-present). This guard removes `null` and `undefined` from the type and works with any shape: a document and `.lean()` and `.plain()` results.
+
+<Snippet id="populate/type-checks/null-handling" twoslash />
+
+If a missing author means the data is broken and you can't go on, ask populate itself for [`required: true`](../reference/populate/populate.mdx#required). Then a missing document throws a `DocumentNotFoundError`, `null` drops out of the result type, and `post.author.name` compiles without checks.
+
+<Snippet id="populate/type-checks/null-handling-2" twoslash />
+
+The `required` option of `@Prop` doesn't change the type of a populated field. It requires the identifier to be in the document, but it doesn't promise that a document with that identifier exists. The third way is `$assertPopulated`, described below. It doesn't remove `null`, though, because a missing reference counts as populated for it too.
+
+## Require population (`$assertPopulated`) [#assert-populated]
+
+The relation may have been populated by code the type couldn't follow: a hook, or a helper function that called `$populate` on the document. You need to confirm the population and get an exact type. [`$assertPopulated`](../reference/documents/document-api.mdx#assert-populated) checks at runtime that the path is populated and narrows the type of the returned value. It doesn't populate anything itself. If the path isn't populated, it throws.
+
+<Snippet id="populate/type-checks/assert-populated" twoslash />
+
+The method returns the same document, but with a type where the path is populated. So work with the returned value, because the type of the `post` variable doesn't change from the call.
+
+An empty result counts as populated too. If a post has no tags and the array is empty after populate, `$assertPopulated("tags")` passes, since populate did run. A missing single reference passes as well. Its value is `null`, and in the returned type the field stays `HydratedDoc<User> | null`. And if the path isn't populated, the error comes before you touch the field.
+
+<Snippet id="populate/type-checks/assert-populated-2" />
+
+One call checks several paths. The method takes the same list of paths and objects as [`$populate`](./document-populate.mdx), for example `post.$assertPopulated(["author", "tags"])`. The error names the first unpopulated path in the list. For an object with a nested `populate`, the nested path is checked too, so `{ path: "author", populate: "company" }` requires both `author` and `author.company` to be populated.
+
+For a nested path the whole chain is checked. `post.author` on a comment passes only if both `post` and `author` on the found posts are populated. If only `post` is populated, the method reports `QueryError: $assertPopulated: "post.author" of Comment is not populated — populate it first`. You can also pass an object, such as `{ path: "tags", select: { label: 1 } }`, so the type takes the selected fields into account.
+
+In essence the method is a confirmation. You tell the compiler "this is already populated" and get a runtime check in return. If the relation isn't populated, you find out right away, not through an `undefined` in the middle of an email template. And if the function needs to accept any document rather than one specific kind, there's [`isPopulated`](../reference/populate/populate-types.mdx#is-populated). It doesn't throw, it picks a branch.
+
+## Check population without an error (`$populated`) [#populated]
+
+If you don't want an error but a branch, ask [`$populated`](../reference/documents/document-api.mdx#populated). For a populated path it returns the original identifiers, for an unpopulated one `undefined`.
+
+<Snippet id="populate/type-checks/populated" twoslash />
+
+The method returns `unknown` and doesn't narrow the type. It answers the question only at runtime. To get the type after branching as well, use `isPopulated` if the parameter is declared as `AnyPopulationDoc`, or `$assertPopulated`. You can also populate the relation with [`$populate`](./document-populate.mdx) and take the returned value.
+
+## What populated field types look like [#populated-types]
+
+A document with a populated relation is called [`HydratedDocWith`](../reference/values/form-types.mdx#hydrated-doc-with). The first argument is the class, the second is the populated fields as they read. For a post with its author it's `HydratedDocWith<Post, { author: HydratedDoc<User> | null }>`. The other fields are the same as in `HydratedDoc<Post>` and aren't repeated in the tooltip.
+
+Inside the type a populated field is described with [`PopulatedField<Value, Original>`](../reference/populate/populate-types.mdx#populated-field). It holds both the value after population and the original type. You don't see it in tooltips, but it explains two things. The [`$depopulate`](../reference/documents/document-api.mdx#depopulate) method knows which type to return the field to, `Ref<User>`, and that's [`Depopulated`](../reference/populate/populate-types.mdx#depopulated). And [`$set`](../reference/documents/document-api.mdx#set) on a populated field accepts identifiers, not documents.
+
+<Snippet id="populate/type-checks/populated-types" twoslash />
+
+For a populated field your editor shows `HydratedDoc<User> | null`, and after `$depopulate` it shows `Ref<User>`. The tooltip for the document itself names the class and the populated field, `HydratedDocWith<Post, { author: HydratedDoc<User> | null }>`. Once `$depopulate()` has put back every populated field, the document reads as `HydratedDoc<Post>` again.
+
+## How to choose [#how-to-choose]
+
+Ask yourself who knows that the relation is populated.
+
+- **The code that ran the query itself**: name the type after its result. The check is free, because the compiler does it.
+- **Nobody, the function has to accept a document in any state**: declare the parameter as `AnyPopulationDoc` and ask `isPopulated`. The branch is picked by what's actually there.
+- **Other code, and you need a specific `HydratedDoc`**: require population with `$assertPopulated`. You pay with a runtime check, but a violation shows up right away with a clear text.
+- **You need a branch without narrowing the type**: ask `$populated`.
+
+Decide about `null` separately. If a missing reference is acceptable, use `isPresent`, if not, `required: true`.
+
+## When not to use it [#when-not-to-use]
+
+If you read with `.plain()` or `.lean()` and populate the relation in the same query, you don't need a separate check. The result type is already exact, and you can derive it from the function the same way as for a document. If the function calls `$populate` itself, there's nothing to check, because the returned value already has the right type. And if you don't need the reference as a document at all and `_id` is enough, both populate and the checks around it are unnecessary.
+
+## Troubleshooting [#troubleshooting]
+
+**`$assertPopulated` didn't change the variable's type.** You called `post.$assertPopulated("author")` and keep reaching for `post.author?.name`. The compiler answers `Property 'name' does not exist on type 'Ref<User>'`. The method narrows the type of the returned value, not of the variable. Keep the result, `const loaded = post.$assertPopulated("author")`, and work with it.
+
+**The author is "possibly null".** For example, like this.
+
+<Snippet id="populate/type-checks/troubleshooting" twoslash />
+
+The compiler reports `TS18047: 'post.author' is possibly 'null'`. A single reference after populate allows `null`, because the document could have been deleted. Check the field with `?.` or [`isPresent`](../reference/populate/populate-types.mdx#is-present), and if a missing reference is an error for you, add `required: true` to populate.
+
+**`isPopulated` doesn't accept the path.** For example, when the parameter is declared as `HydratedDoc<Post>`.
+
+<Snippet id="populate/type-checks/troubleshooting-2" twoslash />
+
+The compiler answers `Argument of type '"author"' is not assignable to parameter of type 'never'`. The function accepts only a document declared as `AnyPopulationDoc<Post>`. A plain `HydratedDoc<Post>` says its references are identifiers, and it has no populated paths. Change the parameter type to `AnyPopulationDoc<Post>`, or use `$assertPopulated` if you need exactly a `HydratedDoc`. A path that isn't a reference is rejected the same way: `Argument of type '"title"' is not assignable to parameter of type 'PopulatableKeys<Post>'`.
+
+**A call with a wrong path.** For example, the model has no `nope` field.
+
+<Snippet id="populate/type-checks/troubleshooting-3" twoslash />
+
+The compiler checks the path the same way as in `.populate`: `Invalid populate path "nope": unknown field "nope"`. If the string isn't a path at all, at runtime you get `QueryError: $assertPopulated: a populate path or { path }`.
+
+## Full example [#full-example]
+
+<Snippet id="populate/type-checks/full-example" title="blog/mail.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Populate a document you already have" href="./document-populate.mdx">
+  `$populate`, `$depopulate`, and `$populated`: populate a relation on a document and put it back.
+</Card>
+<Card title="Populate types" href="../reference/populate/populate-types.mdx">
+  `AnyPopulationDoc`, `isPopulated`, `isPresent`, `PopulatedField`, `Depopulated`, and the path check types.
+</Card>
+<Card title="Show related data" href="./basics.mdx">
+  Populate relations in the query itself.
+</Card>
+</Cards>

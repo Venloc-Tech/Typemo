@@ -1,0 +1,324 @@
+---
+title: Populate types
+description: "The populate types and functions: PopulatedField, Depopulated, ApplyPopulate, AnyPopulationDoc, isPopulated, isPresent, and the path check types"
+icon: Braces
+---
+
+After a call to [`.populate`](./populate.mdx#populate), not only the result changes but also its type. The `author` field goes from `Ref<User>` to a user document, or `null` if the document is gone. The virtual field `comments` goes from a service marker to an array of comments. The public types on this page handle that, along with two functions for code that doesn't know whether a relation is loaded: [`isPopulated`](#is-populated) and [`isPresent`](#is-present). For each type, the page says where you'll meet it: in editor hovers and error messages, or only in your own wrappers over populate results.
+
+If related data is new to you, start with the [Show related data](../../populate/basics.mdx) guide. To check types in your own code, read the [Make sure a reference is populated](../../populate/type-checks.mdx) guide. This page is the reference for the types themselves.
+
+The examples take the blog model from the [`.populate`](./populate.mdx) page: a post with a reference to the author, tags, and a virtual field of comments. The database has two users (Alice and Bob), two tags (`db` and `ts`), three posts, and three comments, as there.
+
+The page describes [`PopulatedField`](#populated-field), [`Depopulated`](#depopulated), [`ApplyPopulate`](#apply-populate), [`isPresent`](#is-present), [`isPopulated`](#is-populated), [`AnyPopulationDoc`](#any-population-doc), [`PartlyPopulatedDoc`](#partly-populated-doc), [`AnyPopulationMethods`](#any-population-methods), [`PopulatableKeys`](#populatable-keys), and the [other types](#other-types): path checks, the `populate` argument, `transform`.
+
+---
+
+## PopulatedField [#populated-field]
+
+`PopulatedField<Value, Original>` describes a field that is already loaded. `Value` is what the field holds after populate (a document or `null`, an array of documents, a number, the result of `transform`). `Original` is what the field held before (`Ref<M>`, `Ref<M>[]`, `Map<string, Ref<M>>`, `VirtualRef`). It's a marker type. There is no value of such a type at runtime, and the compiler needs it to remember both states of the field.
+
+Both states are needed because loading can be undone. [`$depopulate`](../documents/document-api.mdx#depopulate) puts the original identifiers back in place of the documents, and [`$set`](../documents/document-api.mdx#set) on a loaded field accepts identifiers, not documents. Both types come from `Original`. A reader of the field sees only `Value`, because the document view collapses the marker, and you won't meet `PopulatedField` in hovers.
+
+<Params title="Type parameters">
+<Param name="Value" type="unknown" required>
+
+What the field holds after populate. `HydratedDoc<User> | null` for one reference (`null` means the document is gone or failed `match`), `readonly HydratedDoc<Tag>[]` for an array, `ReadonlyMap<string, HydratedDoc<User> | null>` for a map, and a number for a counter.
+
+</Param>
+<Param name="Original" type="unknown" required>
+
+What the field held before populate. `$depopulate` returns this type and `$set` accepts it.
+
+</Param>
+<Param name="Transformed" type="boolean" default="false">
+
+`true` when the field holds results of `transform` rather than documents. Such a value doesn't need converting through `.plain()` or `.lean()`, because it's already final.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/populate/populate-types/populated-field" />
+
+</FullType>
+
+Helper types read the marker. [`PopulatedValueOf<V>`](#other-types) gives `Value` (for a non-marker, `V` itself), [`PopulatedOriginalOf<V>`](#other-types) gives `Original`, and [`IsTransformed<V>`](#other-types) gives `Transformed`. `AnyPopulatedField` is the general form of any marker, used to check whether a field is loaded.
+
+The document itself doesn't show the marker in a hover. The editor names the class and the loaded fields, for example `HydratedDocWith<Post, { author: HydratedDoc<User> | null }>`. The second argument here is the `Value` of each loaded field, and the type takes `Original` from the class. The shape itself is described in the [`HydratedDocWith`](../values/form-types.mdx#hydrated-doc-with) reference.
+
+## Depopulated [#depopulated]
+
+`Depopulated<T, K>` is the document type after [`$depopulate(key)`](../documents/document-api.mdx#depopulate). Fields under the key `K` have their original identifier type again. The type replaces `PopulatedField` markers with their `Original` up to four levels deep, inside arrays, maps, and nested objects. Other fields don't change.
+
+<Params>
+<Param name="T" type="object" required>
+
+The document shape.
+
+</Param>
+<Param name="K" type="PropertyKey" required>
+
+A key or a union of keys whose loaded fields must return to their original form.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/populate/populate-types/depopulated" />
+
+</FullType>
+
+You almost never write `Depopulated` yourself. `$depopulate` uses it to compute which fields went back to identifiers. It isn't visible in the result's hover. A field that returned to its class type drops out of the second argument of [`HydratedDocWith`](../values/form-types.mdx#hydrated-doc-with). When no loaded fields are left, the document is `HydratedDoc<Post>` again, and its `author` is `Ref<User>` again.
+
+<Snippet id="reference/populate/populate-types/depopulated-2" twoslash />
+
+## ApplyPopulate [#apply-populate]
+
+`ApplyPopulate<T, Entries, IsLean>` is the main type. It turns a model type into the result type after populate. `T` is the source model. `Entries` are the accumulated records of loaded paths, one per path, with the projection and shape details. `IsLean` says whether plain objects or documents are needed. The type walks the keys once, so the cost grows with the number of paths, not their combinations. The query builder accumulates the records through `ExtractPopulationEntries` and `ReplaceEntries`, so a repeated call for the same path replaces the record, as it does at runtime.
+
+You rarely call `ApplyPopulate` directly. You see its result in the type of any query with `populate`. Here is what the `.lean()` result looks like after `.populate("author")`.
+
+<Snippet id="reference/populate/populate-types/apply-populate" twoslash />
+
+A loaded reference stays optional (`editor?` stayed as it was), while a loaded virtual field is always present after populate. With unions, meaning embedded discriminators, the type works per member, and each is loaded separately.
+
+<FullType>
+
+<Snippet id="reference/populate/populate-types/apply-populate-2" />
+
+</FullType>
+
+What ends up in the field depends on the shape of the path. An array reference in a document becomes `readonly HydratedDoc<M>[]` and a map becomes `ReadonlyMap`, while in a `.lean()` result they are `M[]` and a plain object. A single reference always allows `null`. The document it led to may have been deleted, and the [`match`](./populate.mdx#match) option may have filtered it out. [`required`](./populate.mdx#required) removes `| null`, and [`transform`](./populate.mdx#transform) replaces the value type with the function's result. `PopulateShape` and `PopulationEntry` describe these details.
+
+## isPresent [#is-present]
+
+`isPresent(value)` answers the question "is there a value?". It returns `true` if the value is neither `null` nor `undefined`. It exists because of the `null` in a loaded single reference. After `populate("author")`, the field `post.author` is a document or `null`, and without a check the compiler won't let `post.author.name` through. `isPresent` is a type guard. Inside an `if` the type narrows to `NonNullable`, and it works with any shape: a document, a `.lean()` or `.plain()` result, a loaded field, a list element.
+
+<Snippet id="reference/populate/populate-types/is-present" twoslash />
+
+<Returns type="boolean">
+
+`true` if the value is neither `null` nor `undefined`. The result type is `value is NonNullable<T>`, so in the `true` branch the compiler removes `null` and `undefined` from the type.
+
+</Returns>
+
+<Params>
+<Param name="value" type="T" required>
+
+The value to check. A field of a loaded document, a list element, the result of `findOne` without `orFail`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/populate/populate-types/is-present-2" />
+
+</FullType>
+
+### A list with empty elements [#sparse-list]
+
+If a list is loaded with the [`retainNullValues`](./populate.mdx#retain-null-values) option, a `null` stands in place of a missing reference. Pass `isPresent` straight to `.filter`. The array type narrows along with the check, and no `null` is left in it.
+
+### When you don't need `isPresent` [#is-present.when-not-to-use]
+
+If a missing reference is a data error for you, don't check for `null`. Ask for [`required: true`](./populate.mdx#required), and such a reference throws [`DocumentNotFoundError`](../errors/query-errors.mdx#document-not-found-error), and the result type has no `null`. `isPresent` won't tell you whether the relation is loaded at all. For that there are [`isPopulated`](#is-populated) and [`$assertPopulated`](../documents/document-api.mdx#assert-populated).
+
+## isPopulated [#is-populated]
+
+`isPopulated(doc, path)` checks at runtime whether the relation `path` is loaded and narrows the document type to [`PartlyPopulatedDoc<T, path>`](#partly-populated-doc). The `path` field in it reads as loaded. The function is for code that receives documents in any state: without populate, with one path, or with several. You declare the parameter of such a function with the [`AnyPopulationDoc<T>`](#any-population-doc) type, and `isPopulated` picks the branch. It reads the same records as [`$populated`](../documents/document-api.mdx#populated) and returns `true` as long as the field holds what populate put there.
+
+<Snippet id="reference/populate/populate-types/is-populated" twoslash />
+
+One function accepted both a post without populate and a post with a loaded author. In the `true` branch the `post.author` field has the type `AnyPopulationDoc<User> | null`. The `null` stayed because the author may have been deleted. Outside the branch the field reads as `Ref<User> | AnyPopulationDoc<User> | null`, and `post.author.name` doesn't compile.
+
+<Returns type="boolean">
+
+`true` if `path` is loaded, meaning populate ran and the field holds its result. The result type is a guard, and in the `true` branch the document narrows to `PartlyPopulatedDoc<T, path>`. A reference for which no document was found counts as loaded too. Populate ran, and the result is `null`. A field that wasn't in the document at all ("Hello" has no `editor`) isn't loaded, because there was nothing to substitute.
+
+</Returns>
+
+<Params>
+<Param name="doc" type="D" required>
+
+A document declared as `AnyPopulationDoc<T>`. A plain `HydratedDoc<T>` and the result of a query with `populate` that isn't cast to this type won't do. See the [Limits](#is-populated-limits) section for details.
+
+</Param>
+<Param name="path" type="PopulatableKeys<T>" required>
+
+A top-level key: a reference, an array of references, a map of references, or a virtual field with populate. A dotted path isn't accepted. Check a nested relation with a second call on the loaded document (`isPopulated(post.author, "posts")`). A key that isn't a reference is a compile error.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/populate/populate-types/is-populated-2" />
+
+</FullType>
+
+### All kinds of relations [#all-relations]
+
+The function tells relations apart by their declaration in the model. An array of references narrows to `readonly (AnyPopulationDoc<Tag> | null)[]`, where a `null` element is possible with `retainNullValues`. A map gives `ReadonlyMap<string, AnyPopulationDoc<…> | null>`. A virtual field gives a list of documents, one document or `null` (`justOne`), and a number for a counter.
+
+<Snippet id="reference/populate/populate-types/all-relations" twoslash />
+
+### Nested relations [#nested-populate]
+
+A document inside a loaded field has the type `AnyPopulationDoc` itself, so the same call checks a nested relation. First `isPopulated(post, "author")`, then check that `post.author` isn't `null`, and call `isPopulated(post.author, "posts")`.
+
+<Snippet id="reference/populate/populate-types/nested-populate" twoslash />
+
+### Limits of isPopulated [#is-populated-limits]
+
+The function is narrower than it may seem, and each limit has a reason.
+
+**Only `AnyPopulationDoc` is accepted.** A plain `HydratedDoc<Post>` tells the compiler that references in it are identifiers, so there is nothing to ask "is it loaded". A document from `populate` that isn't cast to `AnyPopulationDoc<Post>` doesn't fit either. Its type already describes the loaded fields. The call gives a compile error where the path isn't accepted (`parameter of type 'never'`). Usually it's enough to declare the function parameter as `AnyPopulationDoc<Post>`, because both kinds of documents are assignable to it. If the function needs exactly `HydratedDoc<Post>` and other code may have loaded the relation, use [`$assertPopulated`](../documents/document-api.mdx#assert-populated).
+
+<Snippet id="populate/type-checks/troubleshooting-2" twoslash />
+
+**Array elements stay `| null`.** After narrowing, the type of an array of references is `readonly (AnyPopulationDoc<Tag> | null)[]`, although without `retainNullValues` there is no `null` in it. The shape doesn't know which options populate ran with and doesn't promise more than it knows. Remove the `null` with `.filter(isPresent)`.
+
+**Some documents don't fit `AnyPopulationDoc`.** The shape describes the whole document, so documents where populate changed the composition or kind of values aren't assignable to it.
+
+- With `select`, if the selection removes required fields of the loaded document. `select: { email: 1 }` removes the required `name`, while a selection that removes only optional fields is assignable.
+- With `transform`, because the field holds not a document but the result of your function.
+- With `justOne` over an array of references or the list of a virtual field, because one document stands in place of a list.
+
+The function won't accept such a document, and the compiler gives `TS2379`. If the function needs exactly such a result, declare the parameter with the query result type. The [Make sure a reference is populated](../../populate/type-checks.mdx#pass-populated) guide shows how.
+
+<Snippet id="reference/populate/populate-types/is-populated-limits" twoslash />
+
+## AnyPopulationDoc [#any-population-doc]
+
+`AnyPopulationDoc<T>` is the document type of model `T` in any loading state. Both a plain `HydratedDoc<T>` and a document with populate on any paths are assignable to it, nested relations included. Functions that don't care whether a relation is loaded need it: post formatting, a check, a calculation. Without it you'd have to write a signature for each combination of loaded paths.
+
+The fields of such a shape are read carefully. A reference is `Ref<M> | AnyPopulationDoc<M> | null`, that is, an identifier, a document, or a missing document. An array of references is an array of the same kind per element, and map values too. A virtual field reads as its marker or as the loaded value. All fields are read-only, and fields with `Hidden` are optional, because a read without them is also a document `T`. To see a reference as loaded, narrow the document through [`isPopulated`](#is-populated).
+
+<Params title="Type parameters">
+<Param name="T" type="object" required>
+
+The model class.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/populate/populate-types/any-population-doc" />
+
+</FullType>
+
+The shape has few methods. What's left are those whose meaning doesn't depend on loading, [`AnyPopulationMethods`](#any-population-methods). So `post.$populate(...)`, `post.$set(...)`, and field assignment don't compile. The shape doesn't know what is in the field and can neither accept a write nor load a relation. For those actions, use a concrete document type.
+
+The shape is given its own name instead of being a second parameter of `HydratedDoc`. That way the editor shows `AnyPopulationDoc<Post>` and not an expanded intersection of types.
+
+## PartlyPopulatedDoc [#partly-populated-doc]
+
+`PartlyPopulatedDoc<T, P>` is a document in any state whose keys `P` are known to be loaded. [`isPopulated`](#is-populated) narrows to this type. The keys from `P` read as documents (or `null`) and are present, and the rest are as in [`AnyPopulationDoc<T>`](#any-population-doc). A `PartlyPopulatedDoc` value is assignable back to `AnyPopulationDoc<T>`, and a document that knows more loaded keys is assignable to one that knows fewer.
+
+You rarely write this type yourself. You'll see it in the hover of a narrowed document (`PartlyPopulatedDoc<Post, "author">`), and it's needed when a function accepts an already checked document.
+
+<Snippet id="reference/populate/populate-types/partly-populated-doc" twoslash />
+
+<Params title="Type parameters">
+<Param name="T" type="object" required>
+
+The model class.
+
+</Param>
+<Param name="P" type="string" required>
+
+Keys known to be loaded. A union of string literals from [`PopulatableKeys<T>`](#populatable-keys).
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/populate/populate-types/partly-populated-doc-2" />
+
+</FullType>
+
+It's a separate name and not a second parameter of `AnyPopulationDoc`, because the editor prints the default parameter value (`AnyPopulationDoc<Person, never>`) everywhere a type is computed rather than written by hand.
+
+## AnyPopulationMethods [#any-population-methods]
+
+`AnyPopulationMethods` are the document methods that the shapes [`AnyPopulationDoc<T>`](#any-population-doc) and [`PartlyPopulatedDoc<T, P>`](#partly-populated-doc) have. Their meaning doesn't depend on the loading state. They are [`$isNew`](../documents/document-api.mdx#is-new), [`$locals`](../documents/document-api.mdx#locals), [`$isModified`](../documents/document-api.mdx#is-modified), [`$getChanges`](../documents/document-api.mdx#get-changes), [`$validate`](../documents/document-api.mdx#validate), [`$save`](../documents/document-api.mdx#save), [`$deleteOne`](../documents/document-api.mdx#delete-one), [`$toObject`](../documents/document-api.mdx#to-object), [`$toJSON`](../documents/document-api.mdx#to-json), [`$toPlain`](../documents/document-api.mdx#to-plain), [`$populated`](../documents/document-api.mdx#populated), and [`$session`](../documents/document-api.mdx#session).
+
+The list has no write or load methods. `$set`, `$get`, `$markModified`, `$populate`, `$depopulate`, `$assertPopulated`, `$is`, and `$updateOne` don't compile on the shape, because their types depend on which fields are loaded. The serialization methods return a wide `Record<string, unknown>`. They serialize a loaded field as a document and an unloaded one as an identifier, and the shape doesn't know which of the two. `$save` returns the same shape, and a loaded field is saved as identifiers.
+
+<FullType>
+
+<Snippet id="reference/populate/populate-types/any-population-methods" />
+
+</FullType>
+
+## PopulatableKeys [#populatable-keys]
+
+`PopulatableKeys<T>` is the union of the keys of model `T` that can be loaded through populate. These are references (one, an array, a map of references) and virtual fields with populate. The type defines the `path` argument of [`isPopulated`](#is-populated). A key that isn't in the union doesn't compile, and the editor suggests exactly these keys in the argument. For the blog model the union is `"author" | "editor" | "tags" | "reviewers" | "comments" | "commentCount"`. The fields `title` and `views` aren't references, so they aren't in the union.
+
+<Snippet id="reference/populate/populate-types/populatable-keys" twoslash />
+
+<Params title="Type parameters">
+<Param name="T" type="object" required>
+
+The model class.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/populate/populate-types/populatable-keys-2" />
+
+</FullType>
+
+## Other types [#other-types]
+
+The other public types serve checks and hovers. You'll meet them in error messages and hovers, and you rarely write your own wrappers on them.
+
+<TypeTable
+  type={{
+    "PopulateArgument<T, Ps, Pa, Sel, O, L>": { description: "The parameter type of `populate` and `$populate`: a path, an object with options, or a list. It's computed from what you pass, and for a wrong argument it contains the reason text instead of a long list of overloads.", type: "type" },
+    "PopulateArgumentEntries<Ps, Pa, O, L>": { description: "The records of loaded paths for a `populate` call. They come from a string, an object, or a list, whichever was passed.", type: "type" },
+    "PopulatePathHint<T>": { description: "What the editor suggests in the `path` argument. Paths up to three segments, any model key, any dotted continuation, and any string. The last one is needed so that a wrong path reaches the check and gets a clear message.", type: "type" },
+    "PopulatePaths<T, D>": { description: "The model's paths up to depth `D` (three segments by default). Needed only for the hint.", type: "type" },
+    "CheckedPopulatePath<T, P>": { description: "The path `P` itself if it's valid, otherwise a string with the reason: `Invalid populate path \"title\": \"title\" is not a reference`. For a string that isn't a literal: `populate path must be a literal`.", type: "type" },
+    "WalkPopulate<T, P, D>": { description: "The segment-by-segment path check. Returns `true` or the reason text. It understands `$*` for maps, embedded documents, virtual fields, and unions.", type: "type" },
+    "PopulateTargetOf<T, P>": { description: "The type of the document the path `P` leads to. For `Post` and `\"author\"` it's `User`.", type: "type" },
+    "SegmentTarget<V>": { description: "The model one segment leads to: a reference, a virtual field, or an embedded element. `never` if the segment leads nowhere.", type: "type" },
+    "MaxPopulateDepth": { description: "The ceiling of the path depth check: `7`.", type: "7" },
+    "PopulateHintDepth": { description: "The depth of paths in the editor hint: `3`.", type: "3" },
+    "ExtractPopulationEntries<Spec>": { description: "The record (or union of records) of loaded paths from a `populate` argument: a string, an object, or a list.", type: "type" },
+    "ReplaceEntries<Old, New>": { description: "The accumulated records where the paths from `New` are replaced. That's how the types repeat the \"a repeated call replaces\" rule.", type: "type" },
+    "PopulationEntry": { description: "One record: `path`, `select`, and `shape`.", type: "interface" },
+    "PopulateShape": { description: "The value details from the object options: `justOne`, `retain`, `matched`, `required`, `transform`.", type: "interface" },
+    "DefaultShape": { description: "The shape of a string path when no option is set.", type: "interface" },
+    "PopulatedKeys<T, Entries>": { description: "The keys of `T` that the records touch: the path itself or a path below it.", type: "type" },
+    "LeanBase<T, Entries>": { description: "The form of `T` in a `.lean()` result before populate. Loaded keys stay as declared, so `ApplyPopulate` can replace them.", type: "type" },
+    "PopulatedValueOf<V>": { description: "The value of a loaded field. For a non-marker, `V` itself.", type: "type" },
+    "PopulatedOriginalOf<V>": { description: "The original field (identifiers) behind a loaded one. For a non-marker, `V` itself.", type: "type" },
+    "IsTransformed<V>": { description: "`true` when the field's values are results of `transform`.", type: "type" },
+    "AnyPopulatedField": { description: "The general form of any `PopulatedField`, for the \"is the field loaded?\" check.", type: "interface" },
+    "PopulateObject": { description: "The loose shape of an object with options, from which the argument is inferred. The precise check is done by `PopulateObjectCheck`.", type: "interface" },
+    "PopulateObjectSpec<T, P, S>": { description: "The object's options after the path `P` is inferred. `match` and `transform` are typed by the target model.", type: "type" },
+    "PopulateObjectCheck<T, P>": { description: "The check of an object with options. Gives `unknown` if all is well, otherwise a required `\"populate error\"` property with the reason text.", type: "type" },
+    "PopulateListCheck<T, P>": { description: "The same for a list, and every element is checked. A repeat of one path in a list counts as a reason too.", type: "type" },
+    "PopulateReport<Errors>": { description: "`unknown` for an empty set of errors, otherwise `{ readonly \"populate error\": Errors }`.", type: "type" },
+    "PopulateQueryOptions<Target>": { description: "The populate query options: `sort` by the target model's paths, `limit`, `skip`.", type: "interface" },
+    "TransformDoc<T, P, S>": { description: "The document `transform` receives. It's the `.lean()` result for the target model with `select` applied, or `null`.", type: "type" },
+    "TransformId<T, P>": { description: "The identifier `transform` receives. The type of the reference's identifier, and `unknown` for a virtual field.", type: "type" },
+  }}
+/>
+
+### How to read error messages [#read-error-messages]
+
+An error in a `populate` call arrives from the compiler as one `TS2345` message. The method has one signature, and the reason sits in the type of the parameter the argument didn't fit. For example, for `populate("title")` the message is `Argument of type '"title"' is not assignable to parameter of type 'PopulateObject | "Invalid populate path \"title\": \"title\" is not a reference"'`. The reason is the part after `|`. For an object with options it arrives in the `"populate error"` property (`select of "author": unknown field "nope"`), and for a path that is too deep, as the message `populate path is deeper than the 7-level ceiling`. `CheckedPopulatePath`, `PopulateObjectCheck`, and `PopulateListCheck` produce them. All the messages are listed in the [Errors](./populate.mdx#errors) section of the `.populate` page.
+
+### When you don't need these types [#other-types.when-not-to-use]
+
+Usually you don't need explicit populate types, because the builder's result is inferred by itself. If you must name the result type, for example to return it from a function, infer it from the call: `Awaited<ReturnType<typeof loadPost>>`. Building a type through `ApplyPopulate` by hand is needed almost only by library authors. If a function needs a post in any state, declare the parameter with the [`AnyPopulationDoc`](#any-population-doc) type. When a document is declared as `HydratedDoc` and you need to check that the right path is loaded, use [`$assertPopulated`](../documents/document-api.mdx#assert-populated). It narrows the type without hand-written expressions.

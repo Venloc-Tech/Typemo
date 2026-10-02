@@ -1,0 +1,329 @@
+---
+title: "@Schema"
+description: "The schema class decorator and every option: collection name, special collections, policies, concurrency, and the checks made at build time."
+icon: Settings
+---
+
+`@Schema` turns a class into a schema. That can be a collection document, a subdocument, or a nested object. The decorator's options configure the whole collection: its name, its kind (ordinary, capped, time series), its validator, and its policies. This page describes the decorator itself and **all** its options, each in its own section.
+
+To start your first model, the guide [Define a model](../../schemas/define-model.mdx) is a better place. Special collections are covered in the guide [Special collections](../../schemas/special-collections.mdx). This page is the reference.
+
+For options that name class fields (`timeseries.timeField`, `discriminatorKey`, a policy's field), the compiler checks them against the class itself. A typo in a field name is a compile error. An option the decorator doesn't have is also a compile error, and in code without types it's a `ConfigurationError` when the model is built. Typemo doesn't silently accept `strict`, `strictQuery`, `timestamps`, `versionKey`, `toJSON`, or `toObject`.
+
+---
+
+## @Schema [#schema]
+
+`@Schema(options?)` records the options in the class description. Without an argument, the defaults apply. The class must be creatable with no arguments. When building a model, Typemo calls `new Class()` for its checks, and a constructor with parameters throws `ConfigurationError`. The same `ConfigurationError` goes to a class that serves as a field type or a model but isn't marked `@Schema`: `Account: not a schema; decorate the class with @Schema()`.
+
+<Snippet id="reference/schemas/schema/schema" twoslash />
+
+<Returns type="(target: C) => void">
+
+A class decorator. It only records the options, and [`model`](../connection/connection.mdx) builds the schema. Typemo finds an error in the options when the model is built and throws `ConfigurationError` with the class name.
+
+</Returns>
+
+<Params>
+<Param name="options" type="SchemaOptions">
+
+The schema options, each described below. The `SchemaOptions` type is exported from `@venloc/typemo`.
+
+</Param>
+</Params>
+
+<FullType>
+
+<Snippet id="reference/schemas/schema/schema-2" />
+
+</FullType>
+
+A typo in an option name is highlighted with a suggestion.
+
+<Snippet id="reference/schemas/schema/schema-3" twoslash />
+
+The compiler reports that `colection` isn't in `SchemaOptions` and suggests `collection`.
+
+---
+
+## collection [#collection]
+
+`collection` is the collection name in the database. Without it, Typemo takes the class name in lowercase and pluralizes it by English rules. `Account` becomes `accounts`, and `UserProfile` becomes `userprofiles`. The rules are described on the [`CollectionNaming`](./collection-naming.mdx) page. For an existing collection, set the name explicitly.
+
+<Snippet id="reference/schemas/schema/collection" twoslash />
+
+The name must be a non-empty string with no `$` and no null character, and it can't start with `system.`. Otherwise you get `ConfigurationError`: `collection: "system." collections are reserved` or `collection: the collection name "a$b" cannot contain "$" or a null character`.
+
+---
+
+## nested [#nested]
+
+`nested: true` declares a **nested object**. That's a group of the parent's fields with no `_id` of its own, no hooks, no discriminators, and no collection options. Without the option, a class used as a field type is a **subdocument**, a full participant in the schema with hooks. A subdocument gets an `_id` only if the class inherits [`Entity`](./base-classes.mdx#entity) or declares an `_id` field itself. A plain `@Schema()` without `Entity` gets no `_id`. A nested object suits an "address" or a "first and last name" that you don't need to search or update by a separate identifier.
+
+<Snippet id="reference/schemas/schema/nested" twoslash />
+
+You can't make a nested object a model: `Name: a nested object (@Schema({ nested: true })) cannot be a model`. Anything that belongs only to documents throws `ConfigurationError` on it, and the message lists all the violations at once. A declared `_id` (including one inherited from `Entity`) gives `Name: a nested object (no _id, no own hooks) — it declares _id`. Hooks give `it has hooks`. Discriminators give `it has discriminators`. The options `collection`, `discriminatorKey`, `discriminators`, `validator`, `tenant`, `softDelete`, `audit`, `optimisticConcurrency`, `shardKey`, and the special collections give `option "collection" is for documents`, for example `Name: a nested object (no _id, no own hooks) — option "collection" is for documents; option "tenant" is for documents`.
+
+---
+
+## discriminatorKey [#discriminator-key]
+
+`discriminatorKey` is the name of the field that holds the discriminator value. Typemo picks the document's class in the hierarchy by this string. By default it's `__t`, and the field is added automatically. If you set your own name, declare the field in the class as a string. Otherwise, for a base with subclasses, the build throws `ConfigurationError` (`Shape: discriminatorKey "kind" is not a declared field (declare it as a string field, or list the discriminators and declare readonly kind?: Discriminators<…>)`). The second half of the hint refers to the [`discriminators`](#discriminators) option, where the key is declared by its type alone. How discriminators work is described in [`@Discriminator`](./discriminator.mdx#discriminator).
+
+<Snippet id="reference/schemas/schema/discriminator-key" twoslash />
+
+The compiler rejects a key that isn't a string field of the class: `@Schema: discriminatorKey "kind" is not a string field of the class`. At build time, the field on a base with subclasses must be a string without `nullable`: `Shape: the discriminator key "kind" must be a non-nullable string field`. The option belongs to documents, and on a nested object it throws `ConfigurationError`.
+
+---
+
+## The discriminators option [#discriminators]
+
+`discriminators` lists all the subclasses of a base: `discriminators: () => [Card, Transfer]`. The types need the list. Without it, the type of a document read through the base model knows only the base's fields, and you have to tell the compiler the kind by hand. With the list, the result of a read through the base model (document, `lean`, `plain`, JSON, and cursor) becomes the union "base without a key, or any of the subclasses". Checking the key narrows it to the right kind. The list is an arrow function because the subclasses are declared below the base.
+
+Together with the list, the key is declared in the base class as optional, with the type `Discriminators<…>` ([description](./discriminator.mdx#discriminators)). A base document created without a kind is still allowed, and it has no key.
+
+<Snippet id="reference/schemas/schema/discriminators" twoslash />
+
+The `__t` key is stored only in the subclasses' documents, and the base's document doesn't have it. With your own key name, the declaration changes along with the option: `discriminatorKey: "kind"` and `declare readonly kind?: Discriminators<Click>`. You don't declare the field in the base class with the `@Prop` decorator. The schema adds the key itself, just as it does `__t`.
+
+The list is checked when the schema is built, from any class of the hierarchy, and the error names the mismatch. A subclass missing from the list gives `Payment: the "discriminators" list does not match the hierarchy — registered but not listed: Refund`. An extra class that isn't a `@Discriminator` of this base gives `… — listed but not a @Discriminator class below Payment: Other`. A class listed twice gives `… — a class is listed twice`. A value that isn't an arrow function returning a list of classes gives `Payment: "discriminators" must be a thunk returning a list of classes: () => [Child, …]`. The list includes all the subclasses, and subclasses of subclasses too.
+
+The compiler checks the list against the key declaration. The option without `declare readonly __t?: Discriminators<…>` gives `@Schema: declare the discriminator key with the listed classes — declare readonly __t?: Discriminators<A | B>`. Different classes in the list and in the type give `@Schema: the classes of __t: Discriminators<…> differ from the "discriminators" list`. A declaration without the option gives `@Schema: "__t" is Discriminators<…>, but the schema has no "discriminators" option — add discriminators: () => [A, B]`. The option belongs to documents, and on a nested object it throws `ConfigurationError`.
+
+---
+
+## optimisticConcurrency [#optimistic-concurrency]
+
+`optimisticConcurrency` turns on **optimistic concurrency**. Saving a document becomes conditional and succeeds only if the document in the database hasn't changed since you read it. Otherwise Typemo throws [`VersionError`](../errors/query-errors.mdx#version-error). The option needs a version field, which means the [`Versioned`](./base-classes.mdx#versioned) base class. Without it you get `ConfigurationError` (`optimisticConcurrency needs the version field — extend Versioned(...)`).
+
+The values are as follows. `true`: every `$save` that changes the document checks the version and increments it. A non-empty list of paths: only a save that touched one of the paths (or wrote a whole array or subdocument that contains it) checks the version. With a list, other saves run with the default protection for positional array changes. The paths are checked against the class. For subdocument fields you write `items.price`, and for Map values `settings.$*`.
+
+<Snippet id="reference/schemas/schema/optimistic-concurrency" twoslash />
+
+The second save didn't overwrite the other change. It failed, and `first.__v` became `1`. The compiler rejects an unknown path in the list (`@Schema: optimisticConcurrency names "nope", which is not a path of the class`), and at build time you get `ConfigurationError` with a hint about the path form: `Account: optimisticConcurrency names "nope", which is not a path of the class (subdocument fields as "items.price", a Map's values as "field.$*")`. An empty list (`Account: optimisticConcurrency is true or a non-empty list of paths`) and a repeated path (`optimisticConcurrency lists a path twice`) are forbidden too. On a subdocument, the option causes a build error, because the root document is the one that's versioned (`Line: option "optimisticConcurrency" is for the documents of a model — the subdocument at "lines" of Order is versioned by its root (set it on Order)`).
+
+---
+
+## autoCreate [#auto-create]
+
+`autoCreate: false` excludes the collection from [`init()`](../connection/connection.mdx#connection.init) and [`syncAll()`](../connection/connection.mdx#connection.sync-all). They don't create it. The default is `true`. The model itself creates nothing on the server. Only those two operations create collections and indexes, which is why special collections (time series, capped, with a validator) appear at exactly that step. Turn the option off when you manage the collection yourself, through a migration or another service.
+
+<Snippet id="reference/schemas/schema/auto-create" twoslash />
+
+After `init()`, the report created nothing, and the `external_events` collection isn't on the server. A `listCollections` query through the driver returned an empty list. The option applies to explicit calls too. [`Events.createCollection()`](../collections/collection-manager.mdx#model.create-collection) with `autoCreate: false` throws `ConfigurationError` (`ExternalEvent.createCollection: the schema of ExternalEvent says autoCreate: false — Typemo does not create the collection "external_events"; create it where it is owned, or remove autoCreate: false`). The [`Events.ensureCollection()`](../collections/collection-manager.mdx#model.ensure-collection) method creates the collection despite the option. You call it yourself and take the responsibility.
+
+---
+
+## autoIndex [#auto-index]
+
+`autoIndex: false` excludes the collection's indexes from `init()` and `syncAll()`. The default is `true`. The model builds no indexes itself, neither on creation nor on the first write. Use the option when your migration creates the indexes and the application shouldn't do it at startup.
+
+<Snippet id="reference/schemas/schema/auto-index" twoslash />
+
+The `kind_1` index isn't built, and only the mandatory `_id` index remains. An explicit call to [`Rows.createIndexes()`](../collections/model-indexes.mdx#model.create-indexes) ignores the option and builds the schema's indexes, since you're asking for it yourself.
+
+---
+
+## capped [#capped]
+
+`capped` makes the collection **capped**. It holds no more than a set size and pushes out old documents in favor of new ones. It suits logs you need only for the recent past. `size` is the maximum size in bytes (a positive integer, required), and `max` is an optional limit on the number of documents. It doesn't combine with `clustered` and `timeseries`.
+
+<Snippet id="reference/schemas/schema/capped" twoslash />
+
+A non-positive number throws `ConfigurationError` (`capped.size must be a positive integer, got 0`).
+
+---
+
+## timeseries [#timeseries]
+
+`timeseries` makes the collection a **time series collection**. MongoDB stores the measurements compactly, grouping them into buckets. The option is an object. `timeField` is required and names the field with the measurement time, and the other keys are optional.
+
+<Snippet id="reference/schemas/schema/timeseries" twoslash />
+
+The server added `bucketMaxSpanSeconds` and `fixedBucketing` itself. A time series collection can't have unique indexes (`a time series collection cannot have unique indexes`), and can't be `capped` or `clustered`.
+
+### timeseries.timeField [#timeseries.time-field]
+
+The name of the class field with the measurement time. The field must be a `Date`, required (`required: true`), and not `nullable`, otherwise `ConfigurationError`: `timeseries: timeField "at" must be required (every measurement has it)`. The compiler checks that the field is of type `Date`: `@Schema: timeseries.timeField "nope" is not a Date field of the class`.
+
+### timeseries.metaField [#timeseries.meta-field]
+
+An optional name of the field with the measurement's metadata, such as a sensor or device. It can't be `_id` and can't match `timeField`. The compiler message is `@Schema: timeseries.metaField "x" is not a field of the class (and not _id)`.
+
+### timeseries.granularity [#timeseries.granularity]
+
+A hint to the server about how often measurements arrive: `"seconds"`, `"minutes"`, or `"hours"`. It doesn't combine with `bucketMaxSpanSeconds` and `bucketRoundingSeconds` (`timeseries.granularity cannot be combined with bucketMaxSpanSeconds/bucketRoundingSeconds`).
+
+### timeseries.bucketMaxSpanSeconds [#timeseries.bucket-max-span-seconds]
+
+The maximum interval of one bucket in seconds, a positive integer. It's set together with `bucketRoundingSeconds` and with the same value. The server requires equality, and Typemo checks it in advance (`timeseries.bucketMaxSpanSeconds and bucketRoundingSeconds must both be set and equal (the server requires it)`).
+
+### timeseries.bucketRoundingSeconds [#timeseries.bucket-rounding-seconds]
+
+How the bucket's start is rounded, in seconds. The rules are the same as for `bucketMaxSpanSeconds`.
+
+### timeseries.expireAfterSeconds [#timeseries.expire-after-seconds]
+
+Automatically deletes old measurements after the given number of seconds. A non-negative integer.
+
+---
+
+## clustered [#clustered]
+
+`clustered` makes the collection **clustered**. Documents are stored in `_id` order, and the `_id` index coincides with the collection itself. `true` turns the option on with the server's default settings. An object accepts `name` (the name of the clustered index) and `expireAfterSeconds`. It doesn't combine with `capped` and `timeseries`. A time series collection is clustered by itself, and `ConfigurationError` hints at that: `a time series collection is clustered by itself; remove clustered`.
+
+<Snippet id="reference/schemas/schema/clustered" twoslash />
+
+### clustered.name [#clustered.name]
+
+The name of the clustered index. If it isn't set, the server picks a name.
+
+### clustered.expireAfterSeconds [#clustered.expire-after-seconds]
+
+The lifetime of documents. Those whose `_id` (a date) is older than the given value are deleted. It needs an `_id` of type `Date`, otherwise `ConfigurationError`: `clustered.expireAfterSeconds needs a Date _id`.
+
+---
+
+## collation [#collation]
+
+`collation` sets the default rules for comparing strings in the collection: language, and sensitivity to case and accents. The value is a collation settings object from the MongoDB driver. Indexes without their own collation inherit it.
+
+<Snippet id="reference/schemas/schema/collation" twoslash />
+
+A text index and a `2d` index don't support collation. In a collection with a collation, declare such an index with `collation: { locale: "simple" }`, otherwise `ConfigurationError`: `a text index cannot have a collation; the collection has a default one, so declare the index with collation: { locale: "simple" }`.
+
+---
+
+## validator [#validator]
+
+`validator` creates a `$jsonSchema` collection validator on the server, built from the schema. The server rejects documents that violate types, required fields, `enum`, bounds, and lengths, even if another program writes them. `true` turns on the validator with the level `strict` and the action `error`, and an object refines them. The option applies when the collection is created, that is, on `init()` with `autoCreate`.
+
+<Snippet id="reference/schemas/schema/validator" twoslash />
+
+The validator is strictly closed, with `additionalProperties: false` on every level. Your own `validate` functions, date bounds, and Map key rules can't be expressed on the server, and only Typemo checks them. How the schema is built is described in [`JsonSchemaGenerator`](./json-and-standard-schema.mdx#json-schema-generator).
+
+### validationLevel [#validation-level]
+
+Which documents the server checks. `"strict"` checks all inserts and updates, `"moderate"` checks only documents that are already valid, and `"off"` checks none. The default is `strict`.
+
+### validationAction [#validation-action]
+
+What the server does about a violation. `"error"` rejects the write, and `"warn"` only writes a warning to the log. The default is `error`.
+
+---
+
+## changeStreamPreAndPostImages [#change-stream-pre-and-post-images]
+
+`changeStreamPreAndPostImages: true` turns on recording a document's state before and after a change on the collection. Change streams need it when they ask for `fullDocumentBeforeChange` or `fullDocument: "required" | "whenAvailable"`.
+
+<Snippet id="reference/schemas/schema/change-stream-pre-and-post-images" twoslash />
+
+---
+
+## shardKey [#shard-key]
+
+`shardKey` describes the collection's shard key, an object `{ field: 1 | "hashed" }`. It's needed for one thing. `$save` and `bulkSave` filter by the **original** values of the key's fields as they were read, so a document whose key field has changed is still found. The field must be a top-level field (`shardKey names "x", which is not a top-level field`), and the value must be `1` or `"hashed"` (`shardKey "x" must be 1 or "hashed"`). You declare the key itself on the server with admin commands, and Typemo doesn't shard the collection. The behavior hasn't been checked on a sharded cluster.
+
+<Snippet id="reference/schemas/schema/shard-key" twoslash />
+
+---
+
+## readConcern [#read-concern]
+
+`readConcern` declares the collection's default read consistency level, `{ level: "majority" }`. The type checks the value (the driver's `ReadConcernLevel`). The level goes to the server with every read of the model: `find`, `findOne`, `countDocuments`, `distinct`, and `aggregate`. A level set on the operation itself ([`.readConcern()`](../query/options.mdx#read-concern)) outranks the schema's. Inside a transaction, the schema level isn't sent, and the transaction's own settings apply.
+
+<Snippet id="reference/schemas/schema/read-concern" twoslash />
+
+---
+
+## writeConcern [#write-concern]
+
+`writeConcern` declares the collection's default write guarantee (`w`, `journal`, and `wtimeoutMS` as driver settings). The rules are the same as for [`readConcern`](#read-concern). The guarantee goes with every write of the model (`insert`, `update`, `delete`, `findAndModify`), [`.writeConcern()`](../writes/writes.mdx#write-concern) on the operation outranks it, and inside a transaction the schema guarantee isn't sent.
+
+<Snippet id="reference/schemas/schema/write-concern" twoslash />
+
+---
+
+## softDelete [#soft-delete]
+
+`softDelete` turns on the **soft delete** policy. A deleted document stays in the collection with a timestamp, and ordinary queries don't see it. `true` uses the `deletedAt` field, and an object lets you pick another name through [`field`](#field). The field must be `Date | null`. At build time you otherwise get `ConfigurationError` (`Note: softDelete field "deletedAt" must be a nullable Date field (Date | null)`), and the compiler says `@Schema: softDelete field "deletedAt" is not a Date | null field of the class`.
+
+<Snippet id="reference/schemas/schema/soft-delete" twoslash />
+
+How the policy changes queries and writes is described in the reference [Policy options in the schema](../policies/schema-options.mdx) and in the policies section.
+
+---
+
+## tenant [#tenant]
+
+`tenant` turns on the **multi-tenancy** policy. All of the model's queries are filtered by the owner field, and a write puts the current tenant into it. `true` uses the `tenantId` field, and an object picks the name through [`field`](#field). The field is declared as a pair: the [`@Tenant()`](./field-markers.mdx#tenant) decorator next to `@Prop` and the type [`TenantField<T>`](./field-markers.mdx#tenant-field). The type tells the compiler that the core fills the field itself. `create` doesn't require it, and a read always contains it. The decorator tells the runtime the same thing, and the schema uses it to find the tenant field.
+
+<Snippet id="reference/schemas/schema/tenant" twoslash />
+
+A schema without the pair doesn't build. The compiler complains in three cases. The field isn't declared with the `TenantField<T>` type: `@Schema: declare the tenant field as tenantId!: TenantField<T> — the core fills it, create() does not require it, reads always have it`. The type is there but the option isn't: `@Schema: "tenantId" is TenantField<T>, but the schema has no tenant option — add tenant: { field: "tenantId" } or use a plain type`. The type sits on a different field: `@Schema: "owner" is TenantField<T>, but the tenant field is "tenantId"`. At build time the runtime checks the same rules, and everywhere it's a `ConfigurationError`.
+
+- the field isn't in the class: `Doc: tenant field "tenantId" is not a field of the class`
+- the field exists but has no `@Tenant()`: `Doc: the tenant field "tenantId" must be marked @Tenant() (declare it @Prop(...) @Tenant() tenantId!: TenantField<T>)`
+- `@Tenant()` is there but the `tenant` option isn't: `Doc: @Tenant() on "tenantId", but the schema has no tenant policy — add tenant: true (or { field }) to @Schema`
+- `@Tenant()` sits on two fields: `Doc: @Tenant() marks "tenantId", "other"; only the tenant field "tenantId" may be marked`
+
+For the policy's details, including how to pass the tenant to a query, see [Policy options in the schema](../policies/schema-options.mdx).
+
+---
+
+## audit [#audit]
+
+`audit` turns on the **audit** policy. Every write of the model leaves a row in the log. `true` writes to the `<collection>_audit` collection, and an object lets you pick the name through `collection`. A write outside a transaction runs in its own transaction (the write and its trace are committed together), so you need a replica set or a sharded cluster. On a standalone `mongod`, such a write throws `ConfigurationError`.
+
+<Snippet id="reference/schemas/schema/audit" twoslash />
+
+What goes into the log and how fields are hidden is described in [`sensitive`](./prop.mdx#sensitive) and in the policies guide.
+
+---
+
+## field [#field]
+
+`field` is a shared option of the `tenant` and `softDelete` objects. It's the name of the class field that carries the policy. For `tenant` the default is `tenantId`, and for `softDelete` it's `deletedAt`. The name check is described in the corresponding sections.
+
+<Snippet id="reference/schemas/schema/field" twoslash />
+
+---
+
+## ext [#ext]
+
+`ext` holds the options of registered extensions at the schema level. This is metadata for integrations, the extension checks it, and it's frozen after the build. The key is the extension name. An unregistered key is a compile error (`@Schema: ext "nope" is not a registered extension (SchemaExtensions)`), and in code without types it's a `ConfigurationError` at build time (`Account: ext "nope" is not a registered extension; register it before the first model with client.use() (for the models of one client) or Typemo.use() (for every client)`). An integration reads the options through [`SchemaInfo.ext`](./schema-info.mdx#ext). For more, see the guide [Add your own field and schema options](../../extensions/custom-options.mdx).
+
+---
+
+## Errors common to all options [#common-errors]
+
+`@Schema` has no other options. `toJSON` and `toObject` are a special case with a separate text. Serialization parameters are passed to each `$toJSON()`, `$toObject()`, and `$toPlain()` call, because otherwise the result type couldn't follow the schema's setting.
+
+<Snippet id="reference/schemas/schema/common-errors" twoslash />
+
+In code without types, the model doesn't build: `Account: @Schema has no "toJSON" option — pass serialization options to each $toJSON()/$toObject()/$toPlain() call`. Any other unknown key (`strict`, `strictQuery`, `timestamps`, `versionKey`) throws `ConfigurationError` at build time with the list of valid options: `Account: @Schema has no "strict" option (the options are: collection, nested, ext, discriminatorKey, discriminators, timeseries, capped, collation, clustered, changeStreamPreAndPostImages, validator, autoIndex, autoCreate, readConcern, writeConcern, optimisticConcurrency, shardKey, tenant, softDelete, audit)`. Errors that name a single option are described in its section. The other build checks are:
+
+- the model has no `_id`: `Account: a model needs an _id field (extend Entity or declare @Prop _id)`. For an `_id` of another type, there's the [`EntityWithId`](./base-classes.mdx#entity-with-id) base class
+- `_id` can't have `dbName`, `nullable`, or be an array
+- a discriminator with its own `@Schema`: `Circle: a discriminator uses its root's schema options; remove @Schema (root: Shape)`
+- the class has an own data property without `@Prop`: `Account: property "note" has no @Prop, so it is not a field of the schema (never stored, cast or loaded); decorate it with @Prop, declare it with "declare", or make it a getter or a method`. Methods, getters, and non-enumerable properties don't count
+- a field matches a class method: `Account: field "foo" is also a method of the class`
+- the constructor has parameters: `Account: the constructor takes 1 argument(s); an entity is created by Typemo without arguments`
+
+## When not to use it [#when-not-to-use]
+
+`@Schema` configures the collection and policies, but not fields or indexes across several fields. [`@Prop`](./prop.mdx#prop) describes a field, [`@Index`](./index-decorators.mdx#index) describes a compound or partial index, and [`@Discriminator`](./discriminator.mdx#discriminator) sets a discriminator value. The `_id`, `createdAt`, `updatedAt`, and `__v` fields come from the base classes [`Entity`](./base-classes.mdx#entity), [`Timestamped`](./base-classes.mdx#timestamped), and [`Versioned`](./base-classes.mdx#versioned), not from schema options.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Special collections" href="../../schemas/special-collections.mdx">
+  Capped collections, time series, clustered collections, and validators on real tasks.
+</Card>
+<Card title="Collection names" href="../../schemas/collection-names.mdx">
+  How a collection name comes from a class name and when to set it explicitly.
+</Card>
+<Card title="Timestamps and versions" href="../../schemas/timestamps-and-versions.mdx">
+  Base classes and `optimisticConcurrency` at work.
+</Card>
+</Cards>

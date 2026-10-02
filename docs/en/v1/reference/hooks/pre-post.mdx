@@ -1,0 +1,352 @@
+---
+title: "@Pre, @Post, and @PostError"
+description: "The three hook decorators, the full list of events, what a hook receives, and how it differs between events"
+icon: Webhook
+---
+
+A **hook** is a method of your model that Typemo calls before or after an operation. For example, before a document is saved, before a read, or after a delete. Hooks are for the case when one action has to fire on any path to an operation: normalize a field before saving, add a condition to every read, log the result of a write. This page describes the three decorators that declare hooks and all the events you can attach them to.
+
+If you're writing hooks for the first time, start with the guides [Hook into an operation](../../hooks/operation-hooks.mdx) and [Run code when a document is saved](../../hooks/document-hooks.mdx). This page is a reference. What an operation hook sees and what it can change is described on the page [Operation context](./operation-context.mdx).
+
+All the examples use one account model.
+
+<Snippet id="reference/hooks/operation-context/intro" title="accounts/account.ts" twoslash />
+
+---
+
+## @Pre [#pre]
+
+`@Pre` runs a method **before** an event. The event names the operation together with its scope. `document.save` is saving a document, `query.updateMany` is the `updateMany` query, `model.insertMany` is a batch insert, and `aggregate` is an aggregation. The scope in the name removes the guesswork. In Mongoose the name `updateOne` meant both a document hook and a query hook, and you chose between them with flags. Here every event has one scope, and the scope decides what `this` is.
+
+<Snippet id="reference/hooks/pre-post/pre" twoslash />
+
+Now `create` and `$save` trim the spaces around the title before writing. `create({ title: "  Main  " })` saved `"Main"`.
+
+<Params>
+<Param name="events" type="HookEvent | [HookEvent, ...HookEvent[]]" required>
+
+One event or a non-empty list. With a list, one method serves several events, for example `["query.find", "query.findOne"]`. All events are listed in [`HOOK_EVENTS`](#hook-events). The compiler rejects an event outside the list, while in untyped JavaScript the decorator doesn't check it.
+
+</Param>
+</Params>
+
+<Returns type="MethodDecorator">
+
+A method decorator. It checks the method signature against the event, and `this` and the arguments must fit the event. The method must be an instance method, not a static one. The return value is ignored, but Typemo waits for a promise.
+
+</Returns>
+
+<FullType>
+
+<Snippet id="reference/hooks/pre-post/pre-2" />
+
+</FullType>
+
+### `this` depends on the event scope [#this-by-scope]
+
+In `document.*` events, `this` is an instance of your class. That's a model document or, if the class is embedded in another model, a subdocument. A class hook runs in both cases, so its type is [`HookThis<"document.save", Account>`](#hook-this), that is `HydratedDoc<Account> | Subdocument<Account>`.
+
+Without a check you get the class fields and the shared methods `$isNew()`, `$isModified()`, and `$isRoot()`. The methods only a root has (`$getChanges()`, `$save()`, and others) open up after [`if (this.$isRoot())`](../documents/document-api.mdx#is-root). In all other events, `this` is an [`OperationHookContext`](./operation-context.mdx#operation-hook-context), the view of the operation with the [`.skip`](./operation-context.mdx#skip) and [`.modify`](./operation-context.mdx#modify) methods.
+
+Declare the type of `this` in the method signature: `this: HookThis<"document.save", Account>` or `this: OperationHookContext<Account, "query.find">`. Then the compiler knows which fields and methods are available to you, and it refuses a wrong declaration.
+
+<Snippet id="reference/hooks/pre-post/this-by-scope" twoslash />
+
+`this: Account` works too. It's the same document, but the type has only the class fields, without the `$` methods. If you don't declare `this` at all, it gets the class type inside the method.
+
+You can't declare `this: HydratedDoc<Account>`. That type promises root methods a subdocument doesn't have, and the call would fail at runtime as soon as the class ends up embedded. The compiler refuses with a text that names the decorator and the event.
+
+<Snippet id="reference/hooks/pre-post/this-by-scope-2" twoslash />
+
+The error text is `@Pre("document.save"): a document hook may also run on a subdocument of the class; declare this as HydratedDoc<Entity> | Subdocument<Entity>, or narrow with if (this.$isRoot())`. Declare `this: HookThis<"document.save", Line>` and narrow it with a `$isRoot()` check.
+
+### Several hooks on one event [#multiple-hooks]
+
+Hooks of one event and one phase don't replace each other. All of them run, strictly one after another, and each waits for the previous one. The order is: hooks of the base class first, then hooks of the class itself in the order they're declared in the file, then hooks of plugins. One method can be attached to several events with a list. For order and errors, see the guide [Hook order and errors](../../hooks/order-and-errors.mdx).
+
+### Errors [#errors]
+
+The decorator checks the method when the class is declared. For a static method it throws `ConfigurationError`.
+
+<Snippet id="reference/hooks/pre-post/errors" />
+
+`@Pre`, `@Post`, and `@PostError` from `@venloc/typemo` work with legacy decorators. For TC39 decorators the same ones live in the `@venloc/typemo-decorators` package. If your `@Pre` threw an error, it reaches the calling code as is, and the operation doesn't run. For details, see the guide [Hook order and errors](../../hooks/order-and-errors.mdx#pre-hook-error).
+
+### An operation hook in a subdocument class [#subdocument-hook]
+
+<Callout type="warning">
+
+An operation hook (`query.*`, `model.*`, `aggregate`) fires only on operations of the **model** of this class. If the class serves only as a subdocument (it's embedded in another class and isn't passed to `connection.model`), such a hook never runs. Neither the compiler nor model creation reports it, because operations go to the model of the outer class and its hooks run. Declare operation hooks in the model class. Document hooks (`document.*`) in a subdocument class work, and `this` in them is the subdocument.
+
+</Callout>
+
+There's no error because the same class can be a model somewhere else in the application, where its operation hook is needed and works. For an example and the fix, see the guide [An operation hook in a subdocument class never runs](../../hooks/operation-hooks.mdx#subdocument-hook-skipped).
+
+### When `@Pre` doesn't fit [#pre.when-not-to-use]
+
+To only cast and check field values, use the [`@Prop`](../schemas/prop.mdx) options (`trim`, `lowercase`, `validate`). They work in updates too, while the `document.save` hook runs only when a document is saved. To watch operations without interfering, use [operation events](../observability/events.mdx). If many models need the same set of hooks, package it as a [plugin](./plugins.mdx#schema-plugin).
+
+---
+
+## @Post [#post]
+
+`@Post` runs a method **after** an event, if it finished successfully. The method receives the result of the operation. It's for actions that make sense only after success: log how many documents changed, clear a cache, send a message.
+
+<Snippet id="reference/hooks/pre-post/post" twoslash />
+
+`deleteMany({ owner: "bob" })` with one account for Bob printed `accounts deleted: 1`. The type of `deletedCount` here is `number | null`. The same hook is called for `deleteMany` inside [`bulkWrite`](../../writes/bulk.mdx#bulk-write-hooks) too, where the number of deleted documents is unknown for a single operation. For more, see the section [The result for each event](#result-per-event).
+
+<Params>
+<Param name="events" type="HookEvent | [HookEvent, ...HookEvent[]]" required>
+
+One event or a list of events, same as in [`@Pre`](#pre).
+
+</Param>
+</Params>
+
+<Returns type="MethodDecorator">
+
+A method decorator. The method's only argument is the event result, and its type is set by [`PostResult`](#post-result). For `document.save` it's the document itself, for `query.countDocuments` a number, and for `query.deleteMany` a `DeleteResult`. The compiler rejects a method with an argument of another type.
+
+</Returns>
+
+<FullType>
+
+<Snippet id="reference/hooks/pre-post/post-2" />
+
+</FullType>
+
+### The result for each event [#result-per-event]
+
+What `@Post` receives depends on the event. In `query.find` and other reads that return an array, the result is a list of documents in the form the calling code will get, either documents or `.lean()` data. That's why the element type here is `unknown`, not your model. The caller picks the document form. For a cursor the hook is called for each batch the database returned whole, after it's turned into documents. With `batchSize(3)` and seven documents the hook fired three times, with three, three, and one document. The full table is in the section [PostResult](#post-result).
+
+In the hooks `query.updateOne`, `query.updateMany`, `query.replaceOne`, `query.deleteOne`, and `query.deleteMany` the result depends on where the operation came from. A call `Accounts.updateOne(...)` gives an [`UpdateResult`](../writes/writes.mdx#update-result) with real counters. But the same hooks are called for each operation inside [`bulkWrite`](../writes/writes.mdx#bulk-write) too, and for a single operation of a batch the server reports only the id of a document inserted through `upsert`. So there the hook receives a [`BulkOperationResult`](./operation-context.mdx#bulk-operation-result) where the counters are `null`, not made-up zeros.
+
+A hook that reads `matchedCount` must check for `null`. You can tell the calls apart by `this.bulkIndex`, which is `undefined` in an ordinary call.
+
+### An error inside `@Post` [#error-in-post]
+
+What the calling code gets if `@Post` threw an error depends on whether the operation managed to write anything. By this point the operation has already run, so `@PostError` doesn't fire. Reporting an operation error would be untrue.
+
+In a **read**, the calling code gets the hook error as is. A `find` whose `@Post` threw `Error("find post failed")` was rejected with exactly that error.
+
+In a **write** outside a transaction, the write stays in the database, and Typemo doesn't hand over the hook error as is, since retrying the call would write the document a second time. The calling code gets a [`PostHookError`](../errors/hierarchy.mdx#post-hook-error) with `applied: true`. `operation` holds the name of the called method, `result` the result of the write, and `cause` the hook error. A `create` with a `@Post("document.save")` that threw `Error("post failed")` was rejected like this: `PostHookError: Account.create: a post hook failed after the write succeeded: post failed. The write IS applied (outside a transaction nothing rolls it back); do not repeat it — the hook's error is the cause`. The document is in the collection. For `bulkWrite` the `operation` field holds `bulkWrite`.
+
+Inside a transaction, the write rolls back together with the hook error, so the calling code gets the hook error itself, not a `PostHookError`. The same `create` inside `client.transaction(...)` was rejected with `Error: post failed`, and the document isn't in the collection.
+
+### When `@Post` doesn't fit [#post.when-not-to-use]
+
+If you need the result right where you called the operation, you don't need a hook, because the call returns the result itself. You can't change the result from `@Post`, since the return value is ignored. You can change the operation in [`@Pre`](#pre) through [`.modify`](./operation-context.mdx#modify) and [`.skip`](./operation-context.mdx#skip).
+
+---
+
+## @PostError [#post-error]
+
+`@PostError` is a **separate decorator**, not a variant of `@Post`. It runs a method instead of `@Post` when the event finished with an error, and passes that error to the method. It's separate because of the types. The error argument of `@PostError` has the type `unknown`, while the argument of `@Post` is the event result, and one function couldn't describe both cases honestly.
+
+<Snippet id="reference/hooks/pre-post/post-error" twoslash />
+
+<Params>
+<Param name="events" type="HookEvent | [HookEvent, ...HookEvent[]]" required>
+
+One event or a list of events, same as in [`@Pre`](#pre).
+
+</Param>
+</Params>
+
+<Returns type="MethodDecorator">
+
+A method decorator. The method takes one argument, `error: unknown`. The return value is ignored.
+
+</Returns>
+
+<FullType>
+
+<Snippet id="reference/hooks/pre-post/post-error-2" />
+
+</FullType>
+
+### One of the two for each event: `@Post` or `@PostError` [#post-or-post-error]
+
+If at least one `@Pre` of the event was called, the event ends with exactly one of the two, `@Post` or `@PostError`. An error inside `@Pre` itself counts as an error of the event too. The operation never reached the driver, but `@PostError` is called. A casting or filter validation error happens even before `@Pre`, and it also leads to `@PostError`, while the `@Pre` hooks aren't called then. `find({ nope: 1 })` called only `@PostError` with a `StrictModeError`.
+
+### An error inside `@PostError` [#error-in-post-error]
+
+If `@PostError` throws an error, the calling code gets it instead of the original, but the original isn't lost. It sits in the `cause` of the new one. A hook that threw `Error("postError failed")` on a filter error replaced the `StrictModeError`, and `error.cause` stayed the `StrictModeError`. It's the same with `create` and an invalid value. The calling code got `Error: postError failed`, and the `cause` was a `ValidationError`. Still, don't throw from `@PostError`. If you only need to log the error, log it and return.
+
+### When `@PostError` doesn't fit [#post-error.when-not-to-use]
+
+To handle an operation error where you called it, `try`/`catch` is enough, see [Error handling](../../errors/handling.mdx). You need `@PostError` when one reaction to an error has to work on all paths to an operation.
+
+---
+
+## HOOK_EVENTS [#hook-events]
+
+`HOOK_EVENTS` is a frozen list of all the events you can attach a hook to. It's handy when a plugin attaches a hook to all events at once, or when you check an event name that comes from configuration.
+
+<Snippet id="reference/hooks/pre-post/hook-events" twoslash />
+
+The event type is `HookEvent`, the union of three groups and the event `"aggregate"`. The groups are `DocumentHookEvent`, `QueryHookEvent`, and `ModelHookEvent`. Within a group `this` is built the same way.
+
+### Document events [#document-events]
+
+In them `this` is a document (`HydratedDoc<T>`), and the errors and results concern the document itself. Subdocument hooks run together with the root hooks. For details, see the guide [Run code when a document is saved](../../hooks/document-hooks.mdx).
+
+<TypeTable
+  type={{
+    "document.save": { description: "Saving a document: `create`, `insertOne`, `insertMany`, `Model.new` + `$save`, `$save`, `bulkSave`, and also the `insertOne` insert inside `bulkWrite`. It runs for an unchanged document too. The `@Post` result is the document itself.", type: "this: HydratedDoc<T> | Subdocument<T>" },
+    "document.validate": { description: "Validating a document. It's nested in `document.save` and runs on its own on `$validate()`. The `@Post` result is the document.", type: "this: HydratedDoc<T> | Subdocument<T>" },
+    "document.init": { description: "A document is created from data read from the database, including through `Model.hydrate`. Only `@Pre` and `@Post`, and the result is the document. It isn't called for a `.lean()` result.", type: "this: HydratedDoc<T> | Subdocument<T>" },
+    "document.updateOne": { description: "The document method `$updateOne`. The model's `updateOne` query doesn't trigger this event. The `@Post` result is an `UpdateResult`.", type: "this: HydratedDoc<T> | Subdocument<T>" },
+    "document.deleteOne": { description: "The document method `$deleteOne`. The model's `deleteOne` query doesn't trigger this event. The `@Post` result is a `DeleteResult`.", type: "this: HydratedDoc<T> | Subdocument<T>" },
+  }}
+/>
+
+### Query events [#query-events]
+
+In them `this` is an [`OperationHookContext`](./operation-context.mdx#operation-hook-context). A hook can change the query by the keys named in the description and skip it by supplying a result of the `SkipResult` shape.
+
+<TypeTable
+  type={{
+    "query.find": { description: "`find`. You can change `where`, `select`, `sort`.", type: "post: readonly unknown[]" },
+    "query.findOne": { description: "`findOne`, and also `findById` and `exists`. You can change `where`, `select`, `sort`.", type: "post: unknown" },
+    "query.countDocuments": { description: "`countDocuments`. You can change `where`.", type: "post: number" },
+    "query.estimatedDocumentCount": { description: "`estimatedDocumentCount`. There is nothing to change.", type: "post: number" },
+    "query.distinct": { description: "`distinct`. You can change `where`.", type: "post: readonly unknown[]" },
+    "query.updateOne": { description: "`updateOne`, and also the same operation inside `bulkWrite`. You can change `where`, `update`.", type: "post: UpdateResult | BulkOperationResult" },
+    "query.updateMany": { description: "`updateMany`, and also the same operation inside `bulkWrite`. You can change `where`, `update`.", type: "post: UpdateResult | BulkOperationResult" },
+    "query.replaceOne": { description: "`replaceOne`, and also the same operation inside `bulkWrite`. You can change `where`.", type: "post: UpdateResult | BulkOperationResult" },
+    "query.deleteOne": { description: "`deleteOne`, and also the same operation inside `bulkWrite`. You can change `where`.", type: "post: DeleteResult | BulkOperationResult" },
+    "query.deleteMany": { description: "`deleteMany`, and also the same operation inside `bulkWrite`. You can change `where`.", type: "post: DeleteResult | BulkOperationResult" },
+    "query.findOneAndUpdate": { description: "`findOneAndUpdate` and `findByIdAndUpdate`. You can change `where`, `update`, `select`, `sort`.", type: "post: unknown" },
+    "query.findOneAndReplace": { description: "`findOneAndReplace`. You can change `where`, `select`, `sort`.", type: "post: unknown" },
+    "query.findOneAndDelete": { description: "`findOneAndDelete` and `findByIdAndDelete`. You can change `where`, `select`, `sort`.", type: "post: unknown" },
+  }}
+/>
+
+### Model and aggregation events [#model-and-aggregate-events]
+
+<TypeTable
+  type={{
+    "model.insertMany": { description: "`insertMany`, including with an empty list. There is nothing to change. The `@Post` result is the inserted documents. The document hooks of each inserted document run inside this event.", type: "post: readonly unknown[]" },
+    "model.bulkWrite": { description: "`bulkWrite`, including with an empty list. There is nothing to change. The `@Post` result is a `BulkWriteResult`. The hooks of the batch operations run around this event.", type: "post: BulkWriteResult" },
+    "aggregate": { description: "`aggregate`. You can change `stages`, and stages are added to the end.", type: "post: readonly unknown[]" },
+  }}
+/>
+
+### Which hooks inserts trigger [#insert-hooks]
+
+Any way of creating a document triggers the document hooks `document.save` and `document.validate`. These are [`create`](../writes/writes.mdx#create), [`insertOne`](../writes/writes.mdx#insert-one), [`insertMany`](../writes/writes.mdx#insert-many), `$save` of a new document, [`bulkSave`](../writes/writes.mdx#bulk-save), and the `insertOne` insert inside [`bulkWrite`](../writes/writes.mdx#bulk-write). So it's enough to attach the rule "on any insert" to `document.save`. `insertOne`, `insertMany` with two documents, and `create` left identical events for each document (`pre document.save`, `post document.save`), and the change made in `@Pre` (`stamp`) reached the database.
+
+The batch methods as a whole have events of their own. `insertMany` also triggers `model.insertMany`, and `bulkWrite` triggers `model.bulkWrite`. `insertOne` has no event of its own, and its hooks are the document hooks. The order of batch events is described in the guide [Operation hooks inside bulkWrite](../../writes/bulk.mdx#bulk-write-hooks).
+
+### Which events `findById` and other methods trigger [#events-by-method]
+
+Wrapper methods trigger the event of their main operation. `findById` and `exists` trigger `query.findOne`, `findByIdAndUpdate` triggers `query.findOneAndUpdate`, and `findByIdAndDelete` triggers `query.findOneAndDelete`. If a read returns documents, `document.init` fires for each of them after `query.*`. For a `.lean()` result `document.init` doesn't fire.
+
+---
+
+## HookPhase [#hook-phase]
+
+`HookPhase` is the phase of a hook relative to the event: `"pre"`, `"post"`, or `"postError"`. The type is useful when you add a hook in a plugin through [`PluginBuilder.addHook`](./plugins.mdx#plugin-builder) and set the phase by hand.
+
+<FullType>
+
+<Snippet id="reference/hooks/pre-post/hook-phase" />
+
+</FullType>
+
+## HookArgs [#hook-args]
+
+`HookArgs<P, E, T>` is the tuple of hook arguments. `pre` has none, `post` has one, the result [`PostResult`](#post-result), and `postError` has one, `error: unknown`.
+
+<FullType>
+
+<Snippet id="reference/hooks/pre-post/hook-args" />
+
+</FullType>
+
+## HookThis [#hook-this]
+
+`HookThis<E, T>` is the type of `this` for event `E` of model `T`. For `document.*` events it's `HydratedDoc<T> | Subdocument<T>`, because a class hook runs on both a document and a subdocument, and [`$isRoot()`](../documents/document-api.mdx#is-root) narrows the type. For the others it's [`OperationHookContext<T, E>`](./operation-context.mdx#operation-hook-context). `HookThisOf<E, T>` does the same for a list of events and gives the union of the `this` types of each one.
+
+<FullType>
+
+<Snippet id="reference/hooks/pre-post/hook-this" />
+
+</FullType>
+
+## PostResult [#post-result]
+
+`PostResult<E, T>` is what the `@Post` of event `E` receives.
+
+- `document.save`, `document.validate`, and `document.init` give a document `T`.
+- `document.deleteOne` gives a `DeleteResult`, and `document.updateOne` an `UpdateResult`.
+- `query.deleteOne` and `query.deleteMany` give a `DeleteResult` or a [`BulkOperationResult`](./operation-context.mdx#bulk-operation-result) with `deletedCount: null`. The second form comes from an operation inside `bulkWrite`.
+- `query.updateOne`, `query.updateMany`, and `query.replaceOne` give an `UpdateResult` or a `BulkOperationResult` with `null` counters.
+- Counts give a number.
+- Reads, `distinct`, `insertMany`, and `aggregate` give a list of values.
+- `bulkWrite` gives a `BulkWriteResult`.
+
+For `query.findOne` and the three `findOneAnd…` the type is `unknown`, and the calling code picks the document form.
+
+<FullType>
+
+<Snippet id="reference/hooks/pre-post/post-result" />
+
+</FullType>
+
+The compiler rejects an argument of the wrong type. `@Post("query.countDocuments")` accepts a number but not a string.
+
+<Snippet id="reference/hooks/pre-post/post-result-2" twoslash />
+
+## SkipResult [#skip-result]
+
+`SkipResult<E, T>` is what [`.skip`](./operation-context.mdx#skip) accepts for event `E`. It's the value the server would have returned, in the names used in code. Documents are given as `.lean()` data, and a write result and a number are ordinary values.
+
+- `query.find` and `model.insertMany` accept `readonly Lean<T>[]`.
+- `query.findOne` and the three `findOneAnd…` accept `Lean<T> | null`.
+- Counts accept `number`.
+- `query.distinct` and `aggregate` accept `readonly unknown[]`.
+- Updates accept `UpdateResult`, deletes accept `DeleteResult`, and `model.bulkWrite` accepts `BulkWriteResult`.
+
+<FullType>
+
+<Snippet id="reference/hooks/pre-post/skip-result" />
+
+</FullType>
+
+`SkipResult` has no `document.*` events. A document hook can't skip an operation. It can only throw an error.
+
+## OperationHookEvent and other event types [#operation-hook-event]
+
+The other event types are narrowings of `HookEvent`. `DocumentHookEvent` is the five `document.*` events, `QueryHookEvent` is the thirteen `query.*` events, and `ModelHookEvent` is `model.insertMany` and `model.bulkWrite`. `OperationHookEvent` is everything except `document.*`, that is, the events where `this` is the operation context.
+
+<FullType>
+
+<Snippet id="reference/hooks/pre-post/operation-hook-event" />
+
+</FullType>
+
+`QueryHookEvent` holds the thirteen values from the table above, from `query.find` to `query.findOneAndDelete`.
+
+## Other elements [#other-elements]
+
+`HookMethod<E, T, P>` is the type of a hook method, which the decorators use to check the signature. It's shown in the "Full type" of [`@Pre`](#pre). The types `OperationChanges`, `OperationChange`, and `ChangeKeys` describe the query changes in [`.modify`](./operation-context.mdx#modify). Together with the [`BulkOperationResult`](./operation-context.mdx#bulk-operation-result) type, which an operation hook receives inside `bulkWrite`, they are collected on the page [Operation context](./operation-context.mdx).
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Hook into an operation" href="../../hooks/operation-hooks.mdx">
+  How to add a condition to all reads, append an update, and skip an operation.
+</Card>
+<Card title="Run code when a document is saved" href="../../hooks/document-hooks.mdx">
+  What you can do before and after a document is saved, validated, and deleted.
+</Card>
+<Card title="Hook order and errors" href="../../hooks/order-and-errors.mdx">
+  What runs first, what happens on an error, and how hooks behave in a transaction.
+</Card>
+<Card title="Operation context" href="./operation-context.mdx">
+  The `this` fields of an operation hook, and the `skip` and `modify` methods.
+</Card>
+</Cards>

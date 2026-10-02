@@ -1,0 +1,221 @@
+---
+title: Filters
+description: "Write a search condition: comparisons, sets of values, arrays, missing fields, text, and a filter built from user input"
+icon: Filter
+---
+
+A **filter** is an object that tells the database which documents you want, for example `{ price: { $gte: 20 } }`. A filter key is a model field. Its value is either the field value itself or an object of **operators**, keys starting with `$`, each of which sets one condition.
+
+Typemo checks a filter twice. While you write code, the compiler sees the fields and types. And before sending the query, Typemo repeats the check, because a real filter is often built from data the compiler can't see.
+
+If you're new to MongoDB, remember the main thing. The database won't tell you about a typo in a field name. It'll honestly return an empty result. Typemo reports it as an error right away, and almost this whole page is about where that saves you.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and a product model. It has numbers, an array of strings, an optional date, a field that can be `null`, and an array of nested documents.
+
+<Snippet id="queries/filters/prerequisites" title="products/product.ts" twoslash />
+
+The collection has three products.
+
+- `Keyboard`: price 50, 10 in stock, tags `office` and `usb`, released January 10, 2025, `note` is `null`. Two variants, `K-1` with a quantity of 4 and `K-2` with a quantity of 0.
+- `Mouse`: price 20, 0 in stock, tag `usb`, released June 1, 2025, `note` is `"sale"`. One variant, `M-1`, 7 units.
+- `Monitor`: price 300, 3 in stock, no tags, no release date, `note` is `null`, no variants.
+
+The `// →` comments list the names of the products found, in alphabetical order.
+
+## Quick start [#quick-start]
+
+The three most common conditions are equality, a range, and "one of these values". The short form is the value itself, and the long form is an object with an operator.
+
+<Snippet id="queries/filters/quick-start" twoslash />
+
+We'll go through each condition on real tasks below. Every operator, with the field types it applies to, is listed in the [Filter operators](../reference/query/filter-operators.mdx) reference.
+
+## Compare a value [#compare-value]
+
+A condition on one field can be written two equivalent ways. `{ price: 50 }` means "`price` equals 50", the same as [`$eq`](../reference/query/filter-operators.mdx#eq). For "greater than" and "less than" you need an operator object with [`$gt`, `$gte`, `$lt`, `$lte`](../reference/query/filter-operators.mdx#gt-gte-lt-lte). Several operators in one object work together as "and", and that's how you write a range.
+
+<Snippet id="queries/filters/compare-value" twoslash />
+
+The value in a condition must be the same type as the field: a number for a number, a `Date` for a date. MongoDB compares values of different types without an error, but the result is useless to anyone. The string `"30"` is neither greater nor less than the number 30. It's a different type. Typemo stops such a filter before the database sees it, as described in [Troubleshooting](#troubleshooting).
+
+Ids work the same way. In a filter on `_id` you can pass a string, and Typemo turns it into an `ObjectId` itself. A string that doesn't look like an id gives a [`CastError`](../reference/errors/data-errors.mdx#cast-error).
+
+## Pick from a set of values [#one-of-values]
+
+When any of several values will do, use [`$in`](../reference/query/filter-operators.mdx#in). When none of them may match, use [`$nin`](../reference/query/filter-operators.mdx#nin). They're a short replacement for a long chain of equalities, for example to pick products by a list of names or orders by a list of ids.
+
+<Snippet id="queries/filters/one-of-values" twoslash />
+
+The operand of `$in` must be an array. If such a filter arrives at runtime rather than from your typed code, Typemo throws a `CastError` with the text `Cast to Array failed at path "price.$in" for 5 (number): $in takes an array [type]`.
+
+## Combine conditions [#combine-conditions]
+
+Several keys in one filter work as "and". Products over 10 with non-zero stock are two fields. You need a separate operator for "or" and for "none of".
+
+<Snippet id="queries/filters/combine-conditions" twoslash />
+
+[`$or`](../reference/query/filter-operators.mdx#or) requires at least one condition from the list to hold, and [`$nor`](../reference/query/filter-operators.mdx#nor) requires that none of them holds. You rarely need [`$and`](../reference/query/filter-operators.mdx#and), except when the same field or operator has to appear twice.
+
+[`$not`](../reference/query/filter-operators.mdx#not) inverts a condition, but it also matches documents that don't have the field at all. `{ released: { $not: { $gt: date } } }` finds both `Keyboard` and `Monitor`, which has no date at all. If you can express the condition with the opposite operator, do that: `$lte` instead of `$not` with `$gt`.
+
+## Search by an array [#query-arrays]
+
+An array field accepts everything its element accepts. The condition holds if at least one element matches it. So `{ tags: "usb" }` finds products whose tags include `usb`.
+
+<Snippet id="queries/filters/query-arrays" twoslash />
+
+[`$all`](../reference/query/filter-operators.mdx#all) requires the array to contain all the listed values, in any order. [`$size`](../reference/query/filter-operators.mdx#size) checks the exact length. You can't write a condition like "at least three tags" with it. For that, store the length in a separate field.
+
+### A condition on one element of an array of nested documents [#elem-match-condition]
+
+`Keyboard` has two variants: `K-1` with a quantity of 4 and `K-2` with a quantity of 0. You need a product that has a `K-1` variant with zero stock. There's no such variant, but a filter with two keys "finds" it.
+
+<Snippet id="queries/filters/elem-match-condition" twoslash />
+
+Conditions on nested fields of an array are checked independently. `sku` matched the first element, `qty` matched the second, and the product passed. [`$elemMatch`](../reference/query/filter-operators.mdx#elem-match) requires **the same** element to meet all the conditions at once. When you need two conditions about one nested record, use it.
+
+## A condition on a nested field [#nested-field-condition]
+
+A field of a nested document is written as a dotted path, such as `"variants.sku"`. The compiler knows these paths, suggests them in your editor, and rejects ones that don't exist.
+
+<Snippet id="queries/filters/nested-field-condition" twoslash />
+
+For an array of nested documents, a condition on a path checks the elements one by one, and one matching element is enough. For conditions that must hold "together on one element", you need [`$elemMatch`](#elem-match-condition), covered above.
+
+## Find documents without a field or with null [#missing-or-null]
+
+In MongoDB "the field is missing" and "the field holds `null`" are different states, and they need different filters. [`$exists`](../reference/query/filter-operators.mdx#exists) with `false` finds documents without the field.
+
+<Snippet id="queries/filters/missing-or-null" twoslash />
+
+A field set to `null` exists, so `{ note: { $exists: true } }` returns all three products. To find exactly `null`, compare with `null` directly.
+
+<Snippet id="queries/filters/missing-or-null-2" twoslash />
+
+You can compare with `null` only fields that can be `null`, here `note`. The filter `{ released: null }` won't compile. Otherwise "missing" and "`null`" would mix in one filter, and you'd find something other than what you were looking for.
+
+## Search by text [#text-search]
+
+[`$regex`](../reference/query/filter-operators.mdx#regex) writes a condition on a string as a regular expression, either a pattern string or a `RegExp` object. Flags for a pattern string go in a neighboring `$options`, and a `RegExp` carries them in the expression itself.
+
+<Snippet id="queries/filters/text-search" twoslash />
+
+If a user types the pattern, escape it. Otherwise the special characters in their string become part of the expression, and a search for `.*` returns the whole collection.
+
+<Snippet id="queries/filters/text-search-2" title="products/products.service.ts" twoslash />
+
+A search by the start of a string (`^Mo`) can use an index, while a search in the middle reads every value of the field. Regular expressions aren't suited for real full-text search. See [Full-text and vector search](./text-and-vector-search.mdx).
+
+## Build a filter from user input [#filter-from-input]
+
+Most often a filter is built from request parameters. The client picks a tag, a minimum price, or part of a name. Every parameter is optional, so the filter is assembled piece by piece, and only the conditions that were set go into it. [`.where(filter)`](../reference/query/conditions.mdx#where-filter) fits this well. It adds conditions to the query and doesn't replace the ones already added.
+
+<Snippet id="queries/filters/filter-from-input" title="products/products.service.ts" twoslash />
+
+The conditions combine with "and", and a query without parameters returns all products, since an empty filter is allowed for reads. Notice that `where` receives values that are already checked (a number, a string), not the raw request object.
+
+A raw object from the client can contain operators. The body `{"name": {"$gt": ""}}` is a perfectly valid condition for a string field. Pass it to `find` whole, and it runs and returns every product.
+
+<Snippet id="queries/filters/filter-from-input-2" twoslash />
+
+Typemo catches only clear violations: an unknown field, an unknown operator, `$where`, `undefined`, a value of the wrong type. It can't know whether `{ "$gt": "" }` came from the client or from your code. So check the input (types, format, range) and build the filter in your own code, as above.
+
+For extra safety, wrap the value from the request in [`untrusted`](../reference/policies/soft-delete-and-untrusted.mdx#untrusted). This function rejects any key with `$` at any depth. See [Accept a filter from a client request](../policies/untrusted-input.mdx).
+
+<Snippet id="queries/filters/filter-from-input-3" twoslash />
+
+## Build a filter piece by piece [#build-filter]
+
+It's not only user input that adds conditions one at a time. Ordinary code does too. One function restricts permissions, another adds a range. Besides `.where(filter)`, a query has a chain on one field, [`.where("field")`](../reference/query/conditions.mdx#where-path), with methods like `gte` and `lt`.
+
+<Snippet id="queries/filters/build-filter" twoslash />
+
+When the bounds of a range come from different places, this form reads better than nested objects. The chain also narrows the result type. After `.where("role").in([...])` the compiler knows that the `role` field in the result takes only those values. The details and the other chain methods are in the [Chained conditions](../reference/query/conditions.mdx) reference.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **where the condition comes from**.
+
+- **You write it in code, and it doesn't change**: write it as an object. `{ price: { $gte: 20 } }` is the shortest and clearest form.
+- **Conditions are added piece by piece in different places**, especially from optional parameters: use [`.where(filter)`](../reference/query/conditions.mdx#where-filter).
+- **A readable range on one field or a narrowed result type matters more**: [`.where("field")`](../reference/query/conditions.mdx#where-path).
+
+If the whole condition came from the client, don't hand it to the query as a filter. Parse the input and build the filter yourself.
+
+## When not to use it [#when-not-to-use]
+
+You don't need a filter for one document by `_id`. Use [`findById`](../reference/query/reading.mdx#model.find-by-id), which accepts a string from the URL too. To check whether a matching document exists, there's [`exists`](../reference/query/reading.mdx#model.exists), and to count documents, [`countDocuments`](../reference/query/reading.mdx#model.count-documents). Filters aren't suited for searching by the meaning of text or by a vector. See [Full-text and vector search](./text-and-vector-search.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**A string instead of a number.** A number came from the URL as a string, and you passed it into the filter as is. The compiler won't let that code through.
+
+<Snippet id="queries/filters/troubleshooting" twoslash />
+
+If the filter was built at runtime, Typemo doesn't send it to the database and throws a `CastError`.
+
+<Snippet id="queries/filters/troubleshooting-2" />
+
+MongoDB considers the string `"30"` neither equal to the number 30 nor greater than it. The query would return an empty result without a single error. Convert the value to a number yourself with `Number(params.price)` and check that the result isn't `NaN`.
+
+**`undefined` in a filter.** An optional parameter didn't arrive, and `{ price: undefined }` got into the filter. The compiler rejects this code, and at runtime `find` throws a `QueryError`.
+
+<Snippet id="queries/filters/troubleshooting-3" />
+
+If Typemo silently treated `undefined` as no condition, you'd get every document instead of the users you were looking for. Add a condition only when the parameter is set, as in the `searchProducts` function above. And look for documents without the field explicitly: `{ price: { $exists: false } }`.
+
+**A typo in a field name.** The compiler underlines the unknown field, and at runtime Typemo throws a `StrictModeError`.
+
+<Snippet id="queries/filters/troubleshooting-4" twoslash />
+
+<Snippet id="queries/filters/troubleshooting-5" />
+
+MongoDB would return an empty array, since no document has a `nope` field. You'd have to track the error down through odd app behavior.
+
+The compiler sees only the keys written in code or described in the filter type. A filter built at runtime, such as a `Record<string, unknown>` object (or `{ [key: string]: unknown }`) from parsing parameters, it accepts whole, because it doesn't know that object's keys. That's how `find`, `findOne`, `countDocuments`, `exists`, and writes with a filter behave: `updateOne`, `updateMany`, `deleteOne`, `deleteMany`, `findOneAnd*`.
+
+In such a filter, a typo in a key and a value of the wrong type surface only when the query runs, with the same `StrictModeError` and `CastError`. The query still won't reach the database. To get the compiler's help here too, build the filter piece by piece with [`.where(filter)`](../reference/query/conditions.mdx#where-filter) and literals, as in [Build a filter from user input](#filter-from-input).
+
+**Two conditions about one element are checked on different elements.** Conditions on nested fields of an array returned a product that has no matching variant. Why that happens and how to fix it is covered above. Use [`$elemMatch`](../reference/query/filter-operators.mdx#elem-match) so the conditions are checked on the same element.
+
+**The operator doesn't fit the field type.** A regular expression on a number makes no sense, and `Products.find({ price: { $regex: "5" } })` won't compile. At runtime Typemo throws a `StrictModeError`.
+
+<Snippet id="queries/filters/troubleshooting-6" />
+
+That way a type mix-up surfaces before it produces a wrong result. For every operator, the [Filter operators](../reference/query/filter-operators.mdx) reference says which fields it applies to.
+
+## Full example [#full-example]
+
+A product service that searches by request parameters, finds products with a variant of the right quantity, and lists products without a release date. Code that isn't part of Typemo and that you write yourself is marked `__…__`.
+
+<Snippet id="queries/filters/full-example" title="products/products.service.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose a field that isn't in the schema was silently dropped from the filter with `strictQuery`, and without it went to the database as is. In Typemo an unknown field, an unknown operator, `undefined`, a value of the wrong type, and `$where` are always errors.
+
+Typemo won't reject an operator from client input (`{ "$gt": "" }` instead of a string) by itself if it's valid for the field. Check the input, and wrap it in [`untrusted`](../reference/policies/soft-delete-and-untrusted.mdx#untrusted) when needed.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Filter operators" href="../reference/query/filter-operators.mdx">
+  Each operator: which field types it applies to, what it means, and which errors it throws.
+</Card>
+<Card title="Chained conditions" href="../reference/query/conditions.mdx">
+  `.where`, `.and`, `.or`, `.merge`, the field chain methods, and narrowing the result type.
+</Card>
+<Card title="Accept a filter from a client request" href="../policies/untrusted-input.mdx">
+  Protection against operator injection, and rules for checking data from requests.
+</Card>
+<Card title="Projections and the result type" href="./projections.mdx">
+  Return only the fields you need, and what happens to the type.
+</Card>
+<Card title="Sorting and paging" href="./sorting-and-pages.mdx">
+  The order of documents, limits, and paging through the results.
+</Card>
+</Cards>

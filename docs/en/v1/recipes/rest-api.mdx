@@ -1,0 +1,165 @@
+---
+title: A REST API for bank accounts
+description: "A full set of create, read, update, and delete handlers, with filters, pages, and clear error responses"
+icon: Server
+---
+
+To serve data over HTTP, you need five handlers: a list, a single object, create, update, and delete. Plus a shared rule that turns a library error into a response for the client. Let's put it all together in one working example for bank accounts. The list goes page by page by key, the filters come from the query string, and each error gets its own response code.
+
+The handlers here are ordinary functions. They take input that's already parsed: strings from the URL and an object from the request body. They return data or throw an error with a marker: `__NotFound__`, `__BadRequest__`, or `__Conflict__`. The double underscores mean the class is yours. Your web layer decides how it becomes a 404, 400, or 409 status, and Typemo doesn't depend on it. So the example fits any server.
+
+## What you need [#prerequisites]
+
+- A client connected as in [Connect to the database](../connection/connect.mdx).
+- The `@venloc/typemo` and `mongodb` packages installed.
+- Three files: `accounts/account.ts` with the model, `http/errors.ts` with your errors, and `accounts/accounts.service.ts` with the handlers.
+
+## Quick start [#quick-start]
+
+The handler you need most often is "one object by the id from the URL". [`findById`](../reference/query/reading.mdx#model.find-by-id) takes the string as is, [`.orFail()`](../reference/query/reading.mdx#or-fail) turns "not found" into an error, and [`.plain()`](../reference/query/reading.mdx#plain) returns a plain object ready for JSON.
+
+<Snippet id="recipes/rest-api/quick-start" twoslash />
+
+Next we build the full set of handlers around it. First the shared error mapping, then reading, creating, updating, and deleting.
+
+## Describe the model and your errors [#define-model-and-errors]
+
+Let's start with the model. For now an account has two fields: a title and an owner. The title is unique, since a bank shouldn't have two accounts with the same title.
+
+<Snippet id="recipes/rest-api/define-model-and-errors" title="accounts/account.ts" twoslash />
+
+[`Timestamped`](../reference/schemas/base-classes.mdx#timestamped) adds `createdAt` and `updatedAt`, and Typemo updates them on every write. Your error classes mark the boundary of the app, one per response code.
+
+<Snippet id="recipes/rest-api/define-model-and-errors-2" title="http/errors.ts" twoslash />
+
+## Turn library errors into responses [#map-errors-to-responses]
+
+Typemo errors say what's wrong with the data, not what to answer the client. Map them in one place, or every handler grows its own `try/catch`. The `toHttpError` function sorts an error by class, and `guard` wraps the handler body and throws the already mapped error.
+
+<Snippet id="recipes/rest-api/map-errors-to-responses" title="accounts/accounts.service.ts" twoslash />
+
+Each branch is an error the client can fix.
+
+- [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#document-not-found-error) means "no such account".
+- [`ValidationError`](../reference/errors/data-errors.mdx#validation-error) means the fields didn't pass the schema. You can send its [`toJSON()`](../reference/errors/data-errors.mdx#response) to the client. It has the paths and reasons, but not the values themselves.
+- [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicate-key-error) comes from the server when a unique index rejected the write. The class alone is enough. Don't put the `message` (`duplicate key on title_1: { title: "Main" } (code 11000 DuplicateKey)`) into the response, because it holds the key's value.
+- The other four are a bad id or value format ([`CastError`](../reference/errors/data-errors.mdx#cast-error)), an extra field ([`StrictModeError`](../reference/errors/data-errors.mdx#strict-mode-error)), a broken page token ([`KeysetTokenError`](../reference/errors/query-errors.mdx#keyset-token-error)), and a query the library rejected before sending it ([`QueryError`](../reference/errors/query-errors.mdx#query-error)).
+
+Everything else (the network, the server, a bug in your code) passes through unmapped. That's how it should be. The client can't fix such errors, and your web layer should answer them with a 500, not a 400.
+
+## Read one account [#read-account]
+
+`getAccount` gets the id from the URL and returns the account. Apart from `guard`, there's nothing to add. The library checks the id format itself.
+
+<Snippet id="recipes/rest-api/read-account" title="accounts/accounts.service.ts" twoslash />
+
+Look at the result type. In the `.plain()` result, `_id` is a string and dates stay `Date`, so the object turns into JSON without loss. The kinds of results are covered in [Reading data](../queries/reading-data.mdx). If the id isn't found, the client gets `__NotFound__` (`Account not found`). And if the string doesn't look like an id, it gets `__BadRequest__` with the text `Cast to ObjectId failed at path "_id" for "abc" (string): not a 24-character hex string [format]`.
+
+## Return an account with its manager [#account-with-manager]
+
+The client asks for `GET /accounts/:id?expand=manager` and wants to see the manager's name, not their id. The account gets a `manager` reference to an employee. An account read without [`populate`](../reference/populate/populate.mdx) holds an id in `manager`, and with `populate("manager")` it holds the employee document. These two states have different types.
+
+A function that builds the response for either of them takes an [`AnyPopulationDoc<Account>`](../reference/populate/populate-types.mdx#any-population-doc) parameter, and [`isPopulated`](../reference/populate/populate-types.mdx#is-populated) picks the branch. Inside the `if`, the compiler knows that `account.manager` is a loaded document or `null`, since the employee might have been deleted.
+
+<Snippet id="recipes/rest-api/account-with-manager" title="accounts/accounts.service.ts" twoslash />
+
+For the account `Main` with the manager `Bob Manager`, without `expand` you get `{ id: "…", title: "Main" }`, and with it `{ id: "…", title: "Main", manager: "Bob Manager" }`. If the account has no manager, `populate` fills in nothing, and the response has no `manager` field either, because `isPopulated` returns `false`. If the manager was deleted but the reference remained, the field is loaded and equals `null`, and the response gets `manager: null`. The types of populated documents are covered in [Accept a document in any state](../populate/type-checks.mdx#accept-any-state).
+
+## Return a paged list with filters [#paged-list-with-filters]
+
+You can't return the whole list. The collection grows, and the client needs one page. Pages built on "skip N rows" ([`.skip`](../reference/query/reading.mdx#skip)) get more expensive the deeper you go, because the database counts the skipped rows again every time. Besides, if someone adds an account between requests, one row ends up on two pages at once.
+
+So the list goes by key. [`keysetPage`](../reference/query/keyset.mdx#model.keyset-page) returns a page and a token where the next one starts. The details are in [Keyset pagination](../queries/keyset-pagination.mdx).
+
+First add a `status` field to the model to filter by.
+
+<Snippet id="recipes/rest-api/paged-list-with-filters" title="accounts/account.ts" twoslash />
+
+Query parameters arrive as strings, and you can't trust the client: `limit=1000000` would dump everything. The handler checks them itself and builds the filter only from known keys.
+
+<Snippet id="recipes/rest-api/paged-list-with-filters-2" title="accounts/accounts.service.ts" twoslash />
+
+The order is by `createdAt`, newest accounts first. For models on `Timestamped`, `createdAt` and `updatedAt` work as page keys. Typemo adds `_id` as the last key on its own, so two accounts with the same time are neither repeated nor lost. `updatedAt` doesn't suit a feed, though. It changes on every write, and the account "jumps" between pages.
+
+The client sends the `next` token back in `after`. A forged token gives a `KeysetTokenError`, that is, a 400 response. The page's documents are turned into plain objects with [`$toPlain()`](../reference/documents/document-api.mdx#to-plain), and fields like `_id` became strings.
+
+The collection has three accounts: `Main` and `Second` belong to `alice`, and `Other` to `bob`. Here's the first page of `alice`'s list, one account per page.
+
+<Snippet id="recipes/rest-api/paged-list-with-filters-3" twoslash />
+
+The last page comes with `next: null`, and the client knows there's nowhere further to go.
+
+## Create an account [#create-account]
+
+The request body comes from JSON, and Typemo checks it against the schema on write: required fields, length, values from a list. It doesn't silently drop an unknown field. It rejects it. A client that sent `role: "admin"` gets an error, not a quietly lost field.
+
+<Snippet id="recipes/rest-api/create-account" title="accounts/accounts.service.ts" twoslash />
+
+[`create`](../reference/writes/writes.mdx#create) returns a document, and `$toPlain()` turns it into the response. Here's what happens for three bad bodies.
+
+<Snippet id="recipes/rest-api/create-account-2" twoslash />
+
+The index checks uniqueness, not your code. A `findOne` before the write wouldn't save you from two simultaneous requests.
+
+## Update an account [#update-account]
+
+A partial update (PATCH) sends only the fields to change. The handler loads the account and answers 404 if it isn't there. Then it assigns only the allowed fields through [`$set`](../reference/documents/document-api.mdx#set) and saves the document with [`$save`](../reference/documents/document-api.mdx#save). Only the changed fields go to the database.
+
+<Snippet id="recipes/rest-api/update-account" title="accounts/accounts.service.ts" twoslash />
+
+The list of allowed fields is set in code. You can't change `owner` through the API, so `$set` is never called for it, and extra keys in the body are ignored. Values are checked the same way as on create. `status: "gone"` returns `__BadRequest__` with the reason `enum` (`must be one of "open", "frozen"`), and renaming to a taken title returns `__Conflict__`. An empty body changes nothing and returns the account as is, because a PATCH without changes isn't an error.
+
+## Delete an account [#delete-account]
+
+[`deleteOne`](../reference/writes/writes.mdx#delete-one) with `.orFail()` answers 404 if there's nothing to delete. Without `orFail`, the client would get "success" when deleting an account that doesn't exist, and a typo in the URL would be hard to notice.
+
+<Snippet id="recipes/rest-api/delete-account" title="accounts/accounts.service.ts" twoslash />
+
+## How to choose [#how-to-choose]
+
+**Keyset pages, or `skip` and `limit`.** Ask yourself whether the user pages forward or jumps to a numbered page. If they page forward, as with a "more" button, an infinite feed, or an export, use `keysetPage`. If you need page numbers and a total, [`.skip`](../reference/query/reading.mdx#skip), [`.limit`](../reference/query/reading.mdx#limit), and [`countDocuments`](../reference/query/reading.mdx#model.count-documents) will do, but deep pages will be slower.
+
+**Load and save, or update in one query.** The handler above loads the document because some fields change conditionally, and the types check each `$set` separately. If you know the new values in full, [`findByIdAndUpdate`](../reference/writes/writes.mdx#find-by-id-and-update) does the same in one operation, without a read. What goes to the database on save is explained in [Change and save a document](../documents/change-and-save.mdx).
+
+## When not to use it [#when-not-to-use]
+
+If the response is built from several collections or from counts, simple handlers over one model won't do. Use [related data](../populate/basics.mdx) or an aggregation pipeline. If you only need a batch endpoint for an admin panel, look at [`bulkWrite`](../reference/writes/writes.mdx#bulk-write): one request instead of five handlers.
+
+## Troubleshooting [#troubleshooting]
+
+**The client sent an unreadable page token.** The client tampered with or truncated the `after` token. `keysetPage` refuses with a [`KeysetTokenError`](../reference/errors/query-errors.mdx#keyset-token-error) and the text `keysetPage: invalid cursor — it cannot be read`, and `guard` turns that into a 400 response. Don't parse and patch the token yourself. It holds the position, the key values, and a check, and any edit makes it invalid. Let the client start the list from the first page.
+
+**The client changes fields it shouldn't.** If you pass the whole body to the update (`{ $set: body }`), the client can change any field the schema allows, including `owner`. The schema doesn't know which fields you allowed the client. Call `$set` only for the allowed keys, as in `updateAccount`.
+
+**The client gets a 500 for a bad id.** A `CastError` is the client's mistake, but a handler without `guard` would let it through as an ordinary error. Wrap every handler in `guard`. Error mapping should live in one place.
+
+## Full example [#full-example]
+
+All the parts in one file. Split it into files as the comments suggest, or keep it as is. The code works.
+
+<Snippet id="recipes/rest-api/full-example" title="accounts/accounts.service.ts" twoslash />
+
+Calling it from the web layer looks the same for any server. Parse the URL and the body, call the handler, and turn `__NotFound__`, `__BadRequest__`, and `__Conflict__` into the 404, 400, and 409 statuses.
+
+<Callout type="migration">
+
+In Mongoose a list was usually built on `.skip()` and `.limit()`, and errors were sorted by `error.name` and the code 11000. Here [`keysetPage`](../reference/query/keyset.mdx#model.keyset-page) and error classes checked with `instanceof` do the same job. The library also casts an id from a string itself, so you don't need `mongoose.Types.ObjectId(id)` in the handler.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Error handling" href="../errors/handling.mdx">
+  How to catch library errors and what's in them, so you can answer the client more precisely.
+</Card>
+<Card title="Keyset pagination" href="../queries/keyset-pagination.mdx">
+  Why `skip` is expensive and how the next-page token works.
+</Card>
+<Card title="A multi-tenant app" href="./multi-tenant.mdx">
+  How to split the same API between several customers so nobody sees someone else's accounts.
+</Card>
+<Card title="Caching responses" href="./caching.mdx">
+  How to stop going to the database for the same account on every request.
+</Card>
+</Cards>

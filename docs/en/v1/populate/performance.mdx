@@ -1,0 +1,110 @@
+---
+title: Load related data faster
+description: "Cut the volume and number of populate queries with field selection, counters, a per-document limit, an index, and a switch to $lookup"
+icon: Gauge
+---
+
+Populate is handy because it hides the extra queries, and that's exactly why it's easy to make expensive. Each path is a separate query to the database, and each populated document takes up memory in your app. A virtual field with thousands of comments per post turns a list of ten posts into ten thousand documents.
+
+There are four ways to make populate faster.
+
+- Take fewer fields.
+- Don't load what you only need to count.
+- Limit the number of documents per owner.
+- When you need the data for a computation, switch to an aggregation with a [`$lookup`](../reference/aggregation/stages.mdx#lookup) stage.
+
+## What you need [#prerequisites]
+
+The client and the blog models from [Show related data](./basics.mdx). The database holds two users and three posts: "Hello" and "Second" by Alice, "Bob's" by Bob. There are three comments: `c1` and `c2` on "Hello", `c3` on "Second".
+
+## Quick start [#quick-start]
+
+The three most common techniques: select only the fields you need, count instead of loading, and limit the number of documents per owner.
+
+<Snippet id="populate/performance/quick-start" twoslash />
+
+## Take only the fields you need [#select-needed-fields]
+
+A list of posts needs the author's name, but a user document also has a profile, settings, and a long bio. By default populate loads all of it. The [`select`](../reference/populate/populate.mdx#select) option is the same projection as in ordinary queries. The database returns only the selected fields, and less data reaches your app.
+
+<Snippet id="populate/performance/select-needed-fields" twoslash />
+
+The gain grows with the size of the related documents. For a user with three fields there's almost no difference, and for a document with images in binary fields it's huge. The result type narrows along with the projection, and if you selected only the name, the compiler won't let you read the email.
+
+## Count instead of loading [#count-not-load]
+
+The list of posts needs to show "comments: 2", but not the comments themselves. A virtual field with a counter (`count: true` in [`@Virtual`](../reference/schemas/virtual.mdx)) makes Typemo count the documents on the database side with one aggregation, instead of loading them and counting in the app.
+
+<Snippet id="populate/performance/count-not-load" twoslash />
+
+The [operation events](../observability/events.mdx) show that the counter sends one aggregation, `aggregate:Comment@commentCount`, not a `find`.
+
+A counter doesn't accept `select`, `sort`, limits, `justOne`, `transform`, `required`, `clone`, or a nested populate. The result is a number, and none of these options would make sense. Typemo answers with an error like `QueryError: populate "commentCount": a count virtual takes no select (it gives a number)`. `match` is allowed, though, and then only the matching documents are counted.
+
+## Limit the number of documents per owner [#per-owner-limit]
+
+A list shows the latest comment of each post, and there are thousands of comments. The [`perDocumentLimit`](../reference/populate/populate.mdx#per-document-limit) option, or `options.limit`, which is the same thing, limits the number of documents per post. For virtual fields over several posts, Typemo turns this into one aggregation with `$lookup` and a `$limit` per post. The database itself picks what's needed, and nothing extra reaches your app.
+
+<Snippet id="populate/performance/per-owner-limit" twoslash />
+
+The limit applies to each post separately: "at most one per post", not "one in total". You can't set it twice. `options.limit` together with `perDocumentLimit` gives the error `QueryError: populate "comments": "options.limit" and "perDocumentLimit" are the same per-document limit; give one`.
+
+## An index for virtual fields [#virtual-index]
+
+The `comments` virtual field looks up comments by their `post` field. If there's no index on that field, the database scans the whole comments collection on every populate. Index the field the lookup uses in the target model. References (`ref`) already use the `_id` index, but a virtual field's `foreignField` has no index until you declare one.
+
+<Snippet id="populate/performance/virtual-index" title="blog/models.ts" twoslash />
+
+Indexes are created on sync ([`Model.syncIndexes`](../reference/collections/model-indexes.mdx#model.sync-indexes)). When to run it is explained in [Sync indexes](../collections/index-sync.mdx).
+
+## Don't populate in a loop [#no-loop-loading]
+
+You read a list of posts and then call [`$populate`](../reference/documents/document-api.mdx#populate) on each one in a loop. That's N extra queries instead of one, since every call is a separate round trip to the database. If the whole list needs the relation, populate it in the query. `.populate` collects the identifiers from every post and finds the documents in one query.
+
+<Snippet id="populate/performance/no-loop-loading" twoslash />
+
+## When $lookup is better [#when-lookup]
+
+Populate works after the read. It first finds the main documents, then the related ones, and puts them together in the app. So it can't filter the main documents by related fields or compute over related data on the database side. For that you need an aggregation with [`$lookup`](../reference/aggregation/stages.mdx#lookup). The database pulls in the documents itself, and the following stages filter, group, and compute.
+
+<Snippet id="populate/performance/when-lookup" twoslash />
+
+An aggregation returns rows, not model documents, meaning plain values. Populate, on the other hand, reads the target model with an ordinary query, so its hidden fields and soft delete still apply. A hidden field of the target won't show up in a `.plain()` result, and a soft-deleted document won't be found. For more on aggregations, see [Joins](../aggregation/joins.mdx).
+
+## How to choose [#how-to-choose]
+
+Ask yourself what you do with the related data: show it or compute over it.
+
+- **Show it**: populate with `select` and a limit.
+- **Only count it**: a counter, `count: true`.
+- **Filter the main documents by related ones, or group**: `$lookup`.
+
+If the related data is needed not for every row of a list but only for the selected one, load it with a separate query when the user opens it.
+
+## When not to use it [#when-not-to-use]
+
+If the list is small, say a dozen posts, and the related documents are small too, there's nothing to optimize. Two queries are barely different from one. Start optimizing when the [operation events](../observability/events.mdx) show many subqueries or large results, not in advance.
+
+## Troubleshooting [#troubleshooting]
+
+**The list slowed down after adding a virtual field.** Usually there's no index on `foreignField`, or you load every document where a counter or a limit would do. Look at the events. A `find:Comment@comments` subquery without an index scans the whole collection. Add `index: true` to the target field, and `perDocumentLimit` or `count: true` where needed.
+
+**More documents were loaded than expected.** `options.limit` applies to each owner separately, not to the whole result. To limit the size of the whole list, limit the main query with `.limit`, not populate.
+
+## Full example [#full-example]
+
+<Snippet id="populate/performance/full-example" title="blog/reports.service.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Joins" href="../aggregation/joins.mdx">
+  `$lookup` and the other joins in aggregations.
+</Card>
+<Card title=".populate" href="../reference/populate/populate.mdx">
+  Every option, including `select`, `options`, `perDocumentLimit`, and `required`.
+</Card>
+<Card title="Sync indexes" href="../collections/index-sync.mdx">
+  Create an index on the field a virtual field looks up by.
+</Card>
+</Cards>

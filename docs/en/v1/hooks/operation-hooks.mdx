@@ -1,0 +1,178 @@
+---
+title: Hook into an operation
+description: "Hooks that add a condition to every read, extend an update, replace the result, and measure an operation"
+icon: Workflow
+---
+
+An operation hook is a model method that Typemo calls before and after a query, whether it's `find`, `updateMany`, `deleteMany`, `aggregate`, or another one. Use it when a rule has to apply to every path to the data at once. For example, hide archived records, bump a revision counter on every update, or do a dry run of a write. You write the hook once in the model, and the calling code knows nothing about it.
+
+If you need to do something with a document, like cast a field before saving or check an object, read [Run code when a document is saved](./document-hooks.mdx). Documents have their own events. And if a rule follows from what the model means, like soft delete or tenant isolation, there are [policies](../policies/soft-delete.mdx) for that, and they don't depend on hooks.
+
+## What you need [#prerequisites]
+
+- A client connected as in [Connect to the database](../connection/connect.mdx).
+- An account model that grows as you go down the page. `Accounts` is `client.db().model(Account)`.
+- Three accounts in the collection: `a` and `b` belong to `alice`, `c` to `bob`.
+
+## Quick start [#quick-start]
+
+A hook is a class method with the [`@Pre`](../reference/hooks/pre-post.mdx#pre) or [`@Post`](../reference/hooks/pre-post.mdx#post) decorator. The event names the operation (`query.find`), and the type of `this` is [`OperationHookContext`](../reference/hooks/operation-context.mdx#operation-hook-context). Most of the time you need three hooks: add a condition, extend an update, and replace the result.
+
+<Snippet id="hooks/operation-hooks/quick-start" title="accounts/account.ts" twoslash />
+
+Now every `find` on this model skips archived accounts, even when the calling code never thought about them. Below we go through each thing a hook can do, one task at a time.
+
+## Add a condition to every read [#filter-all-reads]
+
+The UI reads accounts in a dozen places, and none of them should show archived ones. Adding `archived: false` to every query is easy to forget. A hook does it once.
+
+The [`.modify`](../reference/hooks/operation-context.mdx#modify) method takes a `where` key, a condition that Typemo combines with the calling code's filter through AND. So a hook only narrows the selection and never widens it. Whatever the calling code asked for still holds.
+
+<Snippet id="hooks/operation-hooks/filter-all-reads" twoslash />
+
+The filter sent to the database was `{ owner: "alice", archived: false }`. If `b` had `archived: true`, only `a` would be left in the response. The hook's condition goes through the same checks as a condition in a query. The field must exist in the model, and the value gets cast. So a typo in a hook shows up right away, with a clear error message.
+
+<Snippet id="hooks/operation-hooks/filter-all-reads-2" />
+
+The compiler catches it too, because `where` is typed by the model the same way as the `find` filter.
+
+If one method should serve several reads, list the events: `@Pre(["query.find", "query.findOne", "query.countDocuments"])`. Then you declare `this` without the second parameter, and `modify({ where })` fits every event in the list. `findById` fires the `query.findOne` event, and so does `exists`.
+
+## Extend an update [#extend-update]
+
+Every update of an account has to bump a revision counter. A `modify` hook with the `update` key adds operators to the calling code's update.
+
+<Snippet id="hooks/operation-hooks/extend-update" twoslash />
+
+The calling code wrote only `$set`, but both operators went to the database: `$set` from the caller and `$inc` from the hook. That's why `revision` became 1 on both accounts. Operators are combined by name. If the update already had `$inc`, the hook's paths are added to it.
+
+A hook can't overwrite a value the update already writes. The same path under the same operator twice is an error. Otherwise the hook would silently replace the caller's value.
+
+<Snippet id="hooks/operation-hooks/extend-update-2" />
+
+Hooks also see a pipeline update (an array of stages), but you can't add an `update` to it. Operators can't be inserted into a pipeline, and you get a `QueryError`.
+
+## Change the projection and sort order [#change-select-and-sort]
+
+Say the account list always needs the same order. The `select` and `sort` keys **replace** the projection and the sort order completely. They don't add to them.
+
+<Snippet id="hooks/operation-hooks/change-select-and-sort" twoslash />
+
+The records came back in reverse order and with only `_id` and `title`, because the hook replaced the caller's sort and projection. So use `sort` and `select` in hooks only where the rule really is shared.
+
+## Skip the operation [#skip-operation]
+
+A cleanup script should be able to do a dry run: show what it was going to do and delete nothing. The [`.skip`](../reference/hooks/operation-context.mdx#skip) method cancels the operation. No query goes to the database, and the calling code gets the result you passed as if the server had returned it.
+
+<Snippet id="hooks/operation-hooks/skip-operation" twoslash />
+
+The hook passed a delete result in the shape the server would return, and `deleteMany` finished without touching the database. All three accounts are still there. After `skip`, the remaining `@Pre` hooks of this operation don't run, but the `@Post` hooks do, and they get the same result.
+
+The substituted result goes through the rest of the pipeline like a real one. If you hand documents to `find`, the calling code gets documents of your model. And if a document doesn't match the schema, you get the same cast error as when reading from the database. A hook can't return data the server wouldn't return.
+
+<Snippet id="hooks/operation-hooks/skip-operation-2" twoslash />
+
+## Measure an operation [#measure-operation]
+
+You need to record how many documents a read returned and how long it took. That takes data from both before and after the operation. `@Pre` and `@Post` hooks share it through `this.locals`, a `Map` created fresh for every operation.
+
+<Snippet id="hooks/operation-hooks/measure-operation" twoslash />
+
+`@Post` got the operation's result as an argument and took the start time from `locals`. The next query starts with an empty `Map`, so values of different operations never mix. If the read goes through a cursor, `@Post` is called for every batch the database returned in full, and `locals` stays the same for the whole cursor.
+
+For metrics and tracing Typemo has a separate mechanism, [operation events](../observability/events.mdx). It can't change an operation and costs nothing while there are no subscribers. Use hooks for observation only if you need access to `this.locals` or to `modify`.
+
+## Add stages to an aggregation [#add-stages]
+
+Say every aggregation over accounts should return at most 10 rows. The `stages` key appends stages to the end of the pipeline, and they go through the same steps as the builder's stages.
+
+<Snippet id="hooks/operation-hooks/add-stages" twoslash />
+
+The example lowers the limit to one so that the result shows up on three accounts. The hook's stages come after the builder's stages, so the hook's limit applies last.
+
+## Operation hooks inside bulkWrite [#bulk-write-hooks]
+
+The same hooks run for the operations inside [`bulkWrite`](../reference/writes/writes.mdx#bulk-write). Every operation in the batch (`updateOne`, `updateMany`, `replaceOne`, `deleteOne`, `deleteMany`) fires the `query.*` hooks of its standalone counterpart. `this.bulkIndex` holds the operation's position in the list, and for a normal call it's `undefined`.
+
+- `modify` changes only this one operation.
+- `skip` isn't allowed for a single operation of a batch. To skip the whole batch, use a `model.bulkWrite` hook.
+- `@Post` gets a [`BulkOperationResult`](../reference/hooks/operation-context.mdx#bulk-operation-result) instead of an `UpdateResult` or `DeleteResult`. The server doesn't report counters for a single operation, so they are `null`.
+
+That's why the `@Post("query.deleteMany")` hook in the example above declares `deletedCount: number | null`. The order and an example are in [Bulk writes](../writes/bulk.mdx#bulk-write-hooks).
+
+## What a hook sees [#hook-view]
+
+`this` in an operation hook shows what the operation will send to the database, in the shape it will send it. Values are already cast, policy conditions are added, and ids have become `ObjectId`. For `find({ owner: "alice" })` the hook sees `filter` as `{ owner: "alice" }`. For `updateOne({ title: "a" }, { $inc: { balance: 5 } })` it sees `filter` as `{ title: "a" }` and `update` as `{ $inc: { balance: 5 } }`.
+
+`this` also has `model`, `operation`, `session`, `inTransaction`, `policy`, and `operationId`. Fields that don't apply to the operation are `undefined`. The full list is in the [Operation context](../reference/hooks/operation-context.mdx#operation-hook-context) reference.
+
+A changed operation goes through every policy again. A hook that added `where` can't cross a tenant boundary or lift soft delete. After the hook, Typemo rebuilds the operation as if the calling code had written it. Inside the hook itself, `this.filter` still shows the old value after `modify`. The next hook sees the new one.
+
+## How to choose [#how-to-choose]
+
+Ask yourself **what the rule does to the operation: changes it or only watches it**.
+
+- **Changes the operation on every path, and it's specific to the model**: use a hook.
+- **Decides whose data is visible, or whether to really delete**: the core already does that with [policies](../policies/soft-delete.mdx). A hook would only duplicate them badly.
+- **Only writes a metric or a log**: use [operation events](../observability/events.mdx). They are cheaper and safer.
+
+Between `modify` and `skip`, choose by whether you need the operation at all. You need it, but in a different form: `modify`. You don't need it, and the result is known in advance: `skip`. To forbid an operation, throw an error from the hook.
+
+## When not to use it [#when-not-to-use]
+
+If only one query needs the condition, add it to that query. A hook is for rules that are shared. To cast a field value, the [`@Prop`](../reference/schemas/prop.mdx) options are enough, and they apply to both reads and writes. And if several models need the same rule, make it a [plugin](./plugins.mdx).
+
+## Troubleshooting [#troubleshooting]
+
+**`modify` or `skip` doesn't work in a post hook.** A `@Post` hook calls `this.modify(...)`, and the operation fails.
+
+<Snippet id="hooks/operation-hooks/troubleshooting" />
+
+By then the operation has already run, and it's too late to change it. Move the call to `@Pre`. The same goes for `skip`: `QueryError: Account.find: skip() is only for pre hooks (the operation already ran)`.
+
+**The hook changed something unexpected.** Say, `modify({ update: … })` in a hook for `find`. The compiler won't accept that key, and at runtime you get `QueryError: Account.find: modify(): "update" does not apply to find`. Each event has its own allowed keys, listed in the [`OperationChanges`](../reference/hooks/operation-context.mdx#operation-changes) reference. A hook on a list of events may change only what fits every event in the list.
+
+**The operation hook isn't called when you insert one document.** `insertOne` has no operation hook event. Like `create`, it fires the `document.validate` and `document.save` document hooks. If the rule has to run on every insert, put it on `document.save`. There's more in [Run code when a document is saved](./document-hooks.mdx). For `insertMany`, the `@Pre("model.insertMany")` hook fires, even with an empty list.
+
+**The hook threw an error, and the query didn't run.** That's by design. An error from `@Pre` cancels the operation before it reaches the database. There's more in [Hook order and errors](./order-and-errors.mdx#pre-hook-error).
+
+### An operation hook in a subdocument class never runs [#subdocument-hook-skipped]
+
+You declared `@Pre("query.find")` in the order line class `Line`, which is used only as a subdocument in `Order`, and you expect the hook to fire on `Orders.find()`.
+
+<Snippet id="hooks/operation-hooks/subdocument-hook-skipped" title="orders/order.ts" twoslash />
+
+The hook is never called, and neither the compiler nor `connection.model(Order)` tells you. After `Orders.find()` on an order with a line, the hook's call counter is still zero.
+
+The reason is that an operation hook belongs to a model. `query.*`, `model.*`, and `aggregate` fire the hooks of the class the model was created from. A subdocument has no operations of its own, and the query goes to the `Order` model. Typemo doesn't treat this as an error, because the same class may be a model elsewhere in the app, and the hook is needed there.
+
+Move the hook to the model class, `Order`. Document hooks (`document.save`, `document.validate`) do work in a subdocument class, though. They run on every subdocument. See [Run code when a document is saved](./document-hooks.mdx#subdocuments).
+
+## Full example [#full-example]
+
+Every hook from this page in one file: a condition on every read, a revision on update, a dry-run delete, and counting read results.
+
+<Snippet id="hooks/operation-hooks/full-example" title="accounts/account.ts" twoslash />
+
+<Callout type="migration">
+
+In Mongoose, `pre("find")` got the query as `this` and changed it with query methods like `this.where(...)`. And `pre("updateOne")` was a document hook and a query hook at once, with flags to choose between them. In Typemo each event has one scope, and the `this` of a query is a context whose changes all go through policies. A hook can't overwrite a value the query already writes. It can't change the operation in `post` either, because `modify` throws there.
+
+</Callout>
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Run code when a document is saved" href="./document-hooks.mdx">
+  What you can do before and after saving, validating, and deleting a document.
+</Card>
+<Card title="Hook order and errors" href="./order-and-errors.mdx">
+  What runs first, what happens on an error, and how hooks behave in a transaction.
+</Card>
+<Card title="Reuse behavior across models" href="./plugins.mdx">
+  How to bundle hooks and fields and attach them to several models.
+</Card>
+<Card title="Operation context" href="../reference/hooks/operation-context.mdx">
+  Every field of `this` and every `modify` key.
+</Card>
+</Cards>

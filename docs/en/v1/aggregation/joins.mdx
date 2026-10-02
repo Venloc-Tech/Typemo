@@ -1,0 +1,126 @@
+---
+title: Joins
+description: "Pull in data from another collection, combine two collections into one list, and walk a tree of links"
+icon: Merge
+---
+
+Data rarely lives in one collection. An order points to a customer, a category points to its parent, and old orders sit in an archive apart from the live ones. A normal read in MongoDB doesn't join collections, but aggregation can, in three ways.
+
+- [`lookup`](../reference/aggregation/stages.mdx#lookup) pulls documents from another collection into each row.
+- [`unionWith`](../reference/aggregation/stages.mdx#union-with) appends the documents of another collection to the result.
+- [`graphLookup`](../reference/aggregation/stages.mdx#graph-lookup) follows links however many there are, for example up a category tree.
+
+Typemo knows the type of the pulled-in documents from the model you pass in `from`, and it checks the join fields against both models. A typo in `localField` or `foreignField` is a compile error, not an empty result in production.
+
+## What you need [#prerequisites]
+
+The client from [Connect to the database](../connection/connect.mdx) and the way to run an aggregation from [Your first aggregation](first-aggregation.mdx). The data is a small shop with four collections.
+
+- Customers: `alice` from Germany and `bob` from France.
+- Orders: two from `alice` (120 and 80), one from `bob` (50), and one from `dave` for 10. There is no customer `dave` in the database, and that will matter later.
+- Order archive: one old order from `bob` for 300.
+- Categories: `Electronics`, with `Phones` inside it and `Smartphones` inside `Phones`.
+
+<Snippet id="aggregation/joins/prerequisites" title="shop/models.ts" twoslash />
+
+## Quick start [#quick-start]
+
+To give every order its customer, name the collection in `from`, the order field in `localField`, the customer field in `foreignField`, and the new field in `as`.
+
+<Snippet id="aggregation/joins/quick-start" twoslash />
+
+The pulled-in field is always an **array**, because several customers might share that name, or none at all. If you want a single object, add [`unwind`](../reference/aggregation/stages.mdx#unwind). We'll cover that and the other options below.
+
+## Pull in documents by a matching field [#lookup-by-field]
+
+Say the order report needs the customer's country. `lookup` finds the documents in `customers` whose `name` matches the order's `customer` and puts them in `buyer`. The row type grows with it, and the order fields gain an array of customers.
+
+<Snippet id="aggregation/joins/lookup-by-field" twoslash />
+
+Notice the order from `dave`. It's still there, but its `buyer` is empty. That's how the server works. `lookup` is a left join, so the rows on the left always stay. And the compiler won't let a typo like `localField: "custmer"` or `foreignField: "nam"` through.
+
+Typemo takes the policies of the pulled-in collection from the class you pass in `from`. If `Customer` has soft delete turned on, deleted customers won't show up in `buyer`. If the collection is split by tenant, only the documents of the operation's tenant come in, and Typemo stops a query without a tenant before it reaches the server. `Hidden` fields are cut out too. You don't need to register a `Customer` model for any of this, since Typemo builds the schema from the class. [`unionWith`](../reference/aggregation/stages.mdx#union-with) and [`graphLookup`](../reference/aggregation/stages.mdx#graph-lookup) behave the same way.
+
+## One object instead of an array [#single-object]
+
+An array with one element is awkward to work with. The [`unwind`](../reference/aggregation/stages.mdx#unwind) stage unwinds the array into one row per element, and the field becomes an object. Orders without a customer drop out, because there's nothing to unwind.
+
+<Snippet id="aggregation/joins/single-object" twoslash />
+
+After `unwind`, `f.buyer` is an object, and your editor suggests `f.buyer.country` on its own. To keep orders without a customer, write `unwind({ path: "$buyer", preserveNullAndEmptyArrays: true })`.
+
+## Pull in with a condition [#lookup-with-condition]
+
+Sometimes matching one field isn't enough. Suppose you want only a customer's large orders, and not the orders themselves but their total. For that, `lookup` has a form with a **sub-pipeline**. You pass values from the current row through `let` and build a separate pipeline over the collection you pull from. The variables inside it are typed the same way as `f`.
+
+<Snippet id="aggregation/joins/lookup-with-condition" twoslash />
+
+The first argument of the callback is a builder over `Order`, the second is your variables. The sub-pipeline decides the type of the pulled-in rows, so after `project` they hold only `total`. An empty sub-pipeline won't pass. It needs at least one stage, otherwise you get a `ConfigurationError`.
+
+## Append documents from another collection [#union-with]
+
+Sometimes you need one list out of two collections, for example live orders together with the archive. [`unionWith`](../reference/aggregation/stages.mdx#union-with) appends every document of another collection to the rows. The row type becomes a **union** of the two types, and the compiler won't let you read `archivedAt` until you check that the row came from the archive.
+
+<Snippet id="aggregation/joins/union-with" twoslash />
+
+If you need only part of the second collection, or the same shape as the first, pass an object `{ coll, pipeline }`. The result then gets whatever the sub-pipeline returns.
+
+<Snippet id="aggregation/joins/union-with-2" twoslash />
+
+Now both parts have the same type, and there's no union left. The rows of the current pipeline come first, the appended ones after them.
+
+## Walk a tree of links [#traverse-graph]
+
+A category stores its parent's name, the parent stores its own parent, and so on. To find every ancestor of `Smartphones` without knowing how deep the tree goes, use [`graphLookup`](../reference/aggregation/stages.mdx#graph-lookup). It repeats the search for as long as it finds new links.
+
+- `startWith`: where to start.
+- `connectFromField` and `connectToField`: how to get from a found document to the next one.
+- `depthField`: where to record the step at which a document was found.
+
+<Snippet id="aggregation/joins/traverse-graph" twoslash />
+
+Don't rely on the order of the ancestors. In the example above the nearest one came first, but the server doesn't promise that. Sort by `level` instead. It's the step number, an int64. `maxDepth` limits the depth, and `restrictSearchWithMatch` filters the documents at every step.
+
+## How to choose [#how-to-choose]
+
+Ask yourself what your rows are missing.
+
+- **Fields from another collection**: use `lookup`. The simple form when two fields only need to be equal, the sub-pipeline form when you need conditions or totals.
+- **More rows, not more fields**: `unionWith`.
+- **Links of unknown depth**: `graphLookup`.
+
+## When not to use it [#when-not-to-use]
+
+If you need documents of one collection with their related documents filled in, use [populate](../populate/index.mdx). It returns the related documents with their types and methods. A join in an aggregation is for when the output is a report, with grouping, totals, and a new row shape.
+
+Keep the cost in mind, too. `lookup` runs for every row, so first filter and trim the rows with [`match`](../reference/aggregation/stages.mdx#match) and [`limit`](../reference/aggregation/stages.mdx#limit), and only then join.
+
+## Troubleshooting [#troubleshooting]
+
+**A typo in a join field.** The compiler checks `localField` and `foreignField` against the models, so you see the mistake right away.
+
+<Snippet id="aggregation/joins/troubleshooting" twoslash />
+
+Change the name to `customer`.
+
+**A row disappears after `unwind`.** After `lookup` the order from `dave` was still there, and after `unwind` it's gone. That's the server's behavior, because unwinding an empty array produces no rows. Add `preserveNullAndEmptyArrays: true`, or don't unwind the array.
+
+**A field of the second collection is out of reach after `unionWith`.** The row type is now a union, and you can't read a field that one of the parts lacks without checking first. Bring both parts to one shape with `project` in a sub-pipeline, as in the example above.
+
+## Full example [#full-example]
+
+<Snippet id="aggregation/joins/full-example" title="reports/orders.ts" twoslash />
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="Several reports in one query" href="./facets.mdx">
+  How to compute a summary, a page, and a distribution in a single pass.
+</Card>
+<Card title="Related data" href="../populate/index.mdx">
+  Filling in related documents during a normal read.
+</Card>
+<Card title="Stages" href="../reference/aggregation/stages.mdx">
+  Every parameter of `lookup`, `graphLookup`, and `unionWith`.
+</Card>
+</Cards>

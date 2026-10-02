@@ -1,0 +1,170 @@
+---
+title: JsonSchemaGenerator and StandardSchema
+description: "How a model's schema becomes a MongoDB collection validator and a Standard Schema for forms and external libraries."
+icon: FileCheck
+---
+
+A model's schema describes the data once, and you can hand it out in two formats. **JSON Schema** is the format the MongoDB server uses to check documents. `JsonSchemaGenerator` builds it from the schema. **Standard Schema** is a shared validation interface that forms, tRPC, and other libraries understand. `StandardSchema` provides it for models and accepts a foreign one (zod, valibot, arktype) to check result rows. Come here to find out what goes into the validator and how `~standard` works.
+
+For tasks, see the guide [JSON Schema and Standard Schema](../../schemas/json-and-standard-schema.mdx). This page is the reference.
+
+The examples use a user model with a required name and a role with two possible values. The results in `// →` come from a real run.
+
+The methods of `JsonSchemaGenerator` and `StandardSchema.of` accept a **schema source**, `SchemaSource`. That's a model obtained from a connection (`client.db().model(User)`) or its `schema` property. The result is the same either way. A class without a model, an empty object, and `null` don't work. The message says what was expected (`JsonSchemaGenerator.generate: a model (connection.model(Entity)) or its schema (model.schema) is expected, got object`).
+
+---
+
+## JsonSchemaGenerator [#json-schema-generator]
+
+`JsonSchemaGenerator` builds a `$jsonSchema` document from a schema. That's the subset of JSON Schema the MongoDB server understands (it uses `bsonType` instead of `type`). The server applies it as a collection validator and rejects documents that violate the schema, **even when another program writes them**. Typemo's own checks stay in place. The validator is a second line of defense, not a replacement.
+
+The schema's [`validator`](./schema.mdx#validator) option creates the validator, and the collection gets exactly what the generator built. Here is what the server receives for a model with constraints.
+
+<Snippet id="reference/schemas/json-and-standard-schema/json-schema-generator" twoslash />
+
+The resulting document.
+
+<Snippet id="reference/schemas/json-and-standard-schema/json-schema-generator-2" />
+
+The building rules show in the result. `bsonType` comes from the field's type, and `"null"` is added only to fields with `nullable` (in Mongoose, null was allowed on every nested object). `required` is collected from explicit `required: true` and from `_id`. Strictness is absolute: `additionalProperties: false` sits on every level, and the server rejects an extra field. `enum`, `minimum`/`maximum`, and `minLength`/`maxLength` carry over as they are. `pattern` appears only for a regular expression with no flags. For a hierarchy of discriminators, the document is built with `oneOf` over the root and each subclass, and an `enum` with the discriminator value picks the variant.
+
+The server can **not** express your own [`validate`](./prop.mdx#validate) functions, date bounds, the number of vector dimensions, and Map key rules. Only Typemo makes those checks.
+
+### JsonSchemaGenerator.generate [#json-schema-generator.generate]
+
+`generate(source)` returns the `$jsonSchema` node (type `BsonJsonSchema`) for a model's schema. Pass a model or its `schema`.
+
+<Params>
+<Param name="source" type="SchemaSource" required>
+
+A model (`connection.model(Entity)`) or its `schema`. Anything else throws `ConfigurationError`.
+
+</Param>
+</Params>
+
+<Returns type="BsonJsonSchema">
+
+A `$jsonSchema` object with the keys `bsonType`, `properties`, `required`, `additionalProperties`, `items`, `enum`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `oneOf`, and `description`.
+
+</Returns>
+
+With a model and with its `schema` the result is the same. The compiler won't accept a class in place of a model: `JsonSchemaGenerator.generate(User)` is a type error.
+
+<Snippet id="reference/schemas/json-and-standard-schema/json-schema-generator-generate" twoslash />
+
+### JsonSchemaGenerator.validator [#json-schema-generator.validator]
+
+`validator(source)` returns what's left to pass to the server: `{ validator: { $jsonSchema }, validationLevel, validationAction }` (type `CollectionValidator`). The level and action come from the schema's `validationLevel` and `validationAction` options. By default they are `strict` and `error`.
+
+<FullType>
+
+<Snippet id="reference/schemas/json-and-standard-schema/json-schema-generator-validator" />
+
+</FullType>
+
+---
+
+## StandardSchema [#standard-schema]
+
+`StandardSchema` is an adapter between a Typemo schema and the Standard Schema v1 interface. It works in both directions.
+
+**Outward.** Every model is itself a Standard Schema, and its `~standard` property is typed by the model. The input is `CreateInput` and the output is `DataFields`. A form or tRPC procedure that can read Standard Schema validates data with the model's type casting and validators and learns nothing about Typemo. The check casts types with strict cascades, fills in defaults, and runs `required` and every `validate`. Asynchronous `validate` functions work too, and then the result arrives as a `Promise`. The response holds either the cast value or **all** the problems found.
+
+<Snippet id="reference/schemas/json-and-standard-schema/standard-schema" twoslash />
+
+The core makes up the `_id` value during the check, which is why the comment abbreviates it. The check doesn't require the service fields the core fills in on save (timestamps, the version). A problem's path is a list of keys, and array indexes in it are numbers.
+
+**Inward.** The `.parse(schema)` method on `.lean()` queries, aggregations, and cursors checks each row with any Standard Schema (zod, valibot, arktype). The core doesn't depend on those libraries. The problems are gathered into one [`ValidationError`](../errors/data-errors.mdx#validation-error) with the reason `schema`. Foreign schemas inside `@Prop` aren't accepted.
+
+<Returns type="StandardSchemaV1<Input, Output>">
+
+An object with a `~standard` property. It holds `version: 1`, `vendor: "typemo"`, a `validate(value)` method, and a `types` field for the types.
+
+</Returns>
+
+### StandardSchema.of [#standard-schema.of]
+
+`of(source)` creates a Standard Schema validator for the input of a schema's documents. It's the same validator that sits in a model's `~standard`. It accepts a model or its `schema`, so `StandardSchema.of(Users)` and `StandardSchema.of(Users.schema)` give identical validators. Any other argument throws `ConfigurationError` (`StandardSchema.of: a model (connection.model(Entity)) or its schema (model.schema) is expected, got null`).
+
+### StandardSchema.isSchema [#standard-schema.is-schema]
+
+`isSchema(value)` is a predicate. It returns `true` for an object or function that has a `~standard` property whose `version` is `1` and whose `validate` is a function. The same predicate checks the argument of `.parse`.
+
+<Snippet id="reference/schemas/json-and-standard-schema/standard-schema-is-schema" twoslash />
+
+### StandardSchema.require [#standard-schema.require]
+
+`require(schema, where)` returns the argument as a Standard Schema or throws [`QueryError`](../errors/query-errors.mdx#query-error) with the text `<where>: a Standard Schema v1 validator (an object with "~standard": { version: 1, validate })`.
+
+<Params>
+<Param name="schema" type="unknown" required>
+
+The argument to check.
+
+</Param>
+<Param name="where" type="string" required>
+
+The name of the call, for the error text.
+
+</Param>
+</Params>
+
+### StandardSchema.validateRows [#standard-schema.validate-rows]
+
+`validateRows(schema, rows, indexed, offset?)` checks rows with a foreign schema. It returns the output values or throws one `ValidationError` with all the problems of all the rows. When `indexed` is `true`, a problem's path starts with the row index and its text starts with `row N:`. Synchronous schemas stay synchronous, and asynchronous ones are awaited together. If the schema throws, rejects a promise, or answers with something that isn't an object, you get a `QueryError` (`parse: the Standard Schema (vendor) threw instead of reporting issues`).
+
+<Params>
+<Param name="schema" type="AnyStandardSchema" required>
+
+The validator that checks the rows.
+
+</Param>
+<Param name="rows" type="readonly unknown[]" required>
+
+The rows.
+
+</Param>
+<Param name="indexed" type="boolean" required>
+
+Whether problem paths start with the row index.
+
+</Param>
+<Param name="offset" type="number" default="0">
+
+The index of the first row. It's added to the indexes in the paths.
+
+</Param>
+</Params>
+
+### StandardSchema.issue [#standard-schema.issue]
+
+`issue(issue)` translates a Typemo problem (`SchemaIssue`) into the Standard Schema format, `{ message, path }`.
+
+### StandardSchema.vendor [#standard-schema.vendor]
+
+`StandardSchema.vendor` is the string `"typemo"`, the vendor name in `~standard.vendor`.
+
+<FullType>
+
+<Snippet id="reference/schemas/json-and-standard-schema/standard-schema-vendor" />
+
+</FullType>
+
+## Types [#types]
+
+The exports are `SchemaSource` (a model or its `schema`, the argument of the generator and `StandardSchema.of`), `StandardSchemaV1`, `AnyStandardSchema`, `StandardSchemaProps`, `StandardSchemaResult`, and `StandardSchemaIssue`. There are also `StandardSchemaInput` and `StandardSchemaOutput`, which infer the validator's input and output. `BsonJsonSchema` and `CollectionValidator` sit alongside them.
+
+## When not to use it [#when-not-to-use]
+
+If you need a validator on the server, don't call the generator by hand. Turn on [`validator`](./schema.mdx#validator) in `@Schema`. The generator is useful for looking at, or checking in a test, what will go to the server. To validate data in the application itself before a write, call `~standard.validate` or the model's methods. Typemo doesn't export plain JSON Schema (draft 2020-12), and the generator emits only the MongoDB dialect.
+
+## What's next [#next-steps]
+
+<Cards>
+<Card title="JSON Schema and Standard Schema" href="../../schemas/json-and-standard-schema.mdx">
+  How to wire the collection validator and `~standard` into real tasks.
+</Card>
+<Card title="@Schema" href="./schema.mdx">
+  The `validator`, `validationLevel`, and `validationAction` options.
+</Card>
+</Cards>
