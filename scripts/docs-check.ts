@@ -69,21 +69,28 @@ const structureFiles = async (): Promise<Set<string>> => {
   return new Set();
 };
 
+/** An explicit id at the end of a heading line: `## Быстрый путь [#quick-start]`. */
+const EXPLICIT_ID = /\s*\[#([^\]]+)\]\s*$/;
+
 /**
- * The anchor the build makes from a heading: components (`<Badge>…</Badge>`) and inline-code marks are dropped,
- * the text is lower-cased, punctuation except `-` and `_` removed, spaces become `-` (Cyrillic kept).
+ * The anchor the build makes from a heading: its explicit id (`[#quick-start]`, the same in every language) when
+ * it has one; otherwise components (`<Badge>…</Badge>`) and inline-code marks are dropped, the text is lower-cased,
+ * punctuation except `-` and `_` removed, spaces become `-` (Cyrillic kept).
  *
  * @param heading - The heading text without the leading `#`s.
  * @returns The anchor, without `#`.
  */
-const slug = (heading: string): string =>
-  heading
+const slug = (heading: string): string => {
+  const explicit = EXPLICIT_ID.exec(heading)?.[1];
+  if (explicit !== undefined) return explicit;
+  return heading
     .replace(/<([A-Z][A-Za-z]*)[^>]*>[\s\S]*?<\/\1>|<[A-Z][^>]*\/>/g, "")
     .replace(/`/g, "")
     .trim()
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s_-]/gu, "")
     .replace(/\s/g, "-");
+};
 
 /** The anchors of the headings of a page (`#` lines outside code blocks). */
 const anchorsOf = (text: string): Set<string> => {
