@@ -44,7 +44,7 @@ Not root scripts, run with `bun scripts/<name>.ts`:
 
 | Script | Use |
 |---|---|
-| `docs-check.ts [--types] [--full] <page.mdx \| dir>` | compiles the twoslash blocks of docs pages, checks the front matter, MDX pitfalls and relative links (details in `03-docs-and-discrepancies.md`) |
+| `docs-check.ts [--types] [--full] <page.mdx \| dir>` | expands the `<Snippet />` tags of docs pages, compiles the twoslash blocks, checks the front matter, MDX pitfalls and relative links (details in `03-docs-and-discrepancies.md`) |
 | `code-unchanged.ts` | proves a comment-only change did not touch the code: compares every changed TS file with `HEAD` after both are re-printed without comments (titles of `describe/test/it` ignored); exit 1 lists the files whose code differs |
 | `ported-report.ts` | the report of the ported tests and their inconsistencies (needs the local list of divergences) |
 | `history-coverage.ts [--table]` | maintainers' check of pitfall coverage; it reads a local file that a clone does not have |

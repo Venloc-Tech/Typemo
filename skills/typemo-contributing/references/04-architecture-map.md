@@ -14,7 +14,8 @@ integrations/    each integration is its own package; vendor dependencies only i
   nestjs/        @venloc/typemo-nestjs
   opentelemetry/ @venloc/typemo-opentelemetry
   sentry/        @venloc/typemo-sentry
-docs/            user documentation: docs/<language>/<version>/... (ru/v1, en/v1)
+docs/            user documentation: docs/<language>/<version>/... (ru/v1, en/v1); heading-id registry docs/ru/v1/anchors.json
+snippets/        code examples of the docs pages: snippets/<version>/<page>/<section-id>.<ext>, shown by <Snippet id="..." />
 skills/          agent skills: typemo, typemo-nestjs (shipped), typemo-contributing (repository only)
 scripts/         Bun scripts (build, publish, docs-check, check-*, timing, budget, port)
 VERSIONS.md      pinned versions and the date they were checked

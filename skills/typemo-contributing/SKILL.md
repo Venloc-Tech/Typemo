@@ -13,7 +13,7 @@ Typemo is a from-scratch TypeScript ODM for MongoDB, a full Mongoose replacement
 |---|---|
 | Write or change source, write any test, hover/shape/type tests, ported Mongoose tests, guards, perf and compile budget, the order of work for a feature | `references/01-code-and-tests.md` |
 | Run or interpret a root command, which command for which change, MongoDB 9.0 / 8.3 runs, Bun specifics | `references/02-commands-and-checks.md` |
-| Write or change a docs page, verify it on a real database, report a discrepancy | `references/03-docs-and-discrepancies.md` |
+| Write or change a docs page (code in `snippets/` files shown by `<Snippet />`, permanent heading ids `[#id]` and their registry), verify it on a real database, report a discrepancy | `references/03-docs-and-discrepancies.md` |
 | Find where something lives (core folders, integrations, test-kit, bench) | `references/04-architecture-map.md` |
 
 ## Rules that never bend
@@ -58,5 +58,5 @@ A bug in the code, a wrong TSDoc, a confusing error text, a docs contradiction y
 - [ ] All test kinds exist for the change; no test was bent to pass; the guards pass (`test-integrity`, `no-decision-ids`).
 - [ ] The relevant root commands ran one at a time and I report their real results (or that I did not run them).
 - [ ] Hot paths changed: `bun run test:perf` ran and the `[perf]` numbers are in the report. Types changed: `typecheck:timing` growth over 15% is reported.
-- [ ] Docs pages: `docs-check --types` is `ok`; every result and error text comes from a run or a test.
+- [ ] Docs pages: `docs-check --types` is `ok`; every result and error text comes from a run or a test; code lives in `snippets/` files with English comments; no published heading id changed, new ids are in `docs/ru/v1/anchors.json`.
 - [ ] The report lists what is not verified.

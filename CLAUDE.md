@@ -111,6 +111,7 @@ integrations/        integrations, one package each; vendor dependencies only in
   sentry/            @venloc/typemo-sentry
   nestjs/            @venloc/typemo-nestjs
 docs/                user documentation: docs/<language>/<version>/… (docs/ru/v1); every example is checked by scripts/docs-check.ts
+snippets/            code of the docs examples: snippets/<version>/<page>/<section-id>.<ext>, shown in a page by <Snippet id="…" />
 skills/              agent skills: typemo and typemo-nestjs (shipped inside the packages), typemo-contributing
 scripts/             Bun scripts: build, publish, docs-check, check-any, check-tsdoc, check-skills, test-dist, timing, …
 VERSIONS.md          pinned versions and the date they were checked
