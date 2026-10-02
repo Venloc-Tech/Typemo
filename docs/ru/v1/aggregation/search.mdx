@@ -4,19 +4,19 @@ description: "Как построить запрос Atlas Search и векто�
 icon: Search
 ---
 
-Обычный текстовый индекс MongoDB ищет по словам, но не умеет нечёткий поиск, подсветку и поиск по смыслу. Для этого у MongoDB Atlas есть **Atlas Search** (стадия `$search`) и **векторный поиск** (стадия `$vectorSearch`): они строятся не в `find`, а в конвейере агрегации, и всегда стоят **первой** стадией. В Typemo это методы [`search`](../reference/aggregation/stages.mdx#search), [`searchMeta`](../reference/aggregation/stages.mdx#searchmeta) и [`vectorSearch`](../reference/aggregation/stages.mdx#vectorsearch); для объединения нескольких поисков есть [`rankFusion`](../reference/aggregation/stages.mdx#rankfusion), [`scoreFusion`](../reference/aggregation/stages.mdx#scorefusion) и [`score`](../reference/aggregation/stages.mdx#score).
+Обычный текстовый индекс MongoDB ищет по словам, но нечёткого поиска, подсветки и поиска по смыслу не умеет. Для этого в MongoDB Atlas есть **Atlas Search** (стадия `$search`) и **векторный поиск** (стадия `$vectorSearch`). Их строят не в `find`, а в конвейере агрегации, и они всегда стоят **первой** стадией. В Typemo это методы [`search`](../reference/aggregation/stages.mdx#search), [`searchMeta`](../reference/aggregation/stages.mdx#searchmeta) и [`vectorSearch`](../reference/aggregation/stages.mdx#vectorsearch). Чтобы объединить несколько поисков, есть [`rankFusion`](../reference/aggregation/stages.mdx#rankfusion), [`scoreFusion`](../reference/aggregation/stages.mdx#scorefusion) и [`score`](../reference/aggregation/stages.mdx#score).
 
 <Callout type="warning">
 
-Эта страница описана по коду продукта. Поиск Atlas на тестовом сервере документации не работает: сервер отвечает `ServerError: Using $search and $vectorSearch aggregation stages requires additional configuration. (code 31082 SearchNotEnabled)` (полный текст сервера — в поле `serverMessage` ошибки: «Please connect to Atlas or an AtlasCLI local deployment to enable»). Проверено запуском: все примеры компилируются, а конвейеры собираются в показанные ниже стадии (`plan()`). Результаты поиска на Atlas в этой документации не выполнялись, поэтому комментариев с полученными строками здесь нет.
+Эта страница описана по коду продукта. На тестовом сервере документации поиск Atlas не работает, сервер отвечает `ServerError: Using $search and $vectorSearch aggregation stages requires additional configuration. (code 31082 SearchNotEnabled)`. Полный текст сервера лежит в поле `serverMessage` ошибки — «Please connect to Atlas or an AtlasCLI local deployment to enable». Запуском проверено, что все примеры компилируются, а конвейеры собираются в показанные ниже стадии (`plan()`). На Atlas результаты поиска для этой документации не получали, поэтому комментариев с полученными строками здесь нет.
 
 </Callout>
 
-Поиск по обычным словам и полнотекстовый индекс без Atlas описаны в руководстве [Полнотекстовый и векторный поиск](../queries/text-and-vector-search.mdx). Поисковые индексы объявляются и синхронизируются по руководству [Поисковые индексы](../collections/search-indexes.mdx).
+Поиск по обычным словам и полнотекстовый индекс без Atlas описаны в руководстве [Полнотекстовый и векторный поиск](../queries/text-and-vector-search.mdx). Как объявить и синхронизировать поисковые индексы, рассказано в руководстве [Поисковые индексы](../collections/search-indexes.mdx).
 
-## Что предполагается
+## Что понадобится
 
-Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель статьи блога. У неё есть поисковый индекс `articles_text` для `$search` и векторный индекс `vec` для поля `embedding` (объявлены по руководству о поисковых индексах).
+Клиент из руководства [Подключиться к базе](../connection/connect.mdx) и модель статьи блога. У неё есть поисковый индекс `articles_text` для `$search` и векторный индекс `vec` для поля `embedding`, оба объявлены по руководству о поисковых индексах.
 
 ```ts twoslash title="blog/article.ts"
 import { Entity, Prop, Schema, Spec, type Vector } from "@venloc/typemo";
@@ -36,7 +36,7 @@ export class Article extends Entity {
 
 ## Быстрый путь
 
-`search` принимает имя индекса и оператор поиска, например `text`. Оценку релевантности вы получаете через [`fn.meta`](../reference/aggregation/expr-misc.mdx#fnmeta):
+`search` принимает имя индекса и оператор поиска, например `text`. Оценку релевантности даёт [`fn.meta`](../reference/aggregation/expr-misc.mdx#fnmeta).
 
 ```ts twoslash
 import { Entity, Prop, Schema, Spec, TypemoClient, fn, Pipeline, type Vector } from "@venloc/typemo";
@@ -58,11 +58,18 @@ console.log(JSON.stringify(pipeline.plan().pipeline));
 // → [{"$search":{"index":"articles_text","text":{"path":"title","query":"mongo"}}},{"$project":{"title":1,"score":{"$meta":"searchScore"}}}]
 ```
 
-Остальная страница разбирает операторы, векторный поиск и объединение результатов.
+Ниже разберём операторы, векторный поиск и объединение результатов.
 
 ## Найти по словам с условиями
 
-Оператор `text` ищет слова в поле, а `compound` собирает несколько условий: `must` (обязательно), `should` (желательно, повышает оценку), `mustNot` (исключить), `filter` (отбор без влияния на оценку). Поле `path` проверяется по модели: опечатка не скомпилируется.
+Оператор `text` ищет слова в поле, а `compound` собирает несколько условий.
+
+- `must` — обязательно.
+- `should` — желательно, повышает оценку.
+- `mustNot` — исключить.
+- `filter` — отбор, который на оценку не влияет.
+
+Поле `path` проверяется по модели, так что опечатка не скомпилируется.
 
 ```ts twoslash
 import { Entity, Prop, Schema, Spec, TypemoClient, fn, Pipeline, type Vector } from "@venloc/typemo";
@@ -86,9 +93,9 @@ const pipeline = Pipeline.from(Article).search({
 });
 ```
 
-Конвейер собирается в `{"$search":{"index":"articles_text","compound":{"must":[{"text":…}],"should":[{"phrase":…}]}}}`. В `search` доступны и другие операторы: `phrase`, `autocomplete`, `equals`, `range`, `regex`, `wildcard`, `near`, `queryString`, `moreLikeThis`, а также `highlight`, `count` и `sort`; полный перечень — в справочнике [Стадии](../reference/aggregation/stages.mdx#search).
+Конвейер собирается в `{"$search":{"index":"articles_text","compound":{"must":[{"text":…}],"should":[{"phrase":…}]}}}`. В `search` есть и другие операторы — `phrase`, `autocomplete`, `equals`, `range`, `regex`, `wildcard`, `near`, `queryString`, `moreLikeThis`, а ещё `highlight`, `count` и `sort`. Полный перечень — в справочнике [Стадии](../reference/aggregation/stages.mdx#search).
 
-Через [`Model.aggregate`](../reference/aggregation/pipeline.mdx#modelaggregate) `search` тоже вызывается первой стадией. Если у модели есть [скрытые поля](../schemas/hidden-and-sensitive.mdx#скрытое-поле-в-агрегации), Typemo убирает их стадией `$unset`, которую ставит сразу после поиска, а не перед ним: сервер принимает `$search`, `$searchMeta` и `$vectorSearch` только первыми. Отправленный конвейер начинается так: `[{ $search: … }, { $unset: ["…"] }, …]`.
+Через [`Model.aggregate`](../reference/aggregation/pipeline.mdx#modelaggregate) `search` тоже вызывается первой стадией. Если у модели есть [скрытые поля](../schemas/hidden-and-sensitive.mdx#скрытое-поле-в-агрегации), Typemo убирает их стадией `$unset` и ставит её сразу после поиска, а не перед ним. Сервер принимает `$search`, `$searchMeta` и `$vectorSearch` только первыми. Отправленный конвейер начинается так — `[{ $search: … }, { $unset: ["…"] }, …]`.
 
 ```ts twoslash title="blog/articles.service.ts"
 import { Entity, Prop, Schema, Spec, TypemoClient, fn, Pipeline, type Vector } from "@venloc/typemo";
@@ -114,7 +121,7 @@ export const searchTitles = (query: string) =>
 
 ## Получить метаданные поиска
 
-[`searchMeta`](../reference/aggregation/stages.mdx#searchmeta) возвращает не документы, а сведения о поиске: сколько совпадений всего, как они распределены по фасетам. Оно нужно, чтобы показать «найдено 128 статей» без выгрузки самих статей.
+[`searchMeta`](../reference/aggregation/stages.mdx#searchmeta) возвращает не документы, а сведения о поиске. Сколько всего совпадений и как они распределены по фасетам. С ним можно показать «найдено 128 статей», не выгружая сами статьи.
 
 ```ts twoslash
 import { Entity, Prop, Schema, Spec, TypemoClient, fn, Pipeline, type Vector } from "@venloc/typemo";
@@ -140,7 +147,12 @@ console.log(JSON.stringify(pipeline.plan().pipeline));
 
 ## Искать по смыслу
 
-[`vectorSearch`](../reference/aggregation/stages.mdx#vectorsearch) находит документы, чей вектор ближе всего к вектору запроса. Вектор запроса строит ваш код (модель эмбеддингов); Typemo проверяет, что `path` — поле модели, и принимает массив чисел или бинарный вектор. `limit` — сколько документов вернуть, `numCandidates` — сколько кандидатов рассмотреть (чем больше, тем точнее и медленнее), `exact: true` включает точный, а не приближённый поиск, а `filter` отбирает документы по индексируемым полям до сравнения.
+[`vectorSearch`](../reference/aggregation/stages.mdx#vectorsearch) находит документы, чей вектор ближе всего к вектору запроса. Вектор запроса строит ваш код, то есть модель эмбеддингов. Typemo проверяет, что `path` — поле модели, и принимает массив чисел или бинарный вектор.
+
+- `limit` — сколько документов вернуть.
+- `numCandidates` — сколько кандидатов рассмотреть. Чем больше, тем точнее и медленнее.
+- `exact: true` включает точный поиск вместо приближённого.
+- `filter` отбирает документы по индексируемым полям ещё до сравнения.
 
 ```ts twoslash title="blog/similar.service.ts"
 import { Entity, Prop, Schema, Spec, TypemoClient, fn, Pipeline, type Vector } from "@venloc/typemo";
@@ -165,7 +177,7 @@ export const similar = (queryVector: number[]) =>
 
 ## Объединить текстовый и векторный поиск
 
-Текстовый поиск находит точные слова, векторный — похожий смысл; вместе они дают лучший список. [`rankFusion`](../reference/aggregation/stages.mdx#rankfusion) принимает именованные подконвейеры и объединяет их результаты по месту в каждом списке; `weights` задают вес каждого подконвейера. Это тоже первая стадия, и ей нужен MongoDB 8.1 или новее.
+Текстовый поиск находит точные слова, векторный — похожий смысл, а вместе они дают список лучше. [`rankFusion`](../reference/aggregation/stages.mdx#rankfusion) принимает именованные подконвейеры и объединяет их результаты по месту в каждом списке. `weights` задают вес каждого подконвейера. Это тоже первая стадия, и ей нужен MongoDB 8.1 или новее.
 
 ```ts twoslash
 import { Entity, Prop, Schema, Spec, TypemoClient, fn, Pipeline, type Vector } from "@venloc/typemo";
@@ -194,21 +206,25 @@ const pipeline = Pipeline.from(Article)
   .limit(5);
 ```
 
-Имена в `weights` проверяются по именам подконвейеров: вес несуществующего подконвейера не скомпилируется. [`scoreFusion`](../reference/aggregation/stages.mdx#scorefusion) (MongoDB 8.2+) объединяет по **оценкам**, а не по местам, и требует `normalization` (`"none"`, `"sigmoid"` или `"minMaxScaler"`), чтобы привести оценки разных поисков к одной шкале. [`score`](../reference/aggregation/stages.mdx#score) (MongoDB 8.2+) задаёт оценку документа выражением.
+Имена в `weights` сверяются с именами подконвейеров, и вес несуществующего подконвейера не скомпилируется. [`scoreFusion`](../reference/aggregation/stages.mdx#scorefusion) (MongoDB 8.2+) объединяет по **оценкам**, а не по местам. Ему нужна `normalization` — `"none"`, `"sigmoid"` или `"minMaxScaler"`, — чтобы привести оценки разных поисков к одной шкале. [`score`](../reference/aggregation/stages.mdx#score) (MongoDB 8.2+) задаёт оценку документа выражением.
 
 ## Как выбрать
 
-Задайте вопрос: что должно совпадать, слова или смысл? Слова, формы слов, фразы и нечёткое совпадение — `search`. Смысл — `vectorSearch`. Нужно и то и другое — `rankFusion` (когда важен порядок в списках) или `scoreFusion` (когда важны сами оценки). Если вам нужен просто поиск по словам без Atlas, хватит текстового индекса в [`find`](../reference/query/reading.mdx#modelfind).
+Спросите себя, что должно совпадать — слова или смысл.
+
+- **Слова, их формы, фразы, нечёткое совпадение** — `search`.
+- **Смысл** — `vectorSearch`.
+- **И то и другое** — `rankFusion`, если важен порядок в списках, или `scoreFusion`, если важны сами оценки.
+
+Если нужен просто поиск по словам без Atlas, хватит текстового индекса в [`find`](../reference/query/reading.mdx#modelfind).
 
 ## Когда это не нужно
 
-Если ваш сервер не Atlas, эти стадии не выполнятся: используйте [`$text`](../queries/text-and-vector-search.mdx) с текстовым индексом. Для простого отбора по значению поля берите обычный фильтр в `find`: поиск Atlas оправдан, когда нужна релевантность.
+Если ваш сервер не Atlas, эти стадии не выполнятся. Берите [`$text`](../queries/text-and-vector-search.mdx) с текстовым индексом. Для простого отбора по значению поля хватит обычного фильтра в `find`. Поиск Atlas оправдан, когда нужна релевантность.
 
-## Частые ошибки
+## Если что-то пошло не так
 
-### Поиск не первой стадией
-
-`search`, `searchMeta`, `vectorSearch`, `rankFusion` и `scoreFusion` вызываются только на пустом конвейере, поэтому поставленные после другой стадии они не скомпилируются.
+**Поиск не первой стадией.** `search`, `searchMeta`, `vectorSearch`, `rankFusion` и `scoreFusion` вызываются только на пустом конвейере. После другой стадии они не скомпилируются.
 
 ```ts twoslash
 // @errors: 2684
@@ -229,9 +245,7 @@ Pipeline.from(Article).limit(10).search({ text: { path: "title", query: "mongo" 
 
 Поставьте поиск первым, а `limit` после него.
 
-### `ServerError` на обычном сервере
-
-Стадии работают только в Atlas и локальной среде Atlas CLI. На обычном `mongod` вы получаете `ServerError` с текстом из начала страницы. Это не ошибка кода: запустите приложение на Atlas или уберите поиск из конвейера.
+**`ServerError` на обычном сервере.** Эти стадии работают только в Atlas и в локальной среде Atlas CLI. На обычном `mongod` придёт `ServerError` с текстом из начала страницы. С кодом всё в порядке — запустите приложение на Atlas или уберите поиск из конвейера.
 
 ## Полный пример
 
@@ -270,12 +284,12 @@ export const similarArticles = (queryVector: number[]) =>
 
 <Cards>
 <Card title="Полнотекстовый и векторный поиск" href="../queries/text-and-vector-search.mdx">
-  Поиск без Atlas: `$text`, текстовый индекс и релевантность.
+  Поиск без Atlas — `$text`, текстовый индекс и релевантность.
 </Card>
 <Card title="Поисковые индексы" href="../collections/search-indexes.mdx">
   Как описать индексы, которые нужны `search` и `vectorSearch`.
 </Card>
-<Card title="Справочник: стадии" href="../reference/aggregation/stages.mdx#search">
+<Card title="Справочник по стадиям" href="../reference/aggregation/stages.mdx#search">
   Все операторы `search` и параметры стадий объединения.
 </Card>
 </Cards>

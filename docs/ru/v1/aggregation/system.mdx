@@ -1,16 +1,22 @@
 ---
 title: Служебные агрегации
-description: "Как получить статистику коллекции и индексов, посмотреть выполняющиеся операции и сессии и выполнить агрегации уровня базы"
+description: "Как получить статистику коллекции и индексов, посмотреть текущие операции и сессии и выполнить агрегации уровня базы"
 icon: Activity
 ---
 
-Агрегация умеет читать не только документы, но и служебные данные сервера: сколько документов в коллекции и сколько места она занимает, как часто используется каждый индекс, что выполняется прямо сейчас, какие сессии открыты. Эти стадии называются **служебными**, и у каждой своё место запуска. Стадии уровня коллекции ([`collStats`](../reference/aggregation/stages.mdx#collstats), [`indexStats`](../reference/aggregation/stages.mdx#indexstats), [`planCacheStats`](../reference/aggregation/stages.mdx#plancachestats)) запускаются через модель, как обычная агрегация. Стадии базы и сервера ([`currentOp`](../reference/aggregation/stages.mdx#currentop), [`queryStats`](../reference/aggregation/stages.mdx#querystats), [`listLocalSessions`](../reference/aggregation/stages.mdx#listlocalsessions) и другие) строятся в отдельных конвейерах [`Pipeline.database`](../reference/aggregation/pipeline.mdx#pipelinedatabase) и [`Pipeline.admin`](../reference/aggregation/pipeline.mdx#pipelineadmin), а стадия [`listSessions`](../reference/aggregation/stages.mdx#listsessions) — в [`Pipeline.sessions`](../reference/aggregation/pipeline.mdx#pipelinesessions). Эти планы выполняют [`client.aggregate`](../reference/connection/typemo-client.mdx#clientaggregate) и [`connection.aggregate`](../reference/connection/connection.mdx#connectionaggregate): подробно — в руководстве [Запросы уровня базы](./database-level.mdx).
+Агрегация читает не только документы, но и служебные данные сервера. Сколько в коллекции документов и сколько места она занимает, как часто используется каждый индекс, что выполняется прямо сейчас, какие сессии открыты. Такие стадии называются **служебными**, и у каждой своё место запуска.
 
-Типы не дают поставить стадию не туда: `currentOp` нет у конвейера коллекции, `collStats` нет у конвейера базы, а любая из этих стадий стоит только первой.
+- Стадии уровня коллекции — [`collStats`](../reference/aggregation/stages.mdx#collstats), [`indexStats`](../reference/aggregation/stages.mdx#indexstats), [`planCacheStats`](../reference/aggregation/stages.mdx#plancachestats). Их запускают через модель, как обычную агрегацию.
+- Стадии базы и сервера — [`currentOp`](../reference/aggregation/stages.mdx#currentop), [`queryStats`](../reference/aggregation/stages.mdx#querystats), [`listLocalSessions`](../reference/aggregation/stages.mdx#listlocalsessions) и другие. Они строятся в отдельных конвейерах [`Pipeline.database`](../reference/aggregation/pipeline.mdx#pipelinedatabase) и [`Pipeline.admin`](../reference/aggregation/pipeline.mdx#pipelineadmin).
+- Стадия [`listSessions`](../reference/aggregation/stages.mdx#listsessions) строится в [`Pipeline.sessions`](../reference/aggregation/pipeline.mdx#pipelinesessions).
 
-## Что предполагается
+Планы базы и сервера выполняют [`client.aggregate`](../reference/connection/typemo-client.mdx#clientaggregate) и [`connection.aggregate`](../reference/connection/connection.mdx#connectionaggregate), подробно об этом — в руководстве [Запросы уровня базы](./database-level.mdx).
 
-Примеры используют клиент из руководства [Подключиться к базе](../connection/connect.mdx) и запуск агрегации из руководства [Первая агрегация](first-aggregation.mdx). Служебные стадии обычно нужны администратору или скрипту мониторинга, поэтому у пользователя сервера должны быть права на чтение статистики. В коллекции `orders` два документа, а у модели один индекс по `status`.
+Поставить стадию не туда не дадут типы. У конвейера коллекции нет `currentOp`, у конвейера базы нет `collStats`, а любая из этих стадий может стоять только первой.
+
+## Что понадобится
+
+Клиент из руководства [Подключиться к базе](../connection/connect.mdx) и запуск агрегации из руководства [Первая агрегация](first-aggregation.mdx). Служебные стадии обычно нужны администратору или скрипту мониторинга, и у пользователя сервера должны быть права на чтение статистики. В коллекции `orders` два документа, а у модели один индекс по `status`.
 
 ```ts twoslash title="orders/order.ts"
 import { Entity, Index, Prop, Schema } from "@venloc/typemo";
@@ -28,7 +34,7 @@ export class Order extends Entity {
 
 ## Быстрый путь
 
-Для коллекции — через модель, для сервера — план из `Pipeline.admin()` и `client.aggregate`:
+Для коллекции — через модель, для сервера — план из `Pipeline.admin()` и `client.aggregate`.
 
 ```ts twoslash
 import { Entity, Index, Prop, Schema, TypemoClient, Pipeline } from "@venloc/typemo";
@@ -53,11 +59,18 @@ console.log(ops.length);
 // → 1
 ```
 
-Дальше страница разбирает статистику коллекции, индексы, выполняющиеся операции и правила запуска.
+Ниже разберём статистику коллекции, индексы, текущие операции и правила запуска.
 
 ## Узнать размер и число документов коллекции
 
-`collStats` возвращает статистику коллекции; вы сами перечисляете разделы, которые нужны: `count` (число документов), `storageStats` (размер и хранилище, с необязательным `scale`), `latencyStats` (задержки) и `queryExecStats` (выполнение запросов). Лишние ключи отвергает компилятор, а тип строки содержит только запрошенные разделы.
+`collStats` возвращает статистику коллекции, а нужные разделы вы перечисляете сами.
+
+- `count` — число документов.
+- `storageStats` — размер и хранилище, можно с `scale`.
+- `latencyStats` — задержки.
+- `queryExecStats` — выполнение запросов.
+
+Лишние ключи компилятор отвергнет, а в типе строки будут только запрошенные разделы.
 
 ```ts twoslash
 import { Entity, Index, Prop, Schema, TypemoClient, Pipeline } from "@venloc/typemo";
@@ -77,11 +90,11 @@ const rows = await query;
 //    ^?
 ```
 
-Число документов (`count`) имеет тип `StatNumber`, то есть `number | bigint`: сервер пишет счётчик как int32, пока он мал, и как int64, когда он вырос, поэтому на большой коллекции значение придёт как `bigint`. Сравнивайте через `Number(row.count)` или проверяйте `typeof`. Стадия должна быть первой в конвейере: после неё можно ставить обычные стадии (`match`, `project`), чтобы выбрать нужное.
+Число документов `count` имеет тип `StatNumber`, то есть `number | bigint`. Пока счётчик маленький, сервер пишет его как int32, а когда вырастет — как int64. Поэтому на большой коллекции значение придёт как `bigint`. Сравнивайте через `Number(row.count)` или проверяйте `typeof`. Стадия должна стоять в конвейере первой, а после неё можно ставить обычные стадии вроде `match` и `project`, чтобы выбрать нужное.
 
 ## Посмотреть использование индексов
 
-[`indexStats`](../reference/aggregation/stages.mdx#indexstats) возвращает по строке на каждый индекс: имя, ключ, число использований с момента запуска сервера. По ней находят неиспользуемые индексы, которые замедляют записи.
+[`indexStats`](../reference/aggregation/stages.mdx#indexstats) возвращает по строке на индекс — имя, ключ и число использований с момента запуска сервера. По ней находят неиспользуемые индексы, которые только замедляют запись.
 
 ```ts twoslash
 import { Entity, Index, Prop, Schema, TypemoClient, Pipeline } from "@venloc/typemo";
@@ -102,11 +115,11 @@ const rows = await query;
 // → [{ name: "_id_" }, { name: "status_1" }]
 ```
 
-Помимо индекса по `status`, есть встроенный `_id_`: он создаётся всегда. [`planCacheStats`](../reference/aggregation/stages.mdx#plancachestats) показывает планы запросов, которые сервер запомнил для коллекции; на свежей коллекции их нет, и результат пуст.
+Кроме индекса по `status`, есть встроенный `_id_`, он создаётся всегда. [`planCacheStats`](../reference/aggregation/stages.mdx#plancachestats) показывает планы запросов, которые сервер запомнил для коллекции. У свежей коллекции их нет, и результат пуст.
 
 ## Посмотреть, что выполняется сейчас
 
-`currentOp` перечисляет операции сервера: запросы, простаивающие соединения и курсоры. Это стадия сервера, поэтому конвейер начинается с [`Pipeline.admin`](../reference/aggregation/pipeline.mdx#pipelineadmin), а выполняет его [`client.aggregate`](../reference/connection/typemo-client.mdx#clientaggregate): запрос идёт в базу `admin`, результат типизирован, ошибки приходят как ошибки Typemo, а подписчики событий видят операцию.
+`currentOp` перечисляет операции сервера — запросы, простаивающие соединения и курсоры. Это стадия сервера. Поэтому конвейер начинается с [`Pipeline.admin`](../reference/aggregation/pipeline.mdx#pipelineadmin), а выполняет его [`client.aggregate`](../reference/connection/typemo-client.mdx#clientaggregate). Запрос идёт в базу `admin`, результат типизирован, ошибки приходят как ошибки Typemo, а подписчики событий видят операцию.
 
 ```ts twoslash title="ops/current-ops.ts"
 import { Entity, Index, Prop, Schema, TypemoClient, Pipeline } from "@venloc/typemo";
@@ -127,25 +140,34 @@ export const currentOps = async () => {
 };
 ```
 
-Каждая строка описывает одну операцию (среди её полей `type`, `host`, `desc`, `active`). Параметры `allUsers`, `idleConnections`, `idleCursors`, `idleSessions`, `localOps` и `backtrace` включают соответствующие сведения.
+Каждая строка описывает одну операцию, среди её полей есть `type`, `host`, `desc` и `active`. Параметры `allUsers`, `idleConnections`, `idleCursors`, `idleSessions`, `localOps` и `backtrace` включают соответствующие сведения.
 
 ## Сессии, статистика запросов и каталог
 
-Остальные служебные стадии устроены так же. [`listLocalSessions`](../reference/aggregation/stages.mdx#listlocalsessions) показывает сессии текущего узла и строится в конвейере базы или администратора. [`listSessions`](../reference/aggregation/stages.mdx#listsessions) читает `config.system.sessions`, то, что сервер уже записал, и строится только в `Pipeline.sessions()`: на только что запущенном сервере она вернёт пустой список. [`queryStats`](../reference/aggregation/stages.mdx#querystats), [`querySettings`](../reference/aggregation/stages.mdx#querysettings) и [`listSampledQueries`](../reference/aggregation/stages.mdx#listsampledqueries) требуют базы `admin`, а [`listClusterCatalog`](../reference/aggregation/stages.mdx#listclustercatalog) — MongoDB 8.1 или новее. Для шардированных кластеров есть [`shardedDataDistribution`](../reference/aggregation/stages.mdx#shardeddatadistribution): на обычном сервере она отвечает `ServerError`, что запускается только на маршрутизаторе. Параметры и типы строк каждой стадии — в справочнике [Стадии](../reference/aggregation/stages.mdx). На тестовом сервере документации `queryStats`, `querySettings` и `listSampledQueries` вернули пустой список, а `listClusterCatalog` — по строке на каждую коллекцию базы.
+Остальные служебные стадии устроены так же.
+
+- [`listLocalSessions`](../reference/aggregation/stages.mdx#listlocalsessions) показывает сессии текущего узла и строится в конвейере базы или администратора.
+- [`listSessions`](../reference/aggregation/stages.mdx#listsessions) читает `config.system.sessions`, то есть то, что сервер уже записал, и строится только в `Pipeline.sessions()`. На только что запущенном сервере она вернёт пустой список.
+- [`queryStats`](../reference/aggregation/stages.mdx#querystats), [`querySettings`](../reference/aggregation/stages.mdx#querysettings) и [`listSampledQueries`](../reference/aggregation/stages.mdx#listsampledqueries) требуют базы `admin`.
+- [`listClusterCatalog`](../reference/aggregation/stages.mdx#listclustercatalog) требует MongoDB 8.1 или новее.
+- [`shardedDataDistribution`](../reference/aggregation/stages.mdx#shardeddatadistribution) — для шардированных кластеров. На обычном сервере она отвечает `ServerError`, что запускается только на маршрутизаторе.
+
+Параметры и типы строк каждой стадии — в справочнике [Стадии](../reference/aggregation/stages.mdx). На тестовом сервере документации `queryStats`, `querySettings` и `listSampledQueries` вернули пустой список, а `listClusterCatalog` — по строке на каждую коллекцию базы.
 
 ## Как выбрать
 
-Задайте вопрос: о чём вы спрашиваете сервер? О конкретной коллекции или её индексах — стадии уровня коллекции через модель. О состоянии сервера, сессиях, запросах — `Pipeline.admin()`, `Pipeline.database()` или `Pipeline.sessions()` и `client.aggregate`.
+Спросите себя, о чём вы спрашиваете сервер.
+
+- **О конкретной коллекции или её индексах** — стадии уровня коллекции через модель.
+- **О состоянии сервера, сессиях, запросах** — `Pipeline.admin()`, `Pipeline.database()` или `Pipeline.sessions()` вместе с `client.aggregate`.
 
 ## Когда это не нужно
 
-Если нужно только число документов, используйте [`countDocuments`](../reference/query/reading.mdx#modelcountdocuments). Статистику индексов, нужную для приложения, а не для администрирования, лучше держать в системе мониторинга: проверить, что запрос использует индекс, можно в тестах через [`explain`](../reference/aggregation/pipeline.mdx#explain).
+Если нужно только число документов, берите [`countDocuments`](../reference/query/reading.mdx#modelcountdocuments). Статистику индексов, нужную приложению, а не администратору, лучше держать в системе мониторинга. А проверить, что запрос пользуется индексом, можно в тестах через [`explain`](../reference/aggregation/pipeline.mdx#explain).
 
-## Частые ошибки
+## Если что-то пошло не так
 
-### План базы передан модели
-
-`Model.aggregate` принимает только план своей коллекции. План из `Pipeline.admin()` читает базу, поэтому модель отвергает его с `ConfigurationError`, а текст называет нужный метод:
+**План базы передан модели.** `Model.aggregate` принимает только план своей коллекции. План из `Pipeline.admin()` читает базу, поэтому модель отвергнет его с `ConfigurationError`, и текст подскажет нужный метод.
 
 ```text
 ConfigurationError: Order.aggregate: the plan reads a database, not this model's collection "orders"; run it with connection.aggregate(plan) or client.aggregate(plan)
@@ -153,9 +175,7 @@ ConfigurationError: Order.aggregate: the plan reads a database, not this model's
 
 Выполните такой план через `client.aggregate`, как выше.
 
-### Служебная стадия не первая
-
-Все служебные стадии стоят только в начале конвейера. Поставленная после другой стадии она не скомпилируется.
+**Служебная стадия не первая.** Все служебные стадии стоят только в начале конвейера. После другой стадии такая не скомпилируется.
 
 ```ts twoslash
 // @errors: 2684
@@ -210,12 +230,12 @@ export const runningOps = () => {
 
 <Cards>
 <Card title="Запросы уровня базы" href="./database-level.mdx">
-  Как выполнить план базы, сервера и сессий: `client.aggregate`, события, транзакции.
+  Как выполнить план базы, сервера и сессий — `client.aggregate`, события, транзакции.
 </Card>
-<Card title="Справочник: Pipeline и Model.aggregate" href="../reference/aggregation/pipeline.mdx#pipelineadmin">
+<Card title="Справочник по Pipeline и Model.aggregate" href="../reference/aggregation/pipeline.mdx#pipelineadmin">
   `Pipeline.database`, `Pipeline.admin`, `Pipeline.sessions` и их планы.
 </Card>
-<Card title="Справочник: стадии" href="../reference/aggregation/stages.mdx#collstats">
+<Card title="Справочник по стадиям" href="../reference/aggregation/stages.mdx#collstats">
   Параметры и типы строк всех служебных стадий.
 </Card>
 <Card title="Индексы" href="../collections/index-sync.mdx">

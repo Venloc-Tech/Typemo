@@ -1,20 +1,22 @@
 ---
 title: REST API для счетов
-description: "Как построить полный набор обработчиков создания, чтения, изменения и удаления с фильтрами, страницами и ответами об ошибках"
+description: "Полный набор обработчиков создания, чтения, изменения и удаления — с фильтрами, страницами и понятными ответами об ошибках"
 icon: Server
 ---
 
-Чтобы отдать данные по HTTP, вам нужны пять обработчиков — список, один объект, создание, изменение и удаление — и общее правило, как превратить ошибку библиотеки в ответ клиенту. Эта страница собирает их в один работающий пример для банковских счетов: страницы списка идут по ключу, фильтры приходят из строки запроса, а у каждой ошибки есть свой код ответа.
+Чтобы отдать данные по HTTP, нужны пять обработчиков — список, один объект, создание, изменение и удаление. И ещё общее правило, по которому ошибка библиотеки превращается в ответ клиенту. Соберём всё это в один работающий пример для банковских счетов. Список будет идти страницами по ключу, фильтры придут из строки запроса, а у каждой ошибки будет свой код ответа.
 
-Обработчики здесь — обычные функции. Они принимают уже разобранный ввод (строки из адреса, объект из тела запроса) и возвращают данные или бросают ошибку с пометкой (`__NotFound__`, `__BadRequest__`, `__Conflict__`). Пометка двойными подчёркиваниями означает, что класс ваш: как именно он превращается в статус 404, 400 или 409, решает ваш веб-слой, а Typemo от него не зависит. Поэтому пример подойдёт к любому серверу.
+Обработчики здесь — обычные функции. Они принимают уже разобранный ввод, то есть строки из адреса и объект из тела запроса. А возвращают данные или бросают ошибку с пометкой — `__NotFound__`, `__BadRequest__` или `__Conflict__`. Двойные подчёркивания значат, что класс ваш. Как он превращается в статус 404, 400 или 409, решает ваш веб-слой, и Typemo от него не зависит. Так что пример подойдёт к любому серверу.
 
-## Что предполагается
+## Что понадобится
 
-Клиент подключён так, как описано в руководстве [Подключиться к базе](../connection/connect.mdx). Пакеты `@venloc/typemo` и `mongodb` установлены. В примерах используются файлы `accounts/account.ts` (модель), `http/errors.ts` (ваши ошибки), `accounts/accounts.service.ts` (обработчики).
+- Клиент, подключённый по руководству [Подключиться к базе](../connection/connect.mdx).
+- Установленные пакеты `@venloc/typemo` и `mongodb`.
+- Три файла — `accounts/account.ts` с моделью, `http/errors.ts` с вашими ошибками и `accounts/accounts.service.ts` с обработчиками.
 
 ## Быстрый путь
 
-Самый частый обработчик — «один объект по id из адреса». [`findById`](../reference/query/reading.mdx#modelfindbyid) принимает строку как есть, [`.orFail()`](../reference/query/reading.mdx#orfail) превращает «не нашлось» в ошибку, а [`.plain()`](../reference/query/reading.mdx#plain) отдаёт обычный объект, готовый для JSON:
+Чаще всего нужен обработчик «один объект по id из адреса». [`findById`](../reference/query/reading.mdx#modelfindbyid) принимает строку как есть, [`.orFail()`](../reference/query/reading.mdx#orfail) превращает «не нашлось» в ошибку, а [`.plain()`](../reference/query/reading.mdx#plain) отдаёт обычный объект, готовый для JSON.
 
 ```ts twoslash
 import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
@@ -36,11 +38,11 @@ const guard = async <R>(work: () => Promise<R>): Promise<R> => work();
 export const getAccount = async (id: string) => Accounts.findById(id).orFail().plain();
 ```
 
-Остальная страница строит вокруг него полный набор обработчиков: сначала общий перевод ошибок, потом чтение, создание, изменение и удаление.
+Дальше построим вокруг него полный набор обработчиков. Сначала общий перевод ошибок, потом чтение, создание, изменение и удаление.
 
 ## Описать модель и свои ошибки
 
-Начните с модели. У счёта пока два поля: название и владелец. Название уникально: два счёта с одним названием в одном банке не нужны.
+Начнём с модели. У счёта пока два поля — название и владелец. Название уникально, двух счетов с одним названием в банке быть не должно.
 
 ```ts twoslash title="accounts/account.ts"
 import { Entity, Prop, Schema, Timestamped } from "@venloc/typemo";
@@ -55,7 +57,7 @@ export class Account extends Timestamped(Entity) {
 }
 ```
 
-[`Timestamped`](../reference/schemas/base-classes.mdx#timestamped) добавляет `createdAt` и `updatedAt`: Typemo ведёт их сам при каждой записи. Границу приложения задают ваши классы ошибок, по одному на код ответа:
+[`Timestamped`](../reference/schemas/base-classes.mdx#timestamped) добавляет `createdAt` и `updatedAt`, и Typemo сам обновляет их при каждой записи. Границу приложения задают ваши классы ошибок, по одному на код ответа.
 
 ```ts twoslash title="http/errors.ts"
 export class __NotFound__ extends Error {}
@@ -71,7 +73,7 @@ export class __Conflict__ extends Error {}
 
 ## Перевести ошибки библиотеки в ответы
 
-Ошибки Typemo описывают, что пошло не так в данных, а не что ответить клиенту. Перевод нужен в одном месте, иначе каждый обработчик обрастёт своим `try/catch`. Функция `toHttpError` разбирает ошибку по классу, а `guard` оборачивает тело обработчика и бросает уже переведённую ошибку:
+Ошибки Typemo говорят, что не так с данными, а не что ответить клиенту. Переводить их нужно в одном месте, иначе каждый обработчик обрастёт своим `try/catch`. Функция `toHttpError` разбирает ошибку по классу, а `guard` оборачивает тело обработчика и бросает уже переведённую ошибку.
 
 ```ts twoslash title="accounts/accounts.service.ts"
 import { CastError, DocumentNotFoundError, DuplicateKeyError, KeysetTokenError, QueryError, StrictModeError, ValidationError } from "@venloc/typemo";
@@ -105,13 +107,18 @@ const guard = async <R>(work: () => Promise<R>): Promise<R> => {
 };
 ```
 
-Каждая ветка — ошибка, за которую отвечает клиент. [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#documentnotfounderror) значит «нет такого счёта». [`ValidationError`](../reference/errors/data-errors.mdx#validationerror) значит, что поля не прошли схему, и её [`toJSON()`](../reference/errors/data-errors.mdx#ответ-клиенту) можно отдать клиенту: в нём пути и причины, но нет самих значений. [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicatekeyerror) приходит от сервера, когда уникальный индекс отверг запись; хватает самого класса, а `message` (`duplicate key on title_1: { title: "Main" } (code 11000 DuplicateKey)`) в ответ не кладут: в нём значение ключа. Остальные четыре — неверный формат id или значения ([`CastError`](../reference/errors/data-errors.mdx#casterror)), лишнее поле ([`StrictModeError`](../reference/errors/data-errors.mdx#strictmodeerror)), испорченный токен страницы ([`KeysetTokenError`](../reference/errors/query-errors.mdx#keysettokenerror)) и запрос, который библиотека отвергла до отправки ([`QueryError`](../reference/errors/query-errors.mdx#queryerror)).
+Каждая ветка — это ошибка, которую может исправить клиент.
 
-Всё остальное — сеть, сервер, ошибка в вашем коде — проходит дальше без перевода. Это правильно: такие ошибки клиент исправить не может, и ваш веб-слой должен ответить на них статусом 500, а не 400.
+- [`DocumentNotFoundError`](../reference/errors/query-errors.mdx#documentnotfounderror) значит «нет такого счёта».
+- [`ValidationError`](../reference/errors/data-errors.mdx#validationerror) значит, что поля не прошли схему. Её [`toJSON()`](../reference/errors/data-errors.mdx#ответ-клиенту) можно отдать клиенту — там есть пути и причины, но нет самих значений.
+- [`DuplicateKeyError`](../reference/errors/server-errors.mdx#duplicatekeyerror) приходит от сервера, когда уникальный индекс отверг запись. Хватит самого класса. `message` (`duplicate key on title_1: { title: "Main" } (code 11000 DuplicateKey)`) в ответ не кладут, ведь в нём значение ключа.
+- Остальные четыре — неверный формат id или значения ([`CastError`](../reference/errors/data-errors.mdx#casterror)), лишнее поле ([`StrictModeError`](../reference/errors/data-errors.mdx#strictmodeerror)), испорченный токен страницы ([`KeysetTokenError`](../reference/errors/query-errors.mdx#keysettokenerror)) и запрос, который библиотека отвергла до отправки ([`QueryError`](../reference/errors/query-errors.mdx#queryerror)).
+
+Всё остальное — сеть, сервер, ошибка в вашем коде — проходит дальше без перевода. Так и должно быть. Такие ошибки клиент исправить не может, и ваш веб-слой должен ответить на них статусом 500, а не 400.
 
 ## Прочитать один счёт
 
-Обработчик `getAccount` получает id из адреса и возвращает счёт. Ничего, кроме `guard`, добавлять не нужно: формат id проверит сама библиотека.
+`getAccount` получает id из адреса и возвращает счёт. Кроме `guard`, ничего добавлять не нужно, формат id библиотека проверит сама.
 
 ```ts twoslash title="accounts/accounts.service.ts"
 import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
@@ -137,11 +144,13 @@ const account = await getAccount("6abd2c26093f52b7931dca2a").catch(() => null);
 //    ^?
 ```
 
-Тип результата показывает, что `_id` в plain-виде — строка, а даты остались `Date`: этот объект без потерь превращается в JSON. Подробнее о видах результата — в руководстве [Чтение данных](../queries/reading-data.mdx). Если id не найден, клиент получает `__NotFound__` (`Account not found`), а если строка не похожа на id — `__BadRequest__` с текстом `Cast to ObjectId failed at path "_id" for "abc" (string): not a 24-character hex string [format]`.
+Посмотрите на тип результата. В результате `.plain()` `_id` — строка, а даты остались `Date`, так что объект без потерь превращается в JSON. Подробнее о видах результата — в руководстве [Чтение данных](../queries/reading-data.mdx). Если id не найден, клиент получит `__NotFound__` (`Account not found`). А если строка не похожа на id, придёт `__BadRequest__` с текстом `Cast to ObjectId failed at path "_id" for "abc" (string): not a 24-character hex string [format]`.
 
 ## Отдать счёт вместе с менеджером
 
-Ситуация: клиент просит `GET /accounts/:id?expand=manager` и хочет увидеть имя менеджера, а не его идентификатор. У счёта появляется ссылка `manager` на сотрудника. Счёт, прочитанный без [`populate`](../reference/populate/populate.mdx), хранит в `manager` идентификатор, а с `populate("manager")` — документ сотрудника, и эти два состояния имеют разные типы. Функцию, которая строит ответ для любого из них, описывают параметром [`AnyPopulationDoc<Account>`](../reference/populate/populate-types.mdx#anypopulationdoc), а ветку выбирает [`isPopulated`](../reference/populate/populate-types.mdx#ispopulated): внутри `if` компилятор знает, что `account.manager` — загруженный документ или `null` (сотрудника могли удалить).
+Клиент просит `GET /accounts/:id?expand=manager` и хочет видеть имя менеджера, а не его идентификатор. У счёта появляется ссылка `manager` на сотрудника. Счёт, прочитанный без [`populate`](../reference/populate/populate.mdx), хранит в `manager` идентификатор, а с `populate("manager")` — документ сотрудника. У этих двух состояний разные типы.
+
+Функцию, которая строит ответ для любого из них, описывают параметром [`AnyPopulationDoc<Account>`](../reference/populate/populate-types.mdx#anypopulationdoc), а ветку выбирает [`isPopulated`](../reference/populate/populate-types.mdx#ispopulated). Внутри `if` компилятор знает, что `account.manager` — загруженный документ или `null`, ведь сотрудника могли удалить.
 
 ```ts twoslash title="accounts/accounts.service.ts"
 import { type AnyPopulationDoc, Entity, isPopulated, Prop, Schema, Timestamped, TypemoClient, Types, type Ref } from "@venloc/typemo";
@@ -173,13 +182,15 @@ export const getAccountView = (id: string, expand?: "manager") =>
   });
 ```
 
-Запуск на счёте `Main` с менеджером `Bob Manager` дал `{ id: "…", title: "Main" }` без `expand` и `{ id: "…", title: "Main", manager: "Bob Manager" }` с ним. Если у счёта менеджера нет, `populate` ничего не подставляет: поле `manager` в ответе тоже отсутствует (`isPopulated` вернул `false`). Если менеджера удалили, а ссылка осталась, поле загружено и равно `null`, и ответ содержит `manager: null`. Подробнее о типах загруженных документов — в руководстве [Принять документ в любом состоянии](../populate/type-checks.mdx#принять-документ-в-любом-состоянии).
+Для счёта `Main` с менеджером `Bob Manager` без `expand` вернётся `{ id: "…", title: "Main" }`, а с ним — `{ id: "…", title: "Main", manager: "Bob Manager" }`. Если у счёта нет менеджера, `populate` ничего не подставит, и поля `manager` в ответе тоже не будет, ведь `isPopulated` вернёт `false`. Если менеджера удалили, а ссылка осталась, поле загружено и равно `null`, и в ответе окажется `manager: null`. Подробнее о типах загруженных документов — в руководстве [Принять документ в любом состоянии](../populate/type-checks.mdx#принять-документ-в-любом-состоянии).
 
 ## Отдать список страницами с фильтрами
 
-Список нельзя отдавать целиком: коллекция растёт, а клиенту нужна страница. Страницы «пропусти N строк» ([`.skip`](../reference/query/reading.mdx#skip)) чем глубже, тем дороже: база каждый раз отсчитывает пропущенное заново. К тому же, если между запросами страниц кто-то добавил счёт, строка окажется на двух страницах сразу. Поэтому список идёт по ключу: [`keysetPage`](../reference/query/keyset.mdx#modelkeysetpage) возвращает страницу и токен, с которого начинается следующая. Подробности — в руководстве [Пагинация по ключу](../queries/keyset-pagination.mdx).
+Отдавать список целиком нельзя. Коллекция растёт, а клиенту нужна одна страница. Страницы через «пропусти N строк» ([`.skip`](../reference/query/reading.mdx#skip)) чем глубже, тем дороже — база каждый раз заново отсчитывает пропущенное. К тому же, если между запросами кто-то добавил счёт, одна строка окажется сразу на двух страницах.
 
-Сначала добавьте в модель поле `status`, по которому будем фильтровать:
+Поэтому список идёт по ключу. [`keysetPage`](../reference/query/keyset.mdx#modelkeysetpage) возвращает страницу и токен, с которого начнётся следующая. Подробности — в руководстве [Пагинация по ключу](../queries/keyset-pagination.mdx).
+
+Сначала добавьте в модель поле `status`, по которому будем фильтровать.
 
 ```ts twoslash title="accounts/account.ts"
 import { type Defaulted, Entity, Prop, Schema, Timestamped } from "@venloc/typemo";
@@ -197,7 +208,7 @@ export class Account extends Timestamped(Entity) {
 }
 ```
 
-Параметры запроса приходят строками, и клиенту нельзя верить: `limit=1000000` выгрузил бы всё. Обработчик проверяет их сам и собирает фильтр только из известных ключей:
+Параметры запроса приходят строками, и верить клиенту нельзя — `limit=1000000` выгрузил бы всё. Обработчик проверяет их сам и собирает фильтр только из известных ключей.
 
 ```ts twoslash title="accounts/accounts.service.ts"
 import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
@@ -240,9 +251,11 @@ export const listAccounts = (query: {
   });
 ```
 
-Порядок задан по `createdAt`, самым новым счетам вперёд. У моделей на `Timestamped` ключом страницы годятся `createdAt` и `updatedAt`, а `_id` Typemo добавляет последним ключом сам, поэтому два счёта с одинаковым временем не повторяются и не пропадают. `updatedAt` для ленты не подходит: он меняется при каждой записи, и счёт «прыгает» между страницами. Токен `next` клиент присылает обратно в `after`, а поддельный токен приведёт к `KeysetTokenError`, то есть к ответу 400. Документы страницы превращены в plain-вид через [`$toPlain()`](../reference/documents/document-api.mdx#toplain): так поля вроде `_id` становятся строками.
+Порядок задан по `createdAt`, самые новые счета первыми. У моделей на `Timestamped` ключом страницы годятся `createdAt` и `updatedAt`. Последним ключом Typemo сам добавляет `_id`, так что два счёта с одинаковым временем не повторятся и не потеряются. А вот `updatedAt` для ленты не подходит — он меняется при каждой записи, и счёт «прыгает» между страницами.
 
-В коллекции три счёта: `Main` и `Second` у `alice`, `Other` у `bob`. Первая страница списка `alice` по одному счёту:
+Токен `next` клиент присылает обратно в `after`. Поддельный токен даст `KeysetTokenError`, то есть ответ 400. Документы страницы превращены в обычные объекты через [`$toPlain()`](../reference/documents/document-api.mdx#toplain), и поля вроде `_id` стали строками.
+
+В коллекции три счёта — `Main` и `Second` у `alice` и `Other` у `bob`. Вот первая страница списка `alice` по одному счёту.
 
 ```ts twoslash
 import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
@@ -271,11 +284,11 @@ console.log(second.items.map((item) => item.title), second.next);
 // → ["Main"] null
 ```
 
-Последняя страница возвращает `next: null`, и клиент понимает, что дальше идти некуда.
+На последней странице придёт `next: null`, и клиент поймёт, что дальше идти некуда.
 
 ## Создать счёт
 
-Тело запроса приходит из JSON, и Typemo проверяет его по схеме при записи: обязательные поля, длину, значения из списка. Неизвестное поле он не отбрасывает молча, а отвергает, поэтому клиент, который прислал `role: "admin"`, получит ошибку, а не незаметно потерянное поле.
+Тело запроса приходит из JSON, и Typemo проверяет его по схеме при записи — обязательные поля, длину, значения из списка. Неизвестное поле он не отбрасывает молча, а отвергает. Клиент, приславший `role: "admin"`, получит ошибку, а не незаметно потерянное поле.
 
 ```ts twoslash title="accounts/accounts.service.ts"
 import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
@@ -298,7 +311,7 @@ export const createAccount = (body: { title: string; owner: string }) =>
   guard(async () => (await Accounts.create(body)).$toPlain());
 ```
 
-[`create`](../reference/writes/writes.mdx#create) возвращает документ, поэтому `$toPlain()` превращает его в ответ. Результаты для трёх ошибочных тел:
+[`create`](../reference/writes/writes.mdx#create) возвращает документ, и `$toPlain()` превращает его в ответ. Вот что будет для трёх ошибочных тел.
 
 ```ts twoslash
 import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
@@ -328,11 +341,11 @@ await createAccount({ title: "Zed", owner: "bob", role: "admin" } as never).catc
 // → Cast to Account failed at path "role" for "admin" (string): not a field of Account [unknown-key]
 ```
 
-Проверка уникальности — работа индекса, а не вашего кода: `findOne` перед записью не защитил бы от двух одновременных запросов.
+Уникальность проверяет индекс, а не ваш код. `findOne` перед записью не спас бы от двух одновременных запросов.
 
 ## Изменить счёт
 
-Частичное изменение (PATCH) присылает только те поля, которые нужно поменять. Обработчик загружает счёт (нет счёта — 404), присваивает через [`$set`](../reference/documents/document-api.mdx#set) только разрешённые поля и сохраняет документ методом [`$save`](../reference/documents/document-api.mdx#save): в базу уйдёт обновление только изменённых полей.
+Частичное изменение (PATCH) присылает только те поля, которые нужно поменять. Обработчик загружает счёт, и если его нет, отвечает 404. Затем он присваивает через [`$set`](../reference/documents/document-api.mdx#set) только разрешённые поля и сохраняет документ методом [`$save`](../reference/documents/document-api.mdx#save). В базу уйдёт обновление только изменённых полей.
 
 ```ts twoslash title="accounts/accounts.service.ts"
 import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
@@ -361,11 +374,11 @@ export const updateAccount = (id: string, body: { title?: string | undefined; st
   });
 ```
 
-Список разрешённых полей здесь задан кодом: `owner` менять через API нельзя, и `$set` для него просто не вызывается, а лишние ключи тела игнорируются. Значения проверяются так же, как при создании: `status: "gone"` вернёт `__BadRequest__` с причиной `enum` (`must be one of "open", "frozen"`), а переименование в занятое название — `__Conflict__`. Пустое тело ничего не меняет и возвращает счёт как есть: PATCH без изменений — не ошибка.
+Список разрешённых полей задан кодом. `owner` через API менять нельзя, и `$set` для него просто не вызывается, а лишние ключи тела игнорируются. Значения проверяются так же, как при создании. `status: "gone"` вернёт `__BadRequest__` с причиной `enum` (`must be one of "open", "frozen"`), а переименование в занятое название — `__Conflict__`. Пустое тело ничего не меняет и возвращает счёт как есть, ведь PATCH без изменений — не ошибка.
 
 ## Удалить счёт
 
-[`deleteOne`](../reference/writes/writes.mdx#deleteone) с `.orFail()` отвечает 404, если удалять нечего. Без `orFail` клиент получил бы «успех» на удаление несуществующего счёта, что затрудняет поиск опечатки в адресе.
+[`deleteOne`](../reference/writes/writes.mdx#deleteone) с `.orFail()` отвечает 404, если удалять нечего. Без `orFail` клиент получил бы «успех» при удалении несуществующего счёта, и опечатку в адресе было бы трудно заметить.
 
 ```ts twoslash title="accounts/accounts.service.ts"
 import { CastError, DocumentNotFoundError, DuplicateKeyError, Entity, KeysetTokenError, Prop, QueryError, Schema, StrictModeError, Timestamped, TypemoClient, ValidationError, type Defaulted } from "@venloc/typemo";
@@ -392,31 +405,25 @@ export const deleteAccount = (id: string) =>
 
 ## Как выбрать
 
-**Страницы по ключу или `skip`/`limit`.** Спросите себя, листает ли пользователь вперёд или прыгает на страницу с номером. Если вперёд («ещё», бесконечная лента, выгрузка) — используйте `keysetPage`. Если нужны номера страниц и общее число, вам подойдут [`.skip`](../reference/query/reading.mdx#skip), [`.limit`](../reference/query/reading.mdx#limit) и [`countDocuments`](../reference/query/reading.mdx#modelcountdocuments), но глубокие страницы будут медленнее.
+**Страницы по ключу или `skip` и `limit`.** Спросите себя, листает ли пользователь вперёд или прыгает на страницу с номером. Если листает вперёд, как в кнопке «ещё», бесконечной ленте или выгрузке, берите `keysetPage`. Если нужны номера страниц и общее число, подойдут [`.skip`](../reference/query/reading.mdx#skip), [`.limit`](../reference/query/reading.mdx#limit) и [`countDocuments`](../reference/query/reading.mdx#modelcountdocuments), но глубокие страницы будут медленнее.
 
-**Загрузить и сохранить или изменить одним запросом.** Обработчик выше загружает документ, потому что часть полей меняется по условию, а типы проверяют каждый `$set` отдельно. Если новые значения известны целиком, [`findByIdAndUpdate`](../reference/writes/writes.mdx#findbyidandupdate) делает то же одной операцией без предварительного чтения. Руководство [Изменить и сохранить документ](../documents/change-and-save.mdx) объясняет, что при сохранении уходит в базу.
+**Загрузить и сохранить или изменить одним запросом.** Обработчик выше загружает документ, потому что часть полей меняется по условию, а типы проверяют каждый `$set` отдельно. Если новые значения известны целиком, [`findByIdAndUpdate`](../reference/writes/writes.mdx#findbyidandupdate) сделает то же одной операцией, без чтения. Что уходит в базу при сохранении, объясняет руководство [Изменить и сохранить документ](../documents/change-and-save.mdx).
 
 ## Когда это не нужно
 
-Если ответ строится из нескольких коллекций или из подсчётов, обычные обработчики над одной моделью не годятся: используйте [связанные данные](../populate/basics.mdx) или конвейер агрегации. Если вам нужен только пакетный вход для админки, сравните с [`bulkWrite`](../reference/writes/writes.mdx#bulkwrite): один запрос вместо пяти обработчиков.
+Если ответ собирается из нескольких коллекций или из подсчётов, простые обработчики над одной моделью не годятся. Берите [связанные данные](../populate/basics.mdx) или конвейер агрегации. Если нужен только пакетный вход для админки, посмотрите на [`bulkWrite`](../reference/writes/writes.mdx#bulkwrite) — один запрос вместо пяти обработчиков.
 
-## Частые ошибки
+## Если что-то пошло не так
 
-### Клиент прислал токен страницы, который не читается
+**Клиент прислал нечитаемый токен страницы.** Клиент подменил или обрезал токен `after`. `keysetPage` откажет с [`KeysetTokenError`](../reference/errors/query-errors.mdx#keysettokenerror) и текстом `keysetPage: invalid cursor — it cannot be read`, а `guard` превратит это в ответ 400. Разбирать и подправлять токен самому нельзя. В нём позиция, значения ключей и проверка, и любая правка делает его недействительным. Пусть клиент начнёт список с первой страницы.
 
-Клиент подменил или обрезал токен `after`. `keysetPage` отказывает ошибкой [`KeysetTokenError`](../reference/errors/query-errors.mdx#keysettokenerror) с текстом `keysetPage: invalid cursor — it cannot be read`, и `guard` превращает её в ответ 400. Токен нельзя разбирать самому и подправлять: он содержит позицию, значения ключей и проверку, и любая правка делает его недействительным. Пусть клиент начнёт список с первой страницы.
+**Клиент меняет поля, которые менять нельзя.** Если передать тело в обновление целиком (`{ $set: body }`), клиент сможет поменять любое поле, которое допускает схема, включая `owner`. Схема не знает, какие поля вы разрешили клиенту. Вызывайте `$set` только для разрешённых ключей, как в `updateAccount`.
 
-### Клиент меняет поля, которые менять нельзя
-
-Если передать тело в обновление целиком (`{ $set: body }`), клиент сможет поменять любое поле, которое допускает схема, включая `owner`. Схема не знает, какие поля вы разрешили клиенту. Правильно — вызывать `$set` только для разрешённых ключей, как в `updateAccount`.
-
-### Клиент получает ответ 500 на неверный id
-
-Ошибка `CastError` — ошибка клиента, но обработчик без `guard` пропустил бы её как обычную. Оберните каждый обработчик в `guard`: перевод ошибок должен быть в одном месте.
+**На неверный id клиент получает 500.** `CastError` — ошибка клиента, но обработчик без `guard` пропустил бы её как обычную. Оборачивайте каждый обработчик в `guard`, перевод ошибок должен жить в одном месте.
 
 ## Полный пример
 
-Все части в одном файле. Разделите его по файлам, как показано в комментариях, или оставьте как есть: код рабочий.
+Все части в одном файле. Разделите его по файлам, как подсказывают комментарии, или оставьте как есть — код рабочий.
 
 ```ts twoslash title="accounts/accounts.service.ts"
 import {
@@ -555,11 +562,11 @@ export const deleteAccount = (id: string) =>
   });
 ```
 
-Вызов из вашего веб-слоя выглядит одинаково для любого сервера: разобрать адрес и тело, вызвать обработчик, а `__NotFound__`, `__BadRequest__` и `__Conflict__` превратить в статусы 404, 400 и 409.
+Вызов из веб-слоя выглядит одинаково для любого сервера. Разберите адрес и тело, вызовите обработчик, а `__NotFound__`, `__BadRequest__` и `__Conflict__` превратите в статусы 404, 400 и 409.
 
 <Callout type="migration">
 
-В Mongoose список чаще всего строили на `.skip()` и `.limit()`, а ошибки разбирали по `error.name` и коду 11000. Здесь ту же работу делают [`keysetPage`](../reference/query/keyset.mdx#modelkeysetpage) и классы ошибок, которые проверяются через `instanceof`. Приведение id из строки тоже делает сама библиотека: `mongoose.Types.ObjectId(id)` в обработчике не нужен.
+В Mongoose список чаще всего строили на `.skip()` и `.limit()`, а ошибки разбирали по `error.name` и коду 11000. Здесь ту же работу делают [`keysetPage`](../reference/query/keyset.mdx#modelkeysetpage) и классы ошибок, которые проверяются через `instanceof`. Id из строки библиотека тоже приводит сама, `mongoose.Types.ObjectId(id)` в обработчике не нужен.
 
 </Callout>
 
@@ -573,7 +580,7 @@ export const deleteAccount = (id: string) =>
   Почему `skip` дорогой и как устроен токен следующей страницы.
 </Card>
 <Card title="Многотенантное приложение" href="./multi-tenant.mdx">
-  Как тот же API разделить между несколькими клиентами, чтобы они не видели чужих счетов.
+  Как разделить тот же API между несколькими клиентами, чтобы никто не видел чужих счетов.
 </Card>
 <Card title="Кеширование ответов" href="./caching.mdx">
   Как не ходить в базу за одним и тем же счётом при каждом запросе.
